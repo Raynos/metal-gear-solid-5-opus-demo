@@ -33,7 +33,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 0.9,
     fogColor: [0.66, 0.62, 0.62],
     fogDensity: 0.000105,
-    exposure: 0.78,
+    exposure: 1.00,
   },
   noon: {
     sunElevation: 68.0,
@@ -48,7 +48,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 1.15,
     fogColor: [0.70, 0.735, 0.80],
     fogDensity: 0.000082,
-    exposure: 0.66,
+    exposure: 0.74,
   },
   afternoon: {
     sunElevation: 27.0,
@@ -63,7 +63,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 1.0,
     fogColor: [0.72, 0.70, 0.71],
     fogDensity: 0.000095,
-    exposure: 0.70,
+    exposure: 0.95,
   },
   dusk: {
     sunElevation: 2.0,
@@ -75,46 +75,53 @@ export const TIME_OF_DAY = {
     mieCoefficient: 0.011,
     mieDirectionalG: 0.88,
     ambientColor: [0.30, 0.34, 0.52],
-    ambientIntensity: 0.85,
+    ambientIntensity: 1.05,
     fogColor: [0.60, 0.52, 0.52],
     fogDensity: 0.000118,
-    exposure: 0.82,
+    exposure: 1.00,
   },
   night: {
     sunElevation: -14.0,
     sunAzimuth: 300,
-    sunColor: [0.42, 0.52, 0.78],
-    sunIntensity: 0.55,
+    sunColor: [0.46, 0.56, 0.82],
+    sunIntensity: 0.95,
     skyTurbidity: 2.2,
     rayleigh: 0.9,
     mieCoefficient: 0.003,
     mieDirectionalG: 0.78,
-    ambientColor: [0.16, 0.21, 0.36],
-    ambientIntensity: 0.5,
+    ambientColor: [0.18, 0.24, 0.40],
+    ambientIntensity: 1.0,
     fogColor: [0.13, 0.16, 0.24],
     fogDensity: 0.00013,
-    exposure: 1.10,
+    exposure: 1.40,
   },
 };
 
 /** Post-process / grade constants. */
 export const GRADE = {
   // Split-tone. Restrained: MGSV is dusty, not neon.
-  shadowTint: [0.86, 0.95, 1.06],
-  midTint: [1.02, 1.0, 0.955],
-  highlightTint: [1.0, 0.995, 0.985],
-  saturation: 0.86,
-  contrast: 1.06,
-  lift: 0.012,
+  shadowTint: [0.88, 0.955, 1.085],
+  midTint: [1.065, 1.005, 0.905],
+  highlightTint: [1.005, 0.995, 0.972],
+  saturation: 0.97,
+  contrast: 1.12,
+  lift: 0.032,
   // Bloom
-  bloomStrength: 0.42,
+  bloomStrength: 0.34,
   bloomRadius: 0.62,
   bloomThreshold: 0.92,
   // Grain / lens
   grainAmount: 0.036,
-  vignette: 0.34,
+  vignette: 0.26,
   chromaticAberration: 0.0016,
-  sharpen: 0.34,
+  sharpen: 0.22,
+  // Photographic finish (appended)
+  anamorphic: 0.10,      // horizontal streak off the bright pass
+  lensDirt: 0.10,        // veiling glare through the front-element dirt map
+  barrel: 0.035,         // barrel distortion; perfectly rectilinear reads as CG
+  fStop: 2.4,            // aperture for the depth-of-field solve
+  sensorHeight: 0.024,   // metres; 35mm-format sensor, sets CoC -> pixels
+  focusEdgeSoftness: 1.2, // extra CoC in the corners (field curvature), pixels
 };
 
 /** Terrain / material palette (linear-space albedo). */
@@ -132,8 +139,8 @@ export const PALETTE = {
 
 export const QUALITY = {
   shadowMapSize: 2048,
-  cascadeCount: 4,
-  shadowDistance: 420,
+  cascadeCount: 3,
+  shadowDistance: 380,
   terrainSize: 4096,
   viewDistance: 6000,
 };

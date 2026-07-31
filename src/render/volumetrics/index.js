@@ -1,17 +1,35 @@
+import { TerrainFields } from './TerrainFields.js';
+import { VolumetricPass, ATMOS } from './VolumetricPass.js';
+import { ParticleAtmosphere } from './Particles.js';
+
 /**
- * volumetrics module — owned by a single agent.
+ * volumetrics — the atmosphere-in-the-volume layer.
  *
- * Contract: export `install(world)`. It is called once at boot, in the fixed
- * order defined in src/main.js, after terrain/sky/lighting exist. Return an
- * object (or nothing). Anything needing a per-frame tick should call
- * `world.engine.addSystem({ order, update(dt, engine) {} })`.
+ * Three cooperating pieces, all procedural, all linear-HDR:
  *
- * `world` provides: { engine, scene, sky, lighting, terrain, registry }
- *   - terrain.heightAt(x, z) / terrain.normalAt(x, z) for ground placement
- *   - registry: shared object other modules publish handles into
+ *   TerrainFields       CPU-built lookup textures: terrain elevation and the
+ *                       sun *shadow-height* field, which answers "is this point
+ *                       in the air shadowed by a ridge?" in a single fetch at
+ *                       any distance. Kilometre-scale god rays depend on it —
+ *                       the engine's own shadow map only spans 240 m.
+ *   VolumetricPass      half-res raymarch of the haze (aerial perspective +
+ *                       shafts) and a cumulus slab, temporally accumulated and
+ *                       composited into the HDR buffer by one in-scene quad.
+ *   ParticleAtmosphere  ground dust motes and wind-driven sand streaming off
+ *                       the ridge crests, as depth-faded instanced billboards.
  *
- * Do NOT edit files outside this directory.
+ * Published on `registry.volumetrics` so other modules can read the tuning or
+ * borrow the depth/height textures.
  */
 export async function install(world) {
-  return null;
+  const fields = new TerrainFields(world.terrain, 512);
+  fields.updateSun(world.lighting.sunDirection);
+
+  const pass = new VolumetricPass(world, fields);
+  world.engine.addSystem(pass);
+
+  const particles = new ParticleAtmosphere(world, fields, pass);
+  world.engine.addSystem(particles);
+
+  return { fields, pass, particles, ATMOS };
 }

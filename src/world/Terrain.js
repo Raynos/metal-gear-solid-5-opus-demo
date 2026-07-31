@@ -2,143 +2,1133 @@ import * as THREE from 'three';
 import { PALETTE, QUALITY } from '../config/ArtDirection.js';
 
 /**
- * Terrain — Afghanistan-style eroded desert highland.
+ * Terrain — Afghanistan-style eroded high desert.
  *
- * Heightfield is generated on the CPU (so gameplay can raycast it cheaply via
- * `heightAt`) and shaded with a MeshStandardMaterial whose fragment stage is
- * augmented with procedural triplanar detail: multi-octave value noise supplies
- * albedo variation, a derived normal, and slope/altitude-driven material blending
- * between sand, gravel and rock. No texture files, no seams, detail at every
- * distance.
+ * Three things make this read as a real landscape rather than a noise plane:
+ *
+ *  1. The heightfield is *simulated*, not just summed. A domain-warped ridged
+ *     multifractal lays down meandering spines and stratified mesas; a talus
+ *     (thermal) pass then cuts them back to the angle of repose, building scree
+ *     aprons; a droplet hydraulic pass incises wadis and deposits alluvium in
+ *     the valley floors; a D8 flow accumulation pass extracts the drainage
+ *     network. The playable basin is a *landform* — the mountain mask simply
+ *     goes to zero near the origin — so there is no circular seam anywhere.
+ *
+ *  2. Geometry is a geo-clipmap: concentric rings sharing a single snapped
+ *     centre, displaced in the vertex shader from a packed height texture.
+ *     Near ground is 0.5 m, the 8 km outer ring is 64 m, no cracks (odd
+ *     boundary vertices are averaged to match the coarser neighbour exactly),
+ *     and the CPU never touches a vertex after load.
+ *
+ *  3. Everything expensive is *baked*. Surface normals, sky occlusion, flow,
+ *     rock exposure and scree live in two generated RGBA maps sampled once per
+ *     pixel; tactile detail comes from generated tiling albedo/normal tiles at
+ *     two scales. No per-pixel fbm anywhere.
+ *
+ * `heightAt`/`normalAt` read the same arrays the GPU reads, so placement by
+ * other modules always agrees with what is drawn.
  */
 
-// ---- CPU noise (matches the GLSL implementation closely enough for gameplay) ----
-function hash2(x, y) {
-  let h = x * 374761393 + y * 668265263;
-  h = (h ^ (h >> 13)) * 1274126177;
-  return ((h ^ (h >> 16)) >>> 0) / 4294967295;
+// ---------------------------------------------------------------------------
+// Noise
+// ---------------------------------------------------------------------------
+
+function mulberry32(a) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
-function smoothNoise(x, y) {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const xf = x - xi;
-  const yf = y - yi;
-  const u = xf * xf * (3 - 2 * xf);
-  const v = yf * yf * (3 - 2 * yf);
-  const a = hash2(xi, yi);
-  const b = hash2(xi + 1, yi);
-  const c = hash2(xi, yi + 1);
-  const d = hash2(xi + 1, yi + 1);
-  return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
-}
-function fbm(x, y, octaves, lacunarity = 2.03, gain = 0.5) {
-  let amp = 0.5;
-  let freq = 1.0;
-  let sum = 0;
-  let norm = 0;
-  for (let i = 0; i < octaves; i++) {
-    sum += amp * smoothNoise(x * freq, y * freq);
-    norm += amp;
-    amp *= gain;
-    freq *= lacunarity;
+
+const PERM = new Uint8Array(512);
+const GX = new Float32Array(256);
+const GY = new Float32Array(256);
+(function initNoise() {
+  const rnd = mulberry32(0x5eed17);
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  for (let i = 255; i > 0; i--) {
+    const j = (rnd() * (i + 1)) | 0;
+    const t = p[i];
+    p[i] = p[j];
+    p[j] = t;
   }
-  return sum / norm;
+  for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+  // 24 evenly spaced gradients: enough directions that the lattice never shows.
+  for (let i = 0; i < 256; i++) {
+    const a = ((i % 24) / 24) * Math.PI * 2;
+    GX[i] = Math.cos(a);
+    GY[i] = Math.sin(a);
+  }
+})();
+
+/** Classic 2D gradient noise, roughly [-1, 1]. */
+function perlin2(x, y) {
+  const fx = Math.floor(x);
+  const fy = Math.floor(y);
+  const xf = x - fx;
+  const yf = y - fy;
+  const X = fx & 255;
+  const Y = fy & 255;
+  const u = xf * xf * xf * (xf * (xf * 6 - 15) + 10);
+  const v = yf * yf * yf * (yf * (yf * 6 - 15) + 10);
+  const pX = PERM[X];
+  const pX1 = PERM[X + 1];
+  const h00 = PERM[pX + Y];
+  const h10 = PERM[pX1 + Y];
+  const h01 = PERM[pX + Y + 1];
+  const h11 = PERM[pX1 + Y + 1];
+  const n00 = GX[h00] * xf + GY[h00] * yf;
+  const n10 = GX[h10] * (xf - 1) + GY[h10] * yf;
+  const n01 = GX[h01] * xf + GY[h01] * (yf - 1);
+  const n11 = GX[h11] * (xf - 1) + GY[h11] * (yf - 1);
+  const a = n00 + u * (n10 - n00);
+  const b = n01 + u * (n11 - n01);
+  return (a + v * (b - a)) * 1.42;
 }
-/** Ridged multifractal — gives the sharp eroded spines the Afghan map is built from. */
-function ridged(x, y, octaves) {
+
+/** Rotated-octave fbm in [-1, 1]. Rotation kills the axis-aligned plaid look. */
+function fbm2(x, y, oct) {
   let amp = 0.5;
-  let freq = 1.0;
   let sum = 0;
   let norm = 0;
-  for (let i = 0; i < octaves; i++) {
-    const n = 1.0 - Math.abs(smoothNoise(x * freq, y * freq) * 2 - 1);
-    sum += amp * n * n;
+  let px = x;
+  let py = y;
+  for (let i = 0; i < oct; i++) {
+    sum += amp * perlin2(px, py);
     norm += amp;
-    amp *= 0.52;
-    freq *= 2.07;
+    amp *= 0.5;
+    const nx = px * 1.5893 - py * 1.2444;
+    py = px * 1.2444 + py * 1.5893;
+    px = nx;
   }
   return sum / norm;
 }
 
+/** Ridged multifractal in [0, 1]. Sharp crests, wide troughs. */
+function ridged2(x, y, oct) {
+  let amp = 0.5;
+  let sum = 0;
+  let norm = 0;
+  let weight = 1;
+  let px = x;
+  let py = y;
+  for (let i = 0; i < oct; i++) {
+    let n = 1 - Math.abs(perlin2(px, py));
+    n *= n;
+    n *= weight;
+    // Feed the previous octave forward: crests stay sharp, flanks stay smooth.
+    weight = Math.min(1, n * 2.1);
+    sum += amp * n;
+    norm += amp;
+    amp *= 0.52;
+    const nx = px * 1.6893 - py * 1.1444;
+    py = px * 1.1444 + py * 1.6893;
+    px = nx;
+  }
+  return sum / norm;
+}
+
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+function smoothstep(e0, e1, x) {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+// ---------------------------------------------------------------------------
+// Heightfield simulation
+// ---------------------------------------------------------------------------
+
+/**
+ * Talus / thermal erosion. Material above the angle of repose slides downhill.
+ * This is what turns noise blobs into faceted rock with scree fans at their feet,
+ * and it is dirt cheap compared to a droplet sim.
+ *
+ * `deposit` accumulates where material lands — that is the scree mask.
+ */
+function thermalErode(h, N, cell, passes, talus, rate, deposit) {
+  const dh = new Float32Array(h.length);
+  for (let p = 0; p < passes; p++) {
+    dh.fill(0);
+    for (let j = 1; j < N - 1; j++) {
+      const row = j * N;
+      for (let i = 1; i < N - 1; i++) {
+        const c = row + i;
+        const hc = h[c];
+        let total = 0;
+        let maxDiff = 0;
+        const d0 = hc - h[c - 1];
+        const d1 = hc - h[c + 1];
+        const d2 = hc - h[c - N];
+        const d3 = hc - h[c + N];
+        const t = talus * cell;
+        if (d0 > t) { total += d0 - t; if (d0 > maxDiff) maxDiff = d0; }
+        if (d1 > t) { total += d1 - t; if (d1 > maxDiff) maxDiff = d1; }
+        if (d2 > t) { total += d2 - t; if (d2 > maxDiff) maxDiff = d2; }
+        if (d3 > t) { total += d3 - t; if (d3 > maxDiff) maxDiff = d3; }
+        if (total <= 0) continue;
+        // Cap the transfer well below the largest step: a Jacobi pass that can
+        // invert the local ordering oscillates into a checkerboard.
+        const move = Math.min(maxDiff * 0.24, total * rate);
+        const inv = move / total;
+        if (d0 > t) { const m = (d0 - t) * inv; dh[c - 1] += m; dh[c] -= m; }
+        if (d1 > t) { const m = (d1 - t) * inv; dh[c + 1] += m; dh[c] -= m; }
+        if (d2 > t) { const m = (d2 - t) * inv; dh[c - N] += m; dh[c] -= m; }
+        if (d3 > t) { const m = (d3 - t) * inv; dh[c + N] += m; dh[c] -= m; }
+      }
+    }
+    for (let k = 0; k < h.length; k++) {
+      h[k] += dh[k];
+      if (deposit && dh[k] > 0) deposit[k] += dh[k];
+    }
+  }
+}
+
+/**
+ * Droplet hydraulic erosion (Mei/Lague style). Carves dendritic wadis and lays
+ * alluvium out into the flats. One run at load; nothing per frame.
+ */
+function hydraulicErode(h, N, cell, count, seed, opts) {
+  const {
+    lifetime = 42,
+    inertia = 0.055,
+    capacityK = 5.5,
+    minSlope = 0.008,
+    erodeRate = 0.35,
+    depositRate = 0.28,
+    evaporation = 0.018,
+    gravity = 6.0,
+    radius = 2,
+  } = opts || {};
+
+  // Precompute the erosion brush (a normalised cone) so a droplet never digs a
+  // single-texel pit.
+  const bOff = [];
+  const bW = [];
+  let wsum = 0;
+  for (let by = -radius; by <= radius; by++) {
+    for (let bx = -radius; bx <= radius; bx++) {
+      const d = Math.hypot(bx, by);
+      if (d > radius) continue;
+      const w = 1 - d / (radius + 0.5);
+      bOff.push(by * N + bx);
+      bW.push(w);
+      wsum += w;
+    }
+  }
+  for (let i = 0; i < bW.length; i++) bW[i] /= wsum;
+
+  const rnd = mulberry32(seed);
+  const flow = new Float32Array(h.length);
+  const lo = radius + 2;
+  const hi = N - radius - 3;
+
+  for (let d = 0; d < count; d++) {
+    let px = lo + rnd() * (hi - lo);
+    let py = lo + rnd() * (hi - lo);
+    let dx = 0;
+    let dy = 0;
+    let speed = 1;
+    let water = 1;
+    let sediment = 0;
+
+    for (let step = 0; step < lifetime; step++) {
+      const ix = px | 0;
+      const iy = py | 0;
+      const fx = px - ix;
+      const fy = py - iy;
+      const c = iy * N + ix;
+      const h00 = h[c];
+      const h10 = h[c + 1];
+      const h01 = h[c + N];
+      const h11 = h[c + N + 1];
+      const hOld = (h00 * (1 - fx) + h10 * fx) * (1 - fy) + (h01 * (1 - fx) + h11 * fx) * fy;
+
+      // Bilinear gradient, in metres per cell.
+      const gx = (h10 - h00) * (1 - fy) + (h11 - h01) * fy;
+      const gy = (h01 - h00) * (1 - fx) + (h11 - h10) * fx;
+
+      dx = dx * inertia - gx * (1 - inertia);
+      dy = dy * inertia - gy * (1 - inertia);
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) break;
+      dx /= len;
+      dy /= len;
+      px += dx;
+      py += dy;
+      if (px < lo || px > hi || py < lo || py > hi) break;
+
+      flow[c] += water;
+
+      const nix = px | 0;
+      const niy = py | 0;
+      const nfx = px - nix;
+      const nfy = py - niy;
+      const n = niy * N + nix;
+      const n00 = h[n];
+      const n10 = h[n + 1];
+      const n01 = h[n + N];
+      const n11 = h[n + N + 1];
+      const hNew = (n00 * (1 - nfx) + n10 * nfx) * (1 - nfy) + (n01 * (1 - nfx) + n11 * nfx) * nfy;
+      const delta = hNew - hOld;
+
+      const capacity = Math.max(-delta / cell, minSlope) * speed * water * capacityK * cell;
+
+      if (sediment > capacity || delta > 0) {
+        // Uphill or saturated: drop load. Filling a pit exactly levels it.
+        const amount = delta > 0 ? Math.min(delta, sediment) : (sediment - capacity) * depositRate;
+        sediment -= amount;
+        h[c] += amount * (1 - fx) * (1 - fy);
+        h[c + 1] += amount * fx * (1 - fy);
+        h[c + N] += amount * (1 - fx) * fy;
+        h[c + N + 1] += amount * fx * fy;
+      } else {
+        const amount = Math.min((capacity - sediment) * erodeRate, -delta);
+        sediment += amount;
+        for (let b = 0; b < bOff.length; b++) h[c + bOff[b]] -= amount * bW[b];
+      }
+
+      speed = Math.sqrt(Math.max(0, speed * speed - (delta / cell) * gravity));
+      water *= 1 - evaporation;
+      if (water < 0.02) break;
+    }
+  }
+  return flow;
+}
+
+/**
+ * D8 flow accumulation. Gives clean dendritic drainage lines — far crisper than
+ * droplet visit counts — which drive the dark mineral staining in the wadis.
+ * Counting-sorted by height so it stays O(n).
+ */
+function flowAccumulate(h, N) {
+  const n = h.length;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (h[i] < min) min = h[i];
+    if (h[i] > max) max = h[i];
+  }
+  const BINS = 4096;
+  const scale = (BINS - 1) / Math.max(1e-6, max - min);
+  const counts = new Int32Array(BINS + 1);
+  const bin = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const b = ((h[i] - min) * scale) | 0;
+    bin[i] = b;
+    counts[b]++;
+  }
+  // Descending order: walk bins from high to low.
+  const start = new Int32Array(BINS);
+  let acc = 0;
+  for (let b = BINS - 1; b >= 0; b--) {
+    start[b] = acc;
+    acc += counts[b];
+  }
+  const order = new Int32Array(n);
+  const cursor = start.slice();
+  for (let i = 0; i < n; i++) order[cursor[bin[i]]++] = i;
+
+  const flow = new Float32Array(n).fill(1);
+  const NB = [-1, 1, -N, N, -N - 1, -N + 1, N - 1, N + 1];
+  const ND = [1, 1, 1, 1, 1.4142, 1.4142, 1.4142, 1.4142];
+  for (let k = 0; k < n; k++) {
+    const c = order[k];
+    const j = (c / N) | 0;
+    const i = c - j * N;
+    if (i < 1 || j < 1 || i >= N - 1 || j >= N - 1) continue;
+    let best = -1;
+    let bestSlope = 0;
+    // Deterministic tie-break jitter: on a near-flat pan, exact ties make every
+    // cell pick the same neighbour and the channels comb into parallel lines.
+    const jit = 1 + (((Math.imul(c, 0x9e3779b1) >>> 24) / 255) - 0.5) * 0.08;
+    for (let d = 0; d < 8; d++) {
+      const s = ((h[c] - h[c + NB[d]]) / ND[d]) * (d & 1 ? jit : 2 - jit);
+      if (s > bestSlope) {
+        bestSlope = s;
+        best = c + NB[d];
+      }
+    }
+    if (best >= 0) flow[best] += flow[c];
+  }
+  return flow;
+}
+
+/**
+ * Horizon-scan sky occlusion. This is the single cheapest thing that makes a
+ * vista read as a real mountain range: gorges go dark, ridge tops stay bright,
+ * and the ambient term stops being flat.
+ */
+function skyOcclusion(h, N, cell) {
+  const ao = new Float32Array(h.length);
+  const DIRS = 8;
+  const dirX = new Float32Array(DIRS);
+  const dirY = new Float32Array(DIRS);
+  for (let d = 0; d < DIRS; d++) {
+    const a = (d / DIRS) * Math.PI * 2 + 0.31;
+    dirX[d] = Math.cos(a);
+    dirY[d] = Math.sin(a);
+  }
+  const STEPS = [1, 2, 3, 5, 8, 12, 18, 27, 40, 60];
+  const S = 2; // compute on a half-res lattice, then upsample
+  const M = Math.ceil(N / S);
+  const coarse = new Float32Array(M * M);
+  for (let cj = 0; cj < M; cj++) {
+    const j = Math.min(N - 1, cj * S);
+    for (let ci = 0; ci < M; ci++) {
+      const i = Math.min(N - 1, ci * S);
+      const h0 = h[j * N + i];
+      let occ = 0;
+      for (let d = 0; d < DIRS; d++) {
+        let maxTan = 0;
+        for (let s = 0; s < STEPS.length; s++) {
+          const step = STEPS[s];
+          let sx = i + ((dirX[d] * step) | 0);
+          let sy = j + ((dirY[d] * step) | 0);
+          if (sx < 0) sx = 0; else if (sx >= N) sx = N - 1;
+          if (sy < 0) sy = 0; else if (sy >= N) sy = N - 1;
+          const t = (h[sy * N + sx] - h0) / (step * cell);
+          if (t > maxTan) maxTan = t;
+        }
+        occ += maxTan / Math.sqrt(1 + maxTan * maxTan);
+      }
+      coarse[cj * M + ci] = 1 - occ / DIRS;
+    }
+  }
+  for (let j = 0; j < N; j++) {
+    const cy = j / S;
+    const j0 = Math.min(M - 1, cy | 0);
+    const j1 = Math.min(M - 1, j0 + 1);
+    const fy = cy - j0;
+    for (let i = 0; i < N; i++) {
+      const cx = i / S;
+      const i0 = Math.min(M - 1, cx | 0);
+      const i1 = Math.min(M - 1, i0 + 1);
+      const fx = cx - i0;
+      const a = coarse[j0 * M + i0] * (1 - fx) + coarse[j0 * M + i1] * fx;
+      const b = coarse[j1 * M + i0] * (1 - fx) + coarse[j1 * M + i1] * fx;
+      ao[j * N + i] = a * (1 - fy) + b * fy;
+    }
+  }
+  return ao;
+}
+
+/** Separable box blur, used to build the "regional mean height" a basin relaxes to. */
+function blurField(src, N, radius, iterations = 1) {
+  let a = Float32Array.from(src);
+  let b = new Float32Array(src.length);
+  const inv = 1 / (radius * 2 + 1);
+  for (let it = 0; it < iterations; it++) {
+    for (let j = 0; j < N; j++) {
+      const row = j * N;
+      let sum = 0;
+      for (let i = -radius; i <= radius; i++) sum += a[row + clamp(i, 0, N - 1)];
+      for (let i = 0; i < N; i++) {
+        b[row + i] = sum * inv;
+        sum += a[row + clamp(i + radius + 1, 0, N - 1)] - a[row + clamp(i - radius, 0, N - 1)];
+      }
+    }
+    for (let i = 0; i < N; i++) {
+      let sum = 0;
+      for (let j = -radius; j <= radius; j++) sum += b[clamp(j, 0, N - 1) * N + i];
+      for (let j = 0; j < N; j++) {
+        a[j * N + i] = sum * inv;
+        sum += b[clamp(j + radius + 1, 0, N - 1) * N + i] - b[clamp(j - radius, 0, N - 1) * N + i];
+      }
+    }
+  }
+  return a;
+}
+
+// ---------------------------------------------------------------------------
+// Grid: one level of the world heightfield plus its baked material channels
+// ---------------------------------------------------------------------------
+
+class Grid {
+  constructor(n, cell) {
+    this.n = n;
+    this.cell = cell;
+    this.size = n * cell;
+    this.origin = -this.size / 2;
+    this.h = new Float32Array(n * n);
+    this.rock = new Float32Array(n * n);
+    this.scree = new Float32Array(n * n);
+    this.flow = new Float32Array(n * n);
+    this.ao = new Float32Array(n * n);
+    this.curv = new Float32Array(n * n);
+    this.nx = new Float32Array(n * n);
+    this.nz = new Float32Array(n * n);
+  }
+
+  /** Continuous grid index for a world coordinate. */
+  ix(w) {
+    return (w - this.origin) / this.cell;
+  }
+
+  sample(field, wx, wz) {
+    const n = this.n;
+    let fx = this.ix(wx);
+    let fz = this.ix(wz);
+    fx = clamp(fx, 0, n - 1.001);
+    fz = clamp(fz, 0, n - 1.001);
+    const i = fx | 0;
+    const j = fz | 0;
+    const tx = fx - i;
+    const tz = fz - j;
+    const a = field[j * n + i] * (1 - tx) + field[j * n + i + 1] * tx;
+    const b = field[(j + 1) * n + i] * (1 - tx) + field[(j + 1) * n + i + 1] * tx;
+    return a * (1 - tz) + b * tz;
+  }
+
+  contains(wx, wz, inset) {
+    const lim = this.size / 2 - inset;
+    return wx > -lim && wx < lim && wz > -lim && wz < lim;
+  }
+}
+
+// Packed height range. Generous enough that erosion can never clip.
+const H_MIN = -400;
+const H_RANGE = 1400;
+
+// ---------------------------------------------------------------------------
+
 export class Terrain {
-  /**
-   * @param {object} opts
-   * @param {number} opts.size    world extent in metres
-   * @param {number} opts.segments grid resolution
-   */
   constructor({ size = QUALITY.terrainSize, segments = 512 } = {}) {
     this.size = size;
     this.segments = segments;
     this.order = 10;
 
-    this.heights = new Float32Array((segments + 1) * (segments + 1));
-    this._buildHeights();
+    // Far grid spans well past the 6 km far plane so the frustum is always full
+    // of landscape; the near grid re-resolves the play area at 2 m.
+    this.far = new Grid(1536, 8);
+    this.near = new Grid(1280, 2);
 
-    const geo = new THREE.PlaneGeometry(size, size, segments, segments);
-    geo.rotateX(-Math.PI / 2);
-    const pos = geo.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      pos.setY(i, this.heights[i]);
-    }
-    geo.computeVertexNormals();
-    geo.computeBoundingSphere();
-    this.geometry = geo;
+    this._buildFar();
+    this._buildNear();
 
-    this.material = this._buildMaterial();
-    this.mesh = new THREE.Mesh(geo, this.material);
-    this.mesh.receiveShadow = true;
-    this.mesh.castShadow = true;
-    this.mesh.name = 'terrain';
+    this._buildTextures();
+    this._buildDetailTextures();
+    this._buildMaterial();
+    this._buildClipmap();
   }
 
-  _buildHeights() {
-    const n = this.segments + 1;
-    const s = this.size;
+  // -- heightfield ---------------------------------------------------------
+
+  /**
+   * The landform, before simulation. Two levels of domain warp bend the ridge
+   * network into meandering, geologically-plausible chains; the mountain mask
+   * itself falls away toward the origin, so the outpost basin is a feature of
+   * the landscape rather than a hole punched into it.
+   */
+  /**
+   * Heavily warped pseudo-distance from the outpost. Every place that needs to
+   * know "am I in the valley or in the mountains" uses this, so the valley has
+   * one coherent, ragged outline rather than several concentric circles.
+   */
+  static _valleyDistance(x, z, S) {
+    const w0 = fbm2(x * S * 1.9 + 17.0, z * S * 1.9 - 11.0, 3);
+    const w1 = fbm2(x * S * 6.1 - 5.0, z * S * 6.1 + 3.0, 2);
+    const w2 = fbm2(x * S * 17.0 + 9.0, z * S * 17.0 + 27.0, 2);
+    // Elliptical and rotated: valleys are not radially symmetric either.
+    const ex = x * 0.92 + z * 0.36;
+    const ez = (-x * 0.36 + z * 0.92) * 1.34;
+    return Math.hypot(ex, ez) + w0 * 560 + w1 * 210 + w2 * 70;
+  }
+
+  _base(x, z) {
+    const S = 1 / 2600;
+
+    // Warp 1 — long wavelength: bends whole ranges into arcs.
+    const w1x = fbm2(x * S * 0.7 + 4.1, z * S * 0.7 - 2.7, 3);
+    const w1z = fbm2(x * S * 0.7 - 8.3, z * S * 0.7 + 6.9, 3);
+    const qx = x + w1x * 900;
+    const qz = z + w1z * 900;
+    // Warp 2 — shorter, smaller: kinks the individual spurs.
+    const w2x = fbm2(qx * S * 2.6 + 1.3, qz * S * 2.6 + 7.7, 2);
+    const w2z = fbm2(qx * S * 2.6 - 5.5, qz * S * 2.6 - 3.1, 2);
+    const rx = qx + w2x * 280;
+    const rz = qz + w2z * 280;
+
+    // Where mountains are allowed. "Distance from the outpost" is warped at
+    // three wavelengths before it is used, so the valley mouth wanders in and
+    // out by hundreds of metres and never reads as a disc.
+    const d = Terrain._valleyDistance(x, z, S);
+    // The main range sits 1.6-2.6 km out. A 350 m crest at that range subtends
+    // ~8 deg from the vista camera — big enough to dominate the frame, low
+    // enough that there is still sky above it.
+    let mask = smoothstep(1150, 3100, d);
+    const region = fbm2(qx * S * 0.85 + 21.0, qz * S * 0.85 - 13.0, 3) * 0.5 + 0.5;
+    mask *= 0.42 + smoothstep(0.2, 0.72, region) * 0.85;
+    mask *= 1.0 + smoothstep(5000, 2600, d) * smoothstep(1300, 2600, d) * 0.45;
+    mask = Math.min(mask, 1.18);
+
+    // Broad basins and swells the ranges sit on.
+    let h = fbm2(qx * S * 0.9, qz * S * 0.9, 4) * 130 - 26;
+
+    // The ridge network itself.
+    const r = ridged2(rx * S * 2.35, rz * S * 2.35, 6);
+    h += Math.pow(r, 1.3) * 440 * mask;
+
+    // Foothills: a second, lower ridge line at 0.7-1.4 km. Three depth planes
+    // (buttes / foothills / range) is what turns a wall of rock into a landscape
+    // with aerial perspective.
+    const foot = ridged2(rx * S * 5.2 - 4.0, rz * S * 5.2 + 9.0, 4);
+    const footMask = smoothstep(520, 1500, d) * (1 - smoothstep(1800, 3100, d)) * (0.5 + region * 0.7);
+    h += Math.pow(foot, 1.25) * 185 * footMask;
+
+    // Isolated buttes standing out of the valley floor — the flat-topped rock
+    // islands the middle distance is read against.
+    const butte = ridged2(rx * S * 8.0 + 13.0, rz * S * 8.0 - 6.0, 3);
+    const butteMask =
+      smoothstep(0.58, 0.86, butte) *
+      (1 - Math.min(1, mask)) *
+      smoothstep(200, 700, d) *
+      (1 - smoothstep(1000, 1700, d)) *
+      smoothstep(330, 620, Math.hypot(x, z));
+    h += butteMask * 120;
+
+    // Mesa terracing: hard horizontal benches, on high ground and on the buttes.
+    const bench = Math.min(1, smoothstep(40, 190, h) * (mask + footMask * 0.8) + butteMask * 1.4);
+    if (bench > 0.01) {
+      const stepH = 28;
+      const t = h / stepH;
+      const fl = Math.floor(t);
+      let f = t - fl;
+      // Flat tread, abrupt riser.
+      f = f < 0.62 ? f * 0.22 : 0.136 + (f - 0.62) * 2.274;
+      h += ((fl + f) * stepH - h) * bench * 0.6;
+    }
+
+    // Mid-scale spurs and gullies so erosion has something to bite into.
+    h += fbm2(rx * S * 11.0 + 3.3, rz * S * 11.0 - 9.1, 4) * 26 * (0.3 + (mask + footMask) * 0.6);
+    // Valley floor is not billiard-flat: gentle alluvial swell.
+    h += fbm2(x * S * 22.0, z * S * 22.0, 3) * 4.5;
+
+    return h;
+  }
+
+  _buildFar() {
+    const g = this.far;
+    const n = g.n;
+    const h = g.h;
     for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
       for (let i = 0; i < n; i++) {
-        const wx = (i / this.segments - 0.5) * s;
-        const wz = (j / this.segments - 0.5) * s;
-        this.heights[j * n + i] = this._sampleHeight(wx, wz);
+        h[j * n + i] = this._base(g.origin + i * g.cell, wz);
+      }
+    }
+
+    // Simulate: talus first (build the faces), water second (cut the wadis),
+    // talus again (dress the fresh cuts with scree).
+    thermalErode(h, n, g.cell, 14, 0.62, 0.5, g.scree);
+    const dropFlow = hydraulicErode(h, n, g.cell, 150000, 0x1234, {
+      lifetime: 46,
+      radius: 2,
+      capacityK: 5.0,
+      erodeRate: 0.32,
+      depositRate: 0.3,
+    });
+    thermalErode(h, n, g.cell, 6, 0.70, 0.45, g.scree);
+    this._addCrags(g, 1 / 130, 34, null);
+
+    this._relaxBasin(g, 500, 1250, 0.75, 150);
+    this._bakeChannels(g, dropFlow);
+  }
+
+  _buildNear() {
+    const g = this.near;
+    const f = this.far;
+    const n = g.n;
+    const h = g.h;
+
+    // Seed from the far field. Because the grids are aligned (8 m / 2 m) the
+    // bilinear reconstruction of this upsample is *identical* to the far
+    // field's, so the two can be switched between without a seam.
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        h[j * n + i] = f.sample(f.h, g.origin + i * g.cell, wz);
+      }
+    }
+
+    // Fade every near-grid-only contribution to zero at the border.
+    const lim = g.size / 2;
+    const edge = new Float32Array(n * n);
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        const wx = g.origin + i * g.cell;
+        const e = Math.max(Math.abs(wx), Math.abs(wz));
+        edge[j * n + i] = 1 - smoothstep(lim * 0.68, lim * 0.985, e);
+      }
+    }
+
+    // Fine relief the 8 m grid could not hold: crags on rock, ripples on sand.
+    const before = Float32Array.from(h);
+    // Bilinear upsampling leaves creases on the coarse cell boundaries; thermal
+    // erosion latches onto them and hatches. Take them out first.
+    h.set(blurField(h, n, 3, 1));
+    for (let j = 1; j < n - 1; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 1; i < n - 1; i++) {
+        const c = j * n + i;
+        const wx = g.origin + i * g.cell;
+        const slope = Math.hypot(h[c + 1] - h[c - 1], h[c + n] - h[c - n]) / (2 * g.cell);
+        const rocky = smoothstep(0.35, 0.95, slope);
+        const amp = 1.1 + rocky * 6.0;
+        h[c] += fbm2(wx * 0.021 + 5.0, wz * 0.021 - 3.0, 3) * amp * edge[c];
+        h[c] += fbm2(wx * 0.075 - 2.0, wz * 0.075 + 8.0, 2) * amp * 0.28 * edge[c];
+      }
+    }
+
+    thermalErode(h, n, g.cell, 8, 0.66, 0.5, g.scree);
+    const dropFlow = hydraulicErode(h, n, g.cell, 130000, 0x77aa, {
+      lifetime: 40,
+      radius: 3,
+      capacityK: 4.0,
+      erodeRate: 0.3,
+      depositRate: 0.32,
+      evaporation: 0.022,
+    });
+    thermalErode(h, n, g.cell, 5, 0.72, 0.45, g.scree);
+    this._addCrags(g, 1 / 34, 9.5, edge);
+    this._addCrags(g, 1 / 9.5, 2.4, edge);
+
+    // Camp pad: relax toward the local mean so vehicles and buildings have
+    // something to sit on. The target is the terrain's own blurred self and the
+    // weight is gated on altitude, so it reads as an alluvial flat.
+    this._relaxBasin(g, 330, 820, 0.9, 92);
+    this._addFloorRelief(g, edge);
+
+    // Force the border back onto the far field exactly.
+    for (let k = 0; k < n * n; k++) h[k] = before[k] + (h[k] - before[k]) * edge[k];
+
+    this._bakeChannels(g, dropFlow, edge);
+  }
+
+  /**
+   * Post-erosion crag pass. Thermal relaxation leaves faces smooth at the angle
+   * of repose, which reads as sand dunes rather than rock. Ridged noise added
+   * *after* the simulation puts the spurs and buttresses back, weighted by slope
+   * so the flats stay flat.
+   */
+  _addCrags(g, freq, amp, edge) {
+    const n = g.n;
+    const h = g.h;
+    const cell = g.cell;
+    const src = Float32Array.from(h);
+    for (let j = 1; j < n - 1; j++) {
+      const wz = g.origin + j * cell;
+      for (let i = 1; i < n - 1; i++) {
+        const c = j * n + i;
+        const slope = Math.hypot(src[c + 1] - src[c - 1], src[c + n] - src[c - n]) / (2 * cell);
+        const rocky = smoothstep(0.30, 0.95, slope);
+        if (rocky < 0.02) continue;
+        const wx = g.origin + i * cell;
+        const a = (ridged2(wx * freq, wz * freq, 3) - 0.40) * amp;
+        const b = (ridged2(wx * freq * 3.3 + 41.0, wz * freq * 3.3 - 23.0, 2) - 0.40) * amp * 0.34;
+        h[c] += (a + b) * rocky * (edge ? edge[c] : 1);
       }
     }
   }
 
-  _sampleHeight(wx, wz) {
-    const x = wx / 900;
-    const z = wz / 900;
-    // Continental shape: big rolling basins.
-    let h = (fbm(x * 0.6 + 11.3, z * 0.6 - 7.1, 4) - 0.5) * 210;
-    // Ridge network — the dominant read of the landscape.
-    const ridgeMask = THREE.MathUtils.smoothstep(fbm(x * 0.35 - 3.0, z * 0.35 + 5.0, 3), 0.42, 0.85);
-    h += ridged(x * 1.35, z * 1.35, 6) * 240 * ridgeMask;
-    // Mid-scale erosion gullies.
-    h += (fbm(x * 4.1 + 31.0, z * 4.1 - 17.0, 5) - 0.5) * 34;
-    // Fine bumpiness so the silhouette never reads as smooth CG.
-    h += (fbm(x * 15.0, z * 15.0, 4) - 0.5) * 5.5;
-
-    // Carve a flat-ish valley floor near the origin for the playable outpost.
-    const d = Math.sqrt(wx * wx + wz * wz);
-    const basin = THREE.MathUtils.smoothstep(d, 110, 460);
-    h = THREE.MathUtils.lerp(-6.0 + (fbm(x * 8, z * 8, 3) - 0.5) * 3.0, h, basin);
-    return h;
+  /**
+   * Wind-worked relief on the valley floor. A pan that has been relaxed to a
+   * mathematically smooth surface reads as poured concrete under raking light
+   * and gives the flow solver nothing but radial ties to follow; a metre of
+   * low-frequency flute and braid fixes both.
+   */
+  _addFloorRelief(g, edge) {
+    const n = g.n;
+    const h = g.h;
+    const cell = g.cell;
+    const src = Float32Array.from(h);
+    for (let j = 1; j < n - 1; j++) {
+      const wz = g.origin + j * cell;
+      for (let i = 1; i < n - 1; i++) {
+        const c = j * n + i;
+        const slope = Math.hypot(src[c + 1] - src[c - 1], src[c + n] - src[c - n]) / (2 * cell);
+        const flat = 1 - smoothstep(0.06, 0.34, slope);
+        if (flat < 0.02) continue;
+        const wx = g.origin + i * cell;
+        const r0 = Math.hypot(wx, wz);
+        // Keep the immediate outpost apron calmer than the open pan.
+        const open = smoothstep(150, 700, r0);
+        // Broad swells, braid-scale flutes, then a shallow directional dune set.
+        let d = fbm2(wx / 230 + 2.0, wz / 230 + 8.0, 2) * 5.4 * open;
+        d += fbm2(wx / 74 + 11.0, wz / 74 - 5.0, 2) * 2.9;
+        d += fbm2(wx / 21 - 7.0, wz / 21 + 13.0, 2) * 0.85;
+        const t = (wx * 0.82 + wz * 0.57) / 33 + fbm2(wx / 260, wz / 260, 2) * 3.0;
+        d += Math.sin(t) * 0.42;
+        // Braided washes: shallow incised channels wandering across the pan.
+        // The flow solver then finds them, so the drainage the eye sees and the
+        // drainage the material map paints are the same thing.
+        const ch = 1 - Math.abs(fbm2(wx / 205 + 3.0, wz / 205 - 9.0, 3));
+        d -= Math.pow(clamp((ch - 0.60) / 0.40, 0, 1), 1.4) * 4.2 * open;
+        h[c] += d * flat * (0.34 + 0.66 * smoothstep(120, 430, r0)) * (edge ? edge[c] : 1);
+      }
+    }
   }
 
-  /** Bilinear height lookup in world space — used by gameplay + placement. */
+  /**
+   * Flatten the playable floor by pulling it toward a heavily blurred copy of
+   * itself. Because the target *is* the terrain (just smoothed), the influence
+   * region has no boundary of its own — no circular seam.
+   */
+  _relaxBasin(g, inner, outer, strength, blurM) {
+    const n = g.n;
+    const h = g.h;
+    const r = Math.max(2, Math.round(blurM / g.cell));
+    const smooth = blurField(h, n, r, 2);
+    // Only ground that is already low participates. That makes the flat read as
+    // an alluvial floor following the valley's own outline, instead of a disc
+    // stamped over whatever happened to be there.
+    let floor = Infinity;
+    for (let k = 0; k < h.length; k++) if (h[k] < floor) floor = h[k];
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        const wx = g.origin + i * g.cell;
+        const d = Terrain._valleyDistance(wx, wz, 1 / 2600);
+        let w = 1 - smoothstep(inner, outer, d);
+        if (w <= 0.002) continue;
+        const c = j * n + i;
+        w *= 1 - smoothstep(floor + 26, floor + 96, h[c]);
+        h[c] += (smooth[c] - h[c]) * w * strength;
+      }
+    }
+  }
+
+  /** Derive the shading + material channels the fragment shader consumes. */
+  _bakeChannels(g, dropFlow, edgeFade) {
+    const n = g.n;
+    const h = g.h;
+    const cell = g.cell;
+
+    const acc = flowAccumulate(h, n);
+    const smooth = blurField(h, n, Math.max(2, Math.round(26 / cell)), 1);
+    const ao = skyOcclusion(h, n, cell);
+
+    let maxAcc = 1;
+    for (let k = 0; k < acc.length; k++) if (acc[k] > maxAcc) maxAcc = acc[k];
+    const invLogMax = 1 / Math.log(1 + maxAcc);
+
+    let screeMax = 1e-4;
+    for (let k = 0; k < g.scree.length; k++) if (g.scree[k] > screeMax) screeMax = g.scree[k];
+
+    const slopes = new Float32Array(n * n);
+    const talus = Float32Array.from(g.scree);
+
+    // Pass 1 — geometry-derived channels.
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const c = j * n + i;
+        const im = i > 0 ? c - 1 : c;
+        const ip = i < n - 1 ? c + 1 : c;
+        const jm = j > 0 ? c - n : c;
+        const jp = j < n - 1 ? c + n : c;
+        const dhx = (h[ip] - h[im]) / (2 * cell);
+        const dhz = (h[jp] - h[jm]) / (2 * cell);
+        const slope = Math.hypot(dhx, dhz);
+        slopes[c] = slope;
+        const invN = 1 / Math.sqrt(dhx * dhx + dhz * dhz + 1);
+        g.nx[c] = -dhx * invN;
+        g.nz[c] = -dhz * invN;
+
+        // Concavity: gullies collect fines, convex noses shed to bare rock.
+        const curv = clamp((h[c] - smooth[c]) / (6 + cell * 1.2), -1, 1);
+        g.curv[c] = curv;
+
+        // Bedrock exposure. Steep faces first, then convex shoulders and
+        // altitude; deposition suppresses it. Slope here is a true gradient, so
+        // 0.7 ~ 35 deg — about where loose material stops holding.
+        let rock = smoothstep(0.60, 1.05, slope);
+        rock = Math.max(rock, smoothstep(0.45, 0.85, slope) * smoothstep(0.05, 0.45, curv));
+        rock *= 1 - smoothstep(0.2, 0.7, -curv) * 0.55;
+        rock = clamp(rock + smoothstep(150, 380, h[c]) * 0.22, 0, 1);
+        g.rock[c] = rock;
+        g.ao[c] = clamp(ao[c], 0, 1);
+      }
+    }
+
+    // "How mountainous is the neighbourhood" — a blurred rock field is a good
+    // cheap proxy for sediment supply, which is what puts an alluvial fan on the
+    // flat ground below a range rather than everywhere.
+    const supply = blurField(g.rock, n, Math.max(2, Math.round(110 / cell)), 1);
+
+    // Pass 2 — depositional channels, which need the neighbourhood.
+    for (let c = 0; c < n * n; c++) {
+      const slope = slopes[c];
+      const rock = g.rock[c];
+      const curv = g.curv[c];
+
+      // Scree: talus deposition on the faces, plus the alluvial apron spilling
+      // out onto the flats below them.
+      const dep = Math.min(1, talus[c] / (screeMax * 0.28));
+      const apron = smoothstep(0.16, 0.55, supply[c]) * (1 - smoothstep(0.10, 0.42, slope));
+      g.scree[c] = clamp(
+        dep * 0.7 + smoothstep(0.16, 0.55, slope) * 0.7 + apron * 0.85,
+        0,
+        1,
+      ) * (1 - rock * 0.85);
+
+      // Drainage. On steep ground any incised line counts; out on the pan only
+      // the trunk washes survive, or the solver paints parallel ties across it.
+      const a = Math.log(1 + acc[c]) * invLogMax;
+      let fl = smoothstep(0.30, 0.70, a);
+      fl = Math.max(fl, smoothstep(0.6, 5.0, dropFlow[c]) * 0.5);
+      fl *= 1 - smoothstep(0.5, 1.0, slope);
+      const incised = smoothstep(0.010, 0.22, -curv);
+      const trunk = smoothstep(0.62, 0.86, a);
+      g.flow[c] = fl * Math.min(1, incised + trunk);
+    }
+
+    // Near grid: dissolve its own channels into the far grid's at the border so
+    // the hard near/far switch in the shader is invisible.
+    if (edgeFade) {
+      const f = this.far;
+      for (let j = 0; j < n; j++) {
+        const wz = g.origin + j * cell;
+        for (let i = 0; i < n; i++) {
+          const c = j * n + i;
+          const w = edgeFade[c];
+          if (w > 0.999) continue;
+          const wx = g.origin + i * cell;
+          g.rock[c] += (f.sample(f.rock, wx, wz) - g.rock[c]) * (1 - w);
+          g.scree[c] += (f.sample(f.scree, wx, wz) - g.scree[c]) * (1 - w);
+          g.flow[c] += (f.sample(f.flow, wx, wz) - g.flow[c]) * (1 - w);
+          g.ao[c] += (f.sample(f.ao, wx, wz) - g.ao[c]) * (1 - w);
+          g.curv[c] += (f.sample(f.curv, wx, wz) - g.curv[c]) * (1 - w);
+          // Normals too: a 2 m central difference of an upsampled 8 m field is
+          // not the same vector as the 8 m one, and the mismatch would ring.
+          g.nx[c] += (f.sample(f.nx, wx, wz) - g.nx[c]) * (1 - w);
+          g.nz[c] += (f.sample(f.nz, wx, wz) - g.nz[c]) * (1 - w);
+        }
+      }
+    }
+  }
+
+  // -- textures ------------------------------------------------------------
+
+  _packHeightTexture(g) {
+    const n = g.n;
+    const data = new Uint8Array(n * n * 4);
+    for (let k = 0; k < n * n; k++) {
+      const v = clamp((g.h[k] - H_MIN) / H_RANGE, 0, 0.99999);
+      const t = v * 255;
+      const a = t | 0;
+      const t2 = (t - a) * 255;
+      const b = t2 | 0;
+      const cch = Math.round((t2 - b) * 255);
+      data[k * 4] = a;
+      data[k * 4 + 1] = b;
+      data[k * 4 + 2] = cch;
+      data[k * 4 + 3] = 255;
+    }
+    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  /** RGBA = normal.x, normal.z, drainage, sky occlusion. */
+  _packSurfaceTexture(g) {
+    const n = g.n;
+    const data = new Uint8Array(n * n * 4);
+    for (let c = 0; c < n * n; c++) {
+      data[c * 4] = Math.round(clamp(g.nx[c] * 0.5 + 0.5, 0, 1) * 255);
+      data[c * 4 + 1] = Math.round(clamp(g.nz[c] * 0.5 + 0.5, 0, 1) * 255);
+      data[c * 4 + 2] = Math.round(clamp(g.flow[c], 0, 1) * 255);
+      data[c * 4 + 3] = Math.round(clamp(g.ao[c], 0, 1) * 255);
+    }
+    return this._dataTex(data, n);
+  }
+
+  /** RGBA = bedrock exposure, scree, curvature, macro tint. */
+  _packMaterialTexture(g) {
+    const n = g.n;
+    const data = new Uint8Array(n * n * 4);
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        const c = j * n + i;
+        const wx = g.origin + i * g.cell;
+        // Six octaves from 900 m down to ~28 m. The valley floor's read at any
+        // distance comes from this: it is the only channel with structure out on
+        // the pan, where slope, curvature and flow are all flat zero.
+        const macro = clamp(fbm2(wx * 0.0011 + 61.0, wz * 0.0011 - 43.0, 7) * 1.35 * 0.5 + 0.5, 0, 1);
+        data[c * 4] = Math.round(clamp(g.rock[c], 0, 1) * 255);
+        data[c * 4 + 1] = Math.round(clamp(g.scree[c], 0, 1) * 255);
+        data[c * 4 + 2] = Math.round(clamp(g.curv[c] * 0.5 + 0.5, 0, 1) * 255);
+        data[c * 4 + 3] = Math.round(clamp(macro, 0, 1) * 255);
+      }
+    }
+    return this._dataTex(data, n);
+  }
+
+  _dataTex(data, n) {
+    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = true;
+    tex.anisotropy = 16;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  _buildTextures() {
+    this.texFarH = this._packHeightTexture(this.far);
+    this.texNearH = this._packHeightTexture(this.near);
+    this.texFarS = this._packSurfaceTexture(this.far);
+    this.texNearS = this._packSurfaceTexture(this.near);
+    this.texFarM = this._packMaterialTexture(this.far);
+    this.texNearM = this._packMaterialTexture(this.near);
+    // Baked into textures; nothing on the CPU side queries these again.
+    this.far.nx = this.far.nz = this.near.nx = this.near.nz = null;
+    this.far.curv = this.near.curv = null;
+  }
+
+  /**
+   * Tiling detail set, generated once. R: grain, G: pebbles, B: cracks/strata,
+   * A: mottle. Plus a matching normal map. Sampling these at two scales is
+   * ~8 texture fetches, versus the hundreds of ALU a per-pixel fbm costs.
+   */
+  _buildDetailTextures() {
+    const N = 512;
+    const inv = 1 / N;
+    const mask = new Uint8Array(N * N * 4);
+    const height = new Float32Array(N * N);
+
+    // Jittered feature points for the pebble layer (tileable Worley).
+    const CG = 32;
+    const rnd = mulberry32(0xbeef);
+    const px = new Float32Array(CG * CG);
+    const py = new Float32Array(CG * CG);
+    const pr = new Float32Array(CG * CG);
+    for (let k = 0; k < CG * CG; k++) {
+      px[k] = rnd();
+      py[k] = rnd();
+      pr[k] = 0.45 + rnd() * 0.55;
+    }
+
+    // Tileable fbm: sample perlin on a torus by wrapping the lattice period.
+    const tile = (u, v, period, oct) => {
+      let amp = 0.5;
+      let sum = 0;
+      let norm = 0;
+      let p = period;
+      for (let o = 0; o < oct; o++) {
+        // Perlin's lattice repeats every 256; keep p a divisor so tiles match.
+        sum += amp * perlin2(((u * p) % p) + 0.5, ((v * p) % p) + 0.5);
+        norm += amp;
+        amp *= 0.5;
+        p *= 2;
+      }
+      return sum / norm;
+    };
+
+    for (let j = 0; j < N; j++) {
+      const v = j * inv;
+      for (let i = 0; i < N; i++) {
+        const u = i * inv;
+        const c = j * N + i;
+
+        const grain = tile(u, v, 64, 3) * 0.5 + 0.5;
+        const fine = tile(u, v, 128, 2) * 0.5 + 0.5;
+
+        // Pebbles / gravel.
+        const gx = u * CG;
+        const gy = v * CG;
+        const gi = gx | 0;
+        const gj = gy | 0;
+        let best = 9;
+        let bestR = 1;
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const ci = (gi + ox + CG) % CG;
+            const cj = (gj + oy + CG) % CG;
+            const k = cj * CG + ci;
+            const fx = gi + ox + px[k] - gx;
+            const fy = gj + oy + py[k] - gy;
+            const d = Math.hypot(fx, fy) / pr[k];
+            if (d < best) {
+              best = d;
+              bestR = pr[k];
+            }
+          }
+        }
+        const pebble = clamp(1 - best * 1.55, 0, 1);
+        const pebbleH = Math.sqrt(pebble) * (0.55 + bestR * 0.45);
+
+        // Cracks / strata: thin ridged lines, anisotropic so they read as beds.
+        const cr = 1 - Math.abs(tile(u * 0.35, v * 1.9, 32, 3));
+        const crack = Math.pow(clamp(cr, 0, 1), 14);
+
+        const mottle = tile(u, v, 8, 3) * 0.5 + 0.5;
+
+        // Stretch each channel: a raw fbm sits in a narrow band around 0.5 and
+        // reads as flat grey once it is multiplied into an albedo.
+        const g0 = clamp((grain * 0.6 + fine * 0.4 - 0.5) * 2.1 + 0.5, 0, 1);
+        const mo = clamp((mottle - 0.5) * 1.9 + 0.5, 0, 1);
+        mask[c * 4] = Math.round(g0 * 255);
+        mask[c * 4 + 1] = Math.round(pebble * 255);
+        mask[c * 4 + 2] = Math.round(crack * 255);
+        mask[c * 4 + 3] = Math.round(mo * 255);
+
+        height[c] = g0 * 0.26 + fine * 0.12 + pebbleH * 0.66 - crack * 0.5;
+      }
+    }
+
+    const nrm = new Uint8Array(N * N * 4);
+    const strength = 5.5;
+    for (let j = 0; j < N; j++) {
+      for (let i = 0; i < N; i++) {
+        const c = j * N + i;
+        const l = height[j * N + ((i - 1 + N) % N)];
+        const r = height[j * N + ((i + 1) % N)];
+        const d = height[((j - 1 + N) % N) * N + i];
+        const u = height[((j + 1) % N) * N + i];
+        const nx = (l - r) * strength;
+        const ny = (d - u) * strength;
+        const invL = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+        nrm[c * 4] = Math.round((nx * invL * 0.5 + 0.5) * 255);
+        nrm[c * 4 + 1] = Math.round((ny * invL * 0.5 + 0.5) * 255);
+        nrm[c * 4 + 2] = Math.round((invL * 0.5 + 0.5) * 255);
+        // Cheap cavity term for the crevices between pebbles.
+        nrm[c * 4 + 3] = Math.round(clamp(0.45 + height[c] * 0.9, 0, 1) * 255);
+      }
+    }
+
+    const mk = (data) => {
+      const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.magFilter = THREE.LinearFilter;
+      t.minFilter = THREE.LinearMipmapLinearFilter;
+      t.generateMipmaps = true;
+      t.anisotropy = 16;
+      t.colorSpace = THREE.NoColorSpace;
+      t.needsUpdate = true;
+      return t;
+    };
+    this.texDetail = mk(mask);
+    this.texDetailN = mk(nrm);
+  }
+
+  // -- queries -------------------------------------------------------------
+
+  /** World-space height. Matches the vertex shader to within packing error. */
   heightAt(wx, wz) {
-    const n = this.segments;
-    const fx = (wx / this.size + 0.5) * n;
-    const fz = (wz / this.size + 0.5) * n;
-    if (fx < 0 || fz < 0 || fx >= n || fz >= n) return this._sampleHeight(wx, wz);
-    const i = Math.floor(fx);
-    const j = Math.floor(fz);
-    const tx = fx - i;
-    const tz = fz - j;
-    const w = n + 1;
-    const h00 = this.heights[j * w + i];
-    const h10 = this.heights[j * w + i + 1];
-    const h01 = this.heights[(j + 1) * w + i];
-    const h11 = this.heights[(j + 1) * w + i + 1];
-    return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
+    const g = this.near.contains(wx, wz, this.near.cell * 1.5) ? this.near : this.far;
+    return g.sample(g.h, wx, wz);
   }
 
   normalAt(wx, wz, eps = 1.5) {
@@ -149,165 +1139,410 @@ export class Terrain {
     return new THREE.Vector3(hL - hR, 2 * eps, hD - hU).normalize();
   }
 
+  /** Drainage / rock / scree at a point — useful for placement rules. */
+  surfaceAt(wx, wz) {
+    const g = this.near.contains(wx, wz, this.near.cell * 1.5) ? this.near : this.far;
+    return {
+      rock: g.sample(g.rock, wx, wz),
+      scree: g.sample(g.scree, wx, wz),
+      flow: g.sample(g.flow, wx, wz),
+      ao: g.sample(g.ao, wx, wz),
+    };
+  }
+
+  // -- geometry ------------------------------------------------------------
+
+  /**
+   * One clipmap level. Level 0 is a full grid; the rest are hollow rings whose
+   * inner hole exactly covers the previous level. `aStitch` marks the odd
+   * vertices of the outer boundary: the shader averages their two neighbours so
+   * the edge lies exactly on the coarser level's linear interpolation. No cracks,
+   * no skirts, no shading discontinuity.
+   */
+  static _ringGeometry(G, spacing, full) {
+    const half = G / 2;
+    const lo = G / 4;
+    const hi = (G * 3) / 4;
+    const stride = G + 1;
+    const vmap = new Int32Array(stride * stride).fill(-1);
+    const pos = [];
+    const st = [];
+    const idx = [];
+
+    const vid = (i, j) => {
+      const key = j * stride + i;
+      let k = vmap[key];
+      if (k >= 0) return k;
+      k = pos.length / 3;
+      vmap[key] = k;
+      pos.push((i - half) * spacing, 0, (j - half) * spacing);
+      let sx = 0;
+      let sz = 0;
+      if ((i === 0 || i === G) && (j & 1) === 1) sz = spacing;
+      else if ((j === 0 || j === G) && (i & 1) === 1) sx = spacing;
+      st.push(sx, sz);
+      return k;
+    };
+
+    for (let j = 0; j < G; j++) {
+      for (let i = 0; i < G; i++) {
+        if (!full && i >= lo && i < hi && j >= lo && j < hi) continue;
+        const a = vid(i, j);
+        const b = vid(i + 1, j);
+        const c = vid(i + 1, j + 1);
+        const d = vid(i, j + 1);
+        idx.push(a, d, c, a, c, b);
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(pos.length), 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array((pos.length / 3) * 2), 2));
+    geo.setAttribute('aStitch', new THREE.Float32BufferAttribute(st, 2));
+    geo.setIndex(new THREE.Uint32BufferAttribute(idx, 1));
+    const nrm = geo.attributes.normal.array;
+    for (let i = 1; i < nrm.length; i += 3) nrm[i] = 1;
+    const ext = (G * spacing) / 2;
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 120, 0), ext * 1.45 + 600);
+    geo.boundingBox = new THREE.Box3(
+      new THREE.Vector3(-ext, H_MIN, -ext),
+      new THREE.Vector3(ext, H_MIN + H_RANGE, ext),
+    );
+    return geo;
+  }
+
+  _buildClipmap() {
+    // G is the per-ring grid resolution. 256 cost 0.82 M tris for the ring set
+    // alone — a fifth of the whole-frame budget before anything else drew — and
+    // the silhouette is indistinguishable at 192 because the height field is
+    // band-limited well below half a texel at every level anyway.
+    const G = 192;
+    const LEVELS = 8; // 0.5 m innermost ... 64 m outermost, 12 km across
+    this.mesh = new THREE.Group();
+    this.mesh.name = 'terrain';
+    this._rings = [];
+
+    for (let l = 0; l < LEVELS; l++) {
+      const spacing = 0.5 * Math.pow(2, l);
+      const geo = Terrain._ringGeometry(G, spacing, l === 0);
+      const m = new THREE.Mesh(geo, this.material);
+      m.name = `terrain-L${l}`;
+      m.receiveShadow = true;
+      // Only the inner levels need to feed the shadow map; the sun's cascade is
+      // ±120 m and rendering an 8 km ring into it is pure waste. L0..L2 reach
+      // ±192 m, which is what the outer cascade needs for the long raking
+      // shadows in the dusk shot; past that the volumetric shadow-height field
+      // carries the kilometre-scale occlusion instead.
+      m.castShadow = l <= 2;
+      m.customDepthMaterial = this.depthMaterial;
+      m.frustumCulled = false;
+      // Level 0 must be the first thing drawn: it carries the re-centre hook,
+      // and every ring has to move together or the seams open for a frame.
+      m.renderOrder = l === 0 ? -2 : -1;
+      this.mesh.add(m);
+      this._rings.push(m);
+    }
+
+    this._cx = NaN;
+    this._cz = NaN;
+    // main.js does not register Terrain as a system, so the clipmap re-centres
+    // off the first ring's draw call. One frame of latency on a 8 m snap grid is
+    // not observable.
+    const self = this;
+    this._rings[0].onBeforeRender = function (renderer, scene, camera) {
+      if (camera && camera.isPerspectiveCamera) self._recenter(camera.position);
+    };
+    this._recenter(new THREE.Vector3(0, 0, 0));
+  }
+
+  _recenter(p) {
+    const q = 8;
+    const cx = Math.round(p.x / q) * q;
+    const cz = Math.round(p.z / q) * q;
+    if (cx === this._cx && cz === this._cz) return;
+    this._cx = cx;
+    this._cz = cz;
+    for (const m of this._rings) {
+      m.position.set(cx, 0, cz);
+      m.updateMatrixWorld(true);
+    }
+  }
+
+  // -- material ------------------------------------------------------------
+
+  _gridUniform(g) {
+    return new THREE.Vector4(g.origin, g.origin, 1 / g.cell, g.n);
+  }
+
   _buildMaterial() {
+    const u = {
+      uFarH: { value: this.texFarH },
+      uNearH: { value: this.texNearH },
+      uFarS: { value: this.texFarS },
+      uNearS: { value: this.texNearS },
+      uFarM: { value: this.texFarM },
+      uNearM: { value: this.texNearM },
+      uDetail: { value: this.texDetail },
+      uDetailN: { value: this.texDetailN },
+      uFarInfo: { value: this._gridUniform(this.far) },
+      uNearInfo: { value: this._gridUniform(this.near) },
+      uNearHalf: { value: this.near.size / 2 - this.near.cell * 2 },
+      uHPack: { value: new THREE.Vector2(H_MIN, H_RANGE) },
+      uSandLight: { value: new THREE.Color(...PALETTE.sandLight) },
+      uSandDark: { value: new THREE.Color(...PALETTE.sandDark) },
+      uRockLight: { value: new THREE.Color(...PALETTE.rockLight) },
+      uRockDark: { value: new THREE.Color(...PALETTE.rockDark) },
+      uRockRed: { value: new THREE.Color(...PALETTE.rockRed) },
+    };
+    this.uniforms = u;
+
+    const HEIGHT_GLSL = /* glsl */ `
+      uniform sampler2D uFarH;
+      uniform sampler2D uNearH;
+      uniform vec4 uFarInfo;
+      uniform vec4 uNearInfo;
+      uniform float uNearHalf;
+      uniform vec2 uHPack;
+      attribute vec2 aStitch;
+
+      float decodeH(vec3 c) {
+        return uHPack.x + dot(c, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0)) * uHPack.y;
+      }
+      // Manual bilinear over a NEAREST-filtered packed texture: bit-exact with
+      // the CPU array, so heightAt() and the drawn surface can never disagree.
+      float gridH(sampler2D tex, vec2 wxz, vec4 info) {
+        vec2 p = (wxz - info.xy) * info.z;
+        p = clamp(p, vec2(0.0), vec2(info.w - 1.001));
+        vec2 i0 = floor(p);
+        vec2 f = p - i0;
+        float inv = 1.0 / info.w;
+        vec2 uv = (i0 + 0.5) * inv;
+        float h00 = decodeH(texture2D(tex, uv).rgb);
+        float h10 = decodeH(texture2D(tex, uv + vec2(inv, 0.0)).rgb);
+        float h01 = decodeH(texture2D(tex, uv + vec2(0.0, inv)).rgb);
+        float h11 = decodeH(texture2D(tex, uv + vec2(inv, inv)).rgb);
+        return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+      }
+      float terrainH(vec2 wxz) {
+        if (abs(wxz.x) < uNearHalf && abs(wxz.y) < uNearHalf) {
+          return gridH(uNearH, wxz, uNearInfo);
+        }
+        return gridH(uFarH, wxz, uFarInfo);
+      }
+    `;
+
+    const DISPLACE_GLSL = /* glsl */ `
+      #include <begin_vertex>
+      vec2 wxz = (modelMatrix * vec4(transformed, 1.0)).xz;
+      float th;
+      if (aStitch.x + aStitch.y > 0.0) {
+        th = 0.5 * (terrainH(wxz - aStitch) + terrainH(wxz + aStitch));
+      } else {
+        th = terrainH(wxz);
+      }
+      transformed.y = th;
+    `;
+
     const mat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      roughness: 0.94,
+      roughness: 1.0,
       metalness: 0.0,
-      envMapIntensity: 0.85,
+      envMapIntensity: 0.9,
       dithering: true,
     });
 
-    mat.userData.uniforms = {
-      uSandLight: { value: new THREE.Vector3(...PALETTE.sandLight) },
-      uSandDark: { value: new THREE.Vector3(...PALETTE.sandDark) },
-      uRockLight: { value: new THREE.Vector3(...PALETTE.rockLight) },
-      uRockDark: { value: new THREE.Vector3(...PALETTE.rockDark) },
-      uRockRed: { value: new THREE.Vector3(...PALETTE.rockRed) },
-      uDetailScale: { value: 1.0 },
-    };
-
     mat.onBeforeCompile = (shader) => {
-      Object.assign(shader.uniforms, mat.userData.uniforms);
+      Object.assign(shader.uniforms, u);
 
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', `#include <common>\nvarying vec3 vWorldPos;\nvarying vec3 vWorldNormal;`)
-        .replace(
-          '#include <worldpos_vertex>',
-          `#include <worldpos_vertex>
-           vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
-           vWorldNormal = normalize(mat3(modelMatrix) * objectNormal);`,
-        );
+        .replace('#include <common>', `#include <common>\nvarying vec3 vWPos;\n${HEIGHT_GLSL}`)
+        .replace('#include <begin_vertex>', `${DISPLACE_GLSL}\n vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
 
       shader.fragmentShader = shader.fragmentShader
         .replace(
           '#include <common>',
-          `#include <common>
-           varying vec3 vWorldPos;
-           varying vec3 vWorldNormal;
-           uniform vec3 uSandLight;
-           uniform vec3 uSandDark;
-           uniform vec3 uRockLight;
-           uniform vec3 uRockDark;
-           uniform vec3 uRockRed;
-           uniform float uDetailScale;
+          /* glsl */ `#include <common>
+          varying vec3 vWPos;
+          uniform sampler2D uFarS;
+          uniform sampler2D uNearS;
+          uniform sampler2D uFarM;
+          uniform sampler2D uNearM;
+          uniform sampler2D uDetail;
+          uniform sampler2D uDetailN;
+          uniform vec4 uFarInfo;
+          uniform vec4 uNearInfo;
+          uniform float uNearHalf;
+          uniform vec3 uSandLight;
+          uniform vec3 uSandDark;
+          uniform vec3 uRockLight;
+          uniform vec3 uRockDark;
+          uniform vec3 uRockRed;
 
-           // Written during <map_fragment>, consumed in <roughnessmap_fragment>
-           // (roughnessFactor is not declared until that chunk).
-           float gTerrainRough = 0.9;
+          // Values shared between the chunks we hook into.
+          vec3  gN;
+          float gRough;
+          float gAO;
 
-           float thash(vec2 p) {
-             p = floor(p);
-             float h = dot(p, vec2(127.1, 311.7));
-             return fract(sin(h) * 43758.5453123);
-           }
-           float tnoise(vec2 p) {
-             vec2 i = floor(p);
-             vec2 f = fract(p);
-             vec2 u = f * f * (3.0 - 2.0 * f);
-             return mix(mix(thash(i), thash(i + vec2(1.0, 0.0)), u.x),
-                        mix(thash(i + vec2(0.0, 1.0)), thash(i + vec2(1.0, 1.0)), u.x), u.y);
-           }
-           float tfbm(vec2 p, int oct) {
-             float a = 0.5, s = 0.0, n = 0.0;
-             mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
-             for (int i = 0; i < 8; i++) {
-               if (i >= oct) break;
-               s += a * tnoise(p);
-               n += a;
-               a *= 0.5;
-               p = rot * p * 2.03;
-             }
-             return s / n;
-           }
-           // Triplanar sampling of the procedural detail, blended by the
-           // world normal so cliffs never smear.
-           float triFbm(vec3 wp, vec3 wn, float scale, int oct) {
-             vec3 bw = pow(abs(wn), vec3(4.0));
-             bw /= (bw.x + bw.y + bw.z);
-             return tfbm(wp.yz * scale, oct) * bw.x
-                  + tfbm(wp.xz * scale, oct) * bw.y
-                  + tfbm(wp.xy * scale, oct) * bw.z;
-           }`,
+          vec2 gridUV(vec2 wxz, vec4 info) {
+            return ((wxz - info.xy) * info.z + 0.5) / info.w;
+          }
+          `,
         )
         .replace(
           '#include <map_fragment>',
-          `#include <map_fragment>
-           {
-             vec3 wn = normalize(vWorldNormal);
-             float slope = 1.0 - clamp(wn.y, 0.0, 1.0);
+          /* glsl */ `#include <map_fragment>
+          {
+            bool nearField = abs(vWPos.x) < uNearHalf && abs(vWPos.z) < uNearHalf;
+            vec2 uvS = nearField ? gridUV(vWPos.xz, uNearInfo) : gridUV(vWPos.xz, uFarInfo);
+            vec4 S = nearField ? texture2D(uNearS, uvS) : texture2D(uFarS, uvS);
+            vec4 M = nearField ? texture2D(uNearM, uvS) : texture2D(uFarM, uvS);
 
-             // Distance-aware detail: keep close-up crunch without aliasing far away.
-             float dist = length(vWorldPos - cameraPosition);
-             float fade = 1.0 - smoothstep(30.0, 260.0, dist);
+            // Baked surface normal: shading is independent of tessellation, so a
+            // 64 m outer-ring triangle still shades like the real landform.
+            vec3 wn;
+            wn.x = S.r * 2.0 - 1.0;
+            wn.z = S.g * 2.0 - 1.0;
+            wn.y = sqrt(max(1e-4, 1.0 - wn.x * wn.x - wn.z * wn.z));
+            wn = normalize(wn);
 
-             float macro = tfbm(vWorldPos.xz * 0.0022, 5);
-             float meso  = triFbm(vWorldPos, wn, 0.055, 4);
-             float micro = triFbm(vWorldPos, wn, 0.62, 3);
-             float grain = triFbm(vWorldPos, wn, 4.1, 2);
+            float flow  = S.b;
+            float bake  = S.a;
+            float rockM = M.r;
+            float screeM = M.g;
+            float curv  = M.b * 2.0 - 1.0;
+            float macro = M.a;
 
-             // Rock exposure driven by slope, altitude and macro variation.
-             float rockMask = smoothstep(0.28, 0.62, slope + macro * 0.28 - 0.08);
-             float altMask = smoothstep(40.0, 190.0, vWorldPos.y);
-             rockMask = clamp(rockMask + altMask * 0.35, 0.0, 1.0);
+            float slope = 1.0 - wn.y;
+            float dist  = length(vWPos - cameraPosition);
 
-             vec3 sand = mix(uSandDark, uSandLight, clamp(meso * 0.7 + micro * 0.45 + 0.15, 0.0, 1.0));
-             // Wind-ripple striping in the flats — very characteristic of the map.
-             float ripple = sin(vWorldPos.x * 0.85 + tfbm(vWorldPos.xz * 0.02, 3) * 9.0) * 0.5 + 0.5;
-             sand *= 1.0 + (ripple - 0.5) * 0.09 * (1.0 - slope) * fade;
+            // --- detail tiles ------------------------------------------------
+            // Steep faces switch to a vertical projection so bedding planes stay
+            // horizontal instead of smearing down the cliff.
+            float wallW = smoothstep(0.55, 0.95, slope);
+            vec2 flatUV = vWPos.xz;
+            vec2 wallUV = vec2(dot(vWPos.xz, vec2(0.7071, 0.7071)), vWPos.y * 1.6);
+            vec2 baseUV = mix(flatUV, wallUV, wallW);
 
-             vec3 rockBase = mix(uRockDark, uRockLight, clamp(meso * 0.85 + micro * 0.4, 0.0, 1.0));
-             float ironBand = smoothstep(0.55, 0.85, tfbm(vWorldPos.xz * 0.006 + vWorldPos.y * 0.01, 4));
-             vec3 rock = mix(rockBase, uRockRed, ironBand * 0.55);
-             // Strata: horizontal banding on steep faces.
-             float strata = sin(vWorldPos.y * 0.55 + macro * 12.0) * 0.5 + 0.5;
-             rock *= 1.0 + (strata - 0.5) * 0.14 * slope;
+            float nearW = 1.0 - smoothstep(6.0, 42.0, dist);
+            float midW  = 1.0 - smoothstep(45.0, 260.0, dist);
+            vec4 dA = texture2D(uDetail,  baseUV * (1.0 / 1.6));
+            vec4 dB = texture2D(uDetail,  baseUV * (1.0 / 26.0));
+            vec4 dC = texture2D(uDetail,  baseUV * (1.0 / 4.6) + vec2(0.37, 0.11));
+            vec4 nA = texture2D(uDetailN, baseUV * (1.0 / 1.6));
+            vec4 nB = texture2D(uDetailN, baseUV * (1.0 / 26.0));
+            vec4 D  = mix(dB, mix(dC, dA, 0.55), 0.34 + 0.55 * nearW);
 
-             vec3 albedo = mix(sand, rock, rockMask);
-             // Gravel / scree speckle accumulating in the shallow slopes.
-             float scree = smoothstep(0.62, 0.95, grain) * (1.0 - rockMask) * fade;
-             albedo = mix(albedo, uRockDark * 1.25, scree * 0.45);
-             albedo *= 0.92 + micro * 0.16;
+            // --- material weights --------------------------------------------
+            // Break the boundaries with the mid-scale mottle so nothing reads as
+            // a smoothstep on slope.
+            float jitter = (D.a - 0.5) * 0.26 + (macro - 0.5) * 0.30;
+            float rockW  = smoothstep(0.34, 0.60, rockM + jitter * 0.8 + slope * 0.30);
+            float screeW = smoothstep(0.26, 0.62, screeM + jitter * 0.7);
+            // Desert pavement: the flats are never uniform sand. Irregular
+            // patches of coarse lag gravel sit on them, and the patch edges are
+            // what the eye reads as "ground" rather than "shader".
+            float lag = smoothstep(0.38, 0.60, macro * 0.95 + D.a * 0.32 + (dB.g - 0.5) * 0.25);
+            screeW = max(screeW, lag * 0.9) * (1.0 - rockW);
+            float flowW  = smoothstep(0.30, 0.75, flow + (D.a - 0.5) * 0.18) * (1.0 - rockW * 0.8);
 
-             diffuseColor.rgb *= albedo;
+            // --- sand: wind-packed khaki. Real dry desert sits near 0.35
+            // linear reflectance, not the 0.6 that "pale" suggests on a swatch.
+            float sandT = clamp(D.r * 0.45 + D.a * 0.60 + macro * 0.35 - 0.24, 0.0, 1.0);
+            vec3 sand = mix(uSandDark * 0.92, uSandLight, sandT);
+            float ripple = sin(dot(vWPos.xz, vec2(0.86, 0.51)) * 1.15 + (macro - 0.5) * 34.0) * 0.5 + 0.5;
+            sand *= 1.0 + (ripple - 0.5) * 0.08 * (1.0 - slope) * (0.35 + 0.65 * nearW);
 
-             // Roughness varies: packed sand is smoother than broken rock.
-             float rgh = mix(0.86, 0.97, rockMask);
-             rgh += (micro - 0.5) * 0.13;
-             gTerrainRough = clamp(rgh, 0.35, 1.0);
-           }`,
+            // --- scree / gravel apron: clearly darker and greyer than sand ----
+            vec3 gravel = mix(uRockDark * 1.05, uSandDark * 0.86, 0.28 + D.a * 0.42);
+            gravel = mix(gravel, uRockLight * 0.92, smoothstep(0.22, 0.85, D.g));
+            gravel *= 0.78 + D.r * 0.42;
+
+            // --- bedrock: stratified, iron-stained ---------------------------
+            vec3 rockBase = mix(uRockDark * 0.85, uRockLight * 0.98, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
+            // Beds are ~3 m thick and only legible on the faces that expose them.
+            float band = fract(vWPos.y * 0.30 + macro * 6.0 + (D.a - 0.5) * 1.1);
+            float strata = smoothstep(0.0, 0.22, band) * (1.0 - smoothstep(0.44, 0.66, band));
+            rockBase *= 1.0 + (strata - 0.45) * 0.20 * wallW;
+            // Mineral zoning: whole massifs shift warm, which is what stops a
+            // range from reading as one grey material at 2 km.
+            float iron = smoothstep(0.48, 0.86, macro);
+            vec3 rock = mix(rockBase, uRockRed * 0.92, iron * 0.55);
+            rock = mix(rock, rock * vec3(0.90, 0.94, 1.02), smoothstep(0.42, 0.12, macro));
+            rock *= 1.0 - D.b * 0.40;                    // cracks read dark
+            rock *= 0.95 + smoothstep(0.3, 0.9, D.r) * 0.10;
+
+            // --- assemble -----------------------------------------------------
+            vec3 albedo = sand;
+            albedo = mix(albedo, gravel, screeW);
+            albedo = mix(albedo, rock, rockW);
+            // Wadis: mineral-stained, coarse lag gravel in the channel floor.
+            vec3 wadi = mix(albedo * 0.70, uRockDark * 1.25, 0.40);
+            wadi *= 0.9 + D.g * 0.30;
+            albedo = mix(albedo, wadi, flowW * 0.55);
+            // Concave hollows collect pale wind-blown fines.
+            albedo = mix(albedo, mix(albedo, uSandLight, 0.30), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
+
+            // Regional tone: whole stretches of the floor are a shade darker or
+            // paler than their neighbours. Without it a 2 km pan is one flat value.
+            albedo *= 0.86 + macro * 0.30;
+            // Micro contrast, faded out with distance so it never aliases.
+            albedo *= 1.0 + (D.r - 0.5) * 0.30 * (0.20 + 0.80 * nearW);
+
+            diffuseColor.rgb *= albedo * 0.80;
+
+            // --- normal --------------------------------------------------------
+            vec4 nC = texture2D(uDetailN, baseUV * (1.0 / 4.6) + vec2(0.37, 0.11));
+            float midNear = 1.0 - smoothstep(18.0, 105.0, dist);
+            vec2 pert = (nB.rg * 2.0 - 1.0) * (0.40 * midW)
+                      + (nC.rg * 2.0 - 1.0) * (0.60 * midNear)
+                      + (nA.rg * 2.0 - 1.0) * (0.95 * nearW);
+            // The detail height field is mostly clasts. Wind-packed sand has no
+            // clasts, so leaving it fully bump-mapped tiles a visible honeycomb
+            // across the pan.
+            pert *= mix(0.42, 1.0, clamp(screeW + rockW, 0.0, 1.0));
+            gN = normalize(wn + vec3(pert.x, 0.0, pert.y));
+            float cav = mix(nB.a, mix(nC.a, nA.a, nearW), midNear);
+            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.25, 1.0));
+            gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05, 0.55, 1.0);
+          }`,
         )
         .replace(
-          '#include <roughnessmap_fragment>',
-          `#include <roughnessmap_fragment>
-           roughnessFactor = gTerrainRough;`,
+          '#include <normal_fragment_begin>',
+          /* glsl */ `
+          float faceDirection = 1.0;
+          vec3 normal = normalize((viewMatrix * vec4(gN, 0.0)).xyz);
+          vec3 nonPerturbedNormal = normal;
+          `,
         )
+        .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\nroughnessFactor = gRough;`)
         .replace(
-          '#include <normal_fragment_maps>',
-          `#include <normal_fragment_maps>
-           {
-             // Derive a detail normal from the same noise field so lighting and
-             // albedo agree. Two scales: meso bumps + micro grain.
-             vec3 wn = normalize(vWorldNormal);
-             float dist = length(vWorldPos - cameraPosition);
-             float fade = 1.0 - smoothstep(25.0, 220.0, dist);
-             if (fade > 0.001) {
-               float e = 0.09;
-               float h0 = triFbm(vWorldPos, wn, 0.62, 2) * 0.6;
-               float hx = triFbm(vWorldPos + vec3(e, 0.0, 0.0), wn, 0.62, 2) * 0.6;
-               float hz = triFbm(vWorldPos + vec3(0.0, 0.0, e), wn, 0.62, 2) * 0.6;
-               vec3 bump = normalize(vec3((h0 - hx) / e, 1.0, (h0 - hz) / e));
-               // Blend in view space via the existing normal.
-               vec3 nWorld = normalize(mix(wn, normalize(wn + bump * 0.85 - vec3(0.0, 0.85, 0.0)), fade * 0.85));
-               normal = normalize((viewMatrix * vec4(nWorld, 0.0)).xyz);
-             }
-           }`,
+          '#include <aomap_fragment>',
+          /* glsl */ `#include <aomap_fragment>
+          {
+            float ao = clamp(gAO, 0.0, 1.6);
+            // Sky occlusion belongs on the indirect term only; the sun is
+            // already shadow-mapped and double-darkening kills the high-key look.
+            reflectedLight.indirectDiffuse *= mix(0.45, 1.05, ao);
+            reflectedLight.indirectSpecular *= mix(0.3, 1.0, ao);
+          }`,
         );
 
       mat.userData.shader = shader;
     };
 
-    return mat;
+    this.material = mat;
+
+    // Shadow pass needs the identical displacement or the terrain self-shadows
+    // against a flat plane.
+    const dm = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    dm.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, u);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `#include <common>\n${HEIGHT_GLSL}`)
+        .replace('#include <begin_vertex>', DISPLACE_GLSL);
+    };
+    this.depthMaterial = dm;
   }
 
   update() {}
