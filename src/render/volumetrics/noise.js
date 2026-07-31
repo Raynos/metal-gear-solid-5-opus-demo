@@ -194,6 +194,68 @@ export function buildCloudVolume(N = 48) {
 }
 
 /**
+ * Weather map — the 2D field that decides WHERE clouds are, tiled over ~48 km.
+ *
+ * Round 1 read the weather out of slices of the 3D shape volume, which meant the
+ * "where" and the "what shape" fields shared their frequency content: every puff
+ * came out the same size, evenly sprinkled, and once that is projected onto a
+ * slab it reads as wallpaper rather than weather. A dedicated 2D map with its
+ * own much lower frequencies gives the sky open lanes, dense banks and clear
+ * holes — which is what makes the perspective convergence legible, because the
+ * eye has structures of several different sizes to compare.
+ *
+ *   R = coverage        large-scale open/closed, two octaves
+ *   G = cloud type      0 = flat stratus deck, 1 = tall billowing cumulus
+ *   B = bank ridges     anisotropic streaks, so banks line up along the wind
+ *   A = peak height     modulates the top of the slab per cell
+ */
+export function buildWeatherMap(N = 256) {
+  const data = new Uint8Array(N * N * 4);
+  const inv = 1 / N;
+  const cov = new Float32Array(N * N);
+  const typ = new Float32Array(N * N);
+  const bank = new Float32Array(N * N);
+  const peak = new Float32Array(N * N);
+
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const i = y * N + x;
+      const u = (x + 0.5) * inv;
+      const v = (y + 0.5) * inv;
+      // Coverage: a very low frequency "front" plus a mid-frequency cell field.
+      const front = valueFbm(u, v, 0.19, 2, 3);
+      const cells = valueFbm(u * 1.0, v * 1.0, 0.53, 5, 4);
+      cov[i] = front * 0.58 + cells * 0.42;
+      typ[i] = valueFbm(u, v, 0.71, 3, 3);
+      // Squash one axis so banks elongate across the wind, as real cloud
+      // streets do; this is most of what sells "a sky" over "a noise field".
+      bank[i] = valueFbm(u * 1.0, v * 1.0, 0.37, 9, 3);
+      peak[i] = valueFbm(u, v, 0.83, 4, 2);
+    }
+  }
+  normalize(cov);
+  normalize(typ);
+  normalize(bank);
+  normalize(peak);
+
+  for (let i = 0; i < N * N; i++) {
+    data[i * 4] = Math.min(255, (cov[i] * 255) | 0);
+    data[i * 4 + 1] = Math.min(255, (typ[i] * 255) | 0);
+    data[i * 4 + 2] = Math.min(255, (bank[i] * 255) | 0);
+    data[i * 4 + 3] = Math.min(255, (peak[i] * 255) | 0);
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.unpackAlignment = 1;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
  * Small tiling 2D noise used for the sand/dust sprite alpha and the heat-haze
  * warp field. R = soft blob falloff, G = streaky grain, B = fbm.
  */

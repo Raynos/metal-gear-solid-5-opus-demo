@@ -35,7 +35,12 @@ export function buildCharacterGeometry(loadout) {
   one(buildNeck(), 'skin', 'neck');
   one(buildHead(loadout.head ?? {}), 'skin', 'head');
   one(buildEyes(), 'skin', 'rigidHead');
-  if (loadout.hair !== false) one(buildHair({ backOnly: loadout.hairBack ?? false }), 'cloth', 'rigidHead');
+  // Skinned to the same bones as the skull, NOT welded rigidly to the head
+  // bone. The face blends across neck/head/headTip, so a rigid hair shell
+  // drifts relative to it the moment the head turns — which is how round 1
+  // ended up with the hair cap punched through the cheeks and the entire
+  // lower face rendering as a dark mask.
+  if (loadout.hair !== false) one(buildHair({ backOnly: loadout.hairBack ?? false }), 'cloth', 'head');
 
   const legR = buildLeg({ bulk });
   one(legR, 'cloth', 'legR');

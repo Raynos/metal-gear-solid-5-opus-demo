@@ -26,6 +26,12 @@ export async function install(world) {
   fields.updateSun(world.lighting.sunDirection);
 
   const pass = new VolumetricPass(world, fields);
+  // Aerial perspective is implemented here AND in RenderPipeline's prepare pass;
+  // running both stacks two hazes. This module takes it so the haze, the cloud
+  // deck and the light shafts share one set of atmosphere numbers. Set
+  // `engine.pipeline.enabled.aerial = true` to hand it back — the pass detects
+  // that and disables its own haze on the next frame.
+  pass.claimHaze();
   world.engine.addSystem(pass);
 
   const particles = new ParticleAtmosphere(world, fields, pass);

@@ -6,7 +6,8 @@ import {
   RESOLVE_FRAG,
   COMPOSITE_FRAG,
 } from './shaders.js';
-import { buildCloudVolume } from './noise.js';
+import { buildCloudVolume, buildWeatherMap } from './noise.js';
+import { PALETTE } from '../../config/ArtDirection.js';
 
 /**
  * VolumetricPass — the atmosphere renderer.
@@ -22,29 +23,60 @@ import { buildCloudVolume } from './noise.js';
  *                      behind it plus the in-scattered light, in one draw call
  *
  * Everything is written in linear HDR. No tonemapping happens here.
+ *
+ * ## Division of labour with RenderPipeline (do NOT stack two hazes)
+ *
+ * RenderPipeline's `prepare` pass also implements aerial perspective. Running
+ * both is exactly the round-1 over-application, so `claimHaze()` turns that one
+ * off at install and this pass owns the distance haze outright — it is the only
+ * place the haze, the cloud deck and the shafts can share one set of atmosphere
+ * numbers. `ownsHaze` follows `pipeline.enabled.aerial` every frame, so setting
+ * that flag back to true hands ownership straight back with no code change and,
+ * critically, never leaves both running.
  */
 
-/** Per time-of-day atmosphere tuning. Read by name from the ToD preset. */
+/**
+ * Per time-of-day atmosphere tuning. Read by name from the ToD preset.
+ *
+ * `sunScatter` is now a gain on the *excess over isotropic* phase energy, i.e.
+ * purely the crepuscular lobe, so the values are much larger than round 1's
+ * whole-sky fog gains and still cover far less of the frame.
+ */
 export const ATMOS = {
   dawn: {
-    fogDensity: 0.00120, fogHeight: 150, sunScatter: 0.62, skyScatter: 0.44, dustBand: 2.0,
-    cloudCoverage: 0.58, cloudDensity: 1.0, cirrus: 0.5, heatHaze: 0.0, cloudShadow: 0.30, cloudAmbient: 0.50, phaseG: 0.76,
+    shaftDensity: 0.00120, shaftHeight: 170, sunScatter: 0.055, phaseG: 0.80, dustBand: 2.0,
+    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.86, cloudAmb: 0.85, cirrus: 0.50,
+    cloudBase: 1500, cloudTop: 3000, cirrusAlt: 7600, heatHaze: 0.0, cloudShadow: 0.22,
+    bounce: 0.40,
+    dustBeta: 4.0e-4, dustHeight: 430, apSun: 0.26, apAmb: 0.62,
   },
   noon: {
-    fogDensity: 0.00060, fogHeight: 250, sunScatter: 0.035, skyScatter: 0.82, dustBand: 0.7,
-    cloudCoverage: 0.33, cloudDensity: 1.0, cirrus: 0.24, heatHaze: 1.0, cloudShadow: 0.34, cloudAmbient: 0.58, phaseG: 0.70,
+    shaftDensity: 0.00042, shaftHeight: 260, sunScatter: 0.020, phaseG: 0.74, dustBand: 0.7,
+    cloudCoverage: 0.28, cloudDensity: 1.0, cloudGain: 0.70, cloudAmb: 0.68, cirrus: 0.24,
+    cloudBase: 1900, cloudTop: 3800, cirrusAlt: 8200, heatHaze: 1.0, cloudShadow: 0.30,
+    bounce: 0.28,
+    dustBeta: 4.0e-4, dustHeight: 620, apSun: 0.34, apAmb: 0.66,
   },
   afternoon: {
-    fogDensity: 0.00074, fogHeight: 245, sunScatter: 0.050, skyScatter: 0.75, dustBand: 1.0,
-    cloudCoverage: 0.36, cloudDensity: 1.0, cirrus: 0.30, heatHaze: 0.85, cloudShadow: 0.32, cloudAmbient: 0.56, phaseG: 0.73,
+    shaftDensity: 0.00058, shaftHeight: 250, sunScatter: 0.026, phaseG: 0.76, dustBand: 1.0,
+    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.68, cloudAmb: 0.70, cirrus: 0.28,
+    cloudBase: 1800, cloudTop: 3600, cirrusAlt: 8000, heatHaze: 0.85, cloudShadow: 0.28,
+    bounce: 0.34,
+    dustBeta: 4.2e-4, dustHeight: 520, apSun: 0.36, apAmb: 0.62,
   },
   dusk: {
-    fogDensity: 0.00140, fogHeight: 145, sunScatter: 0.66, skyScatter: 0.38, dustBand: 2.2,
-    cloudCoverage: 0.56, cloudDensity: 1.0, cirrus: 0.55, heatHaze: 0.0, cloudShadow: 0.30, cloudAmbient: 0.46, phaseG: 0.78,
+    shaftDensity: 0.00135, shaftHeight: 165, sunScatter: 0.060, phaseG: 0.81, dustBand: 2.2,
+    cloudCoverage: 0.42, cloudDensity: 1.05, cloudGain: 0.88, cloudAmb: 0.80, cirrus: 0.52,
+    cloudBase: 1500, cloudTop: 3100, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.20,
+    bounce: 0.44,
+    dustBeta: 4.0e-4, dustHeight: 420, apSun: 0.26, apAmb: 0.60,
   },
   night: {
-    fogDensity: 0.00080, fogHeight: 180, sunScatter: 0.06, skyScatter: 0.22, dustBand: 1.0,
-    cloudCoverage: 0.30, cloudDensity: 0.9, cirrus: 0.25, heatHaze: 0.0, cloudShadow: 0.20, cloudAmbient: 0.10, phaseG: 0.70,
+    shaftDensity: 0.00060, shaftHeight: 200, sunScatter: 0.0, phaseG: 0.72, dustBand: 0.9,
+    cloudCoverage: 0.34, cloudDensity: 0.95, cloudGain: 1.8, cloudAmb: 0.55, cirrus: 0.22,
+    cloudBase: 1700, cloudTop: 3300, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.0,
+    bounce: 0.02,
+    dustBeta: 5.0e-4, dustHeight: 480, apSun: 0.50, apAmb: 1.00,
   },
 };
 
@@ -57,6 +89,9 @@ function quad(material) {
   return m;
 }
 
+const _v3 = new THREE.Vector3();
+const HORIZON = [0, 0, 0];
+
 export class VolumetricPass {
   constructor(world, fields) {
     this.world = world;
@@ -66,6 +101,7 @@ export class VolumetricPass {
     this.order = 400; // after lighting (-50), before the free-fly camera (1000)
 
     this.cloudTex = buildCloudVolume(48);
+    this.weatherTex = buildWeatherMap(256);
 
     this.quadScene = new THREE.Scene();
     this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -79,6 +115,7 @@ export class VolumetricPass {
     this._hist = 0;
     this._width = 0;
     this._height = 0;
+    this.ownsHaze = false;
 
     this._makeMaterials();
     this._resize(1, 1);
@@ -110,35 +147,50 @@ export class VolumetricPass {
         tPrevColor: { value: null },
         tSunHeight: { value: this.fields.sunHeightTex },
         tShadowMap: { value: null },
+        tWeather: { value: this.weatherTex },
         tCloud: { value: this.cloudTex },
         uInvViewProj: { value: new THREE.Matrix4() },
         uShadowMatrix: { value: new THREE.Matrix4() },
         uCamPos: { value: new THREE.Vector3() },
         uSunDir: { value: new THREE.Vector3(0, 1, 0) },
-        uSunColor: { value: new THREE.Vector3(1, 1, 1) },
-        uHazeColor: { value: new THREE.Vector3(0.7, 0.72, 0.78) },
-        uCloudAmbient: { value: new THREE.Vector3(0.4, 0.45, 0.6) },
+        uKeyDir: { value: new THREE.Vector3(0, 1, 0) },
+        uKeyColor: { value: new THREE.Vector3(5, 4.4, 3.5) },
+        uSkyZenith: { value: new THREE.Vector3(0.06, 0.09, 0.16) },
+        uSkyHorizon: { value: new THREE.Vector3(0.16, 0.16, 0.18) },
+        uGroundBounce: { value: new THREE.Vector3(0.05, 0.04, 0.025) },
         uResolution: { value: new THREE.Vector2() },
         uTime: { value: 0 },
         uFrame: { value: 0 },
+        uWindT: { value: 0 },
         uTerrainSize: { value: this.fields.size },
         uShadowExtent: { value: 120 },
         uShadowCenter: { value: new THREE.Vector3() },
-        uFogDensity: { value: 0.004 },
-        uFogHeight: { value: 260 },
-        uFogBase: { value: 0 },
-        uSunScatter: { value: 0.03 },
-        uSkyScatter: { value: 0.38 },
-        uPhaseG: { value: 0.73 },
-        uDustBand: { value: 1.0 },
-        uCloudCoverage: { value: 0.5 },
-        uCloudBase: { value: 2000 },
-        uCloudTop: { value: 3900 },
+        uShaftDensity: { value: 0.0006 },
+        uShaftHeight: { value: 250 },
+        uSunScatter: { value: 0.026 },
+        uPhaseG: { value: 0.76 },
+        uHazeOwned: { value: 0 },
+        uSkyAmbient: { value: new THREE.Vector3(0.42, 0.63, 0.75) },
+        uBetaR: { value: new THREE.Vector3(5.802e-6, 13.558e-6, 33.1e-6) },
+        uBetaD: { value: new THREE.Vector3(2.6e-4, 2.6e-4, 2.6e-4) },
+        uDustAlbedo: { value: new THREE.Vector3(1.25, 1.02, 0.70) },
+        uGroundLight: { value: new THREE.Vector3(0.45, 0.34, 0.21) },
+        uBetaM: { value: 8.0e-6 },
+        uDustHeight: { value: 900 },
+        uApSun: { value: 0.55 },
+        uApAmb: { value: 0.85 },
+        uApG: { value: 0.66 },
+        uCloudCoverage: { value: 0.38 },
+        uCloudBase: { value: 1800 },
+        uCloudTop: { value: 3600 },
         uCloudDensity: { value: 1.0 },
-        uCloudAbsorb: { value: 0.022 },
-        uCirrus: { value: 0.45 },
+        uCloudAbsorb: { value: 0.030 },
+        uCloudGain: { value: 1.0 },
+        uCloudAmbGain: { value: 0.8 },
+        uCirrus: { value: 0.32 },
+        uCirrusAlt: { value: 8000 },
         uHeatHaze: { value: 0.0 },
-        uCloudShadow: { value: 0.45 },
+        uCloudShadow: { value: 0.28 },
       },
       depthTest: false,
       depthWrite: false,
@@ -156,7 +208,7 @@ export class VolumetricPass {
         uCamPos: { value: new THREE.Vector3() },
         uCamFwd: { value: new THREE.Vector3(0, 0, -1) },
         uTexel: { value: new THREE.Vector2() },
-        uBlend: { value: 0.22 },
+        uBlend: { value: 0.3 },
         uReset: { value: 1 },
       },
       depthTest: false,
@@ -218,39 +270,186 @@ export class VolumetricPass {
     this.renderer.render(this.quadScene, this.quadCamera);
   }
 
+  /**
+   * The key light driving the clouds, in renderer linear units.
+   *
+   * Round 1 used `sun.color * sun.intensity`, which at night is the *moon*
+   * preset's placeholder sun (0.46, 0.56, 0.82) x 0.95 — a full-strength light
+   * from a sun 14 degrees below the horizon. That is why night shipped with
+   * near-white daylight cumulus over moonlit terrain.
+   *
+   * `lighting.atmosphere` is the right source for the LEVEL: Lighting builds it
+   * in the same units as the scene's DirectionalLight, so a lit cloud and a lit
+   * ridge agree. Sky's `keyIrradiance()` supplies the CHROMA — it knows the sun
+   * has reddened through 40 airmasses at dusk, and that the key is the moon at
+   * night — but only as a unit-luminance tint, clamped. Taking its level too
+   * would over-attenuate the deck: that irradiance is evaluated at the camera,
+   * and a cloud at 2 km sits above most of the air that reddens it.
+   */
+  _keyLight(out) {
+    const L = this.world.lighting;
+    const atm = L.atmosphere;
+    const dir = atm?.sunDirection ?? L.keyDirection ?? L.sunDirection;
+
+    let r;
+    let g;
+    let b;
+    if (atm?.sunRadiance && atm.sunRadiance.every(Number.isFinite)) {
+      [r, g, b] = atm.sunRadiance;
+    } else {
+      const c = L.sun.color;
+      const i = L.sun.intensity;
+      // Without the atmosphere handle there is nothing that knows the sun is
+      // down, so derive it from the geometry directly.
+      const night = L.night ?? (L.sunDirection.y < 0 ? 1 : 0);
+      const k = night > 0.5 ? 0.004 : 1.0;
+      r = c.r * i * k;
+      g = c.g * i * k;
+      b = c.b * i * k;
+    }
+
+    const tint = this._skyChroma();
+    out.dir = dir;
+    out.rgb = _v3.set(r * tint.x, g * tint.y, b * tint.z);
+    return out;
+  }
+
+  /**
+   * Read a colour out of Sky's query API, whatever shape it hands back. Returns
+   * null rather than throwing if that API is absent or malformed — every caller
+   * here has a working fallback.
+   */
+  _skyQuery(name, arg) {
+    const sky = this.world.sky;
+    const fn = sky?.[name];
+    if (typeof fn !== 'function') return null;
+    let v;
+    try {
+      v = fn.call(sky, arg);
+    } catch {
+      return null;
+    }
+    if (!v || typeof v === 'number') return null;
+    const a = Array.isArray(v) ? v : v.isColor ? [v.r, v.g, v.b] : [v.x, v.y, v.z];
+    if (a.length < 3 || !a.every((n) => Number.isFinite(n) && n >= 0)) return null;
+    return a;
+  }
+
+  /** Unit-luminance chroma of the key light, or white if the API is absent. */
+  _skyChroma() {
+    const t = (this._chroma ??= new THREE.Vector3(1, 1, 1));
+    t.set(1, 1, 1);
+    const a = this._skyQuery('keyIrradiance') ?? this._skyQuery('sunIrradiance');
+    if (!a) return t;
+    const lum = 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+    if (!(lum > 1e-9)) return t;
+    t.set(a[0] / lum, a[1] / lum, a[2] / lum).clampScalar(0.4, 2.5);
+    return t;
+  }
+
+  /**
+   * Zenith and horizon sky radiance, straight out of Sky's own integrator, so
+   * the cloud ambient and the haze ambient are literally the colours the dome
+   * is painted with instead of something reconstructed from an average. Cached
+   * per time-of-day: these are CPU raymarches and the answer only moves when
+   * the sun does.
+   */
+  _refreshSkyRadiance() {
+    const sd = this.world.lighting.sunDirection;
+    // A horizon direction on the sun's side of the sky — that is where the
+    // distant cloud deck and the far ridges actually sit.
+    const h = Math.hypot(sd.x, sd.z) || 1;
+    const hz = this._skyQuery('radianceInDirection', { x: (sd.x / h) * 0.9987, y: 0.05, z: (sd.z / h) * 0.9987 });
+    const zn = this._skyQuery('radianceInDirection', { x: 0, y: 1, z: 0 });
+    this._skyRad = hz && zn ? { zenith: zn, horizon: hz } : null;
+  }
+
   /** Pull colours out of the active time-of-day preset. */
   syncTimeOfDay() {
     const lighting = this.world.lighting;
     const preset = lighting.preset ?? {};
     const u = this.volMat.uniforms;
-    const sun = lighting.sun;
-    u.uSunColor.value.set(sun.color.r, sun.color.g, sun.color.b).multiplyScalar(sun.intensity);
+    const p = this.params;
+
+    const key = this._keyLight((this._key ??= {}));
+    u.uKeyDir.value.copy(key.dir);
+    u.uKeyColor.value.copy(key.rgb);
     u.uSunDir.value.copy(lighting.sunDirection);
 
-    const fog = preset.fogColor ?? [0.7, 0.72, 0.78];
-    const amb = preset.ambientColor ?? [0.4, 0.45, 0.6];
-    const ambI = preset.ambientIntensity ?? 1.0;
-    // The in-scattered haze must be BRIGHTER and COOLER than the ground it
-    // covers, or distant ridges get muddier instead of washing out to pale
-    // dusty blue-grey. Mixing the sky's ambient into the fog tint is what
-    // supplies that blue; fogColor alone is neutral and reads as smog.
-    u.uHazeColor.value
-      .set(fog[0] * 0.6 + amb[0] * 0.85, fog[1] * 0.6 + amb[1] * 0.85, fog[2] * 0.6 + amb[2] * 0.85)
-      .multiplyScalar(ambI);
-    u.uCloudAmbient.value.set(amb[0], amb[1], amb[2]).multiplyScalar(ambI * (this.params.cloudAmbient ?? 0.55));
+    // Sky radiance in the same units, split into a zenith and a horizon value.
+    // The horizon is Mie-dominated — brighter, and pulled toward the sun's own
+    // colour — while the zenith is Rayleigh — dimmer and blue. Keeping the two
+    // apart is what stops distant cloud, which is mostly near the horizon, from
+    // being tinted with a cold zenith blue.
+    const sky = lighting.atmosphere?.skyRadiance ?? [0.06, 0.09, 0.16];
+    const sc = preset.sunColor ?? [1, 1, 1];
+    const scL = Math.max(1e-4, 0.2126 * sc[0] + 0.7152 * sc[1] + 0.0722 * sc[2]);
+    if (this._skyRad) {
+      const z = this._skyRad.zenith;
+      const h = this._skyRad.horizon;
+      u.uSkyZenith.value.set(z[0], z[1], z[2]);
+      u.uSkyHorizon.value.set(h[0], h[1], h[2]);
+    } else {
+      // No query API: reconstruct both from the hemisphere average. The horizon
+      // is built from its LUMINANCE and pushed toward the sun's chroma, because
+      // the raw (blue) average would tint every distant cloud cold — the same
+      // mistake at a smaller scale as round 1's grey veil.
+      u.uSkyZenith.value.set(sky[0] * 0.86, sky[1] * 0.95, sky[2] * 1.12);
+      const skyL = 0.2126 * sky[0] + 0.7152 * sky[1] + 0.0722 * sky[2];
+      const WARM = [1.10, 1.0, 0.86];
+      for (let i = 0; i < 3; i++) {
+        HORIZON[i] = skyL * 1.6 * (1.0 + 0.55 * (sc[i] / scL - 1.0)) * WARM[i];
+      }
+      u.uSkyHorizon.value.set(HORIZON[0], HORIZON[1], HORIZON[2]);
+    }
+    // Radiance of the sunlit desert floor: albedo/PI x irradiance. This lights
+    // both the underside of the cloud deck and the suspended dust, and it is
+    // the term that keeps them khaki instead of sky-blue.
+    const nl = Math.max(0, lighting.sunDirection.y);
+    const SAND = PALETTE.sandLight;
+    u.uGroundLight.value.set(
+      (SAND[0] / Math.PI) * key.rgb.x * nl,
+      (SAND[1] / Math.PI) * key.rgb.y * nl,
+      (SAND[2] / Math.PI) * key.rgb.z * nl,
+    );
 
-    const p = this.params;
-    u.uFogDensity.value = p.fogDensity;
-    u.uFogHeight.value = p.fogHeight;
+    // The same sunlit floor seen from above: the fraction of it that reaches a
+    // cloud base a couple of kilometres up. Small, but it is the difference
+    // between a warm-white cumulus and a blue-grey one, and a whole sky of
+    // blue-grey cumulus is a large part of why round 1 read cold.
+    const b = p.bounce ?? 0.18;
+    u.uGroundBounce.value.copy(u.uGroundLight.value).multiplyScalar(b);
+
+    u.uShaftDensity.value = p.shaftDensity;
+    u.uShaftHeight.value = p.shaftHeight;
     u.uSunScatter.value = p.sunScatter;
-    u.uSkyScatter.value = p.skyScatter;
     u.uPhaseG.value = p.phaseG;
-    u.uDustBand.value = p.dustBand;
     u.uCloudCoverage.value = p.cloudCoverage;
     u.uCloudDensity.value = p.cloudDensity;
+    u.uCloudGain.value = p.cloudGain;
+    u.uCloudAmbGain.value = p.cloudAmb;
     u.uCirrus.value = p.cirrus;
+    u.uCirrusAlt.value = p.cirrusAlt;
+    u.uCloudBase.value = p.cloudBase;
+    u.uCloudTop.value = p.cloudTop;
     u.uHeatHaze.value = p.heatHaze;
     u.uCloudShadow.value = p.cloudShadow;
+    u.uHazeOwned.value = this.ownsHaze ? 1 : 0;
+    u.uSkyAmbient.value.set(sky[0], sky[1], sky[2]);
+
+    // Dust load rides the art-directed fog density so the look stays tunable
+    // from ArtDirection.js without touching a shader.
+    const dust = (preset.fogDensity ?? 0.000095) / 0.000095;
+    u.uBetaD.value.setScalar(p.dustBeta * dust);
+    u.uDustHeight.value = p.dustHeight;
+    u.uApSun.value = p.apSun;
+    u.uApAmb.value = p.apAmb;
+    // Rayleigh and Mie follow the same numbers the sky dome is drawn with, so a
+    // ridge that fades into the sky fades into the colour the sky actually is.
+    const ray = (preset.rayleigh ?? 1.9) / 1.9;
+    u.uBetaR.value.set(5.802e-6 * ray, 13.558e-6 * ray, 33.1e-6 * ray);
+    u.uBetaM.value = 8.0e-6 * ((preset.mieCoefficient ?? 0.0058) / 0.0058);
+    u.uApG.value = Math.min(preset.mieDirectionalG ?? 0.8, 0.82);
   }
 
   update(dt, engine) {
@@ -258,6 +457,19 @@ export class VolumetricPass {
     if (!pipeline || !pipeline.hdr) return;
     const cam = engine.camera;
     const lighting = this.world.lighting;
+
+    // Ownership handshake for the distance haze — exactly one of us runs it.
+    //
+    // We claim it once at install (see claimHaze) by clearing RenderPipeline's
+    // `aerial` flag, because the haze has to agree with the cloud deck and the
+    // shafts, which live here. If anything ever sets that flag back to true we
+    // stand down again on the very next frame, so the failure mode is "their
+    // haze" rather than "two hazes" — which is what round 1 shipped.
+    const owns = !(pipeline.enabled?.aerial ?? false);
+    if (owns !== this.ownsHaze) {
+      this.ownsHaze = owns;
+      this._reset = 1;
+    }
 
     // The atmosphere preset follows whatever time of day Lighting is on.
     const preset = lighting.preset;
@@ -267,6 +479,7 @@ export class VolumetricPass {
         (k) => Math.abs((preset?.sunElevation ?? 0) - (this._todElev(k) ?? 1e9)) < 0.01,
       );
       this.params = { ...(ATMOS[name] ?? ATMOS.afternoon) };
+      this._refreshSkyRadiance();
       this._reset = 1;
     }
     this.fields.updateSun(lighting.sunDirection);
@@ -295,7 +508,10 @@ export class VolumetricPass {
     u.uCamPos.value.copy(cam.position);
     u.uTime.value = engine.elapsed;
     u.uFrame.value = frame % 64;
-    u.uFogBase.value = 0;
+    // Clouds are kilometres across; at 1 m/s of apparent drift the deck moves a
+    // pixel every few seconds, which is what a real sky does. Decoupled from
+    // uTime so the shimmer and the deck do not share a beat frequency.
+    u.uWindT.value = engine.elapsed * 4.0;
 
     const shadow = lighting.sun.shadow;
     if (shadow?.map?.texture) {
@@ -306,8 +522,6 @@ export class VolumetricPass {
     } else {
       u.tShadowMap.value = null;
     }
-    u.uCloudBase.value = 2000;
-    u.uCloudTop.value = 3900;
 
     const prevTarget = this.renderer.getRenderTarget();
 
@@ -343,6 +557,28 @@ export class VolumetricPass {
     this.renderer.setRenderTarget(prevTarget);
   }
 
+  /**
+   * Claim the distance haze from RenderPipeline's `prepare` pass.
+   *
+   * Both passes implement aerial perspective and running both stacks two
+   * hazes — the round-1 over-application. This one owns it because it is the
+   * only one that can keep the haze, the cloud deck and the crepuscular shafts
+   * consistent (same sky radiance, same dust load, same phase function), and
+   * because it can hold the effect off the near field while still washing a
+   * 3 km ridge out, which a single exponential fog cannot.
+   *
+   * Reverting is one flag: `engine.pipeline.enabled.aerial = true` makes this
+   * pass stand down automatically on the next frame.
+   */
+  claimHaze() {
+    const pipeline = this.engine.pipeline;
+    if (!pipeline?.enabled || pipeline.enabled.aerial === false) return;
+    pipeline.enabled.aerial = false;
+    this.ownsHaze = true;
+    this._refreshSkyRadiance();
+    this.syncTimeOfDay();
+  }
+
   /** Sun elevations of the ArtDirection presets, used to identify the ToD. */
   _todElev(name) {
     return { dawn: 4, noon: 68, afternoon: 27, dusk: 2, night: -14 }[name];
@@ -352,5 +588,6 @@ export class VolumetricPass {
     this.world.scene.remove(this.compositeMesh);
     for (const rt of [this.depthRT, this.volRT, this.histRT0, this.histRT1]) rt?.dispose();
     this.cloudTex.dispose();
+    this.weatherTex.dispose();
   }
 }

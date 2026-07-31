@@ -1,14 +1,14 @@
 import * as THREE from 'three';
 import { makeRng } from './rng.js';
 import { MODE, createSurface } from './mat.js';
-import { merge, instanced, makeVars, xform, bakeWeather, catenary, box } from './geo.js';
+import { merge, instanced, makeVars, xform, bakeWeather, catenary, box, inPoly } from './geo.js';
 import {
   newBag, placeBag, blockhouse, barracks, vehicleShed, bunker, watchtower, gateway, helipad,
 } from './buildings.js';
 import * as P from './props.js';
 import { OutpostGround } from './ground.js';
 import { layPerimeter, panelGeo, pilasterGeo, linkPostGeo, linkFabricGeo, sandbagWall, PANEL_H } from './fences.js';
-import { chainLinkTexture, camoNetTexture } from './textures.js';
+import { chainLinkTexture, camoNetTexture, signTexture } from './textures.js';
 
 /**
  * A Soviet-era forward outpost, near the world origin.
@@ -32,9 +32,30 @@ import { chainLinkTexture, camoNetTexture } from './textures.js';
 const THETA = 0.30; // compound yaw, local -> world
 const PAD_Y = 0.0; // finished level of the platform
 
-// Compound extent in local space. The wall runs the perimeter of this rectangle.
-const RECT = { u0: -46, u1: 42, v0: -42, v1: 36, cu0: -2, cv0: -3 };
-const GATE = { u: 14.4, v: RECT.v1, gap: 9 };
+/**
+ * The wall line.
+ *
+ * Round 1 ran the perimeter round a true rectangle with four 90° corners, and
+ * every critic named it first. Real installations are not rectangles: the wall
+ * is set out by an engineer following the top of the cut, it kinks wherever the
+ * ground does, the corners are whatever angle the two runs happen to meet at,
+ * and the plan gets re-entrant wherever a later phase took in more ground. So
+ * this is a thirteen-sided irregular polygon with no right angle anywhere in it
+ * and two deliberate kinks — one on the east run where the wall steps out
+ * around the fuel compound, one on the north-west where a later phase took in
+ * the helipad. `layPerimeter` already worked off an arbitrary closed polyline,
+ * so this costs nothing but the coordinates.
+ */
+const PERIM = [
+  [-47, -41], [-16, -45], [12, -43], [34, -35],
+  [45, -16], [43, 6], [38, 20],
+  [30, 34], [2, 39], [-20, 37],
+  [-40, 30], [-49, 8], [-51, -18],
+];
+// Bounding extent, used for the earthwork platform and the debris scatter only.
+const RECT = { u0: -51, u1: 45, v0: -45, v1: 39, cu0: -2, cv0: -3 };
+// The gate sits on the run between [30,34] and [2,39]; its yaw follows that run.
+const GATE = { u: 15.5, v: 36.2, gap: 9, ry: 0.18 };
 
 export async function install(world) {
   const rng = makeRng(0x5eed1917);
@@ -48,7 +69,7 @@ export async function install(world) {
     {
       // Access track: yard -> gate -> down the ramp -> out across the plain.
       pts: [
-        [2, -6], [8, 2], [12, 12], [13.5, 24], [14.4, 36],
+        [2, -6], [8, 2], [12, 12], [13.9, 24], [15.5, 36.2],
         [19.2, 53], [25.6, 72.8], [33.1, 96], [42.6, 126.2],
         [54, 160], [66, 196], [80, 240], [98, 292],
       ],
@@ -82,7 +103,7 @@ export async function install(world) {
     { cu: 28, cv: 3, hu: 12, hv: 7 },
     { cu: -24, cv: -3, hu: 16, hv: 5 },
     { cu: 2, cv: -16, hu: 12, hv: 5 },
-    { cu: -23, cv: 20, hu: 10, hv: 7.5 },
+    { cu: -9, cv: 26, hu: 10, hv: 7 },
     { cu: -30, cv: 15, hu: 12, hv: 12 },
   ];
   const oil = [
@@ -116,11 +137,30 @@ export async function install(world) {
   // -------------------------------------------------------------- materials --
   const linkTex = chainLinkTexture();
   const netTex = camoNetTexture();
+  const signTex = signTexture();
+  // Measured off round 1: every daylight frame came back with blue exceeding
+  // red. Two things were wrong. The albedos were near-neutral greys, so the
+  // (correctly) blue sky probe decided the hue of everything; and there was no
+  // ground-bounce term at all. Every base colour below is now a genuine warm
+  // khaki with red comfortably ahead of blue — a Soviet cement made from local
+  // aggregate in Kandahar province is not the same grey as one made in Kursk —
+  // and `uBounce` (driven from the time of day, below) supplies the warm light
+  // reflected up off sunlit gravel that fills a real desert shadow.
+  const DUST = [0.585, 0.480, 0.330];
   const M = {
     concrete: createSurface({
-      mode: MODE.CONCRETE, name: 'op-concrete',
-      color: [0.345, 0.338, 0.312], color2: [0.212, 0.207, 0.192], color3: [0.470, 0.458, 0.420],
-      rust: [0.30, 0.155, 0.08], wear: 0.42, dustAmt: 0.34, scale: 1.0, roughness: 0.93, envMapIntensity: 1.45,
+      mode: MODE.CONCRETE, name: 'op-concrete', dust: DUST,
+      color: [0.402, 0.358, 0.282], color2: [0.248, 0.218, 0.170], color3: [0.545, 0.492, 0.396],
+      rust: [0.34, 0.163, 0.072], wear: 0.42, dustAmt: 0.40, scale: 1.0, roughness: 0.93, envMapIntensity: 1.15,
+    }),
+    // Whitewashed blockwork: the original 1960s barrack. Lime over grey block,
+    // failing in patches, with the municipal ochre socle every Soviet building
+    // on earth has up to about 1.2m.
+    masonry: createSurface({
+      mode: MODE.MASONRY, name: 'op-masonry', dust: DUST,
+      color: [0.330, 0.286, 0.212], color2: [0.418, 0.360, 0.272], color3: [0.640, 0.596, 0.502],
+      rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.42, scale: 1.0, roughness: 0.92, envMapIntensity: 1.15,
+      dado: 0.195, dadoStrength: 0.95, dadoColor: [0.212, 0.132, 0.046],
     }),
     // Broken slab and rubble. It lies in the dirt, so it must read *darker* than
     // the hardstanding it sits on. On the shared concrete material a tumbling
@@ -128,68 +168,98 @@ export async function install(world) {
     // sun-bleach term and the full dust film and end up brighter than the road —
     // a scatter of white paper across the yard.
     debris: createSurface({
-      mode: MODE.CONCRETE, name: 'op-debris',
-      color: [0.196, 0.190, 0.172], color2: [0.128, 0.124, 0.114], color3: [0.250, 0.242, 0.220],
-      rust: [0.26, 0.13, 0.06], wear: 0.85, dustAmt: 0.20, scale: 3.2, roughness: 0.96, envMapIntensity: 1.1,
+      mode: MODE.CONCRETE, name: 'op-debris', dust: DUST,
+      color: [0.222, 0.198, 0.158], color2: [0.145, 0.128, 0.102], color3: [0.278, 0.250, 0.202],
+      rust: [0.30, 0.145, 0.062], wear: 0.85, dustAmt: 0.24, scale: 3.2, roughness: 0.96, envMapIntensity: 0.95,
     }),
     wall: createSurface({
-      mode: MODE.CONCRETE, name: 'op-wall',
-      color: [0.368, 0.358, 0.328], color2: [0.222, 0.216, 0.200], color3: [0.500, 0.485, 0.442],
-      rust: [0.30, 0.155, 0.08], wear: 0.62, dustAmt: 0.40, scale: 1.25, roughness: 0.94, envMapIntensity: 1.45,
+      mode: MODE.CONCRETE, name: 'op-wall', dust: DUST,
+      color: [0.428, 0.380, 0.296], color2: [0.258, 0.226, 0.176], color3: [0.578, 0.518, 0.412],
+      rust: [0.34, 0.163, 0.072], wear: 0.62, dustAmt: 0.46, scale: 1.25, roughness: 0.94, envMapIntensity: 1.15,
     }),
     metal: createSurface({
-      mode: MODE.METAL, name: 'op-metal',
-      color: [0.086, 0.098, 0.062], color2: [0.135, 0.140, 0.132], color3: [0.075, 0.098, 0.115],
-      rust: [0.255, 0.115, 0.048], wear: 0.50, dustAmt: 0.26, metalness: 0.62, roughness: 0.55, scale: 1.6, envMapIntensity: 1.2,
+      mode: MODE.METAL, name: 'op-metal', dust: DUST,
+      color: [0.098, 0.104, 0.062], color2: [0.148, 0.146, 0.126], color3: [0.088, 0.100, 0.106],
+      rust: [0.240, 0.115, 0.052], wear: 0.34, dustAmt: 0.36, metalness: 0.62, roughness: 0.55, scale: 1.6, envMapIntensity: 1.05,
     }),
     corr: createSurface({
-      mode: MODE.CORRUGATED, name: 'op-corr',
-      color: [0.185, 0.190, 0.178], color2: [0.128, 0.148, 0.112], color3: [0.245, 0.225, 0.185],
-      rust: [0.245, 0.108, 0.045], wear: 0.60, dustAmt: 0.30, metalness: 0.55, roughness: 0.62,
-      corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.3,
+      mode: MODE.CORRUGATED, name: 'op-corr', dust: DUST,
+      color: [0.205, 0.198, 0.170], color2: [0.148, 0.158, 0.108], color3: [0.282, 0.250, 0.190],
+      rust: [0.205, 0.108, 0.058], wear: 0.30, dustAmt: 0.44, metalness: 0.55, roughness: 0.62,
+      corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.10,
     }),
     wood: createSurface({
-      mode: MODE.WOOD, name: 'op-wood',
-      color: [0.068, 0.054, 0.036], color2: [0.108, 0.086, 0.056], color3: [0.128, 0.122, 0.108],
-      rust: [0.22, 0.12, 0.05], wear: 0.55, dustAmt: 0.30, roughness: 0.92, scale: 1.0, envMapIntensity: 1.4,
+      mode: MODE.WOOD, name: 'op-wood', dust: DUST,
+      color: [0.086, 0.062, 0.036], color2: [0.132, 0.100, 0.058], color3: [0.152, 0.138, 0.114],
+      rust: [0.26, 0.13, 0.05], wear: 0.55, dustAmt: 0.34, roughness: 0.92, scale: 1.0, envMapIntensity: 1.15,
     }),
     cloth: createSurface({
-      mode: MODE.CLOTH, name: 'op-cloth',
-      color: [0.158, 0.143, 0.104], color2: [0.100, 0.092, 0.070], color3: [0.212, 0.194, 0.142],
-      wear: 0.45, dustAmt: 0.30, roughness: 0.97, scale: 1.6, side: THREE.DoubleSide, envMapIntensity: 1.25,
+      mode: MODE.CLOTH, name: 'op-cloth', dust: DUST,
+      color: [0.150, 0.128, 0.082], color2: [0.098, 0.086, 0.062], color3: [0.245, 0.202, 0.122],
+      wear: 0.45, dustAmt: 0.24, roughness: 0.97, scale: 1.6, side: THREE.DoubleSide, envMapIntensity: 0.95,
     }),
     rubber: createSurface({
-      mode: MODE.CLOTH, name: 'op-rubber',
-      color: [0.032, 0.031, 0.030], color2: [0.052, 0.050, 0.048], color3: [0.075, 0.073, 0.070],
-      wear: 0.3, dustAmt: 0.34, roughness: 0.86, scale: 3.0,
+      mode: MODE.CLOTH, name: 'op-rubber', dust: DUST,
+      color: [0.038, 0.035, 0.032], color2: [0.058, 0.054, 0.050], color3: [0.082, 0.077, 0.070],
+      wear: 0.3, dustAmt: 0.40, roughness: 0.88, scale: 3.0, envMapIntensity: 0.9,
     }),
     paint: createSurface({
-      mode: MODE.CONCRETE, name: 'op-paint',
-      color: [0.535, 0.520, 0.470], color2: [0.335, 0.328, 0.305], color3: [0.660, 0.645, 0.590],
-      rust: [0.30, 0.155, 0.08], wear: 1.05, dustAmt: 0.45, scale: 1.6, roughness: 0.90,
+      mode: MODE.CONCRETE, name: 'op-paint', dust: DUST,
+      color: [0.585, 0.545, 0.455], color2: [0.372, 0.345, 0.290], color3: [0.712, 0.672, 0.572],
+      rust: [0.34, 0.163, 0.072], wear: 1.05, dustAmt: 0.48, scale: 1.6, roughness: 0.90, envMapIntensity: 1.1,
+    }),
+    // Vehicle bodywork. Soviet military kit is olive drab, not the pale
+    // architectural paint the trucks were sharing in round 1 — a near-white
+    // truck in a khaki compound reads as untextured placeholder geometry.
+    mil: createSurface({
+      mode: MODE.METAL, name: 'op-mil', dust: DUST,
+      color: [0.070, 0.082, 0.042], color2: [0.100, 0.104, 0.058], color3: [0.124, 0.118, 0.074],
+      rust: [0.205, 0.098, 0.044], wear: 0.06, dustAmt: 0.34, metalness: 0.06, roughness: 0.74, scale: 1.4,
+      envMapIntensity: 0.80,
+    }),
+    // The painted socle. Deliberately the most saturated thing on any building:
+    // one band of institutional ochre at waist height does more to say "Soviet
+    // garrison" than every other detail on the elevation put together.
+    dado: createSurface({
+      mode: MODE.CONCRETE, name: 'op-dado', dust: DUST,
+      color: [0.228, 0.118, 0.026], color2: [0.140, 0.070, 0.016], color3: [0.300, 0.172, 0.048],
+      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.26, scale: 2.0, roughness: 0.66, envMapIntensity: 0.95,
     }),
     paintWarn: createSurface({
-      mode: MODE.METAL, name: 'op-paintwarn',
-      color: [0.235, 0.032, 0.020], color2: [0.175, 0.028, 0.018], color3: [0.290, 0.058, 0.032],
-      rust: [0.24, 0.105, 0.045], wear: 0.72, dustAmt: 0.38, metalness: 0.10, roughness: 0.72, scale: 1.8,
+      mode: MODE.METAL, name: 'op-paintwarn', dust: DUST,
+      color: [0.255, 0.036, 0.020], color2: [0.190, 0.030, 0.018], color3: [0.318, 0.066, 0.034],
+      rust: [0.28, 0.115, 0.045], wear: 0.72, dustAmt: 0.44, metalness: 0.10, roughness: 0.72, scale: 1.8,
     }),
     link: createSurface({
-      mode: MODE.METAL, name: 'op-link', map: linkTex, alphaTest: 0.30, side: THREE.DoubleSide,
-      color: [0.60, 0.615, 0.615], color2: [0.42, 0.425, 0.415], color3: [0.70, 0.705, 0.690],
-      rust: [0.30, 0.135, 0.055], wear: 0.60, dustAmt: 0.16, metalness: 0.70, roughness: 0.52, scale: 2.0,
+      mode: MODE.METAL, name: 'op-link', map: linkTex, alphaTest: 0.30, side: THREE.DoubleSide, dust: DUST,
+      color: [0.62, 0.605, 0.560], color2: [0.44, 0.428, 0.396], color3: [0.72, 0.700, 0.652],
+      rust: [0.34, 0.148, 0.055], wear: 0.60, dustAmt: 0.20, metalness: 0.70, roughness: 0.52, scale: 2.0,
     }),
     net: createSurface({
-      mode: MODE.CLOTH, name: 'op-net', map: netTex, alphaTest: 0.42, side: THREE.DoubleSide,
-      color: [0.400, 0.362, 0.245], color2: [0.245, 0.238, 0.172], color3: [0.330, 0.352, 0.215],
-      wear: 0.5, dustAmt: 0.40, roughness: 0.97, scale: 1.0, envMapIntensity: 1.5,
+      mode: MODE.CLOTH, name: 'op-net', map: netTex, alphaTest: 0.26, side: THREE.DoubleSide, dust: DUST,
+      color: [0.482, 0.418, 0.258], color2: [0.328, 0.292, 0.186], color3: [0.412, 0.400, 0.232],
+      wear: 0.25, dustAmt: 0.48, roughness: 0.97, scale: 1.0, envMapIntensity: 1.35,
+    }),
+    // Stencilled unit markings. Weathered by the concrete body so a fresh decal
+    // never sits on a thirty-year-old wall.
+    sign: createSurface({
+      mode: MODE.CONCRETE, name: 'op-sign', map: signTex, alphaTest: 0.42, side: THREE.DoubleSide, dust: DUST,
+      color: [1.180, 1.130, 1.010], color2: [0.840, 0.800, 0.720], color3: [1.360, 1.310, 1.190],
+      rust: [0.34, 0.163, 0.072], wear: 0.30, dustAmt: 0.26, scale: 2.6, roughness: 0.92, envMapIntensity: 1.0,
     }),
     ground: createSurface({
-      mode: MODE.GROUND, name: 'op-ground',
-      color: [0.372, 0.322, 0.240], color2: [0.238, 0.202, 0.148], color3: [0.182, 0.176, 0.164],
-      wear: 0.4, dustAmt: 0.0, roughness: 0.95, scale: 1.0, envMapIntensity: 1.3,
+      mode: MODE.GROUND, name: 'op-ground', dust: DUST,
+      color: [0.412, 0.338, 0.238], color2: [0.268, 0.216, 0.150], color3: [0.208, 0.190, 0.166],
+      wear: 0.4, dustAmt: 0.0, roughness: 0.95, scale: 1.0, envMapIntensity: 1.15,
+    }),
+    // Behind every window and door opening. Not pure black: an unlit room still
+    // catches a little light off its own floor, and a true 0,0,0 hole is the
+    // reason round-1 windows read as printed rectangles.
+    dark: new THREE.MeshStandardMaterial({
+      color: 0x14120f, roughness: 0.94, metalness: 0.0, envMapIntensity: 0.22, name: 'op-dark',
     }),
     glass: new THREE.MeshStandardMaterial({
-      color: 0x0a0c0d, roughness: 0.22, metalness: 0.05, envMapIntensity: 1.5, name: 'op-glass',
+      color: 0x141a20, roughness: 0.07, metalness: 0.04, envMapIntensity: 3.2, name: 'op-glass',
     }),
   };
   // Glazing that lights up; emissive is driven from the time of day below.
@@ -206,7 +276,10 @@ export async function install(world) {
 
   const R = ground.reach;
   const groundMesh = new THREE.Mesh(ground.build({
-    u0: RECT.u0 - R, u1: RECT.u1 + R, v0: RECT.v0 - R, v1: Math.max(RECT.v1 + R, 250), step: 1.5,
+    // 1.7m spacing: the pad is the single biggest mesh in the module and its
+    // shape work is all in the shader, so the grid only has to resolve the
+    // embankment and the ramp crown.
+    u0: RECT.u0 - R, u1: RECT.u1 + R, v0: RECT.v0 - R, v1: Math.max(RECT.v1 + R, 250), step: 1.7,
   }), M.ground);
   groundMesh.receiveShadow = true;
   groundMesh.castShadow = true;
@@ -217,31 +290,37 @@ export async function install(world) {
   const bag = newBag();
   const put = (built, u, v, ry = 0, dy = 0) => placeBag(bag, built, { u, v, y: gy(u, v) + dy, ry });
 
-  put(barracks({ w: 26, d: 10, rng, litFrac: 0.45 }), -24, -12, 0);
-  put(barracks({ w: 23, d: 9.5, rng, litFrac: 0.35 }), -24, 6, Math.PI);
-  const BLOCK = { u: 2, v: -27, w: 18, d: 13, storeys: 2 };
-  put(blockhouse({ w: BLOCK.w, d: BLOCK.d, storeys: BLOCK.storeys, rng, litFrac: 0.5 }), BLOCK.u, BLOCK.v, 0);
-  put(vehicleShed({ w: 16, d: 12, bays: 3 }), 28, -6, 0);
-  put(bunker({ w: 12, d: 8 }), -38, -30, 0.34);
-  const TOWER_A = { u: 36, v: 29, h: 9.0 };
+  // Three huts, three decades, three trades, three orientations. Not one of
+  // them is parallel to another or to the wall, because a compound that grew
+  // over thirty years never is: the 1960s barrack was set out square to the
+  // original cut, the 1970s hut was squeezed in facing the yard, and the 1980s
+  // steel shed was dropped diagonally across whatever ground was left.
+  put(barracks({ w: 26, d: 10, rng, litFrac: 0.45, style: 'masonry', signCell: 8, lean: true }), -26, -13, 0.085);
+  put(barracks({ w: 22, d: 9.5, rng, litFrac: 0.35, style: 'concrete', signCell: 9, lean: true }), -27.5, 6, Math.PI - 0.155);
+  put(barracks({ w: 16, d: 9.5, rng, litFrac: 0.30, style: 'steel', signCell: 1 }), -8, 26, 0.72);
+  const BLOCK = { u: 1, v: -28, w: 18, d: 13, storeys: 2, ry: -0.13 };
+  put(blockhouse({ w: BLOCK.w, d: BLOCK.d, storeys: BLOCK.storeys, rng, litFrac: 0.5 }), BLOCK.u, BLOCK.v, BLOCK.ry);
+  put(vehicleShed({ w: 16, d: 12, bays: 3 }), 29, -5, 0.10);
+  put(bunker({ w: 12, d: 8 }), -39, -31, 0.36);
+  const TOWER_A = { u: 33, v: 26, h: 9.0 };
   const TOWER_B = { u: -42, v: -37, h: 11.5 };
   put(watchtower({ h: TOWER_A.h }), TOWER_A.u, TOWER_A.v, -2.35);
   put(watchtower({ h: TOWER_B.h }), TOWER_B.u, TOWER_B.v, 0.75);
-  put(gateway({ gap: GATE.gap }), GATE.u, GATE.v, 0);
-  const PAD = { u: -30, v: 15 };
-  put(helipad({ r: 9.5 }), PAD.u, PAD.v, 0.4);
+  put(gateway({ gap: GATE.gap }), GATE.u, GATE.v, GATE.ry);
+  const PAD = { u: -34, v: 22 };
+  put(helipad({ r: 8.2 }), PAD.u, PAD.v, 0.4);
 
   // ------------------------------------------------------------- perimeter --
-  const corners = [
-    [RECT.u0, RECT.v0], [RECT.u1, RECT.v0], [RECT.u1, RECT.v1], [RECT.u0, RECT.v1],
-  ];
+  const corners = PERIM;
   const peri = layPerimeter({
     corners,
     gaps: [{ u: GATE.u, v: GATE.v, r: GATE.gap / 2 + 1.6 }],
+    // Where the concrete ran out and the job was finished in chain-link.
     linkRuns: [
-      { edge: 0, t0: 0.52, t1: 0.86 },
-      { edge: 3, t0: 0.12, t1: 0.42 },
-      { edge: 1, t0: 0.72, t1: 0.88 },
+      { edge: 1, t0: 0.30, t1: 0.66 },
+      { edge: 4, t0: 0.24, t1: 0.78 },
+      { edge: 10, t0: 0.18, t1: 0.72 },
+      { edge: 8, t0: 0.62, t1: 0.90 },
     ],
     groundY: gy,
     rng,
@@ -256,8 +335,8 @@ export async function install(world) {
   // Shipping containers: cover, and the vertical break the yard needs.
   const containers = [
     at(31, 15.5, 0.08), at(31, 15.5, 0.11, { dy: 2.72 }), at(31, 20.6, -0.05),
-    at(23.5, 24, 1.62), at(-2, 27, 0.34), at(-2, 27, 0.30, { dy: 2.72 }),
-    at(-9, 25.4, -0.18), at(38, -19, 1.55), at(38, -24.4, 1.51), at(-41, 9, 0.92),
+    at(23.5, 24, 1.62), at(3, 30.5, 0.34), at(3, 30.5, 0.30, { dy: 2.72 }),
+    at(7.5, 31.2, -0.18), at(38, -19, 1.55), at(38, -24.4, 1.51), at(-41, 9, 0.92),
     at(-11.5, 2.5, 1.48), at(-11.5, 2.5, 1.51, { dy: 2.72 }), at(11.5, -6.5, 0.22),
     at(-42, -22, 0.06), at(-42, -27.2, 0.09), at(-26, -37, 1.62), at(20, -34, 0.14),
   ];
@@ -265,7 +344,7 @@ export async function install(world) {
 
   const drums = [];
   const drumClusters = [
-    [30, 8, 12], [26.5, 11, 7], [-12.5, -8.5, 9], [-40, 3, 8], [4, -20, 7],
+    [30, 8, 12], [26.5, 11, 7], [-12.5, -8.5, 9], [-43, 2, 8], [4, -20, 7],
     [-33, -26, 10], [17, 27, 6], [-9, -16.5, 6], [35.5, 4, 5],
     [-6.5, 6.0, 8], [8.5, -1.5, 7], [19, 45, 6], [-2.5, 2.5, 6], [4.5, -6.5, 5],
     [-36, -20, 8], [-20, -33, 7], [24, -28, 6],
@@ -290,7 +369,7 @@ export async function install(world) {
   const crates = [];
   const pallets = [];
   const jerry = [];
-  const dumps = [[-11, -13], [-32, 18], [12, -18], [33, -27], [-22, 20], [5.0, 3.0], [-38, -14], [-24, -34]];
+  const dumps = [[-9, -14], [-20, 14], [12, -18], [33, -27], [-26, 32], [5.0, 3.0], [-44, -21], [-24, -34]];
   for (const [cu, cv] of dumps) {
     for (let i = 0; i < 7; i++) {
       const u = cu + rng.jitter(2.6);
@@ -358,7 +437,7 @@ export async function install(world) {
   const barriers = [];
   for (const [u, v, r] of [
     [8.5, 30.5, 0.1], [8.9, 28.5, 0.08], [20.5, 31.5, -0.06], [20.9, 29.5, 0.04],
-    [12, 24, 1.55], [16, 22.4, 1.6], [30, 26, 0.2], [32, 24, 0.25], [-3, 20, 1.5], [-3, 22, 1.52],
+    [12, 24, 1.55], [16, 22.4, 1.6], [30, 26, 0.2], [32, 24, 0.25], [5.5, 17.5, 1.5], [5.4, 19.5, 1.52],
     [7.5, 1.0, 0.9], [9.2, -0.6, 0.95], [-7.0, 9.5, 2.3], [17.8, 46.5, 0.28], [19.4, 44.2, 0.3],
     [14.0, 43.0, 0.32], [15.6, 40.8, 0.34],
   ]) {
@@ -366,7 +445,7 @@ export async function install(world) {
     cover.push({ u, v, r: 1.6 });
   }
   const pipes = [];
-  for (const [u, v, r] of [[-14, 16, 0.6], [-14.3, 17.4, 0.62], [22, -18, 2.1], [-13.5, 3.0, 1.35], [-13.9, 4.6, 1.3]]) {
+  for (const [u, v, r] of [[-6, 14, 0.6], [-6.3, 15.4, 0.62], [22, -18, 2.1], [-13.5, 3.0, 1.35], [-13.9, 4.6, 1.3]]) {
     pipes.push(at(u, v, r));
     cover.push({ u, v, r: 1.5 });
   }
@@ -390,7 +469,7 @@ export async function install(world) {
   }
   // Roof position on the command block: same generator, lifted to the parapet.
   {
-    const roofY = gy(BLOCK.u, BLOCK.v) + BLOCK.storeys * 3.2 + 0.34;
+    const roofY = gy(BLOCK.u, BLOCK.v) + BLOCK.storeys * 3.2 + 0.54;
     const flat = () => roofY;
     for (const b2 of sandbagWall({
       pts: [[BLOCK.u - 5, BLOCK.v + 4.4], [BLOCK.u + 3, BLOCK.v + 4.4]], courses: 3, rng, groundY: flat,
@@ -401,7 +480,7 @@ export async function install(world) {
   // Floodlights, high mast, radio mast, dishes.
   const floods = [
     at(6.5, 27.5, 3.3), at(-13, -2, 1.1), at(30.5, -16.5, 2.4),
-    at(-35, 4, -1.2), at(-1, -18.5, 0.4), at(34, 9.5, 2.9), at(-30, 31, 2.2),
+    at(-43, -6, -1.2), at(-1, -18.5, 0.4), at(34, 9.5, 2.9), at(-30, 31, 2.2),
   ];
   const HIGH_MAST = { u: 18.5, v: -4.5, h: 13 };
   const MAST = { u: -12, v: -34, h: 19 };
@@ -411,7 +490,7 @@ export async function install(world) {
   const cableRuns = [
     [[6.5, 27.5, 6.2], [-1, -18.5, 6.2]],
     [[-1, -18.5, 6.2], [-13, -2, 6.2]],
-    [[-13, -2, 6.2], [-35, 4, 6.2]],
+    [[-13, -2, 6.2], [-43, -6, 6.2]],
     [[6.5, 27.5, 6.2], [34, 9.5, 6.2]],
     [[34, 9.5, 6.2], [30.5, -16.5, 6.2]],
     [[-1, -18.5, 5.4], [BLOCK.u, BLOCK.v + BLOCK.d / 2, 5.6]],
@@ -430,8 +509,10 @@ export async function install(world) {
   // over the ready vehicles by the gate.
   const nets = [];
   const netBags = [];
-  for (const [u, v, w, d, ry] of [[-11.5, -13, 13, 9.5, 0.12], [21.5, 24, 11, 8, 1.62], [-38, -14, 10, 8, 0.5]]) {
-    const nb = P.camoNet({ w, d, h: 3.75, sag: 0.75 });
+  for (const [u, v, w, d, ry, h] of [
+    [-8, -14, 13, 9.5, 0.12, 3.9], [21.5, 24, 11, 8, 1.62, 3.6], [-44, -21, 10, 8, 0.5, 3.4],
+  ]) {
+    const nb = P.camoNet({ w, d, h, sag: 1.05, rng });
     const dst = newBag();
     placeBag(dst, nb, { u, v, y: gy(u, v), ry });
     netBags.push(dst);
@@ -439,8 +520,10 @@ export async function install(world) {
   }
 
   const tarps = [];
-  for (const [u, v, ry] of [[-13, -15, 0.3], [-31, 19, 1.2], [13, -19.5, 2.2], [4.0, 6.0, 0.9], [-40, -19, 1.9], [-22, -31, 0.4]]) {
-    const tb = P.tarpGeo({ w: 2.8, d: 2.2, h: 1.35 });
+  let tarpSeed = 3;
+  for (const [u, v, ry] of [[-11, -16, 0.3], [-25, 31, 1.2], [13, -19.5, 2.2], [4.0, 6.0, 0.9], [-41, -18, 1.9], [-22, -31, 0.4]]) {
+    // Each tarp gets its own load underneath, so no two have the same skyline.
+    const tb = P.tarpGeo({ w: 2.6 + (tarpSeed % 3) * 0.35, d: 2.0 + (tarpSeed % 2) * 0.4, h: 1.25 + (tarpSeed % 4) * 0.12, seed: (tarpSeed += 17) });
     const dst = newBag();
     placeBag(dst, tb, { u, v, y: gy(u, v) + 0.2, ry });
     netBags.push(dst);
@@ -464,6 +547,9 @@ export async function install(world) {
   for (const nb of netBags) for (const k of Object.keys(nb)) (bag[k] ??= []).push(...nb[k]);
 
   addMerged(bag.concrete, M.concrete, 'op-arch-concrete');
+  addMerged(bag.masonry, M.masonry, 'op-arch-masonry');
+  addMerged(bag.sign, M.sign, 'op-arch-sign', { cast: false });
+  addMerged(bag.dark, M.dark, 'op-arch-dark', { cast: false });
   addMerged(bag.metal, M.metal, 'op-arch-metal');
   addMerged(bag.corr, M.corr, 'op-arch-corr');
   addMerged(bag.wood, M.wood, 'op-arch-wood');
@@ -473,6 +559,8 @@ export async function install(world) {
   addMerged(bag.glass, M.glass, 'op-arch-glass', { cast: false });
   addMerged(bag.glow, M.glow, 'op-arch-glow', { cast: false });
   addMerged(bag.paint, M.paint, 'op-arch-paint');
+  addMerged(bag.mil, M.mil, 'op-arch-mil');
+  addMerged(bag.dado, M.dado, 'op-arch-dado');
   addMerged(bag.paintWarn, M.paintWarn, 'op-arch-paintwarn');
 
   // Perimeter.
@@ -506,19 +594,33 @@ export async function install(world) {
 
   // Props.
   const matMap = {
-    concrete: M.concrete, metal: M.metal, corr: M.corr, wood: M.wood, cloth: M.cloth,
+    concrete: M.concrete, masonry: M.masonry, metal: M.metal, corr: M.corr, wood: M.wood, cloth: M.cloth,
     net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp, paint: M.paint, paintWarn: M.paintWarn,
+    sign: M.sign, dark: M.dark, mil: M.mil, dado: M.dado,
   };
   addInst(P.bagToGeos(P.containerGeo()), containers, matMap, { wearAmp: 0.8 });
   addInst(P.bagToGeos(P.drumGeo()), drums, matMap, { wearAmp: 0.9 });
   addInst(P.bagToGeos(P.crateGeo()), crates, matMap, { wearAmp: 0.7 });
   addInst(P.bagToGeos(P.palletGeo()), pallets, matMap, { wearAmp: 0.8 });
   addInst(P.bagToGeos(P.jerryCanGeo()), jerry, matMap, { wearAmp: 0.9 });
-  addInst(P.bagToGeos(P.tyreGeo()), tyres, matMap, { wearAmp: 0.5 });
-  addInst(P.bagToGeos(P.rubbleGeo(7)), rubble, { ...matMap, concrete: M.debris }, { wearAmp: 1.0, cast: true });
+  // Repeated props get real mesh variants, not just a scale jitter: three tyre
+  // carcasses, four rubble chunks, seven sandbags. Bucketing the placement list
+  // by variant costs one extra draw call each and removes the "stamped from one
+  // mould" read that a single instanced mesh always has.
+  for (let v = 0; v < 3; v++) {
+    addInst(P.bagToGeos(P.tyreGeo(v)), tyres.filter((_, i) => i % 3 === v), matMap, { wearAmp: 0.5 });
+  }
+  for (let v = 0; v < 4; v++) {
+    addInst(
+      P.bagToGeos(P.rubbleGeo(7 + v * 31)), rubble.filter((_, i) => i % 4 === v),
+      { ...matMap, concrete: M.debris }, { wearAmp: 1.0, cast: true },
+    );
+  }
   addInst(P.bagToGeos(P.barrierGeo()), barriers, matMap, { wearAmp: 0.8 });
   addInst(P.bagToGeos(P.pipeGeo()), pipes, matMap, { wearAmp: 0.8 });
-  addInst(P.bagToGeos(P.sandbagGeo()), sandbags, matMap, { wearAmp: 0.5 });
+  for (let v = 0; v < P.SANDBAG_VARIANTS; v++) {
+    addInst(P.bagToGeos(P.sandbagGeo(v)), sandbags.filter((s) => s.variant === v), matMap, { wearAmp: 0.5 });
+  }
 
   const floodGeos = P.bagToGeos(P.floodlightGeo({ h: 6.4 }));
   addInst(floodGeos, floods, matMap, { wearAmp: 0.6 });
@@ -528,12 +630,12 @@ export async function install(world) {
   addInst(P.bagToGeos(P.highMastGeo({ h: HIGH_MAST.h })), mastList, matMap, { wearAmp: 0.4 });
   addInst(P.bagToGeos(P.highMastLensGeo({ h: HIGH_MAST.h })), mastList, matMap, { cast: false });
   addInst(P.bagToGeos(P.antennaMastGeo({ h: MAST.h })), [at(MAST.u, MAST.v, 0.4)], matMap, { wearAmp: 0.4 });
-  addInst(P.bagToGeos(P.waterTowerGeo({ h: 10.5 })), [at(-2.5, 20.5, 0.5)], matMap, { wearAmp: 0.5 });
+  addInst(P.bagToGeos(P.waterTowerGeo({ h: 10.5 })), [at(4, 22, 0.5)], matMap, { wearAmp: 0.5 });
   addInst(P.bagToGeos(P.fuelTankGeo({})), [
-    at(36.5, -1.5, 1.60), at(36.5, -6.2, 1.58), at(-38.5, 12.5, 0.35),
+    at(36.5, -1.5, 1.60), at(36.5, -6.2, 1.58), at(-42, -8, 1.52),
   ], matMap, { wearAmp: 0.9 });
 
-  const roofY = gy(BLOCK.u, BLOCK.v) + BLOCK.storeys * 3.2 + 0.34;
+  const roofY = gy(BLOCK.u, BLOCK.v) + BLOCK.storeys * 3.2 + 0.54;
   addInst(P.bagToGeos(P.dishGeo({ r: 1.5 })), [
     { pos: new THREE.Vector3(BLOCK.u + 5.4, roofY, BLOCK.v - 3.2), ry: 2.1 },
     { pos: new THREE.Vector3(BLOCK.u - 4.2, roofY, BLOCK.v - 4.0), ry: 2.5, scale: 0.72 },
@@ -542,10 +644,10 @@ export async function install(world) {
 
   addInst(P.bagToGeos(P.truckGeo({ tilt: true })), [
     at(26.5, 18.5, 2.42), at(-2, -19.5, 0.32),
-  ], matMap, { wearAmp: 0.5 });
+  ], matMap, { wearAmp: 0.22 });
   addInst(P.bagToGeos(P.truckGeo({ tilt: false })), [
     at(30.5, 3.5, 0.06), at(21.8, 24.5, 1.60), at(27.5, 57, 1.15),
-  ], matMap, { wearAmp: 0.9 });
+  ], matMap, { wearAmp: 0.45 });
 
   // Telegraph line beside the access track. Poles are the cheapest possible way
   // to make an approach read as a road to somewhere.
@@ -607,6 +709,15 @@ export async function install(world) {
       s.shadow.camera.far = dist;
       s.shadow.bias = -0.0016;
       s.shadow.normalBias = 0.05;
+      // CACHED, not per-frame. This mast is bolted to a tower and it does not
+      // sweep — its caster set is the compound, which does not move either. At
+      // 1024 sq it was re-rasterising 0.97 M triangles and 120 draw calls EVERY
+      // frame for a bit-identical result, which is 20% of the whole night frame
+      // and the entire reason that shot was over the triangle budget. Refreshed
+      // on switch-on, on any lighting invalidation, and on a slow tick (below)
+      // so a walking guard's shadow is stale by at most a third of a second.
+      s.shadow.autoUpdate = false;
+      s.shadow.needsUpdate = true;
     }
     return addLight(s, base);
   };
@@ -620,7 +731,7 @@ export async function install(world) {
   // a second cost a full scene depth pass for a 34 m cone.
   const floodAim = [
     [6.5, 27.5, 14, 33], [-13, -2, -22, -6], [30.5, -16.5, 24, -10],
-    [-35, 4, -30, 14], [-1, -18.5, 4, -26], [34, 9.5, 40, 20], [-30, 31, -22, 28],
+    [-43, -6, -36, 2], [-1, -18.5, 4, -26], [34, 9.5, 40, 20], [-30, 31, -22, 28],
   ];
   for (let i = 0; i < floodAim.length; i++) {
     const [u, v, tu, tv] = floodAim[i];
@@ -653,20 +764,43 @@ export async function install(world) {
 
   // ------------------------------------------------- day / night behaviour --
   const glowMats = [M.glow, M.lamp];
+  // Every procedural surface material, so the ground-bounce term can be driven
+  // from the sun.
+  const surfaces = Object.values(M).filter((m) => m.userData?.u?.uBounce);
+  const BOUNCE_DAY = new THREE.Vector3(0.255, 0.176, 0.086);
+  const BOUNCE_NIGHT = new THREE.Vector3(0.006, 0.008, 0.014);
   let lastN = -1;
+  let tick = 0;
   world.engine.addSystem({
     order: -40,
     update() {
+      // Slow refresh of the cached spot shadow (see spotAt). 20 frames is a
+      // third of a second of staleness on a moving guard and 5% of the cost of
+      // redrawing it every frame.
+      if (++tick % 20 === 0) {
+        for (const l of lights) if (l.castShadow && l.shadow.autoUpdate === false) l.shadow.needsUpdate = true;
+      }
       const el = world.lighting?.preset?.sunElevation ?? 30;
       const n = THREE.MathUtils.clamp((7.0 - el) / 13.0, 0, 1);
       if (Math.abs(n - lastN) < 0.001) return;
       lastN = n;
+      // Warm light off sunlit gravel. It has to die with the sun: a compound
+      // still glowing khaki from below at midnight is worse than the cold cast
+      // it was introduced to fix.
+      const k = (1 - n) * (1 - n);
+      for (const m of surfaces) {
+        m.userData.u.uBounce.value.copy(BOUNCE_NIGHT).lerp(BOUNCE_DAY, k);
+      }
       for (const l of lights) {
         l.intensity = l.userData.baseIntensity * n;
         // Dropping the light entirely below threshold keeps the daylight shots
         // off the multi-light shader path.
         l.visible = n > 0.02;
-        if (l.userData.wantsShadow) l.castShadow = n > 0.55;
+        if (l.userData.wantsShadow) {
+          const want = n > 0.55;
+          if (want && !l.castShadow) l.shadow.needsUpdate = true;
+          l.castShadow = want;
+        }
       }
       glowMats[0].emissiveIntensity = 2.6 * n;
       glowMats[1].emissiveIntensity = 2.4 * n;
@@ -716,7 +850,7 @@ export async function install(world) {
     },
     isInside(x, z) {
       const [u, v] = world2local(x, z);
-      return u > RECT.u0 && u < RECT.u1 && v > RECT.v0 && v < RECT.v1;
+      return inPoly(u, v, PERIM);
     },
     toLocal: world2local,
     toWorld: (u, v) => ground.toWorld(u, v),

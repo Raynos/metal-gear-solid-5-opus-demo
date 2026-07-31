@@ -6,24 +6,32 @@ import { PALETTE, QUALITY } from '../config/ArtDirection.js';
  *
  * Three things make this read as a real landscape rather than a noise plane:
  *
- *  1. The heightfield is *simulated*, not just summed. A domain-warped ridged
- *     multifractal lays down meandering spines and stratified mesas; a talus
- *     (thermal) pass then cuts them back to the angle of repose, building scree
- *     aprons; a droplet hydraulic pass incises wadis and deposits alluvium in
- *     the valley floors; a D8 flow accumulation pass extracts the drainage
- *     network. The playable basin is a *landform* — the mountain mask simply
- *     goes to zero near the origin — so there is no circular seam anywhere.
+ *  1. The heightfield is *tectonic*, then *simulated*. Everything anisotropic
+ *     is written in a strike frame, so ridge networks run in a dominant
+ *     direction and uplift is banded into sub-parallel ranges separated by
+ *     longitudinal valleys; a massif field varies amplitude by 10x across the
+ *     map. On top of that structure a talus (thermal) pass cuts faces back to
+ *     the angle of repose and builds scree aprons; a 340 k droplet hydraulic
+ *     pass incises dendritic wadis and deposits alluvium in the valley floors;
+ *     a D8 flow accumulation pass extracts the drainage network, which then
+ *     drives the material blend. The playable basin is a *landform* — the
+ *     mountain mask simply goes to zero near the origin — so there is no
+ *     circular seam anywhere.
  *
  *  2. Geometry is a geo-clipmap: concentric rings sharing a single snapped
- *     centre, displaced in the vertex shader from a packed height texture.
+ *     centre, displaced in the vertex shader from an R32F height texture — the
+ *     field is float end to end, plus a closed-form 7 cm micro relief that the
+ *     vertex shader, the depth pass and heightAt() all evaluate identically.
  *     Near ground is 0.5 m, the 8 km outer ring is 64 m, no cracks (odd
  *     boundary vertices are averaged to match the coarser neighbour exactly),
  *     and the CPU never touches a vertex after load.
  *
  *  3. Everything expensive is *baked*. Surface normals, sky occlusion, flow,
- *     rock exposure and scree live in two generated RGBA maps sampled once per
- *     pixel; tactile detail comes from generated tiling albedo/normal tiles at
- *     two scales. No per-pixel fbm anywhere.
+ *     rock exposure and scree live in two generated maps sampled once per pixel
+ *     (RGBA16F for the shading channels — a byte of normal bands visibly under
+ *     a low sun); tactile detail comes from generated tiling albedo/normal
+ *     tiles at three scales, the closest of which is a clast field with its own
+ *     sun-direction self-shadow. No per-pixel fbm anywhere.
  *
  * `heightAt`/`normalAt` read the same arrays the GPU reads, so placement by
  * other modules always agrees with what is drawn.
@@ -137,6 +145,121 @@ function smoothstep(e0, e1, x) {
   const t = clamp((x - e0) / (e1 - e0), 0, 1);
   return t * t * (3 - 2 * t);
 }
+
+// ---------------------------------------------------------------------------
+// Tectonic frame
+// ---------------------------------------------------------------------------
+//
+// The one thing that separates a landscape from a noise field is *direction*.
+// A real range has a strike: a dominant tectonic orientation that ridgelines,
+// longitudinal valleys and bedding all follow. Everything anisotropic in the
+// landform below is written in this frame — `s` runs along strike, `t` across
+// it — and the noise is sampled ~3:1 stretched along s, so crests run instead
+// of forming isolated cones.
+const STRIKE = 0.60; // rad, ~34 deg east of north
+const SK_C = Math.cos(STRIKE);
+const SK_S = Math.sin(STRIKE);
+// Bedding dips gently across strike. Benches are cut in (h - bedDip) so treads
+// incline with the beds and never draw a dead-flat contour across the map.
+const DIP_X = 0.048 * SK_S;
+const DIP_Z = -0.048 * SK_C;
+
+/** Tileable fbm on the unit square: perlin's lattice repeats every 256. */
+function tileFbm(u, v, period, oct) {
+  let amp = 0.5;
+  let sum = 0;
+  let norm = 0;
+  let p = period;
+  for (let o = 0; o < oct; o++) {
+    sum += amp * perlin2(((u * p) % p) + 0.5, ((v * p) % p) + 0.5);
+    norm += amp;
+    amp *= 0.5;
+    p *= 2;
+  }
+  return sum / norm;
+}
+
+// ---------------------------------------------------------------------------
+// Sub-metre wind relief
+// ---------------------------------------------------------------------------
+//
+// A wrapping 64 m field of blown-sand relief, ~4 cm peak to trough, held in a
+// tiny RGBA16F texture: R is height in metres, GB is its gradient.
+//
+// It is a *texture* rather than a closed form on purpose. The obvious analytic
+// version — products of phase-modulated sines — costs nothing and looks awful:
+// modulated sine products are exactly the construction that produces
+// fingerprint moire, and it laid a swirling wood grain over the entire pan.
+// Real blown sand is noise, so this is noise.
+//
+// The point of baking it instead of evaluating fbm per vertex is agreement:
+// GL's bilinear filter on a REPEAT texture is reproduced exactly on the CPU
+// below (the stored values are pre-rounded through half precision), so the
+// vertex shader, the shadow-depth pass and heightAt() return the same surface
+// to within 1e-5 m. That is what lets the near rings carry real geometric
+// ripple without props, feet or the outpost pad floating.
+const MICRO_N = 256;
+const MICRO_PERIOD = 64;
+const MICRO_FIELD = new Float32Array(MICRO_N * MICRO_N * 4);
+
+(function buildMicroField() {
+  const N = MICRO_N;
+  const inv = 1 / N;
+  const h = new Float32Array(N * N);
+  for (let j = 0; j < N; j++) {
+    const v = j * inv;
+    for (let i = 0; i < N; i++) {
+      const u = i * inv;
+      // Broad drift + braid, then a shallow directional ripple set. Integer
+      // wave numbers so the ripple tiles with the noise.
+      const broad = tileFbm(u, v, 6, 3);
+      const braid = tileFbm(u * 1.0 + 0.31, v * 1.0 + 0.77, 20, 2);
+      const rip = Math.sin((u * 27 + v * 10) * Math.PI * 2);
+      // Drifts come and go; a uniform ripple field over 6 km reads as corduroy.
+      const env = clamp(tileFbm(u + 0.13, v - 0.41, 3, 2) * 1.7 + 0.5, 0, 1);
+      h[j * N + i] = (broad * 0.55 + braid * 0.30 + rip * 0.15) * (0.22 + 0.78 * env) * 0.062;
+    }
+  }
+  const cell = MICRO_PERIOD / N;
+  const round = (x) => THREE.DataUtils.fromHalfFloat(THREE.DataUtils.toHalfFloat(x));
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const c = j * N + i;
+      const l = h[j * N + ((i - 1 + N) % N)];
+      const r = h[j * N + ((i + 1) % N)];
+      const d = h[((j - 1 + N) % N) * N + i];
+      const uu = h[((j + 1) % N) * N + i];
+      MICRO_FIELD[c * 4] = round(h[c]);
+      MICRO_FIELD[c * 4 + 1] = round((r - l) / (2 * cell));
+      MICRO_FIELD[c * 4 + 2] = round((uu - d) / (2 * cell));
+      MICRO_FIELD[c * 4 + 3] = 0;
+    }
+  }
+})();
+
+/** CPU twin of a REPEAT + LINEAR fetch of MICRO_FIELD.r. */
+function microRelief(x, z) {
+  const N = MICRO_N;
+  const fu = (x / MICRO_PERIOD) * N - 0.5;
+  const fv = (z / MICRO_PERIOD) * N - 0.5;
+  const i0 = Math.floor(fu);
+  const j0 = Math.floor(fv);
+  const tx = fu - i0;
+  const tz = fv - j0;
+  const wi = (k) => ((k % N) + N) % N;
+  const ia = wi(i0);
+  const ib = wi(i0 + 1);
+  const ja = wi(j0);
+  const jb = wi(j0 + 1);
+  const a = MICRO_FIELD[(ja * N + ia) * 4] * (1 - tx) + MICRO_FIELD[(ja * N + ib) * 4] * tx;
+  const b = MICRO_FIELD[(jb * N + ia) * 4] * (1 - tx) + MICRO_FIELD[(jb * N + ib) * 4] * tx;
+  return a * (1 - tz) + b * tz;
+}
+
+const MICRO_GLSL = /* glsl */ `
+  uniform sampler2D uMicro;
+  float microRelief(vec2 p) { return texture2D(uMicro, p * ${(1 / MICRO_PERIOD).toFixed(8)}).r; }
+`;
 
 // ---------------------------------------------------------------------------
 // Heightfield simulation
@@ -489,9 +612,10 @@ class Grid {
   }
 }
 
-// Packed height range. Generous enough that erosion can never clip.
-const H_MIN = -400;
-const H_RANGE = 1400;
+// Vertical extent, used only for ring bounding boxes now that the heightfield
+// is stored as float — nothing is quantised into this range any more.
+const H_MIN = -500;
+const H_RANGE = 1900;
 
 // ---------------------------------------------------------------------------
 
@@ -510,7 +634,9 @@ export class Terrain {
     this._buildNear();
 
     this._buildTextures();
+    this._buildMicroTexture();
     this._buildDetailTextures();
+    this._buildGritTextures();
     this._buildMaterial();
     this._buildClipmap();
   }
@@ -541,69 +667,95 @@ export class Terrain {
   _base(x, z) {
     const S = 1 / 2600;
 
-    // Warp 1 — long wavelength: bends whole ranges into arcs.
-    const w1x = fbm2(x * S * 0.7 + 4.1, z * S * 0.7 - 2.7, 3);
-    const w1z = fbm2(x * S * 0.7 - 8.3, z * S * 0.7 + 6.9, 3);
-    const qx = x + w1x * 900;
-    const qz = z + w1z * 900;
+    // Strike frame. s runs along the range, t across it.
+    const s = x * SK_C + z * SK_S;
+    const t = -x * SK_S + z * SK_C;
+
+    // Warp 1 — long along strike, tight across it, so the warp bends whole
+    // ranges into arcs without ever making them isotropic again.
+    const w1s = fbm2(s * S * 0.40 + 4.1, t * S * 0.95 - 2.7, 3);
+    const w1t = fbm2(s * S * 0.40 - 8.3, t * S * 0.95 + 6.9, 3);
+    const qs = s + w1s * 860;
+    const qt = t + w1t * 360;
     // Warp 2 — shorter, smaller: kinks the individual spurs.
-    const w2x = fbm2(qx * S * 2.6 + 1.3, qz * S * 2.6 + 7.7, 2);
-    const w2z = fbm2(qx * S * 2.6 - 5.5, qz * S * 2.6 - 3.1, 2);
-    const rx = qx + w2x * 280;
-    const rz = qz + w2z * 280;
+    const w2s = fbm2(qs * S * 1.5 + 1.3, qt * S * 3.4 + 7.7, 2);
+    const w2t = fbm2(qs * S * 1.5 - 5.5, qt * S * 3.4 - 3.1, 2);
+    const rs = qs + w2s * 300;
+    const rt = qt + w2t * 135;
 
     // Where mountains are allowed. "Distance from the outpost" is warped at
     // three wavelengths before it is used, so the valley mouth wanders in and
     // out by hundreds of metres and never reads as a disc.
     const d = Terrain._valleyDistance(x, z, S);
-    // The main range sits 1.6-2.6 km out. A 350 m crest at that range subtends
-    // ~8 deg from the vista camera — big enough to dominate the frame, low
-    // enough that there is still sky above it.
-    let mask = smoothstep(1150, 3100, d);
-    const region = fbm2(qx * S * 0.85 + 21.0, qz * S * 0.85 - 13.0, 3) * 0.5 + 0.5;
-    mask *= 0.42 + smoothstep(0.2, 0.72, region) * 0.85;
-    mask *= 1.0 + smoothstep(5000, 2600, d) * smoothstep(1300, 2600, d) * 0.45;
-    mask = Math.min(mask, 1.18);
+    let mask = smoothstep(1000, 2850, d);
+
+    // Uplift belts. Sub-parallel ranges ~1.7 km apart across strike, separated
+    // by longitudinal valleys the drainage empties into. This is the structure
+    // that stops the skyline being a row of interchangeable triangles.
+    const beltPhase = qt / 1700 + fbm2(s * S * 0.55 + 21.0, t * S * 0.30 - 13.0, 3) * 1.2;
+    const belt = 0.5 - 0.5 * Math.cos(beltPhase * Math.PI * 2);
+    mask *= 0.28 + Math.pow(belt, 1.4) * 1.05;
+
+    // Massif field: which stretches of the belt actually stand up. Squared, so
+    // a few dominant massifs tower and the rest are subordinate foothills.
+    const massifN = clamp(fbm2(qs * S * 0.46 + 61.0, qt * S * 0.80 - 43.0, 4) * 0.5 + 0.5, 0, 1);
+    mask = Math.min(mask * (0.16 + Math.pow(massifN, 2.1) * 2.05), 1.45);
 
     // Broad basins and swells the ranges sit on.
-    let h = fbm2(qx * S * 0.9, qz * S * 0.9, 4) * 130 - 26;
+    let h = fbm2(qs * S * 0.70, qt * S * 1.05, 4) * 135 - 30;
 
-    // The ridge network itself.
-    const r = ridged2(rx * S * 2.35, rz * S * 2.35, 6);
-    h += Math.pow(r, 1.3) * 440 * mask;
+    // The ridge network itself, stretched ~2.8:1 along strike.
+    const r = ridged2(rs * S * 1.05, rt * S * 2.95, 6);
+    h += Math.pow(r, 1.28) * 405 * mask;
 
-    // Foothills: a second, lower ridge line at 0.7-1.4 km. Three depth planes
+    // Conjugate ridge set at ~62 deg to the main strike. Real ranges are cut by
+    // a second structural grain; without it every spur is a clone of its
+    // neighbour and the range reads as one extruded profile.
+    const cs = s * 0.47 + t * 0.88;
+    const ct = -s * 0.88 + t * 0.47;
+    const r2 = ridged2(cs * S * 1.7 + 11.0, ct * S * 3.8 - 7.0, 5);
+    h += Math.pow(r2, 1.55) * 155 * mask * smoothstep(0.22, 0.78, massifN);
+
+    // Foothills: a second, lower ridge line at 0.6-1.5 km. Three depth planes
     // (buttes / foothills / range) is what turns a wall of rock into a landscape
     // with aerial perspective.
-    const foot = ridged2(rx * S * 5.2 - 4.0, rz * S * 5.2 + 9.0, 4);
-    const footMask = smoothstep(520, 1500, d) * (1 - smoothstep(1800, 3100, d)) * (0.5 + region * 0.7);
-    h += Math.pow(foot, 1.25) * 185 * footMask;
+    const foot = ridged2(rs * S * 2.5 - 4.0, rt * S * 6.4 + 9.0, 4);
+    const footMask = smoothstep(480, 1450, d) * (1 - smoothstep(1750, 3050, d)) * (0.42 + massifN * 0.9);
+    h += Math.pow(foot, 1.25) * 195 * footMask;
 
     // Isolated buttes standing out of the valley floor — the flat-topped rock
     // islands the middle distance is read against.
-    const butte = ridged2(rx * S * 8.0 + 13.0, rz * S * 8.0 - 6.0, 3);
+    const butte = ridged2(rs * S * 4.4 + 13.0, rt * S * 9.6 - 6.0, 3);
     const butteMask =
-      smoothstep(0.58, 0.86, butte) *
+      smoothstep(0.60, 0.87, butte) *
       (1 - Math.min(1, mask)) *
       smoothstep(200, 700, d) *
       (1 - smoothstep(1000, 1700, d)) *
       smoothstep(330, 620, Math.hypot(x, z));
-    h += butteMask * 120;
+    h += butteMask * 125;
 
-    // Mesa terracing: hard horizontal benches, on high ground and on the buttes.
-    const bench = Math.min(1, smoothstep(40, 190, h) * (mask + footMask * 0.8) + butteMask * 1.4);
-    if (bench > 0.01) {
-      const stepH = 28;
-      const t = h / stepH;
-      const fl = Math.floor(t);
-      let f = t - fl;
+    // Bedding. Cut the benches in (h - bedDip), against a *tilted* datum, with
+    // bed thickness varying regionally and only about half the range bedded at
+    // all: sedimentary sections next to massive ones. Round 1 stepped raw
+    // altitude at a fixed 28 m and drew eight dead-flat lines across the whole
+    // mid-ground, which is what read as an 8-bit heightfield.
+    const bedDip = x * DIP_X + z * DIP_Z;
+    const bedReg = clamp(fbm2(qs * S * 0.95 + 5.0, qt * S * 1.5 - 19.0, 3) * 0.5 + 0.5, 0, 1);
+    const bedding =
+      smoothstep(0.52, 0.88, bedReg) *
+      Math.min(1, smoothstep(30, 175, h) * (mask + footMask * 0.8) + butteMask * 1.4);
+    if (bedding > 0.02) {
+      const stepH = 15 + bedReg * 27;
+      const v = (h - bedDip) / stepH;
+      const fl = Math.floor(v);
+      let f = v - fl;
       // Flat tread, abrupt riser.
-      f = f < 0.62 ? f * 0.22 : 0.136 + (f - 0.62) * 2.274;
-      h += ((fl + f) * stepH - h) * bench * 0.6;
+      f = f < 0.58 ? f * 0.30 : 0.174 + (f - 0.58) * 1.967;
+      h += ((fl + f) * stepH + bedDip - h) * bedding * 0.32;
     }
 
     // Mid-scale spurs and gullies so erosion has something to bite into.
-    h += fbm2(rx * S * 11.0 + 3.3, rz * S * 11.0 - 9.1, 4) * 26 * (0.3 + (mask + footMask) * 0.6);
+    h += fbm2(rs * S * 6.2 + 3.3, rt * S * 13.0 - 9.1, 4) * 27 * (0.3 + (mask + footMask) * 0.55);
     // Valley floor is not billiard-flat: gentle alluvial swell.
     h += fbm2(x * S * 22.0, z * S * 22.0, 3) * 4.5;
 
@@ -623,16 +775,23 @@ export class Terrain {
 
     // Simulate: talus first (build the faces), water second (cut the wadis),
     // talus again (dress the fresh cuts with scree).
+    //
+    // The droplet count is the whole ball game. 150 k over a 1536^2 grid is
+    // ~0.06 visits per cell — enough to roughen a slope, nowhere near enough to
+    // organise a drainage network. 340 k droplets with a 68-step lifetime is
+    // ~1 s of load and it is the difference between "noise with scratches" and
+    // dendritic catchments that connect ridge to valley floor.
     thermalErode(h, n, g.cell, 14, 0.62, 0.5, g.scree);
-    const dropFlow = hydraulicErode(h, n, g.cell, 150000, 0x1234, {
-      lifetime: 46,
+    const dropFlow = hydraulicErode(h, n, g.cell, 340000, 0x1234, {
+      lifetime: 68,
       radius: 2,
-      capacityK: 5.0,
-      erodeRate: 0.32,
-      depositRate: 0.3,
+      capacityK: 6.2,
+      erodeRate: 0.36,
+      depositRate: 0.28,
+      evaporation: 0.014,
     });
     thermalErode(h, n, g.cell, 6, 0.70, 0.45, g.scree);
-    this._addCrags(g, 1 / 130, 34, null);
+    this._addCrags(g, 1 / 130, 34, null, 2.4);
 
     this._relaxBasin(g, 500, 1250, 0.75, 150);
     this._bakeChannels(g, dropFlow);
@@ -685,17 +844,17 @@ export class Terrain {
     }
 
     thermalErode(h, n, g.cell, 8, 0.66, 0.5, g.scree);
-    const dropFlow = hydraulicErode(h, n, g.cell, 130000, 0x77aa, {
-      lifetime: 40,
+    const dropFlow = hydraulicErode(h, n, g.cell, 220000, 0x77aa, {
+      lifetime: 52,
       radius: 3,
-      capacityK: 4.0,
-      erodeRate: 0.3,
+      capacityK: 4.6,
+      erodeRate: 0.32,
       depositRate: 0.32,
-      evaporation: 0.022,
+      evaporation: 0.020,
     });
     thermalErode(h, n, g.cell, 5, 0.72, 0.45, g.scree);
-    this._addCrags(g, 1 / 34, 9.5, edge);
-    this._addCrags(g, 1 / 9.5, 2.4, edge);
+    this._addCrags(g, 1 / 34, 9.5, edge, 2.1);
+    this._addCrags(g, 1 / 9.5, 2.4, edge, 1.6);
 
     // Camp pad: relax toward the local mean so vehicles and buildings have
     // something to sit on. The target is the terrain's own blurred self and the
@@ -715,7 +874,7 @@ export class Terrain {
    * *after* the simulation puts the spurs and buttresses back, weighted by slope
    * so the flats stay flat.
    */
-  _addCrags(g, freq, amp, edge) {
+  _addCrags(g, freq, amp, edge, aniso = 1) {
     const n = g.n;
     const h = g.h;
     const cell = g.cell;
@@ -728,8 +887,12 @@ export class Terrain {
         const rocky = smoothstep(0.30, 0.95, slope);
         if (rocky < 0.02) continue;
         const wx = g.origin + i * cell;
-        const a = (ridged2(wx * freq, wz * freq, 3) - 0.40) * amp;
-        const b = (ridged2(wx * freq * 3.3 + 41.0, wz * freq * 3.3 - 23.0, 2) - 0.40) * amp * 0.34;
+        // Crags inherit the structural grain: buttresses and gullies run down
+        // the dip, not in random directions.
+        const cs = (wx * SK_C + wz * SK_S) * freq;
+        const ct = (-wx * SK_S + wz * SK_C) * freq * aniso;
+        const a = (ridged2(cs, ct, 3) - 0.40) * amp;
+        const b = (ridged2(cs * 3.3 + 41.0, ct * 3.3 - 23.0, 2) - 0.40) * amp * 0.34;
         h[c] += (a + b) * rocky * (edge ? edge[c] : 1);
       }
     }
@@ -886,6 +1049,11 @@ export class Terrain {
       g.flow[c] = fl * Math.min(1, incised + trunk);
     }
 
+    // A D8 trunk is one cell wide and a droplet track is a scratch; a real wadi
+    // floor is 10-20 m across. Widen the channel mask to roughly that, or the
+    // pale silt paints hairlines across the pan.
+    g.flow = blurField(g.flow, n, Math.max(1, Math.round(8 / cell)), 2);
+
     // Near grid: dissolve its own channels into the far grid's at the border so
     // the hard near/far switch in the shader is invisible.
     if (edgeFade) {
@@ -913,22 +1081,17 @@ export class Terrain {
 
   // -- textures ------------------------------------------------------------
 
+  /**
+   * Height, R32F, one texel per cell — the same Float32Array `heightAt()` reads.
+   *
+   * Round 1 packed height into RGB8 and, worse, packed the *shading normal*
+   * into RG8. A byte of normal is a 1/128 step in n.x; under a 4-degree dawn
+   * sun N.L is ~0.07, so each step is an 11% brightness jump and the mid-ground
+   * plateaus banded into visible terraces. Nothing on this path is quantised
+   * any more.
+   */
   _packHeightTexture(g) {
-    const n = g.n;
-    const data = new Uint8Array(n * n * 4);
-    for (let k = 0; k < n * n; k++) {
-      const v = clamp((g.h[k] - H_MIN) / H_RANGE, 0, 0.99999);
-      const t = v * 255;
-      const a = t | 0;
-      const t2 = (t - a) * 255;
-      const b = t2 | 0;
-      const cch = Math.round((t2 - b) * 255);
-      data[k * 4] = a;
-      data[k * 4 + 1] = b;
-      data[k * 4 + 2] = cch;
-      data[k * 4 + 3] = 255;
-    }
-    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
+    const tex = new THREE.DataTexture(g.h, g.n, g.n, THREE.RedFormat, THREE.FloatType);
     tex.magFilter = THREE.NearestFilter;
     tex.minFilter = THREE.NearestFilter;
     tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -938,23 +1101,62 @@ export class Terrain {
     return tex;
   }
 
-  /** RGBA = normal.x, normal.z, drainage, sky occlusion. */
-  _packSurfaceTexture(g) {
-    const n = g.n;
-    const data = new Uint8Array(n * n * 4);
-    for (let c = 0; c < n * n; c++) {
-      data[c * 4] = Math.round(clamp(g.nx[c] * 0.5 + 0.5, 0, 1) * 255);
-      data[c * 4 + 1] = Math.round(clamp(g.nz[c] * 0.5 + 0.5, 0, 1) * 255);
-      data[c * 4 + 2] = Math.round(clamp(g.flow[c], 0, 1) * 255);
-      data[c * 4 + 3] = Math.round(clamp(g.ao[c], 0, 1) * 255);
-    }
-    return this._dataTex(data, n);
+  /** RGBA16F = micro height (m), d/dx, d/dz. Wraps every MICRO_PERIOD metres. */
+  _buildMicroTexture() {
+    const n = MICRO_N;
+    const half = THREE.DataUtils.toHalfFloat;
+    const data = new Uint16Array(n * n * 4);
+    for (let k = 0; k < n * n * 4; k++) data[k] = half(MICRO_FIELD[k]);
+    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat, THREE.HalfFloatType);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.magFilter = THREE.LinearFilter;
+    // Mipped, and it has to be. A vertex texture fetch always reads level 0, so
+    // the CPU twin still agrees exactly with the displacement; the fragment
+    // shader reads the same field at grazing incidence, where an unmipped tap
+    // moires into swirling wood grain across the whole pan — which is precisely
+    // what the closed-form version this replaced was doing.
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.generateMipmaps = true;
+    tex.anisotropy = 16;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true;
+    this.texMicro = tex;
   }
 
-  /** RGBA = bedrock exposure, scree, curvature, macro tint. */
+  /** RGBA16F = normal.x, normal.z, drainage, sky occlusion. */
+  _packSurfaceTexture(g) {
+    const n = g.n;
+    const half = THREE.DataUtils.toHalfFloat;
+    const data = new Uint16Array(n * n * 4);
+    for (let c = 0; c < n * n; c++) {
+      data[c * 4] = half(g.nx[c]);
+      data[c * 4 + 1] = half(g.nz[c]);
+      data[c * 4 + 2] = half(clamp(g.flow[c], 0, 1));
+      data[c * 4 + 3] = half(clamp(g.ao[c], 0, 1));
+    }
+    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat, THREE.HalfFloatType);
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = true;
+    tex.anisotropy = 16;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  /**
+   * RGBA = bedrock exposure, scree, curvature, macro tint.
+   *
+   * These are blend weights, not shading, so 8 bits is enough — but only with a
+   * dither. Undithered, the slowly-varying macro channel steps 1/255 at a time
+   * and paints faint contour lines across a 2 km pan, which is exactly the
+   * artefact the height and normal fields were just taken off bytes to avoid.
+   */
   _packMaterialTexture(g) {
     const n = g.n;
     const data = new Uint8Array(n * n * 4);
+    const dith = (c, k) => (((Math.imul(c * 4 + k, 0x9e3779b1) >>> 24) / 255) - 0.5);
     for (let j = 0; j < n; j++) {
       const wz = g.origin + j * g.cell;
       for (let i = 0; i < n; i++) {
@@ -964,10 +1166,11 @@ export class Terrain {
         // distance comes from this: it is the only channel with structure out on
         // the pan, where slope, curvature and flow are all flat zero.
         const macro = clamp(fbm2(wx * 0.0011 + 61.0, wz * 0.0011 - 43.0, 7) * 1.35 * 0.5 + 0.5, 0, 1);
-        data[c * 4] = Math.round(clamp(g.rock[c], 0, 1) * 255);
-        data[c * 4 + 1] = Math.round(clamp(g.scree[c], 0, 1) * 255);
-        data[c * 4 + 2] = Math.round(clamp(g.curv[c] * 0.5 + 0.5, 0, 1) * 255);
-        data[c * 4 + 3] = Math.round(clamp(macro, 0, 1) * 255);
+        const q = (v, k) => Math.round(clamp(clamp(v, 0, 1) * 255 + dith(c, k), 0, 255));
+        data[c * 4] = q(g.rock[c], 0);
+        data[c * 4 + 1] = q(g.scree[c], 1);
+        data[c * 4 + 2] = q(g.curv[c] * 0.5 + 0.5, 2);
+        data[c * 4 + 3] = q(macro, 3);
       }
     }
     return this._dataTex(data, n);
@@ -1021,6 +1224,12 @@ export class Terrain {
     }
 
     // Tileable fbm: sample perlin on a torus by wrapping the lattice period.
+    // Tileable fbm. The top octave must stay at or below N/8 cycles across the
+    // tile: a perlin octave sampled near its own Nyquist rate does not render as
+    // fine detail, it beats against the texel grid and bakes a low-frequency
+    // swirl of contour lines straight into the texture. Round 1 ran octaves out
+    // to 256 cycles across 512 px — 2 px per period — which is where the wood
+    // grain over the whole landscape came from.
     const tile = (u, v, period, oct) => {
       let amp = 0.5;
       let sum = 0;
@@ -1042,8 +1251,8 @@ export class Terrain {
         const u = i * inv;
         const c = j * N + i;
 
-        const grain = tile(u, v, 64, 3) * 0.5 + 0.5;
-        const fine = tile(u, v, 128, 2) * 0.5 + 0.5;
+        const grain = tile(u, v, 10, 3) * 0.5 + 0.5;
+        const fine = tile(u, v, 20, 2) * 0.5 + 0.5;
 
         // Pebbles / gravel.
         const gx = u * CG;
@@ -1070,8 +1279,8 @@ export class Terrain {
         const pebbleH = Math.sqrt(pebble) * (0.55 + bestR * 0.45);
 
         // Cracks / strata: thin ridged lines, anisotropic so they read as beds.
-        const cr = 1 - Math.abs(tile(u * 0.35, v * 1.9, 32, 3));
-        const crack = Math.pow(clamp(cr, 0, 1), 14);
+        const cr = 1 - Math.abs(tile(u * 0.35, v * 1.9, 12, 3));
+        const crack = Math.pow(clamp(cr, 0, 1), 9);
 
         const mottle = tile(u, v, 8, 3) * 0.5 + 0.5;
 
@@ -1084,7 +1293,11 @@ export class Terrain {
         mask[c * 4 + 2] = Math.round(crack * 255);
         mask[c * 4 + 3] = Math.round(mo * 255);
 
-        height[c] = g0 * 0.26 + fine * 0.12 + pebbleH * 0.66 - crack * 0.5;
+        // The crack channel is a ridged 1-|n| line field: put it in the height
+        // map and its contour lines become grooves in the normal map, which
+        // wood-grains every surface it lands on. It stays an albedo-only channel
+        // and only bedrock ever reads it.
+        height[c] = g0 * 0.26 + fine * 0.12 + pebbleH * 0.66;
       }
     }
 
@@ -1123,20 +1336,237 @@ export class Terrain {
     this.texDetailN = mk(nrm);
   }
 
+  /**
+   * Near-field grit set, one tile = GRIT_TILE metres. This is the texture the
+   * player is actually looking at from 1.5 m, so it is authored for that
+   * distance and nothing else: two Worley clast layers (~4 cm cobbles over
+   * ~1 cm gravel) with hemispherical relief and a per-clast albedo id, a
+   * wind-aligned drift/streak layer, and a sand grain layer.
+   *
+   * The normal map's alpha carries the clast *height*, not a cavity term. The
+   * shader spends one tap on it to run a horizon test toward the sun, so every
+   * pebble casts its own shadow and the shadows lengthen as the sun drops —
+   * which is what "grit" actually looks like, far more than any albedo noise.
+   */
+  _buildGritTextures() {
+    const N = 512;
+    const inv = 1 / N;
+    const mask = new Uint8Array(N * N * 4);
+    const height = new Float32Array(N * N);
+    const rnd = mulberry32(0x9a17c3);
+
+    const layer = (G, rMin, rMax, pow) => {
+      const px = new Float32Array(G * G);
+      const py = new Float32Array(G * G);
+      const pr = new Float32Array(G * G);
+      const pt = new Float32Array(G * G);
+      for (let k = 0; k < G * G; k++) {
+        px[k] = rnd();
+        py[k] = rnd();
+        // Heavy-tailed size distribution: mostly small clasts, a few big enough
+        // to read individually. A uniform distribution looks like bubble wrap.
+        pr[k] = rMin + Math.pow(rnd(), pow) * (rMax - rMin);
+        pt[k] = rnd();
+      }
+      return { G, px, py, pr, pt };
+    };
+    const coarse = layer(6, 0.22, 0.74, 2.4);
+    const fine = layer(22, 0.18, 0.56, 2.0);
+
+    // Tileable Worley: returns normalised distance, plus the winning clast's
+    // radius and random id so each stone can carry its own albedo.
+    const worley = (L, u, v) => {
+      const gx = u * L.G;
+      const gy = v * L.G;
+      const gi = gx | 0;
+      const gj = gy | 0;
+      let best = 9;
+      let bestR = 1;
+      let bestT = 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const ci = (gi + ox + L.G) % L.G;
+          const cj = (gj + oy + L.G) % L.G;
+          const k = cj * L.G + ci;
+          const fx = gi + ox + L.px[k] - gx;
+          const fy = gj + oy + L.py[k] - gy;
+          const dd = Math.hypot(fx, fy) / L.pr[k];
+          if (dd < best) {
+            best = dd;
+            bestR = L.pr[k];
+            bestT = L.pt[k];
+          }
+        }
+      }
+      return { d: best, r: bestR, t: bestT };
+    };
+
+    const tile = (u, v, period, oct) => {
+      let amp = 0.5;
+      let sum = 0;
+      let norm = 0;
+      let p = period;
+      for (let o = 0; o < oct; o++) {
+        sum += amp * perlin2(((u * p) % p) + 0.5, ((v * p) % p) + 0.5);
+        norm += amp;
+        amp *= 0.5;
+        p *= 2;
+      }
+      return sum / norm;
+    };
+
+    for (let j = 0; j < N; j++) {
+      const v = j * inv;
+      for (let i = 0; i < N; i++) {
+        const u = i * inv;
+        const c = j * N + i;
+
+        const grain = clamp((tile(u, v, 10, 3) * 0.55 + tile(u, v, 40, 1) * 0.45) * 1.15 + 0.5, 0, 1);
+        // Wind drift: sheared and squashed so the streaks lie in one direction,
+        // the way blown sand actually organises between the stones.
+        const drift = clamp(tile(u * 0.55 + v * 0.20, v * 1.35, 6, 3) * 1.15 + 0.5, 0, 1);
+
+        const C = worley(coarse, u, v);
+        const F = worley(fine, u, v);
+        const hC = C.d < 1 ? Math.sqrt(1 - C.d * C.d) * (0.42 + C.r * 0.58) : 0;
+        const hF = F.d < 1 ? Math.sqrt(1 - F.d * F.d) * (0.30 + F.r * 0.40) : 0;
+        // Blown sand fills the interstices, so the smallest gravel is half
+        // buried and the big stones stand proud.
+        const buried = 0.28 + drift * 0.34;
+        const clastH = Math.max(hC, hF * 0.55) - buried * 0.35;
+
+        // Sharp shoulder, and the gravel layer must NOT saturate: round-2 first
+        // pass let it cover the whole tile, so every pixel got clast albedo and
+        // no individual stone was legible anywhere.
+        const cover = clamp(Math.max((1 - C.d) * 5.0, (1 - F.d) * 4.0 - 0.35) - buried * 0.55, 0, 1);
+        const tint = C.d < F.d ? C.t : F.t;
+
+        mask[c * 4] = Math.round(grain * 255);
+        mask[c * 4 + 1] = Math.round(cover * 255);
+        mask[c * 4 + 2] = Math.round(tint * 255);
+        mask[c * 4 + 3] = Math.round(drift * 255);
+
+        height[c] = clamp(clastH * 0.88 + grain * 0.07 + drift * 0.045, 0, 1);
+      }
+    }
+
+    const nrm = new Uint8Array(N * N * 4);
+    const strength = 4.4;
+    for (let j = 0; j < N; j++) {
+      for (let i = 0; i < N; i++) {
+        const c = j * N + i;
+        const l = height[j * N + ((i - 1 + N) % N)];
+        const r = height[j * N + ((i + 1) % N)];
+        const d = height[((j - 1 + N) % N) * N + i];
+        const uu = height[((j + 1) % N) * N + i];
+        const nx = (l - r) * strength;
+        const ny = (d - uu) * strength;
+        const invL = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+        nrm[c * 4] = Math.round((nx * invL * 0.5 + 0.5) * 255);
+        nrm[c * 4 + 1] = Math.round((ny * invL * 0.5 + 0.5) * 255);
+        nrm[c * 4 + 2] = Math.round((invL * 0.5 + 0.5) * 255);
+        nrm[c * 4 + 3] = Math.round(clamp(height[c], 0, 1) * 255);
+      }
+    }
+
+    const mk = (data) => {
+      const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.magFilter = THREE.LinearFilter;
+      t.minFilter = THREE.LinearMipmapLinearFilter;
+      t.generateMipmaps = true;
+      t.anisotropy = 16;
+      t.colorSpace = THREE.NoColorSpace;
+      t.needsUpdate = true;
+      return t;
+    };
+    this.texGrit = mk(mask);
+    this.texGritN = mk(nrm);
+  }
+
   // -- queries -------------------------------------------------------------
 
-  /** World-space height. Matches the vertex shader to within packing error. */
-  heightAt(wx, wz) {
+  /** Landform height only — no sub-metre relief. */
+  _macroHeight(wx, wz) {
     const g = this.near.contains(wx, wz, this.near.cell * 1.5) ? this.near : this.far;
     return g.sample(g.h, wx, wz);
   }
 
+  /**
+   * World-space height. Bit-for-bit the surface the vertex shader draws: the
+   * grid is sampled with the same bilinear weights and the same closed-form
+   * micro relief is added on top, so nothing placed against this can float or
+   * sink.
+   */
+  heightAt(wx, wz) {
+    return this._macroHeight(wx, wz) + microRelief(wx, wz);
+  }
+
+  /**
+   * Surface normal for placement. Deliberately built from the landform only —
+   * a 7 cm ripple at 2 m wavelength would otherwise tilt every rock and bush by
+   * a few degrees of noise that nothing else in the scene agrees with.
+   */
   normalAt(wx, wz, eps = 1.5) {
-    const hL = this.heightAt(wx - eps, wz);
-    const hR = this.heightAt(wx + eps, wz);
-    const hD = this.heightAt(wx, wz - eps);
-    const hU = this.heightAt(wx, wz + eps);
+    const hL = this._macroHeight(wx - eps, wz);
+    const hR = this._macroHeight(wx + eps, wz);
+    const hD = this._macroHeight(wx, wz - eps);
+    const hU = this._macroHeight(wx, wz + eps);
     return new THREE.Vector3(hL - hR, 2 * eps, hD - hU).normalize();
+  }
+
+  /**
+   * Height of one clipmap level's *drawn* surface: vertices land on a lattice
+   * of `sp` metres and everything between them is the bilinear interpolant.
+   * Only the level the ring shader would evaluate — no micro relief, which the
+   * rings fade out past 95 m anyway.
+   */
+  _latticeHeight(wx, wz, sp, phase = 0) {
+    const ox = Math.floor((wx - phase) / sp) * sp + phase;
+    const oz = Math.floor((wz - phase) / sp) * sp + phase;
+    const fx = (wx - ox) / sp;
+    const fz = (wz - oz) / sp;
+    const h00 = this._macroHeight(ox, oz);
+    const h10 = this._macroHeight(ox + sp, oz);
+    const h01 = this._macroHeight(ox, oz + sp);
+    const h11 = this._macroHeight(ox + sp, oz + sp);
+    return (h00 * (1 - fx) + h10 * fx) * (1 - fz) + (h01 * (1 - fx) + h11 * fx) * fz;
+  }
+
+  /**
+   * Ground height to SEAT a body of `size` metres on.
+   *
+   * `heightAt` is the fine heightfield, but the clipmap only draws that surface
+   * within ~96 m of the camera. Past there the ring spacing doubles every level
+   * (4 m at 200-380 m, 8 m at 380-770, 16 m to 1.5 km) and the drawn triangle is
+   * a chord across the real relief — measured, up to 2.9 m below it at L3, 5.5 m
+   * at L4, 11 m at L5. Anything seated on `heightAt` at that range therefore
+   * hangs in the air over the mesh that is actually rasterised, which is exactly
+   * the floating boulders and hovering slabs the critics kept finding.
+   *
+   * So seat on the LOWEST surface any level that could plausibly draw this body
+   * would produce. Sinking is invisible on a rock — burial is what a real one
+   * does — while floating never is, so the asymmetry is deliberate. Two lattice
+   * phases are probed because the rings snap to the camera, not to the world.
+   *
+   * The level range is chosen from the body's own size rather than from a
+   * camera distance, because placement runs once at install and a 25 m butte is
+   * on screen from kilometres away while a 30 cm chip is only ever seen from
+   * inside L0, where the lattice error is zero to 2 cm.
+   */
+  seatHeightAt(wx, wz, size = 0) {
+    const h = this.heightAt(wx, wz);
+    // Below ~2.5 m the body is only ever read at close range, where the drawn
+    // surface and the heightfield agree to a centimetre. Skip the work.
+    if (!(size > 2.5)) return h;
+    const coarsest = Math.min(16, size * 0.9);
+    let lo = h;
+    for (let sp = 2; sp <= coarsest; sp *= 2) {
+      lo = Math.min(lo, this._latticeHeight(wx, wz, sp, 0), this._latticeHeight(wx, wz, sp, sp * 0.5));
+    }
+    // Never bury more than a third of the body chasing a coarse ring: a 3 m
+    // stone dropped 3 m is gone, and gone is its own kind of defect.
+    return Math.max(lo, h - size * 0.34);
   }
 
   /** Drainage / rock / scree at a point — useful for placement rules. */
@@ -1252,8 +1682,29 @@ export class Terrain {
     const self = this;
     this._rings[0].onBeforeRender = function (renderer, scene, camera) {
       if (camera && camera.isPerspectiveCamera) self._recenter(camera.position);
+      self._trackSun(scene);
     };
     this._recenter(new THREE.Vector3(0, 0, 0));
+  }
+
+  /**
+   * World-space direction toward the sun, for the near-field micro-shadow pass.
+   * Read off the scene rather than plumbed through: Lighting owns the light and
+   * Terrain is not installed as a system, so the ring-0 draw hook is the one
+   * place per frame where the current sun is knowable.
+   */
+  _trackSun(scene) {
+    if (!this._sun || !this._sun.parent) {
+      this._sun = null;
+      scene.traverse((o) => {
+        if (!this._sun && o.isDirectionalLight) this._sun = o;
+      });
+      if (!this._sun) return;
+    }
+    const d = this.uniforms.uSunDir.value;
+    d.copy(this._sun.position);
+    if (this._sun.target) d.sub(this._sun.target.position);
+    d.normalize();
   }
 
   _recenter(p) {
@@ -1263,6 +1714,7 @@ export class Terrain {
     if (cx === this._cx && cz === this._cz) return;
     this._cx = cx;
     this._cz = cz;
+    this.uniforms.uClipCentre.value.set(cx, cz);
     for (const m of this._rings) {
       m.position.set(cx, 0, cz);
       m.updateMatrixWorld(true);
@@ -1276,6 +1728,16 @@ export class Terrain {
   }
 
   _buildMaterial() {
+    // Terrain-local palette. Warmer than PALETTE all through: round 1 measured
+    // out at blue > red in every daylight frame — a cold quarry, not sunbaked
+    // Afghanistan — because a neutral albedo under a blue sky IBL integrates
+    // blue. Dry desert mineral is iron-stained and absorbs blue hard, so R/B
+    // here sits near 1.5 on sand and 1.3 on rock, and the frame comes out warm
+    // before the grade touches it. Deliberately short of the 1.7 the mineral
+    // would justify: the composite pass now applies its own warm balance, and
+    // stacking both takes the landscape past khaki into sepia.
+    const C = (r, g, b) => new THREE.Color(r, g, b);
+
     const u = {
       uFarH: { value: this.texFarH },
       uNearH: { value: this.texNearH },
@@ -1283,17 +1745,26 @@ export class Terrain {
       uNearS: { value: this.texNearS },
       uFarM: { value: this.texFarM },
       uNearM: { value: this.texNearM },
+      uMicro: { value: this.texMicro },
       uDetail: { value: this.texDetail },
       uDetailN: { value: this.texDetailN },
+      uGrit: { value: this.texGrit },
+      uGritN: { value: this.texGritN },
       uFarInfo: { value: this._gridUniform(this.far) },
       uNearInfo: { value: this._gridUniform(this.near) },
       uNearHalf: { value: this.near.size / 2 - this.near.cell * 2 },
-      uHPack: { value: new THREE.Vector2(H_MIN, H_RANGE) },
-      uSandLight: { value: new THREE.Color(...PALETTE.sandLight) },
-      uSandDark: { value: new THREE.Color(...PALETTE.sandDark) },
-      uRockLight: { value: new THREE.Color(...PALETTE.rockLight) },
-      uRockDark: { value: new THREE.Color(...PALETTE.rockDark) },
-      uRockRed: { value: new THREE.Color(...PALETTE.rockRed) },
+      uClipCentre: { value: new THREE.Vector2(0, 0) },
+      uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.5) },
+      uDip: { value: new THREE.Vector2(DIP_X, DIP_Z) },
+      uSandLight: { value: C(0.618, 0.548, 0.432) },
+      uSandMid: { value: C(0.478, 0.416, 0.318) },
+      uSandDark: { value: C(0.330, 0.282, 0.216) },
+      uSilt: { value: C(0.648, 0.586, 0.478) },
+      uGravel: { value: C(0.376, 0.328, 0.270) },
+      uRockLight: { value: C(0.460, 0.424, 0.372) },
+      uRockDark: { value: C(0.238, 0.212, 0.184) },
+      uRockRed: { value: C(0.415, 0.306, 0.246) },
+      uVarnish: { value: C(0.190, 0.156, 0.134) },
     };
     this.uniforms = u;
 
@@ -1303,14 +1774,12 @@ export class Terrain {
       uniform vec4 uFarInfo;
       uniform vec4 uNearInfo;
       uniform float uNearHalf;
-      uniform vec2 uHPack;
       attribute vec2 aStitch;
+      uniform vec2 uClipCentre;
+      ${MICRO_GLSL}
 
-      float decodeH(vec3 c) {
-        return uHPack.x + dot(c, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0)) * uHPack.y;
-      }
-      // Manual bilinear over a NEAREST-filtered packed texture: bit-exact with
-      // the CPU array, so heightAt() and the drawn surface can never disagree.
+      // Manual bilinear over a NEAREST-filtered R32F texture: bit-exact with the
+      // CPU array, so heightAt() and the drawn surface can never disagree.
       float gridH(sampler2D tex, vec2 wxz, vec4 info) {
         vec2 p = (wxz - info.xy) * info.z;
         p = clamp(p, vec2(0.0), vec2(info.w - 1.001));
@@ -1318,10 +1787,10 @@ export class Terrain {
         vec2 f = p - i0;
         float inv = 1.0 / info.w;
         vec2 uv = (i0 + 0.5) * inv;
-        float h00 = decodeH(texture2D(tex, uv).rgb);
-        float h10 = decodeH(texture2D(tex, uv + vec2(inv, 0.0)).rgb);
-        float h01 = decodeH(texture2D(tex, uv + vec2(0.0, inv)).rgb);
-        float h11 = decodeH(texture2D(tex, uv + vec2(inv, inv)).rgb);
+        float h00 = texture2D(tex, uv).r;
+        float h10 = texture2D(tex, uv + vec2(inv, 0.0)).r;
+        float h01 = texture2D(tex, uv + vec2(0.0, inv)).r;
+        float h11 = texture2D(tex, uv + vec2(inv, inv)).r;
         return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
       }
       float terrainH(vec2 wxz) {
@@ -1330,16 +1799,33 @@ export class Terrain {
         }
         return gridH(uFarH, wxz, uFarInfo);
       }
+      // Micro relief is real geometry, so it also goes into the shadow cascade.
+      // Left on out to the horizon it rakes a 3 cm corrugation across a 6 km
+      // pan and the cascade resolves it as wood grain. Fade it on distance from
+      // the clipmap centre — a value every ring shares, so the fade is the same
+      // function on both sides of every ring boundary and nothing cracks.
+      float fullH(vec2 wxz) {
+        float w = 1.0 - smoothstep(38.0, 95.0, length(wxz - uClipCentre));
+        return terrainH(wxz) + microRelief(wxz) * w;
+      }
     `;
 
-    const DISPLACE_GLSL = /* glsl */ `
+    // `micro` is off for the shadow-depth pass. A 4 cm ripple at 2 m wavelength
+    // is finer than a cascade texel, so a caster that carries it cannot be
+    // biased against a receiver that also carries it: the terrain acnes into
+    // contour lines following the ripple, which is exactly the wood grain that
+    // showed up across the pan. The cascade casts the smooth landform instead;
+    // 4 cm of peter-panning at a 6 cm texel is not observable.
+    const DISPLACE = (micro) => /* glsl */ `
       #include <begin_vertex>
       vec2 wxz = (modelMatrix * vec4(transformed, 1.0)).xz;
       float th;
       if (aStitch.x + aStitch.y > 0.0) {
-        th = 0.5 * (terrainH(wxz - aStitch) + terrainH(wxz + aStitch));
+        // Average the FULL height, micro relief included, or the stitched edge
+        // no longer lands on the coarse level's straight line and cracks open.
+        th = 0.5 * (${micro}(wxz - aStitch) + ${micro}(wxz + aStitch));
       } else {
-        th = terrainH(wxz);
+        th = ${micro}(wxz);
       }
       transformed.y = th;
     `;
@@ -1348,7 +1834,9 @@ export class Terrain {
       color: 0xffffff,
       roughness: 1.0,
       metalness: 0.0,
-      envMapIntensity: 0.9,
+      // Sand is a dielectric powder: it barely returns the sky. 0.9 was pulling
+      // the whole landscape toward the blue IBL.
+      envMapIntensity: 0.72,
       dithering: true,
     });
 
@@ -1357,7 +1845,7 @@ export class Terrain {
 
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', `#include <common>\nvarying vec3 vWPos;\n${HEIGHT_GLSL}`)
-        .replace('#include <begin_vertex>', `${DISPLACE_GLSL}\n vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+        .replace('#include <begin_vertex>', `${DISPLACE('fullH')}\n vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
 
       shader.fragmentShader = shader.fragmentShader
         .replace(
@@ -1370,23 +1858,60 @@ export class Terrain {
           uniform sampler2D uNearM;
           uniform sampler2D uDetail;
           uniform sampler2D uDetailN;
+          uniform sampler2D uGrit;
+          uniform sampler2D uGritN;
           uniform vec4 uFarInfo;
           uniform vec4 uNearInfo;
           uniform float uNearHalf;
+          uniform vec3 uSunDir;
+          uniform vec2 uDip;
           uniform vec3 uSandLight;
+          uniform vec3 uSandMid;
           uniform vec3 uSandDark;
+          uniform vec3 uSilt;
+          uniform vec3 uGravel;
           uniform vec3 uRockLight;
           uniform vec3 uRockDark;
           uniform vec3 uRockRed;
+          uniform vec3 uVarnish;
+
+          // One grit tile is 0.36 m of ground; clast relief spans GRIT_H metres.
+          #define GRIT_TILE 0.36
+          #define GRIT_H 0.055
 
           // Values shared between the chunks we hook into.
           vec3  gN;
           float gRough;
           float gAO;
+          float gMicroShadow;
 
           vec2 gridUV(vec2 wxz, vec4 info) {
             return ((wxz - info.xy) * info.z + 0.5) / info.w;
           }
+          // sc = (cos, sin). rot/unrot are inverses, so a normal-map gradient
+          // read through a rotated projection can be brought back to world axes.
+          vec2 rot(vec2 p, vec2 sc)   { return vec2(p.x * sc.x - p.y * sc.y, p.x * sc.y + p.y * sc.x); }
+          vec2 unrot(vec2 p, vec2 sc) { return vec2(p.x * sc.x + p.y * sc.y, -p.x * sc.y + p.y * sc.x); }
+          #define ROT_C vec2(0.6, 0.8)
+          #define ROT_B vec2(-0.28, 0.96)
+
+          // Detail anti-aliasing.
+          //
+          // Once a tile's texel is smaller than a pixel, mipmapping and 16x
+          // anisotropy are both out of headroom — a ground plane at eye level
+          // runs past 16:1 within twenty metres — and a tiled normal map starts
+          // beating against the pixel grid. That beat is not subtle: rendered as
+          // a colour field it is a full rainbow moire, and shaded it is the
+          // swirling wood grain that covered the valley floor.
+          //
+          // Fade every octave out on its OWN screen-space footprint rather than
+          // on distance. Footprint, not range, is what decides whether a tap is
+          // still resolvable, and it stays correct at any FOV or resolution.
+          float sharpness(vec2 uv) {
+            vec2 fw = fwidth(uv) * 512.0;   // texels crossed per pixel
+            return 1.0 - smoothstep(0.35, 1.5, max(fw.x, fw.y));
+          }
+          ${MICRO_GLSL}
           `,
         )
         .replace(
@@ -1416,22 +1941,45 @@ export class Terrain {
             float slope = 1.0 - wn.y;
             float dist  = length(vWPos - cameraPosition);
 
-            // --- detail tiles ------------------------------------------------
-            // Steep faces switch to a vertical projection so bedding planes stay
-            // horizontal instead of smearing down the cliff.
-            float wallW = smoothstep(0.55, 0.95, slope);
+            // --- projection ---------------------------------------------------
+            // Slope-aligned, not axis-aligned. u runs ALONG the local contour,
+            // v is world height, so bedding runs horizontally across a cliff the
+            // way rock does.
+            //
+            // The crossover matters more than the projections. A top-down
+            // projection stretches by 1/cos(theta) down the fall line, a wall
+            // projection by 1/sin(theta); they cross at 45 deg. Round 1 held on
+            // to top-down out to 63-77 deg, where it stretches 2.2x to 4.5x —
+            // that is the melted-candle smear. Handing over across 33-55 deg
+            // caps the worst stretch anywhere on the terrain at 1.2x.
+            vec2 tanH = normalize(vec2(-wn.z, wn.x) + vec2(1e-4, 1e-4));
             vec2 flatUV = vWPos.xz;
-            vec2 wallUV = vec2(dot(vWPos.xz, vec2(0.7071, 0.7071)), vWPos.y * 1.6);
+            vec2 wallUV = vec2(dot(vWPos.xz, tanH), vWPos.y);
+            float wallW = smoothstep(0.17, 0.42, slope);
             vec2 baseUV = mix(flatUV, wallUV, wallW);
 
             float nearW = 1.0 - smoothstep(6.0, 42.0, dist);
             float midW  = 1.0 - smoothstep(45.0, 260.0, dist);
-            vec4 dA = texture2D(uDetail,  baseUV * (1.0 / 1.6));
-            vec4 dB = texture2D(uDetail,  baseUV * (1.0 / 26.0));
-            vec4 dC = texture2D(uDetail,  baseUV * (1.0 / 4.6) + vec2(0.37, 0.11));
-            vec4 nA = texture2D(uDetailN, baseUV * (1.0 / 1.6));
-            vec4 nB = texture2D(uDetailN, baseUV * (1.0 / 26.0));
-            vec4 D  = mix(dB, mix(dC, dA, 0.55), 0.34 + 0.55 * nearW);
+            // Each scale is read through its own rotation. Sampling one texture
+            // at three scales off the *same* axes superposes a field on scaled
+            // copies of itself; the copies stay correlated and beat into large
+            // swirling contour lines — the wood grain that covered the pan. A
+            // rotation per octave is the standard fix and it is not optional.
+            vec2 uvA = baseUV * (1.0 / 1.6);
+            vec2 uvC = rot(baseUV, ROT_C) * (1.0 / 4.6) + vec2(0.37, 0.11);
+            vec2 uvB = rot(baseUV, ROT_B) * (1.0 / 26.0) + vec2(0.71, 0.23);
+            float sA = sharpness(uvA);
+            float sC = sharpness(uvC);
+            float sB = sharpness(uvB);
+            vec4 dA = texture2D(uDetail,  uvA);
+            vec4 dB = texture2D(uDetail,  uvB);
+            vec4 dC = texture2D(uDetail,  uvC);
+            vec4 nA = texture2D(uDetailN, uvA);
+            vec4 nB = texture2D(uDetailN, uvB);
+            // Detail albedo also collapses to its own mean once it stops being
+            // resolvable, or the same beat shows up in colour instead of relief.
+            vec4 D  = mix(dB, mix(dC, dA, 0.55 * sA), (0.34 + 0.55 * nearW) * max(sC, sA * 0.5));
+            D = mix(vec4(0.5), D, max(sB, max(sC, sA)));
 
             // --- material weights --------------------------------------------
             // Break the boundaries with the mid-scale mottle so nothing reads as
@@ -1441,67 +1989,161 @@ export class Terrain {
             float screeW = smoothstep(0.26, 0.62, screeM + jitter * 0.7);
             // Desert pavement: the flats are never uniform sand. Irregular
             // patches of coarse lag gravel sit on them, and the patch edges are
-            // what the eye reads as "ground" rather than "shader".
-            float lag = smoothstep(0.38, 0.60, macro * 0.95 + D.a * 0.32 + (dB.g - 0.5) * 0.25);
+            // what the eye reads as "ground" rather than "shader". dB.g is a raw
+            // tap rather than the filtered D and it drives screeW, which swings
+            // the albedo AND scales the normal perturbation — so it needs its own
+            // footprint fade or it puts the same beat into both channels at once.
+            float lag = smoothstep(0.36, 0.62, macro * 0.95 + D.a * 0.32 + (mix(0.5, dB.g, sB) - 0.5) * 0.25);
             screeW = max(screeW, lag * 0.9) * (1.0 - rockW);
-            float flowW  = smoothstep(0.30, 0.75, flow + (D.a - 0.5) * 0.18) * (1.0 - rockW * 0.8);
+            float flowW  = smoothstep(0.26, 0.70, flow + (D.a - 0.5) * 0.16) * (1.0 - rockW * 0.85);
+            // Trunk washes only: the wide, sandy-floored part of the drainage.
+            float trunkW = smoothstep(0.60, 0.92, flow) * (1.0 - rockW);
 
             // --- sand: wind-packed khaki. Real dry desert sits near 0.35
             // linear reflectance, not the 0.6 that "pale" suggests on a swatch.
             float sandT = clamp(D.r * 0.45 + D.a * 0.60 + macro * 0.35 - 0.24, 0.0, 1.0);
-            vec3 sand = mix(uSandDark * 0.92, uSandLight, sandT);
-            float ripple = sin(dot(vWPos.xz, vec2(0.86, 0.51)) * 1.15 + (macro - 0.5) * 34.0) * 0.5 + 0.5;
-            sand *= 1.0 + (ripple - 0.5) * 0.08 * (1.0 - slope) * (0.35 + 0.65 * nearW);
+            vec3 sand = mix(mix(uSandDark, uSandMid, clamp(sandT * 2.0, 0.0, 1.0)),
+                            mix(uSandMid, uSandLight, clamp(sandT * 2.0 - 1.0, 0.0, 1.0)),
+                            step(0.5, sandT));
 
-            // --- scree / gravel apron: clearly darker and greyer than sand ----
-            vec3 gravel = mix(uRockDark * 1.05, uSandDark * 0.86, 0.28 + D.a * 0.42);
-            gravel = mix(gravel, uRockLight * 0.92, smoothstep(0.22, 0.85, D.g));
-            gravel *= 0.78 + D.r * 0.42;
+            // --- scree / gravel apron: coarser and darker than the sand, but
+            // still iron-warm. Grey gravel is the fastest way to read "quarry".
+            vec3 gravel = mix(uGravel, uSandDark, 0.24 + D.a * 0.38);
+            gravel = mix(gravel, uRockLight * 0.96, smoothstep(0.22, 0.85, D.g));
+            gravel *= 0.80 + D.r * 0.40;
 
             // --- bedrock: stratified, iron-stained ---------------------------
-            vec3 rockBase = mix(uRockDark * 0.85, uRockLight * 0.98, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
-            // Beds are ~3 m thick and only legible on the faces that expose them.
-            float band = fract(vWPos.y * 0.30 + macro * 6.0 + (D.a - 0.5) * 1.1);
-            float strata = smoothstep(0.0, 0.22, band) * (1.0 - smoothstep(0.44, 0.66, band));
-            rockBase *= 1.0 + (strata - 0.45) * 0.20 * wallW;
+            vec3 rockBase = mix(uRockDark, uRockLight, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
+            // Bedding planes. Measured against the same tilted datum the
+            // geometric benches are cut on (uDip), so the painted strata and the
+            // modelled ledges are the same beds — and they are never horizontal
+            // lines drawn across the whole map.
+            float bedH = vWPos.y - dot(vWPos.xz, uDip);
+            float band = fract(bedH * (0.36 - macro * 0.13) + (D.a - 0.5) * 0.9);
+            float strata = smoothstep(0.0, 0.20, band) * (1.0 - smoothstep(0.40, 0.62, band));
+            rockBase *= 1.0 + (strata - 0.45) * 0.34 * wallW * (1.0 - smoothstep(160.0, 700.0, dist));
             // Mineral zoning: whole massifs shift warm, which is what stops a
             // range from reading as one grey material at 2 km.
-            float iron = smoothstep(0.48, 0.86, macro);
-            vec3 rock = mix(rockBase, uRockRed * 0.92, iron * 0.55);
-            rock = mix(rock, rock * vec3(0.90, 0.94, 1.02), smoothstep(0.42, 0.12, macro));
+            float iron = smoothstep(0.44, 0.86, macro);
+            vec3 rock = mix(rockBase, uRockRed, iron * 0.46);
             rock *= 1.0 - D.b * 0.40;                    // cracks read dark
             rock *= 0.95 + smoothstep(0.3, 0.9, D.r) * 0.10;
+            // Desert varnish: manganese-black staining builds on faces that are
+            // stable and unscoured, so it tracks sky occlusion and the absence
+            // of flow rather than a noise threshold.
+            float varnish = smoothstep(0.62, 0.22, bake) * (1.0 - flow) * smoothstep(0.15, 0.55, rockM);
+            rock = mix(rock, uVarnish, varnish * 0.55);
 
             // --- assemble -----------------------------------------------------
             vec3 albedo = sand;
             albedo = mix(albedo, gravel, screeW);
             albedo = mix(albedo, rock, rockW);
-            // Wadis: mineral-stained, coarse lag gravel in the channel floor.
-            vec3 wadi = mix(albedo * 0.70, uRockDark * 1.25, 0.40);
-            wadi *= 0.9 + D.g * 0.30;
-            albedo = mix(albedo, wadi, flowW * 0.55);
+            // Drainage, driven straight off the flow-accumulation map: fines
+            // settle where the water slows, so the trunk washes floor out in
+            // pale wind-sorted silt while the steep incised heads stay dark and
+            // stony. Physically-motivated boundaries, not a noise threshold.
+            vec3 gully = mix(albedo * 0.74, uGravel * 1.05, 0.45);
+            gully *= 0.9 + D.g * 0.28;
+            albedo = mix(albedo, gully, flowW * (1.0 - trunkW) * 0.60);
+            albedo = mix(albedo, mix(uSilt, uSandLight, 0.4), trunkW * 0.62);
             // Concave hollows collect pale wind-blown fines.
-            albedo = mix(albedo, mix(albedo, uSandLight, 0.30), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
+            albedo = mix(albedo, mix(albedo, uSilt, 0.34), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
 
             // Regional tone: whole stretches of the floor are a shade darker or
             // paler than their neighbours. Without it a 2 km pan is one flat value.
-            albedo *= 0.86 + macro * 0.30;
-            // Micro contrast, faded out with distance so it never aliases.
-            albedo *= 1.0 + (D.r - 0.5) * 0.30 * (0.20 + 0.80 * nearW);
+            albedo *= 0.88 + macro * 0.28;
+
+            // --- near-field grit ----------------------------------------------
+            // At 4 m the player must see individual stones, not a noise field.
+            float gritW = (1.0 - smoothstep(3.0, 26.0, dist)) * sharpness(baseUV * (1.0 / GRIT_TILE));
+            gMicroShadow = 1.0;
+            vec2 gpert = vec2(0.0);
+            if (gritW > 0.004) {
+              vec2 guv = baseUV * (1.0 / GRIT_TILE);
+              // One parallax step, in the projection's own frame. The clasts
+              // shift against the sand between them, which is what gives them a
+              // silhouette rather than a decal.
+              vec3 vdir = normalize(cameraPosition - vWPos);
+              vec3 vT = vdir - wn * dot(vdir, wn);
+              vec2 vuv = mix(vT.xz, vec2(dot(vT.xz, tanH), vT.y), wallW);
+              float h0 = texture2D(uGritN, guv).a;
+              guv += vuv * ((h0 - 0.45) * (GRIT_H / GRIT_TILE) * 2.0);
+
+              vec4 GM = texture2D(uGrit,  guv);
+              vec4 GN = texture2D(uGritN, guv);
+              // One coarse read of the same tile, rotated and 3.4x bigger. It
+              // modulates stone density and tone rather than adding a second
+              // clast field, so it hides the 0.36 m repeat without halving the
+              // contrast that makes the stones legible in the first place.
+              vec4 GB = texture2D(uGrit, (baseUV * mat2(0.80, -0.60, 0.60, 0.80)) * (1.0 / (GRIT_TILE * 3.4)) + 17.3);
+
+              // Sun horizon test through the clast height field: each stone
+              // shadows the sand behind it, and the shadow lengthens as the sun
+              // drops. One tap, and it is the single thing that makes gravel
+              // read as gravel instead of a bump map.
+              vec2 sxz = uSunDir.xz;
+              float sl = length(sxz);
+              if (sl > 1e-3) {
+                const float STEP_M = 0.030;
+                float hs = texture2D(uGritN, guv + (sxz / sl) * (STEP_M / GRIT_TILE)).a;
+                float rise = (hs - GN.a) * GRIT_H - STEP_M * (uSunDir.y / sl);
+                gMicroShadow = 1.0 - smoothstep(0.0, 0.020, rise) * 0.55 * gritW;
+              }
+
+              float clast = GM.g * smoothstep(0.10, 0.62, 0.42 + GB.a * 0.85);
+              float grain = GM.r;
+              float drift = mix(GM.a, GB.a, 0.45);
+              // Every stone gets its own value: half of them lighter than the
+              // matrix, half darker. Uniform pebbles read as a pattern.
+              // Desert pavement is mostly *darker* than the matrix it sits on —
+              // the stones are varnished and the sand between them is not — with
+              // a minority of pale quartzy ones. A symmetric spread reads as
+              // scattered white confetti.
+              vec3 clastC = mix(uRockDark * 1.18, uSandLight * 0.98, pow(GM.b, 1.7));
+              clastC = mix(clastC, uRockRed * 0.94, smoothstep(0.30, 0.72, GM.b) * 0.40);
+
+              vec3 fines = mix(uSandMid, uSandLight, clamp(grain * 0.75 + drift * 0.45 - 0.10, 0.0, 1.0));
+              vec3 gritC = mix(fines, clastC, clast * 0.80);
+              // Drifts: paler where blown sand has banked up between stones.
+              gritC *= (0.94 + drift * 0.14) * (0.93 + GB.r * 0.15);
+
+              albedo = mix(albedo, mix(gritC, albedo * 1.06, 0.30), gritW * (1.0 - rockW * 0.55));
+              gpert = (GN.rg * 2.0 - 1.0) * (0.70 * gritW);
+            }
 
             diffuseColor.rgb *= albedo * 0.80;
 
             // --- normal --------------------------------------------------------
-            vec4 nC = texture2D(uDetailN, baseUV * (1.0 / 4.6) + vec2(0.37, 0.11));
+            vec4 nC = texture2D(uDetailN, uvC);
             float midNear = 1.0 - smoothstep(18.0, 105.0, dist);
-            vec2 pert = (nB.rg * 2.0 - 1.0) * (0.40 * midW)
-                      + (nC.rg * 2.0 - 1.0) * (0.60 * midNear)
-                      + (nA.rg * 2.0 - 1.0) * (0.95 * nearW);
-            // The detail height field is mostly clasts. Wind-packed sand has no
-            // clasts, so leaving it fully bump-mapped tiles a visible honeycomb
-            // across the pan.
-            pert *= mix(0.42, 1.0, clamp(screeW + rockW, 0.0, 1.0));
-            gN = normalize(wn + vec3(pert.x, 0.0, pert.y));
+            vec2 pert = unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.40 * midW * sB)
+                      + unrot(nC.rg * 2.0 - 1.0, ROT_C) * (0.60 * midNear * sC)
+                      + (nA.rg * 2.0 - 1.0) * (0.85 * nearW * sA);
+            // The mid detail height field is mostly clasts. Wind-packed sand has
+            // no clasts at that scale, so leaving it fully bump-mapped tiles a
+            // visible honeycomb across the pan. The grit layer is exempt: that
+            // one IS the stones.
+            pert *= mix(0.36, 1.0, clamp(screeW * 0.55 + rockW, 0.0, 1.0));
+            pert += gpert;
+
+            // The 7 cm geometric ripple in the vertex shader needs a matching
+            // shading normal, or the ground wobbles in silhouette and stays flat
+            // in light. Central difference on the same closed form.
+            {
+              vec2 muv = vWPos.xz * ${(1 / MICRO_PERIOD).toFixed(8)};
+              vec3 MR = texture2D(uMicro, muv).rgb;
+              pert += -MR.gb * (0.85 * nearW * sharpness(muv * 0.5));
+            }
+
+            // The perturbation is a slope in the *projection's* frame. On a wall
+            // that frame is (contour, up), not (x, z), so it has to be rotated
+            // back or every cliff gets its bump lighting from the wrong axis.
+            vec3 Tw = vec3(tanH.x, 0.0, tanH.y);
+            vec3 Bw = normalize(cross(wn, Tw));
+            if (Bw.y < 0.0) Bw = -Bw;
+            vec3 pv = mix(vec3(pert.x, 0.0, pert.y), Tw * pert.x + Bw * pert.y, wallW);
+            gN = normalize(wn + pv);
+
             float cav = mix(nB.a, mix(nC.a, nA.a, nearW), midNear);
             gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.25, 1.0));
             gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05, 0.55, 1.0);
@@ -1516,6 +2158,14 @@ export class Terrain {
           `,
         )
         .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\nroughnessFactor = gRough;`)
+        .replace(
+          '#include <lights_fragment_end>',
+          /* glsl */ `#include <lights_fragment_end>
+          // Clast self-shadowing, direct light only: the sky still reaches into
+          // the gaps between the stones.
+          reflectedLight.directDiffuse *= gMicroShadow;
+          reflectedLight.directSpecular *= gMicroShadow;`,
+        )
         .replace(
           '#include <aomap_fragment>',
           /* glsl */ `#include <aomap_fragment>
@@ -1540,7 +2190,7 @@ export class Terrain {
       Object.assign(shader.uniforms, u);
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', `#include <common>\n${HEIGHT_GLSL}`)
-        .replace('#include <begin_vertex>', DISPLACE_GLSL);
+        .replace('#include <begin_vertex>', DISPLACE('terrainH'));
     };
     this.depthMaterial = dm;
   }

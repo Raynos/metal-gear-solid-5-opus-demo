@@ -33,6 +33,7 @@ export function assemble(parts, rig) {
   const pos = [];
   const uv = [];
   const zone = [];
+  const edge = [];
   const idx = [];
   const groupOf = [];
   const groups = [];
@@ -48,6 +49,7 @@ export function assemble(parts, rig) {
       for (let i = 0; i < s.pos.length; i++) pos.push(s.pos[i]);
       for (let i = 0; i < s.uv.length; i++) uv.push(s.uv[i]);
       for (let i = 0; i < s.zone.length; i++) zone.push(s.zone[i]);
+      for (let i = 0; i < s.count; i++) edge.push(s.ang[i] ?? 0, s.rim[i] ?? 0.25);
       for (let i = 0; i < s.idx.length; i++) idx.push(s.idx[i] + base);
       const g = part.group;
       for (let i = 0; i < s.count; i++) groupOf.push(g);
@@ -67,6 +69,7 @@ export function assemble(parts, rig) {
   geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
   geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
   geo.setAttribute('aZone', new THREE.BufferAttribute(new Float32Array(zone), 1));
+  geo.setAttribute('aEdge', new THREE.BufferAttribute(new Float32Array(edge), 2));
   geo.setAttribute('aAO', new THREE.BufferAttribute(ao, 1));
   geo.setAttribute('skinIndex', new THREE.BufferAttribute(skinIndex, 4));
   geo.setAttribute('skinWeight', new THREE.BufferAttribute(skinWeight, 4));

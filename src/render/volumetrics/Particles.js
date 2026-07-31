@@ -174,6 +174,14 @@ const DUST_FRAGMENT = /* glsl */ `
     float sceneZ = texture2D(tSceneDepth, gl_FragCoord.xy * uInvRes).r;
     // Soft depth fade: dissolve as the sprite approaches whatever is behind it.
     float fade = clamp((sceneZ - vViewDepth) / uSoftness, 0.0, 1.0);
+    // ...and a second fade against the SKY. A mote seen against ground is lit by
+    // roughly the same light as the ground and disappears into it; the same mote
+    // seen against a 10x brighter sky is a dark speck, and a swarm of dark
+    // specks over the horizon is one of the loudest particle-system tells there
+    // is. Real suspended dust is only visible against the sky as a haze, never
+    // as resolvable grains.
+    float againstSky = smoothstep(2000.0, 6000.0, sceneZ);
+    fade *= 1.0 - 0.86 * againstSky;
     diffuseColor.a *= soft * vAlpha * fade;
     if (diffuseColor.a < 0.002) discard;
     // Forward scattering: dust between the viewer and the sun blazes. The floor
@@ -438,10 +446,13 @@ export class ParticleAtmosphere {
       s.tSceneDepth.value = pass.depthRT.texture;
       s.uInvRes.value.set(1 / pass._width, 1 / pass._height);
     }
-    // Dust rides the same time-of-day tuning as the haze.
+    // Dust rides the same time-of-day tuning as the haze. At night there is no
+    // thermal turbulence lofting it and nothing to light it, so it all but
+    // vanishes rather than sitting there as a grey fog of dots.
     const amt = pass?.params?.dustBand ?? 1.0;
-    this.dustUniforms.uAmount.value = 0.5 * amt;
-    this.sandUniforms.uAmount.value = 0.26 + 0.16 * amt;
+    const day = 1.0 - 0.88 * (this.world.lighting.night ?? 0);
+    this.dustUniforms.uAmount.value = 0.5 * amt * day;
+    this.sandUniforms.uAmount.value = (0.26 + 0.16 * amt) * day;
   }
 
   dispose() {

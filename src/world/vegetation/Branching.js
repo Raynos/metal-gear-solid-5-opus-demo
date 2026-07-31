@@ -172,6 +172,10 @@ export function scrubParams(seed) {
   };
 }
 
+// Scrub has no reduced-branch LOD: past ~80 m a branching skeleton is thinner
+// than a pixel however you tune it, and the right distant representation is a
+// dome of wide ribbons rather than fewer sticks. See Scrub.js's bush tiers.
+
 /** Dead tree: a single gnarled leader that forks hard — pure silhouette. */
 export function deadTreeParams(seed) {
   return {
@@ -192,6 +196,19 @@ export function deadTreeParams(seed) {
     spread: 0.62,
     gnarl: 0.30,
     upright: 0.10,
+  };
+}
+
+/** Dead tree, distant LOD: trunk + first fork only, thickened to hold the mass. */
+export function deadTreeParamsL1(seed) {
+  return {
+    ...deadTreeParams(seed),
+    maxDepth: 2,
+    trunkSegments: 3,
+    trunkChildren: 3,
+    branchProb: 0.4,
+    radius: 0.26,
+    minRadius: 0.055,
   };
 }
 

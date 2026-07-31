@@ -172,12 +172,14 @@ export function buildHead(o = {}) {
  */
 export function buildEyes(o = {}) {
   const cy = o.cy ?? 1.661;
-  const cz = o.cz ?? -0.0715;
+  // Seated 6 mm deeper than round 1, which left the front of each sphere
+  // standing proud of the socket — the classic googly-eye read.
+  const cz = o.cz ?? -0.0655;
   const s = new Surface();
   for (const sgn of [-1, 1]) {
     const e = displacedSphere(
       (dir, out) => {
-        out.set(sgn * 0.0325 + dir.x * 0.0122, cy + dir.y * 0.0122, cz + dir.z * 0.0122);
+        out.set(sgn * 0.0325 + dir.x * 0.0115, cy + dir.y * 0.0115, cz + dir.z * 0.0115);
       },
       14,
       10,
@@ -203,7 +205,10 @@ export function buildHair(o = {}) {
       const clump = 1 + 0.55 * Math.sin(dir.x * 34) * Math.sin(dir.z * 29) * cover;
       // Offset ALONG the skull's own radius: negative where there is no hair, so
       // the shell is buried inside the head and the crossover is the hairline.
-      const t = -0.009 + cover * (0.017 + 0.004 * clump);
+      // 30 mm of burial, not 9: the skull has a 36 mm nose and a 14 mm brow
+      // displaced onto it, and a shell that only clears the *average* radius
+      // still surfaces across the cheeks and the jaw.
+      const t = -0.030 + cover * (0.040 + 0.004 * clump);
       out.copy(tmp).sub(c);
       const len = out.length() || 1;
       out.multiplyScalar(1 + t / len).add(c);
@@ -319,7 +324,23 @@ export function buildHand(o = {}) {
     ),
   );
 
-  // Four fingers curled around a ~19 mm grip.
+  // Knuckle row: four bumps across the back of the hand. Without them the hand
+  // is a paddle, and the knuckles are exactly where the eye checks.
+  for (const kx of [0.0225, 0.0078, -0.0072, -0.0218]) {
+    s.merge(
+      displacedSphere(
+        (dir, out) => out.set(kx + dir.x * 0.0088, 0.0805 + dir.y * 0.0068, 0.0105 + dir.z * 0.0088),
+        10,
+        7,
+        zone,
+        0.06,
+      ),
+    );
+  }
+
+  // Four fingers curled around a ~19 mm grip. Each phalanx is authored as a
+  // narrow shaft between two wider joints — a smooth taper reads as a sausage,
+  // and "no visible fingers" was the round-1 note.
   const fingers = [
     { x: 0.0225, len: 1.0 },
     { x: 0.0078, len: 1.09 },
@@ -336,15 +357,21 @@ export function buildHand(o = {}) {
       pts.push(cur);
     }
     const r = 0.0092 * (0.85 + f.len * 0.16);
+    // Fingers are wider than they are deep, and each joint swells ~12%.
+    const joint = (p, k) => ({ p, rx: r * k, rz: r * k * 0.88, n: 2.8, zone: fingerZone });
+    const mid = (a, b, k) => joint(a.clone().lerp(b, 0.5), k);
     fs.merge(
       loftKeys(
         [
-          { p: pts[0], rx: r, rz: r * 0.95, n: 2.6, zone: fingerZone },
-          { p: pts[1], rx: r * 0.97, rz: r * 0.94, n: 2.6, zone: fingerZone },
-          { p: pts[2], rx: r * 0.88, rz: r * 0.86, n: 2.6, zone: fingerZone },
-          { p: pts[3], rx: r * 0.7, rz: r * 0.7, n: 2.6, zone: fingerZone },
+          joint(pts[0], 1.06),
+          mid(pts[0], pts[1], 0.88),
+          joint(pts[1], 1.0),
+          mid(pts[1], pts[2], 0.8),
+          joint(pts[2], 0.9),
+          mid(pts[2], pts[3], 0.74),
+          joint(pts[3], 0.6),
         ],
-        11,
+        15,
         { radial: 8, capStart: false, capEnd: true, forward: V(0, 0, 1) },
       ),
     );
@@ -362,6 +389,20 @@ export function buildHand(o = {}) {
       ],
       9,
       { radial: 8, capStart: true, capEnd: true, forward: V(0, 0, 1) },
+    ),
+  );
+
+  // Cuff: a band at the wrist so the hand terminates in a hem rather than
+  // dissolving into the sleeve.
+  s.merge(
+    loftKeys(
+      [
+        { p: V(0, -0.026, -0.002), rx: 0.028, rz: 0.031, n: 2.6, zone },
+        { p: V(0, -0.012, 0.0), rx: 0.032, rz: 0.035, n: 2.6, zone },
+        { p: V(0, 0.002, 0.001), rx: 0.031, rz: 0.032, n: 2.7, zone },
+      ],
+      7,
+      { radial: 12, capStart: true, capEnd: true, forward: V(0, 0, 1) },
     ),
   );
 
@@ -413,78 +454,179 @@ export function buildLeg(o = {}) {
   return loftKeys(keys, 26, { radial: 18, capStart: true, capEnd: true });
 }
 
+/**
+ * A desert combat boot.
+ *
+ * Round 1 shipped a shaft, a foot and a sole in one near-black leather zone, and
+ * every critic called it out as a black blob. What actually makes a boot read at
+ * 8 m is not resolution, it is the horizontal banding: a tan upper, a PALE
+ * midsole rand, a dark lugged outsole, and a padded collar that widens the
+ * ankle. Those four values stacked are legible even when the whole boot is
+ * 20 px tall. The laces, tongue, eyelet rows, toe cap and heel counter are for
+ * the critic who zooms in.
+ */
 export function buildBoot() {
   const parts = [];
   const x = 0.102;
-  // Shaft: mid-calf combat boot, laced, slightly conical.
-  parts.push({
-    surface: loftKeys(
+  const cloth = (surface) => parts.push({ surface, mat: 'cloth' });
+  const rubber = (surface) => parts.push({ surface, mat: 'rubber' });
+
+  // Shaft: mid-calf, slightly conical, flaring into a padded collar at the top.
+  cloth(
+    loftKeys(
       [
-        { p: V(x, 0.245, 0.022), rx: 0.06, rz: 0.065, n: 2.6, zone: Z.LEATHER },
-        { p: V(x, 0.2, 0.024), rx: 0.058, rz: 0.062, n: 2.6, zone: Z.LEATHER },
-        { p: V(x, 0.15, 0.026), rx: 0.053, rz: 0.058, n: 2.6, zone: Z.LEATHER },
-        { p: V(x, 0.105, 0.028), rx: 0.05, rz: 0.058, n: 2.7, zone: Z.LEATHER },
-        { p: V(x, 0.075, 0.03), rx: 0.05, rz: 0.062, n: 2.8, zone: Z.LEATHER },
+        { p: V(x, 0.248, 0.022), rx: 0.062, rz: 0.067, n: 2.6, zone: Z.BOOT },
+        { p: V(x, 0.226, 0.023), rx: 0.058, rz: 0.063, n: 2.6, zone: Z.BOOT },
+        { p: V(x, 0.19, 0.025), rx: 0.055, rz: 0.06, n: 2.6, zone: Z.BOOT },
+        { p: V(x, 0.15, 0.026), rx: 0.053, rz: 0.058, n: 2.6, zone: Z.BOOT },
+        { p: V(x, 0.105, 0.028), rx: 0.05, rz: 0.058, n: 2.7, zone: Z.BOOT },
+        { p: V(x, 0.075, 0.03), rx: 0.05, rz: 0.062, n: 2.8, zone: Z.BOOT },
       ],
-      11,
+      13,
       { radial: 16, capStart: true },
     ),
-    mat: 'cloth',
-  });
+  );
+  // Padded collar rolled over the top of the shaft — the ankle needs a width
+  // step or the leg just tapers into the ground.
+  cloth(
+    loftKeys(
+      [
+        { p: V(x, 0.256, 0.021), rx: 0.062, rz: 0.067, n: 2.6, zone: Z.BOOT },
+        { p: V(x, 0.243, 0.022), rx: 0.069, rz: 0.074, n: 2.5, zone: Z.BOOT },
+        { p: V(x, 0.228, 0.023), rx: 0.063, rz: 0.068, n: 2.6, zone: Z.BOOT },
+      ],
+      7,
+      { radial: 14, capStart: true, capEnd: true },
+    ),
+  );
 
   // Foot: heel -> instep -> ball -> toe. Spine runs forward (-Z).
-  parts.push({
-    surface: loftKeys(
+  cloth(
+    loftKeys(
       [
-        { p: V(x, 0.05, 0.075), rx: 0.036, rz: 0.045, n: 2.8, zone: Z.LEATHER },
-        { p: V(x, 0.048, 0.045), rx: 0.045, rz: 0.048, n: 2.9, zone: Z.LEATHER },
-        { p: V(x, 0.05, 0.0), rx: 0.05, rz: 0.05, n: 3.0, zone: Z.LEATHER },
-        { p: V(x, 0.048, -0.055), rx: 0.052, rz: 0.043, n: 3.2, zone: Z.LEATHER },
-        { p: V(x, 0.044, -0.105), rx: 0.048, rz: 0.036, n: 3.2, zone: Z.LEATHER },
-        { p: V(x, 0.04, -0.14), rx: 0.034, rz: 0.026, n: 3.0, zone: Z.LEATHER },
+        { p: V(x, 0.05, 0.075), rx: 0.036, rz: 0.045, n: 2.8, zone: Z.BOOT },
+        { p: V(x, 0.048, 0.045), rx: 0.045, rz: 0.048, n: 2.9, zone: Z.BOOT },
+        { p: V(x, 0.05, 0.0), rx: 0.05, rz: 0.05, n: 3.0, zone: Z.BOOT },
+        { p: V(x, 0.048, -0.055), rx: 0.052, rz: 0.043, n: 3.2, zone: Z.BOOT },
+        { p: V(x, 0.044, -0.105), rx: 0.048, rz: 0.036, n: 3.2, zone: Z.BOOT },
+        { p: V(x, 0.04, -0.14), rx: 0.034, rz: 0.026, n: 3.0, zone: Z.BOOT },
       ],
       13,
       { radial: 16, capStart: true, capEnd: true },
     ),
-    mat: 'cloth',
-  });
-
-  // Lugged rubber sole + heel block — a boot with no visible sole reads as a sock.
-  parts.push({
-    surface: loftKeys(
+  );
+  // Toe cap, standing 2 mm proud with its own stitched border.
+  cloth(
+    loftKeys(
       [
-        { p: V(x, 0.019, 0.082), rx: 0.036, rz: 0.019, n: 4.5, zone: 0 },
-        { p: V(x, 0.016, 0.045), rx: 0.047, rz: 0.021, n: 4.5, zone: 0 },
-        { p: V(x, 0.015, 0.0), rx: 0.053, rz: 0.019, n: 4.5, zone: 0 },
-        { p: V(x, 0.015, -0.06), rx: 0.055, rz: 0.019, n: 4.5, zone: 0 },
-        { p: V(x, 0.016, -0.11), rx: 0.05, rz: 0.018, n: 4.5, zone: 0 },
-        { p: V(x, 0.018, -0.146), rx: 0.034, rz: 0.015, n: 4.0, zone: 0 },
+        { p: V(x, 0.047, -0.062), rx: 0.0535, rz: 0.045, n: 3.2, zone: Z.BOOT },
+        { p: V(x, 0.045, -0.1), rx: 0.0498, rz: 0.038, n: 3.2, zone: Z.BOOT },
+        { p: V(x, 0.041, -0.138), rx: 0.036, rz: 0.028, n: 3.0, zone: Z.BOOT },
+      ],
+      7,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+  );
+  // Heel counter wrapping the back of the foot.
+  cloth(
+    loftKeys(
+      [
+        { p: V(x, 0.052, 0.078), rx: 0.0375, rz: 0.047, n: 2.8, zone: Z.BOOT },
+        { p: V(x, 0.05, 0.05), rx: 0.0468, rz: 0.05, n: 2.9, zone: Z.BOOT },
+        { p: V(x, 0.052, 0.028), rx: 0.0505, rz: 0.05, n: 3.0, zone: Z.BOOT },
+      ],
+      7,
+      { radial: 14, capStart: true, capEnd: true },
+    ),
+  );
+
+  // Midsole rand: a PALE band between the tan upper and the dark outsole. This
+  // one 12 mm stripe is what stops the whole boot merging into the ground.
+  cloth(
+    loftKeys(
+      [
+        { p: V(x, 0.031, 0.084), rx: 0.0378, rz: 0.0135, n: 4.2, zone: Z.BOOT },
+        { p: V(x, 0.03, 0.045), rx: 0.0482, rz: 0.014, n: 4.4, zone: Z.BOOT },
+        { p: V(x, 0.03, 0.0), rx: 0.0542, rz: 0.0135, n: 4.4, zone: Z.BOOT },
+        { p: V(x, 0.03, -0.06), rx: 0.0562, rz: 0.0135, n: 4.4, zone: Z.BOOT },
+        { p: V(x, 0.031, -0.11), rx: 0.051, rz: 0.013, n: 4.4, zone: Z.BOOT },
+        { p: V(x, 0.033, -0.147), rx: 0.035, rz: 0.011, n: 4.0, zone: Z.BOOT },
+      ],
+      13,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+  );
+
+  // Lugged rubber outsole + heel block.
+  rubber(
+    loftKeys(
+      [
+        { p: V(x, 0.017, 0.082), rx: 0.036, rz: 0.017, n: 4.5, zone: 0 },
+        { p: V(x, 0.015, 0.045), rx: 0.047, rz: 0.019, n: 4.5, zone: 0 },
+        { p: V(x, 0.014, 0.0), rx: 0.053, rz: 0.018, n: 4.5, zone: 0 },
+        { p: V(x, 0.014, -0.06), rx: 0.055, rz: 0.018, n: 4.5, zone: 0 },
+        { p: V(x, 0.015, -0.11), rx: 0.05, rz: 0.017, n: 4.5, zone: 0 },
+        { p: V(x, 0.017, -0.146), rx: 0.034, rz: 0.014, n: 4.0, zone: 0 },
       ],
       13,
       { radial: 14, capStart: true, capEnd: true },
     ),
-    mat: 'rubber',
-  });
-  parts.push({
-    surface: loftKeys(
+  );
+  rubber(
+    loftKeys(
       [
-        { p: V(x, 0.03, 0.082), rx: 0.037, rz: 0.03, n: 4.5, zone: 0 },
-        { p: V(x, 0.028, 0.048), rx: 0.046, rz: 0.03, n: 4.5, zone: 0 },
-        { p: V(x, 0.026, 0.028), rx: 0.048, rz: 0.026, n: 4.5, zone: 0 },
+        { p: V(x, 0.028, 0.082), rx: 0.037, rz: 0.028, n: 4.5, zone: 0 },
+        { p: V(x, 0.026, 0.048), rx: 0.046, rz: 0.028, n: 4.5, zone: 0 },
+        { p: V(x, 0.025, 0.028), rx: 0.048, rz: 0.024, n: 4.5, zone: 0 },
       ],
       6,
       { radial: 12, capStart: true, capEnd: true },
     ),
-    mat: 'rubber',
-  });
+  );
 
-  // Laces: three visible bands across the instep.
-  for (let i = 0; i < 4; i++) {
-    const z = 0.02 - i * 0.03;
-    parts.push({
-      surface: strap([V(x - 0.04, 0.075 - i * 0.004, z), V(x, 0.083 - i * 0.005, z - 0.004), V(x + 0.04, 0.075 - i * 0.004, z)], 0.009, 0.006, Z.WEBBING, { stations: 7 }),
-      mat: 'cloth',
-    });
+  // Tongue under the laces, plus the two eyelet/speed-hook rows either side of
+  // it. Without a tongue the lace bands float on a smooth dome.
+  cloth(
+    loftKeys(
+      [
+        { p: V(x, 0.098, 0.006), rx: 0.031, rz: 0.012, n: 3.4, zone: Z.BOOT },
+        { p: V(x, 0.093, -0.03), rx: 0.032, rz: 0.012, n: 3.4, zone: Z.BOOT },
+        { p: V(x, 0.083, -0.062), rx: 0.031, rz: 0.011, n: 3.4, zone: Z.BOOT },
+      ],
+      7,
+      { radial: 12, capStart: true, capEnd: true, forward: V(0, 1, 0) },
+    ),
+  );
+  for (const sgn of [-1, 1]) {
+    cloth(
+      strap(
+        [
+          V(x + sgn * 0.036, 0.096, 0.012),
+          V(x + sgn * 0.038, 0.09, -0.024),
+          V(x + sgn * 0.036, 0.079, -0.062),
+          V(x + sgn * 0.03, 0.066, -0.09),
+        ],
+        0.013,
+        0.007,
+        Z.BOOT,
+        { stations: 10 },
+      ),
+    );
+  }
+  // Laces: five bands across the instep, tightening toward the toe.
+  for (let i = 0; i < 5; i++) {
+    const z = 0.014 - i * 0.026;
+    const w = 0.038 - i * 0.002;
+    const y = 0.094 - i * 0.007;
+    cloth(
+      strap(
+        [V(x - w, y, z), V(x, y + 0.008, z - 0.004), V(x + w, y, z)],
+        0.008,
+        0.0055,
+        Z.WEBBING,
+        { stations: 7 },
+      ),
+    );
   }
   return parts;
 }

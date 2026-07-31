@@ -26,16 +26,27 @@ export class Surface {
     this.uv = [];
     this.zone = [];
     this.idx = [];
+    // Two extra per-vertex channels the shaders need to draw *tailoring*:
+    //   ang — 0..1 around the cross-section (0 = character's right, 0.25 front).
+    //         Panel seams live at fixed angles, so this is what lets the shader
+    //         put a side seam down the ribs and a centre-back seam on a jacket.
+    //   rim — metres to the nearest end of the piece along its sweep. A stitched
+    //         border sits a few mm in from every cut edge; without this the
+    //         shader has no idea where a pouch stops and the jacket starts.
+    this.ang = [];
+    this.rim = [];
   }
 
   get count() {
     return this.pos.length / 3;
   }
 
-  vert(x, y, z, u, v, zone) {
+  vert(x, y, z, u, v, zone, ang = 0, rim = 0.25) {
     this.pos.push(x, y, z);
     this.uv.push(u, v);
     this.zone.push(zone);
+    this.ang.push(ang);
+    this.rim.push(rim);
     return this.pos.length / 3 - 1;
   }
 
@@ -53,6 +64,8 @@ export class Surface {
     for (let i = 0; i < other.pos.length; i++) this.pos.push(other.pos[i]);
     for (let i = 0; i < other.uv.length; i++) this.uv.push(other.uv[i]);
     for (let i = 0; i < other.zone.length; i++) this.zone.push(other.zone[i]);
+    for (let i = 0; i < other.ang.length; i++) this.ang.push(other.ang[i]);
+    for (let i = 0; i < other.rim.length; i++) this.rim.push(other.rim[i]);
     for (let i = 0; i < other.idx.length; i++) this.idx.push(other.idx[i] + base);
     return this;
   }
@@ -97,6 +110,8 @@ export class Surface {
     s.pos = this.pos.slice();
     s.uv = this.uv.slice();
     s.zone = this.zone.slice();
+    s.ang = this.ang.slice();
+    s.rim = this.rim.slice();
     for (let i = 0; i < s.pos.length; i += 3) s.pos[i] = -s.pos[i];
     for (let i = 0; i < this.idx.length; i += 3) {
       s.idx.push(this.idx[i], this.idx[i + 2], this.idx[i + 1]);
@@ -182,11 +197,12 @@ export function loft(spine, sections, opts = {}) {
 
     const sec = sections[i];
     const roll = sec.roll ?? 0;
+    const rim = Math.min(arc[i], total - arc[i]);
     for (let j = 0; j <= radial; j++) {
       const th = (j / radial) * Math.PI * 2 + roll;
       sectionPoint(sec, th, sp);
       p.copy(spine[i]).addScaledVector(right, sp.x).addScaledVector(fwd, sp.y);
-      s.vert(p.x, p.y, p.z, (j / radial) * uScale, (arc[i] / total) * vScale, sec.zone ?? zone);
+      s.vert(p.x, p.y, p.z, (j / radial) * uScale, (arc[i] / total) * vScale, sec.zone ?? zone, j / radial, rim);
     }
   }
 
@@ -209,7 +225,7 @@ export function loft(spine, sections, opts = {}) {
 function capRing(s, centre, offset, ring, radial, flip, zone) {
   // Pull the cap centre slightly inward so a capped limb ends in a soft dome
   // rather than a visible flat disc.
-  const c = s.vert(centre.x, centre.y, centre.z, 0.5, flip ? 0 : 1, zone);
+  const c = s.vert(centre.x, centre.y, centre.z, 0.5, flip ? 0 : 1, zone, 0.5, 0);
   for (let j = 0; j < radial; j++) {
     const a = offset + j;
     const b = offset + j + 1;
@@ -332,7 +348,8 @@ export function displacedSphere(fn, segU = 28, segV = 20, zone = 0, uvScale = 0.
       dir.set(Math.sin(phi) * Math.cos(th), Math.cos(phi), Math.sin(phi) * Math.sin(th));
       out.copy(dir);
       fn(dir, out, u, v);
-      s.vert(out.x, out.y, out.z, u * uvScale, v * uvScale * 0.5, zone);
+      // rim = 0.25 m: a sphere has no cut edge, so it never draws a stitch line.
+      s.vert(out.x, out.y, out.z, u * uvScale, v * uvScale * 0.5, zone, u, 0.25);
     }
   }
   const ring = segU + 1;

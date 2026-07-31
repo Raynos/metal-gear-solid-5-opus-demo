@@ -26,12 +26,14 @@ export function panelGeo() {
   b.concrete.push(box(w, 0.26, t, { y: 0.13 }));
   b.concrete.push(box(w, 0.26, t, { y: h - 0.13 }));
   for (const sx of [-1, 1]) b.concrete.push(box(0.24, h, t, { x: sx * (w / 2 - 0.12), y: h / 2 }));
-  // Rhombus relief: four bars at 45 degrees.
+  // Rhombus relief: four bars at 45 degrees. Sharp — the panel is instanced ~130
+  // times and this relief is never seen closer than the wall face it sits on,
+  // whose own arris already carries the highlight.
   const dl = Math.hypot(w * 0.5, h * 0.5) * 0.86;
   for (const sx of [-1, 1]) {
     for (const sy of [-1, 1]) {
       b.concrete.push(box(dl, 0.17, t * 0.85, {
-        x: (sx * w) / 4, y: h / 2 + (sy * h) / 4, rz: sx * sy * Math.atan2(h / 2, w / 2),
+        x: (sx * w) / 4, y: h / 2 + (sy * h) / 4, rz: sx * sy * Math.atan2(h / 2, w / 2), sharp: true,
       }));
     }
   }
@@ -186,30 +188,81 @@ export function sandbagWall({ pts, courses = 8, rng, groundY, bagLen = 0.55, tap
     return { u: pts[0][0], v: pts[0][1], ang: 0 };
   };
 
-  // Courses stack with a slight batter (each one set back a touch) and alternate
-  // their bond, which is what keeps a revetment from reading as a brick texture.
+  // Courses stack with a batter, alternate their bond, and — the part round 1
+  // missed entirely — SETTLE. A bag at the bottom of an eight-course revetment
+  // is carrying 60kg and is visibly squashed; the course line dips wherever the
+  // ground underneath it gave way; and by the time a working party is on its
+  // seventh course, nobody is lining bags up any more. Every one of those is
+  // modelled here, because a perfectly level running bond with uniform bags is
+  // the reason the round-1 emplacements read as a texture rather than as work.
+  const dip = (t) => (
+    Math.sin(t * 5.3 + 1.7) * 0.026 + Math.sin(t * 11.9 + 0.4) * 0.014 + Math.sin(t * 2.1) * 0.020
+  );
+  let courseY = 0;
   for (let c = 0; c < courses; c++) {
     const shrink = taper * c;
-    const y = 0.165 * c;
+    const load = 1 - c / Math.max(1, courses - 1); // 1 at the bottom course
+    // Squashed courses are shorter: accumulate real heights instead of c*const.
+    const squash = 1 - 0.20 * load * load;
+    const y = courseY;
+    courseY += 0.168 * squash;
     const usable = Math.max(bagLen, acc - shrink * 2);
     const n = Math.max(1, Math.round(usable / bagLen));
     const rows = double ? (c % 2 === 0 ? [-0.15, 0.15] : [-0.075, 0.075]) : [0];
+    // Sloppiness grows with height and with how tired the party was.
+    const sloppy = 0.35 + 0.9 * (c / Math.max(1, courses - 1));
     for (let i = 0; i < n; i++) {
-      const s = shrink + (i + (c % 2 === 0 ? 0.5 : 0.15)) * (usable / n);
+      const jitterAlong = rng.jitter(0.05) * sloppy;
+      const s = shrink + (i + (c % 2 === 0 ? 0.5 : 0.15)) * (usable / n) + jitterAlong;
       const p = sample(THREE.MathUtils.clamp(s, 0, acc));
+      const tNorm = s / Math.max(0.001, acc);
       for (const off of rows) {
-        const nx = Math.cos(p.ang) * off;
-        const nz = -Math.sin(p.ang) * off;
+        // One bag in fourteen is properly out of line — kicked, re-laid crooked,
+        // or shoved out by the bag under it.
+        const rogue = rng.chance(0.07);
+        const pushOut = rogue ? rng.range(0.05, 0.16) * (rng.chance(0.5) ? 1 : -1) : 0;
+        const o = off + pushOut + rng.jitter(0.022) * sloppy;
+        const nx = Math.cos(p.ang) * o;
+        const nz = -Math.sin(p.ang) * o;
         out.push({
-          pos: new THREE.Vector3(p.u + nx, groundY(p.u, p.v) + y + rng.jitter(0.010), p.v + nz),
-          ry: p.ang + Math.PI / 2 + rng.jitter(0.055),
-          rz: rng.jitter(0.05),
-          rx: rng.jitter(0.04),
-          scale: rng.range(0.93, 1.10),
-          wear: rng.range(0.1, 0.6),
+          variant: rng.int(0, 6),
+          pos: new THREE.Vector3(
+            p.u + nx,
+            groundY(p.u, p.v) + y + dip(tNorm) * (1 - c / courses) + rng.jitter(0.012),
+            p.v + nz,
+          ),
+          ry: p.ang + Math.PI / 2 + rng.jitter(0.10) * sloppy + (rogue ? rng.jitter(0.45) : 0),
+          rz: rng.jitter(0.05) + (rogue ? rng.jitter(0.20) : 0),
+          rx: rng.jitter(0.05) * sloppy,
+          // Non-uniform: bags spread sideways as they are crushed downward.
+          sx: rng.range(0.94, 1.10),
+          sy: rng.range(0.90, 1.06) * (1 - 0.22 * load * load),
+          sz: rng.range(0.94, 1.12) * (1 + 0.14 * load * load),
+          wear: rng.range(0.1, 0.75),
         });
       }
     }
+  }
+  // A few bags that never made it onto the wall: split, spilled, kicked aside.
+  const spill = Math.max(2, Math.round(acc * 0.9));
+  for (let i = 0; i < spill; i++) {
+    const p = sample(rng.range(0, acc));
+    const o = (rng.chance(0.5) ? 1 : -1) * rng.range(0.35, 1.25);
+    out.push({
+      variant: rng.int(0, 6),
+      pos: new THREE.Vector3(
+        p.u + Math.cos(p.ang) * o,
+        groundY(p.u, p.v) + 0.035,
+        p.v - Math.sin(p.ang) * o,
+      ),
+      ry: rng.range(0, 6.28),
+      rz: rng.jitter(0.35),
+      rx: rng.jitter(0.30),
+      sx: rng.range(0.9, 1.1),
+      sy: rng.range(0.62, 0.92),
+      sz: rng.range(1.0, 1.2),
+      wear: rng.range(0.5, 1.0),
+    });
   }
   return out;
 }

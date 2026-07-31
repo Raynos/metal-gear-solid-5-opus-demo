@@ -87,6 +87,9 @@ function applyShot(name) {
   yaw = e.y;
   pitch = e.x;
   lighting.setTimeOfDay(s.tod);
+  // The AF point travels with the shot: an over-the-shoulder framing focuses on
+  // its subject, not on whatever the optical axis happens to hit.
+  engine.pipeline.afPoint.set(...(s.focus ?? [0.5, 0.5]));
   return s;
 }
 

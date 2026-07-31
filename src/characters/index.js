@@ -37,7 +37,7 @@ const LOADOUTS = {
     vest: true,
     backpack: true,
     holster: true,
-    kneepads: false,
+    kneepads: true,
     fingerless: true,
     beltPouches: [-0.11, 0.11],
     head: { jawWidth: 1.12 },
@@ -127,21 +127,45 @@ function frameSpawn(ground, shot) {
   const bottom = camPitch - halfV;
   const H = 1.86;
   const yaw = Math.atan2(-horiz.x, -horiz.z);
+
+  // An over-the-shoulder shot declares its rig; the subject is then wherever the
+  // rig says, not wherever a whole body happens to fit. Solving for "fits inside
+  // the frame" is what pushed round 2's player out to 4.6 m — the solver was
+  // being asked to keep the boots on screen, and MGSV's camera does not.
+  if (shot.subject) {
+    const { dist, lateral = 0, } = shot.subject;
+    // Camera-right in the same basis three.js' lookAt builds: x = up x (eye-target).
+    const rx = -horiz.z;
+    const rz = horiz.x;
+    return {
+      x: cam.x + horiz.x * dist - rx * lateral,
+      z: cam.z + horiz.z * dist - rz * lateral,
+      D: dist,
+      yaw,
+    };
+  }
+
   let fallback = null;
-  // 2.8 m is the closest a third-person camera ever sits behind a character;
+  // 2.4 m is the closest a third-person camera ever sits behind a character;
   // nearer than that and the shoulder fills the lens.
-  for (let D = 2.8; D <= 70; D += 0.2) {
+  //
+  // The margins are deliberately tight. The gameplay shot is THE frame this
+  // game gets judged on, and the first version of this solver kept a 4-degree
+  // safety border at top and bottom that pushed the player out to 5.3 m — a
+  // 37%-of-frame-height figure standing in the corner, which reads as set
+  // dressing rather than as the protagonist. Landing the boots on the bottom
+  // edge instead buys about 20% more subject.
+  for (let D = 2.4; D <= 70; D += 0.1) {
     const x = cam.x + horiz.x * D;
     const z = cam.z + horiz.z * D;
     const g = ground.heightAt(x, z);
     const head = Math.atan2(g + H - cam.y, D);
     const foot = Math.atan2(g - cam.y, D);
     if (!fallback) fallback = { x, z, D };
-    if (head < top - 0.07 && foot > bottom + 0.05) {
+    if (head < top - 0.035 && foot > bottom + 0.012) {
       // Push off the optical axis so the framing reads over-the-shoulder rather
-      // than centred like a character viewer.
-      // Classic over-the-shoulder: subject on the third, not centred.
-      const off = Math.min(2.0, 0.3 + D * 0.2);
+      // than centred like a character viewer: subject on the third, not centred.
+      const off = Math.min(1.6, 0.25 + D * 0.16);
       return { x: x + dir.z * off, z: z - dir.x * off, D, yaw };
     }
   }
@@ -225,7 +249,12 @@ export async function install(world) {
   const player = makeCharacter('player', {
     name: 'snake',
     position: [spawn.x, 0, spawn.z],
-    yaw: spawn.yaw - 0.22,
+    // Three-quarter away from the camera rather than square-on. A flat back is
+    // one silhouette and one value; turning ~30 degrees puts the chest rig,
+    // the holster and the far shoulder into the outline and gives the sun a
+    // different angle on each plane, which is most of what stops a backlit
+    // character reading as a cutout.
+    yaw: spawn.yaw + 0.52,
     scale: 1.02,
   });
   player.controlled = false;

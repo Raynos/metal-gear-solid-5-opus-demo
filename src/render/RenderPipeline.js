@@ -114,11 +114,24 @@ function buildGradeLUT(grade) {
         let g = gi / (N - 1);
         let b = bi / (N - 1);
 
+        // --- white balance ---
+        // Round 1 measured blue over red in every single daylight frame. The
+        // split tone alone could not fix that: it tints bands, and the whole
+        // image was cold. This warms the balance globally first, then the split
+        // tone shapes it. MGSV Afghanistan is sunbaked khaki, not a quarry.
+        const wb = grade.warmth;
+        r *= wb[0];
+        g *= wb[1];
+        b *= wb[2];
+
         const lum0 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
         // --- split tone ---
-        const sw = 1 - smoothstep(0.0, 0.45, lum0);
-        const hw = smoothstep(0.5, 1.0, lum0);
+        // Wider midtone band than round 1: the warmth has to live in the mids,
+        // which in a desert frame is most of the picture. The cool band is
+        // pulled down to the bottom sixth so only genuine shadow goes cyan.
+        const sw = 1 - smoothstep(0.0, 0.30, lum0);
+        const hw = smoothstep(0.62, 1.0, lum0);
         const mw = Math.max(0, 1 - sw - hw);
         r *= sh[0] * sw + mi[0] * mw + hi[0] * hw;
         g *= sh[1] * sw + mi[1] * mw + hi[1] * hw;
@@ -141,25 +154,37 @@ function buildGradeLUT(grade) {
         b = lum + (b - lum) * satW;
 
         // --- contrast about a filmic pivot ---
+        // Pivot-preserving: a straight (v - pivot) * c + pivot pushes anything
+        // above ~0.95 straight past 1.0, which is where round 1's clipped
+        // highlights were actually manufactured — after the tonemap, in the
+        // grade. This form maps 0 -> 0 and 1 -> 1 exactly and cannot overshoot,
+        // so the tonemap's white point survives the grade intact.
         const pivot = 0.42;
-        r = (r - pivot) * grade.contrast + pivot;
-        g = (g - pivot) * grade.contrast + pivot;
-        b = (b - pivot) * grade.contrast + pivot;
+        const con = (v) =>
+          v < pivot
+            ? pivot * Math.pow(Math.max(v, 0) / pivot, grade.contrast)
+            : 1 - (1 - pivot) * Math.pow(Math.max(1 - v, 0) / (1 - pivot), grade.contrast);
+        r = con(r);
+        g = con(g);
+        b = con(b);
 
         // --- lifted, slightly cool toe: MGSV shadows are never crushed ---
+        // The toe is where the *only* coolness in the frame belongs. Keeping it
+        // here rather than in the midtones is the whole "cool shadows, warm
+        // khaki mids" split; round 1 leaked it across the entire range.
         const lift = grade.lift;
         r = r * (1 - lift) + lift * 0.86;
-        g = g * (1 - lift) + lift * 0.97;
-        b = b * (1 - lift) + lift * 1.14;
+        g = g * (1 - lift) + lift * 0.965;
+        b = b * (1 - lift) + lift * 1.18;
 
         // --- gentle highlight rolloff toward a warm neutral ---
         const roll = (v, warm) => {
-          const t = smoothstep(0.72, 1.05, v);
-          return v * (1 - t * 0.14) + t * 0.14 * warm;
+          const t = smoothstep(0.74, 1.05, v);
+          return v * (1 - t * 0.12) + t * 0.12 * warm;
         };
-        r = roll(r, 1.0);
-        g = roll(g, 0.985);
-        b = roll(b, 0.955);
+        r = roll(r, 1.02);
+        g = roll(g, 0.995);
+        b = roll(b, 0.94);
 
         data[p++] = Math.round(Math.min(1, Math.max(0, r)) * 255);
         data[p++] = Math.round(Math.min(1, Math.max(0, g)) * 255);
@@ -312,6 +337,11 @@ export class RenderPipeline {
     };
     this.exposure = 0.88;
     this.grade = { ...GRADE };
+    /**
+     * Where autofocus reads depth, in UV (0,0 = bottom-left). Shots that put a
+     * subject off the optical axis move it; everything else leaves it centred.
+     */
+    this.afPoint = new THREE.Vector2(0.5, 0.5);
 
     this.frame = 0;
     this._historyValid = false;
@@ -368,10 +398,10 @@ export class RenderPipeline {
     this.hdr.depthTexture.minFilter = THREE.NearestFilter;
     this.hdr.depthTexture.magFilter = THREE.NearestFilter;
 
-    const hw = Math.max(2, Math.floor(w / 2));
-    const hh = Math.max(2, Math.floor(h / 2));
-    this.aoRT = this._rt(hw, hh);
-    this.aoBlurRT = this._rt(hw, hh);
+    // Full-res AO. Contact darkening lives in a 2-3 pixel band and a half-res
+    // buffer cannot carry it however good the upsample is.
+    this.aoRT = this._rt(w, h);
+    this.aoBlurRT = this._rt(w, h);
 
     this.prepRT = this._rt(w, h);
     this.taaA = this._rt(w, h);
@@ -409,8 +439,8 @@ export class RenderPipeline {
     this.taaB.setSize(w, h);
     this.dofRT.setSize(w, h);
     this.compositeRT.setSize(w, h);
-    this.aoRT.setSize(Math.floor(w / 2), Math.floor(h / 2));
-    this.aoBlurRT.setSize(Math.floor(w / 2), Math.floor(h / 2));
+    this.aoRT.setSize(w, h);
+    this.aoBlurRT.setSize(w, h);
     let bw = Math.floor(w / 2);
     let bh = Math.floor(h / 2);
     for (const rt of this.bloomRTs) {
@@ -438,6 +468,22 @@ export class RenderPipeline {
     if (this.lut) this.lut.dispose();
     this.lut = buildGradeLUT(this.grade);
     this.compositeMat.uniforms.tLUT.value = this.lut;
+    this._refreshWhitePoint();
+  }
+
+  /**
+   * Normalise the tonemap so `grade.whitePoint` linear maps to display 1.0.
+   * The ACES input/output matrices preserve neutrals (their rows sum to one),
+   * so the scalar is just the reciprocal of the RRT/ODT fit at the white point.
+   */
+  _refreshWhitePoint() {
+    const W = this.grade.whitePoint ?? 2.6;
+    const shoulder = this.grade.shoulder ?? 0.3;
+    const fit = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081);
+    const u = this.compositeMat.uniforms;
+    u.uWhitePoint.value = W;
+    u.uShoulder.value = shoulder;
+    u.uWhiteScale.value = 1 / Math.max(fit(W), 1e-4);
   }
 
   // -------------------------------------------------------------------------
@@ -452,19 +498,30 @@ export class RenderPipeline {
         depthWrite: false,
       });
 
-    // ---- GTAO / HBAO ----------------------------------------------------
+    // ---- GTAO -----------------------------------------------------------
+    // Ground-truth ambient occlusion: two horizon angles per slice and the
+    // closed-form cosine-weighted visibility integral between them. The round-1
+    // pass took max(sin(horizon)) per side, which is the HBAO approximation —
+    // it under-darkens creases (the integral is dominated by the *arc* between
+    // horizons, not by the deepest one) and it is why nothing in the frame sat
+    // in a pool of contact shading. Runs at full resolution: at 1280x720 the
+    // cost is a fraction of a millisecond and half-res simply cannot resolve
+    // the 2-3 pixel contact band where a sandbag meets the sand.
     this.aoMat = mat(
       /* glsl */ `
       precision highp float;
       varying vec2 vUv;
       uniform sampler2D tDepth;
-      uniform vec2 uResolution;      // half-res target size
+      uniform vec2 uResolution;
       uniform mat4 uProjInv;
       uniform vec2 uProjScale;       // projection scale for radius -> pixels
       uniform float uRadius;
-      uniform float uIntensity;
+      uniform float uThickness;
       uniform float uFrame;
       ${COMMON_GLSL}
+
+      const float PI_ = 3.14159265359;
+      const float HALF_PI = 1.57079632679;
 
       vec3 viewAt(vec2 uv) {
         float d = texture2D(tDepth, uv).x;
@@ -473,7 +530,7 @@ export class RenderPipeline {
 
       void main() {
         float d = texture2D(tDepth, vUv).x;
-        if (d >= 0.9999995) { gl_FragColor = vec4(1.0, 1.0, 0.0, 1.0); return; }
+        if (d >= 0.9999995) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
 
         vec3 P = viewFromDepth(vUv, d, uProjInv);
         vec2 texel = 1.0 / uResolution;
@@ -488,50 +545,77 @@ export class RenderPipeline {
         vec3 dy = abs(pyu.z - P.z) < abs(P.z - pyd.z) ? (pyu - P) : (P - pyd);
         vec3 N = normalize(cross(dx, dy));
         if (N.z < 0.0) N = -N;
+        vec3 V = normalize(-P);
 
         // Screen-space radius of the world-space sample sphere.
         float pixRadius = uRadius * uProjScale.y * uResolution.y * 0.5 / max(-P.z, 0.05);
-        pixRadius = clamp(pixRadius, 2.0, 64.0);
+        pixRadius = clamp(pixRadius, 3.0, 96.0);
 
-        float rot = ign(gl_FragCoord.xy + uFrame * 7.13) * 6.2831853;
+        float rot = ign(gl_FragCoord.xy + uFrame * 7.13);
         float offset = fract(ign(gl_FragCoord.yx * 1.37) + uFrame * 0.618);
 
-        const int SLICES = 4;
-        const int STEPS = 6;
-        float occ = 0.0;
+        const int SLICES = 3;
+        const int STEPS = 8;
+        float visibility = 0.0;
 
         for (int s = 0; s < SLICES; s++) {
-          float phi = (float(s) + 0.5) * 3.14159265 / float(SLICES) + rot;
-          vec2 dir = vec2(cos(phi), sin(phi));
+          float phi = (float(s) + rot) * PI_ / float(SLICES);
+          vec2 omega = vec2(cos(phi), sin(phi));
+          vec3 dirV = vec3(omega, 0.0);
+          vec3 sliceN = cross(dirV, V);
+          float sliceLen = length(sliceN);
+          if (sliceLen < 1e-5) continue;
+          sliceN /= sliceLen;
 
-          for (int side = 0; side < 2; side++) {
-            vec2 sdir = side == 0 ? dir : -dir;
-            float best = 0.0;
-            for (int k = 0; k < STEPS; k++) {
-              float t = (float(k) + offset) / float(STEPS);
-              t = t * t;                       // bias samples toward the centre
-              vec2 suv = vUv + sdir * t * pixRadius * texel;
+          // Project the surface normal into the slice plane; the visibility
+          // integral is one-dimensional in that plane.
+          vec3 projN = N - sliceN * dot(N, sliceN);
+          float projNLen = length(projN);
+          if (projNLen < 1e-4) continue;
+          vec3 tangent = cross(V, sliceN);
+          float cosN = clamp(dot(projN, V) / projNLen, -1.0, 1.0);
+          float n = sign(dot(projN, tangent)) * acos(cosN);
+
+          float hA = -1.0;   // cos of the horizon on the -omega side
+          float hB = -1.0;   // cos of the horizon on the +omega side
+
+          for (int k = 0; k < STEPS; k++) {
+            float t = (float(k) + offset) / float(STEPS);
+            t = t * t;                      // bias samples toward the centre
+            vec2 off = omega * t * pixRadius * texel;
+
+            for (int side = 0; side < 2; side++) {
+              vec2 suv = side == 0 ? vUv + off : vUv - off;
               float sd = texture2D(tDepth, suv).x;
               if (sd >= 0.9999995) continue;
               vec3 S = viewFromDepth(suv, sd, uProjInv);
               vec3 D = S - P;
-              float len = length(D);
-              if (len < 0.0015) continue;
-              float sinH = dot(N, D) / len;
-              // Quadratic distance falloff keeps distant geometry from
-              // painting occlusion onto unrelated surfaces.
-              float att = 1.0 - clamp(len / uRadius, 0.0, 1.0);
-              att *= att;
-              best = max(best, sinH * att);
+              float len2 = dot(D, D);
+              if (len2 < 1e-7) continue;
+              float len = sqrt(len2);
+              float cosH = dot(D, V) / len;
+              // Range falloff, and a thickness heuristic so a thin occluder
+              // (a wire, a fence post) does not shadow everything behind it.
+              float w = clamp(1.0 - (len - uRadius * 0.55) / (uRadius * 0.45), 0.0, 1.0);
+              if (side == 0) {
+                hB = cosH > hB ? mix(hB, cosH, w) : mix(hB, cosH, uThickness);
+              } else {
+                hA = cosH > hA ? mix(hA, cosH, w) : mix(hA, cosH, uThickness);
+              }
             }
-            occ += max(best, 0.0);
           }
+
+          float h1 = n + max(-acos(clamp(hA, -1.0, 1.0)) - n, -HALF_PI);
+          float h2 = n + min( acos(clamp(hB, -1.0, 1.0)) - n,  HALF_PI);
+          float sinN = sin(n);
+          visibility += projNLen * 0.25 * (
+              (h1 * 2.0 * sinN - cos(2.0 * h1 - n)) +
+              (h2 * 2.0 * sinN - cos(2.0 * h2 - n)) + 2.0 * cos(n));
         }
 
-        float ao = 1.0 - occ / float(SLICES * 2) * uIntensity;
-        ao = clamp(ao, 0.0, 1.0);
-        // Store linear view depth alongside so the bilateral blur and the
-        // upsample can reject samples across depth discontinuities.
+        float ao = clamp(visibility / float(SLICES), 0.0, 1.0);
+        // Store linear view depth alongside so the bilateral blur can reject
+        // samples across depth discontinuities.
         gl_FragColor = vec4(ao, -P.z, 0.0, 1.0);
       }
       `,
@@ -540,13 +624,18 @@ export class RenderPipeline {
         uResolution: { value: new THREE.Vector2() },
         uProjInv: { value: new THREE.Matrix4() },
         uProjScale: { value: new THREE.Vector2(1, 1) },
-        uRadius: { value: 1.6 },
-        uIntensity: { value: 1.0 },
+        uRadius: { value: 2.2 },
+        uThickness: { value: 0.14 },
         uFrame: { value: 0 },
       },
     );
 
     // ---- depth-aware bilateral blur for AO ------------------------------
+    // The round-1 blur weighted by |dz| alone, which bleeds an object's own
+    // occlusion out over the ground behind it whenever the two are at similar
+    // depth. Weighting by the distance from the *tangent plane* instead (a
+    // plane-aware bilateral) rejects the neighbour surface even when its depth
+    // matches, which is what stops the halo around every silhouette.
     this.aoBlurMat = mat(
       /* glsl */ `
       precision highp float;
@@ -555,19 +644,23 @@ export class RenderPipeline {
       uniform vec2 uDir;
       void main() {
         vec2 c = texture2D(tAO, vUv).rg;
-        if (c.g <= 0.0) { gl_FragColor = vec4(c, 0.0, 1.0); return; }
+        if (c.g <= 0.0) { gl_FragColor = vec4(c.r, c.g, 0.0, 1.0); return; }
+        // Local depth slope along the blur axis, from the immediate neighbours.
+        float dp = texture2D(tAO, vUv + uDir).g;
+        float dm = texture2D(tAO, vUv - uDir).g;
+        float slope = 0.0;
+        if (dp > 0.0 && dm > 0.0) slope = (dp - dm) * 0.5;
         float sum = c.r;
         float wsum = 1.0;
-        for (int i = 1; i <= 5; i++) {
+        for (int i = 1; i <= 6; i++) {
           float fi = float(i);
-          float gw = exp(-fi * fi * 0.14);
+          float gw = exp(-fi * fi * 0.085);
           for (int s = 0; s < 2; s++) {
-            vec2 o = uDir * fi * (s == 0 ? 1.0 : -1.0);
-            vec2 t = texture2D(tAO, vUv + o).rg;
+            float sg = s == 0 ? 1.0 : -1.0;
+            vec2 t = texture2D(tAO, vUv + uDir * fi * sg).rg;
             if (t.g <= 0.0) continue;
-            // Relative depth tolerance — an absolute one either bleeds in the
-            // near field or over-sharpens at distance.
-            float dw = exp(-abs(t.g - c.g) / (c.g * 0.035 + 0.05));
+            float predicted = c.g + slope * fi * sg;
+            float dw = exp(-abs(t.g - predicted) / (c.g * 0.012 + 0.03));
             float w = gw * dw;
             sum += t.r * w;
             wsum += w;
@@ -587,11 +680,14 @@ export class RenderPipeline {
       uniform sampler2D tColor;
       uniform sampler2D tDepth;
       uniform sampler2D tAO;
-      uniform vec2 uAOTexel;
       uniform mat4 uInvViewProj;
       uniform mat4 uProjInv;
       uniform vec3 uCamPos;
       uniform float uAOEnabled;
+      uniform float uAOPower;
+      uniform float uAOFloor;
+      uniform float uAODirect;
+      uniform vec3 uAOTint;
       uniform float uAerialEnabled;
       // atmosphere
       uniform vec3 uSunDir;
@@ -627,45 +723,35 @@ export class RenderPipeline {
         return (H / k) * (a - b);
       }
 
-      /** Depth-aware upsample of the half-res AO. */
-      float fetchAO(vec2 uv, float viewZ) {
-        vec2 o = uAOTexel;
-        float sum = 0.0;
-        float wsum = 0.0;
-        for (int i = 0; i < 4; i++) {
-          vec2 d = vec2(i == 1 || i == 3 ? 1.0 : -1.0, i >= 2 ? 1.0 : -1.0) * 0.5;
-          vec2 t = texture2D(tAO, uv + d * o).rg;
-          if (t.g <= 0.0) continue;
-          float w = exp(-abs(t.g - viewZ) / (viewZ * 0.04 + 0.08));
-          sum += t.r * w;
-          wsum += w;
-        }
-        return wsum > 0.001 ? sum / wsum : texture2D(tAO, uv).r;
-      }
-
       void main() {
         vec3 color = texture2D(tColor, vUv).rgb;
         float d = texture2D(tDepth, vUv).x;
         bool isSky = d >= 0.9999995;
 
         if (uAOEnabled > 0.5 && !isSky) {
-          vec3 vp = viewFromDepth(vUv, d, uProjInv);
-          float ao = fetchAO(vUv, -vp.z);
+          float ao = pow(clamp(texture2D(tAO, vUv).r, 0.0, 1.0), uAOPower);
           // Jimenez multi-bounce: single-scatter AO over-darkens bright
           // albedos. Approximated against the desert palette.
-          vec3 alb = vec3(0.52, 0.46, 0.37);
+          vec3 alb = vec3(0.54, 0.46, 0.33);
           vec3 a = 2.0404 * alb - 0.3324;
           vec3 b = -4.7951 * alb + 0.6417;
           vec3 c = 2.7552 * alb + 0.6903;
           vec3 mb = max(vec3(ao), ((ao * a + b) * ao + c) * ao);
-          // Floor it. On a surface whose only light is the sky IBL, unbounded AO
-          // takes an already-dim wall to zero, and MGSV shadows are never black.
-          mb = max(mb, vec3(0.34));
-          // Occlusion belongs to the ambient term only; weight it away from
-          // pixels that are obviously carrying direct sun.
+          mb = max(mb, vec3(uAOFloor));
+          // Occlusion removes the *sky* first — it is the widest source — and
+          // leaves the ground bounce, so a pocket of AO gets warmer as it gets
+          // darker. This is a bent-normal effect done on the cheap and it is a
+          // large part of why a real desert crevice is ochre, not blue-black.
+          vec3 occ = mb * mix(uAOTint, vec3(1.0), mb);
+          // Occlusion belongs to the ambient term. With no G-buffer the split
+          // cannot be exact, so lean on the fact that AO only reaches low
+          // values where the sun is geometrically blocked anyway, and keep a
+          // hard floor of uAODirect on lit pixels so contact shading still
+          // reads on sunlit sand — the round-1 weight faded it out to nothing
+          // exactly where the critics went looking for it.
           float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
-          float w = 1.0 - smoothstep(0.22, 1.1, lum);
-          color *= mix(vec3(1.0), mb, w);
+          float w = mix(1.0, uAODirect, smoothstep(0.10, 0.85, lum));
+          color *= mix(vec3(1.0), occ, w);
         }
 
         if (uAerialEnabled > 0.5 && !isSky) {
@@ -710,7 +796,10 @@ export class RenderPipeline {
         tColor: { value: null },
         tDepth: { value: null },
         tAO: { value: null },
-        uAOTexel: { value: new THREE.Vector2() },
+        uAOPower: { value: 1.20 },
+        uAOFloor: { value: 0.32 },
+        uAODirect: { value: 0.55 },
+        uAOTint: { value: new THREE.Vector3(1.14, 1.0, 0.78) },
         uInvViewProj: { value: new THREE.Matrix4() },
         uProjInv: { value: new THREE.Matrix4() },
         uCamPos: { value: new THREE.Vector3() },
@@ -723,9 +812,9 @@ export class RenderPipeline {
         uBetaM: { value: new THREE.Vector3() },
         uBetaD: { value: new THREE.Vector3() },
         uMieG: { value: 0.72 },
-        uApStrength: { value: 1.0 },
-        uApAmbient: { value: 0.78 },
-        uDustAlbedo: { value: new THREE.Vector3(1.18, 1.0, 0.74) },
+        uApStrength: { value: 1.50 },
+        uApAmbient: { value: 1.55 },
+        uDustAlbedo: { value: new THREE.Vector3(1.04, 1.0, 0.93) },
       },
     );
 
@@ -866,9 +955,11 @@ export class RenderPipeline {
         // decide the exposure, which is exactly why the same time of day read
         // two stops apart between a vista and an over-the-shoulder framing.
         vec2 d = vUv - 0.5;
-        float w = 1.0 - 0.78 * smoothstep(0.02, 0.22, dot(d, d));
-        // Clamp the metering range so the sun disc cannot drag the average.
-        float lg = clamp(log(max(l, 1e-4)), -6.0, 2.2);
+        float w = 1.0 - 0.62 * smoothstep(0.02, 0.26, dot(d, d));
+        // Clamp the metering range so the sun disc and the blown sky cannot
+        // drag the average. Round 1 let them, which is why the same time of day
+        // exposed a stop apart between the vista and the outpost.
+        float lg = clamp(log(max(l, 1e-4)), -5.5, 1.4);
         gl_FragColor = vec4(lg * w, w, 0.0, 1.0);
       }
       `,
@@ -903,6 +994,8 @@ export class RenderPipeline {
       uniform float uSnap;
       uniform float uNear;
       uniform float uFar;
+      uniform vec2 uAFPoint;
+      uniform float uAFRadius;
       void main() {
         vec2 lw = texture2D(tLum, vec2(0.5)).rg;
         float cur = lw.r / max(lw.g, 1e-4);
@@ -912,10 +1005,24 @@ export class RenderPipeline {
         float rate = cur < prev ? uRate * 0.55 : uRate;
         float lum = mix(prev, cur, uSnap > 0.5 ? 1.0 : rate);
 
-        // Auto focus rides in .g: linear view distance at the frame centre.
-        float d = texture2D(tDepth, vec2(0.5)).x;
-        float z = d >= 0.9999995 ? uFar : (2.0 * uNear * uFar) / (uFar + uNear - (d * 2.0 - 1.0) * (uFar - uNear));
-        z = min(z, 900.0);
+        // Auto focus rides in .g: linear view distance under the AF point.
+        //
+        // The AF point is NOT the frame centre. An over-the-shoulder framing
+        // puts its subject on the third by definition, so a centre-weighted
+        // autofocus locks onto the yard 15 m behind him and hands back a hero
+        // rendered entirely inside the circle of confusion — which is exactly
+        // what the gameplay shot was doing. Shots declare where the subject is;
+        // everything else keeps the default centre point. Nine taps across a
+        // small patch, nearest wins, so a thin subject is not missed between
+        // texels.
+        float z = 1e9;
+        for (int i = 0; i < 9; i++) {
+          vec2 o = vec2(float(i / 3) - 1.0, float(i - (i / 3) * 3) - 1.0) * uAFRadius;
+          float d = texture2D(tDepth, clamp(uAFPoint + o, vec2(0.002), vec2(0.998))).x;
+          float zi = d >= 0.9999995 ? uFar : (2.0 * uNear * uFar) / (uFar + uNear - (d * 2.0 - 1.0) * (uFar - uNear));
+          z = min(z, zi);
+        }
+        z = clamp(z, 0.3, 900.0);
         float pf = texture2D(tPrev, vec2(0.5)).g;
         float focus = mix(pf, z, uSnap > 0.5 ? 1.0 : 0.12);
 
@@ -930,6 +1037,8 @@ export class RenderPipeline {
         uSnap: { value: 1 },
         uNear: { value: 0.15 },
         uFar: { value: 6000 },
+        uAFPoint: { value: new THREE.Vector2(0.5, 0.5) },
+        uAFRadius: { value: 0.018 },
       },
     );
 
@@ -1173,6 +1282,9 @@ export class RenderPipeline {
       uniform float uKeyValue;
       uniform vec2 uExposureClamp;
       uniform float uLutStrength;
+      uniform float uWhitePoint;
+      uniform float uShoulder;
+      uniform float uWhiteScale;
 
       const mat3 ACESInput = mat3(
         0.59719, 0.07600, 0.02840,
@@ -1189,11 +1301,37 @@ export class RenderPipeline {
         vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
         return a / b;
       }
+      /**
+       * Filmic tonemap with an explicit white point.
+       *
+       * Round 1 ran bare clamped ACES, which has no white point at all: the
+       * vista topped out at L=0.814 across two million pixels (a flat grey
+       * plate) while the outpost piled 5% of its pixels on pure 1.0. Both ends
+       * wrong at once, because "how much linear light is white" was never a
+       * number anywhere in the stack.
+       *
+       * Now it is. Everything above the knee is folded exponentially into
+       * [knee, whitePoint] so no input, however hot, can reach the ceiling;
+       * ACES then shapes the curve and the result is normalised by the tonemap
+       * of the white point itself, so whitePoint maps to exactly 1.0 and only
+       * asymptotically. Sunlit sand sits in the shoulder near 0.85 and the sun
+       * disc rolls off instead of clipping.
+       */
       vec3 acesFitted(vec3 color) {
+        float knee = uWhitePoint * uShoulder;
+        vec3 over = max(color - knee, 0.0);
+        float span = max(uWhitePoint - knee, 1e-3);
+        // Rational fold, not exponential. An exponential reaches 99% of the
+        // ceiling by 5x the span, so a bright sky pins at the white point and
+        // clips exactly as hard as having no white point at all; the rational
+        // form needs 100x, which leaves the sky sitting inside the shoulder
+        // where it belongs and keeps cloud modelling readable.
+        vec3 x = over / span;
+        color = min(color, knee) + span * (x / (1.0 + x));
         color = ACESInput * color;
         color = RRTAndODTFit(color);
         color = ACESOutput * color;
-        return clamp(color, 0.0, 1.0);
+        return clamp(color * uWhiteScale, 0.0, 1.0);
       }
 
       vec3 linearToSRGB(vec3 c) {
@@ -1290,11 +1428,15 @@ export class RenderPipeline {
         uCA: { value: GRADE.chromaticAberration },
         uDistortion: { value: 0.035 },
         uAutoExposure: { value: 1 },
-        uKeyValue: { value: 0.24 },
-        uExposureClamp: { value: new THREE.Vector2(0.45, 2.6) },
+        uKeyValue: { value: 0.203 },
+        uExposureClamp: { value: new THREE.Vector2(0.50, 1.70) },
         uLutStrength: { value: 1.0 },
+        uWhitePoint: { value: GRADE.whitePoint ?? 5.2 },
+        uShoulder: { value: GRADE.shoulder ?? 0.3 },
+        uWhiteScale: { value: 1.0 },
       },
     );
+    this._refreshWhitePoint();
 
     // ---- FXAA (fallback) + sharpen ----------------------------------------
     this.fxaaMat = mat(
@@ -1337,7 +1479,13 @@ export class RenderPipeline {
         // Unsharp mask restores micro-detail that TAA/FXAA smear — the
         // difference between "blurry web demo" and "console sharp".
         vec3 blur = (rgbNW + rgbNE + rgbSW + rgbSE) * 0.25;
-        result += (result - blur) * uSharpen;
+        vec3 sharp = (result - blur) * uSharpen;
+        // Every clipped pixel left in the frame after the tonemap got its white
+        // point was manufactured HERE: a bright halo against the sky pushed past
+        // 1.0 and clamped. Above 0.84 only the dark lobe of the halo survives,
+        // which is the lobe that actually reads as sharpness anyway.
+        float hi = max(result.r, max(result.g, result.b));
+        result += mix(sharp, min(sharp, vec3(0.0)), smoothstep(0.84, 1.0, hi));
 
         gl_FragColor = vec4(clamp(result, 0.0, 1.0), 1.0);
       }
@@ -1373,10 +1521,14 @@ export class RenderPipeline {
     const rs = a.rayleighScale ?? 1;
     const ms = a.mieScale ?? 1;
     const dd = a.dustDensity ?? 1;
-    u.uBetaR.value.set(5.802e-6 * rs, 13.558e-6 * rs, 33.1e-6 * rs).multiplyScalar(1.6);
+    // Rayleigh pulled back and dust pushed up. At 2 km in an Afghan valley the
+    // extinction is dominated by suspended mineral dust, not by air; round 1
+    // had the balance the other way and every distant ridge inherited the sky's
+    // blue, which is most of why the frame measured B > R everywhere.
+    u.uBetaR.value.set(5.802e-6 * rs, 13.558e-6 * rs, 33.1e-6 * rs).multiplyScalar(1.78);
     u.uBetaM.value.set(2.2e-5 * ms, 2.1e-5 * ms, 2.0e-5 * ms);
     // Angstrom-ish 1/lambda tilt: fine dust scatters blue slightly more.
-    u.uBetaD.value.set(0.70e-4 * dd, 0.74e-4 * dd, 0.80e-4 * dd);
+    u.uBetaD.value.set(1.30e-4 * dd, 1.34e-4 * dd, 1.40e-4 * dd);
     u.uCamPos.value.copy(camera.position);
   }
 
@@ -1451,7 +1603,6 @@ export class RenderPipeline {
     pu.tColor.value = this.hdr.texture;
     pu.tDepth.value = this.hdr.depthTexture;
     pu.tAO.value = this.aoRT.texture;
-    pu.uAOTexel.value.set(1 / this.aoRT.width, 1 / this.aoRT.height);
     pu.uInvViewProj.value.copy(this._invViewProj);
     pu.uProjInv.value.copy(this._jitProjInv);
     pu.uAOEnabled.value = this.enabled.ssao ? 1 : 0;
@@ -1493,6 +1644,7 @@ export class RenderPipeline {
     adu.uSnap.value = !this._historyValid || this.frame < 3 || jumped ? 1 : 0;
     adu.uNear.value = camera.near;
     adu.uFar.value = camera.far;
+    adu.uAFPoint.value.copy(this.afPoint);
     this._blit(this.adaptMat, this.adaptA);
     {
       const t = this.adaptA;

@@ -14,10 +14,11 @@ import { makeRockPolytope, weldFaces, polyNormal } from './Polytope.js';
  * sun exactly the way a worn edge does. It is the difference between "low-poly
  * asset" and "rock".
  *
- * Two per-vertex channels are baked and consumed by the shader:
+ * Four per-vertex channels are baked and consumed by the shader:
  *   aRock.x  cavity   — discrete mean curvature. >0 in crevices, <0 on edges.
  *   aRock.y  ao       — the same field smoothed over the surface: broad occlusion.
  *   aRock.z  heightFrac — 0 at the rock's base, 1 at its top (dust + contact dirt).
+ *   aRock.w  skirt    — 0 on the rock body, 1 at the outer rim of the fines apron.
  */
 
 /** Mid-edge weld helper for subdivision. */
@@ -301,7 +302,7 @@ function toGeometry(verts, tris, cav, ao, angleDeg) {
   const n = tris.length * 3;
   const pos = new Float32Array(n * 3);
   const nor = new Float32Array(n * 3);
-  const rk = new Float32Array(n * 3);
+  const rk = new Float32Array(n * 4);
   const acc = new THREE.Vector3();
   const fnUnit = new THREE.Vector3();
   let w = 0;
@@ -325,9 +326,10 @@ function toGeometry(verts, tris, cav, ao, angleDeg) {
       nor[w * 3] = acc.x;
       nor[w * 3 + 1] = acc.y;
       nor[w * 3 + 2] = acc.z;
-      rk[w * 3] = cav[vi];
-      rk[w * 3 + 1] = ao[vi];
-      rk[w * 3 + 2] = (v.y - minY) * invH;
+      rk[w * 4] = cav[vi];
+      rk[w * 4 + 1] = ao[vi];
+      rk[w * 4 + 2] = (v.y - minY) * invH;
+      rk[w * 4 + 3] = 0;
       w++;
     }
   });
@@ -335,10 +337,194 @@ function toGeometry(verts, tris, cav, ao, angleDeg) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-  geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 3));
+  geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 4));
   geo.computeBoundingSphere();
   geo.computeBoundingBox();
   return geo;
+}
+
+/**
+ * Weathering relaxation: pull *convex* vertices toward their neighbourhood mean.
+ *
+ * A uniform chamfer rounds every edge equally, which is not how rock wears — an
+ * exposed shoulder is blunted by decades of sun, frost and grit while a freshly
+ * cleaved face and the grooves between beds stay sharp. Weighting Laplacian
+ * smoothing by convexity does exactly that for free: flat faces have zero
+ * curvature and do not move, crevices are concave and do not move, and only the
+ * exposed edges get blunted. `upBias` rounds skyward edges harder than the
+ * sheltered underside, which is the asymmetry that actually reads.
+ */
+function weatherEdges(verts, tris, strength, upBias = 0.55) {
+  if (strength <= 0) return;
+  const nb = verts.map(() => []);
+  for (const [a, b, c] of tris) {
+    nb[a].push(b, c);
+    nb[b].push(c, a);
+    nb[c].push(a, b);
+  }
+  const nrm = smoothNormals(verts, tris);
+  const avg = new THREE.Vector3();
+  const d = new THREE.Vector3();
+  const target = verts.map(() => null);
+  for (let i = 0; i < verts.length; i++) {
+    const list = nb[i];
+    if (!list.length) continue;
+    avg.set(0, 0, 0);
+    let scale = 0;
+    for (const j of list) {
+      avg.add(verts[j]);
+      scale += verts[j].distanceTo(verts[i]);
+    }
+    avg.multiplyScalar(1 / list.length);
+    scale /= list.length;
+    d.subVectors(avg, verts[i]);
+    // d.n < 0 => the neighbourhood sits behind the surface => convex edge
+    const convex = Math.max(0, -d.dot(nrm[i]) / Math.max(1e-5, scale));
+    const w = Math.min(1, convex * 2.4) * strength * (1 - upBias + upBias * (nrm[i].y * 0.5 + 0.5));
+    if (w > 1e-4) target[i] = verts[i].clone().lerp(avg, Math.min(0.85, w));
+  }
+  for (let i = 0; i < verts.length; i++) if (target[i]) verts[i].copy(target[i]);
+}
+
+/**
+ * Bedding ledges: quantise the body's horizontal profile into courses.
+ *
+ * The shader can paint strata onto a smooth shell all day and it still reads as
+ * a decal. What sells sedimentary rock is that the *silhouette* steps — each
+ * bed weathers back a different distance, so the outline is a staircase. A
+ * saw-tooth in local Y pushed along the horizontal component of the normal
+ * gives that, and it survives to the skyline where texture does not.
+ */
+function beddingLedges(verts, tris, courses, depth, phase) {
+  if (courses <= 0 || depth <= 0) return;
+  const nrm = smoothNormals(verts, tris);
+  const h = new THREE.Vector3();
+  for (let i = 0; i < verts.length; i++) {
+    const n = nrm[i];
+    h.set(n.x, 0, n.z);
+    const side = h.length();
+    if (side < 0.12) continue;              // bed tops and undersides are unaffected
+    h.multiplyScalar(1 / side);
+    const t = verts[i].y * courses + phase;
+    const bed = Math.floor(t);
+    const f = t - bed;
+    // Each course recedes by its own amount, with a sharp undercut at the contact.
+    const recede = ((Math.sin(bed * 12.9898) * 43758.5453) % 1 + 1) % 1;
+    const undercut = Math.exp(-f * f * 26) + Math.exp(-(1 - f) * (1 - f) * 40) * 0.6;
+    verts[i].addScaledVector(h, -depth * side * (recede * 0.75 + undercut * 0.9));
+  }
+}
+
+/**
+ * A low apron of wind- and rain-accumulated fines banked against the rock's base.
+ *
+ * This is the cheapest fix in the whole module and the one that does the most
+ * work: a hard silhouette meeting a flat plane is the single loudest "dropped in
+ * by a script" tell, and 40 triangles of sand collar removes it. The rim is
+ * deliberately taken *below* the body's base plane so the terrain clips it —
+ * there is never a visible disc edge, only the curve where the drift meets the
+ * ground, which is what you actually see in the desert.
+ *
+ * Returns the vertex/tri lists to concatenate; `aRock.w` ramps 0 -> 1 outward so
+ * the shader can fade the rock surface into sand across the collar.
+ */
+function buildSkirt(geo, { bins = 12, flare = 1.62, lip = 0.05, drop = 0.16, sink = 0.3, rng }) {
+  const p = geo.attributes.position.array;
+  const count = geo.attributes.position.count;
+  geo.computeBoundingBox();
+  const sy = Math.max(1e-4, geo.boundingBox.max.y - geo.boundingBox.min.y);
+  // Silhouette radius per azimuth, measured over the lower third of the body —
+  // the collar banks against the base, not against an overhang.
+  const rad = new Float32Array(bins);
+  const yTop = geo.boundingBox.min.y + sy * 0.34;
+  for (let i = 0; i < count; i++) {
+    const x = p[i * 3];
+    const y = p[i * 3 + 1];
+    const z = p[i * 3 + 2];
+    if (y > yTop) continue;
+    const r = Math.hypot(x, z);
+    let b = Math.floor(((Math.atan2(z, x) + Math.PI) / (Math.PI * 2)) * bins) % bins;
+    if (b < 0) b += bins;
+    if (r > rad[b]) rad[b] = r;
+  }
+  // Fill empty bins and smooth, or the collar develops spikes.
+  let fallback = 0;
+  for (let i = 0; i < bins; i++) fallback = Math.max(fallback, rad[i]);
+  for (let i = 0; i < bins; i++) if (rad[i] <= 0) rad[i] = fallback * 0.6;
+  const sm = Float32Array.from(rad);
+  for (let i = 0; i < bins; i++) {
+    rad[i] = sm[(i + bins - 1) % bins] * 0.25 + sm[i] * 0.5 + sm[(i + 1) % bins] * 0.25;
+  }
+
+  const y0 = geo.boundingBox.min.y + sink * sy;   // where the ground line lands
+  const verts = [];
+  const rw = [];                                   // skirt weight per vertex
+  const tris = [];
+  // Drifts are asymmetric — the lee side banks up much further than the windward.
+  const lee = rng() * Math.PI * 2;
+  for (let i = 0; i < bins; i++) {
+    const a = (i / bins) * Math.PI * 2;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const gust = 0.6 + 0.8 * Math.pow(Math.max(0, Math.cos(a - lee)) , 1.3);
+    const r0 = rad[i] * 0.99;
+    const r1 = rad[i] * (1 + (flare - 1) * gust * (0.7 + rng() * 0.6));
+    verts.push(new THREE.Vector3(ca * r0, y0 + lip * sy * gust, sa * r0));
+    rw.push(0.18);
+    verts.push(new THREE.Vector3(ca * r1, y0 - drop * sy, sa * r1));
+    rw.push(1.0);
+  }
+  for (let i = 0; i < bins; i++) {
+    const a0 = i * 2;
+    const b0 = ((i + 1) % bins) * 2;
+    tris.push([a0, b0, b0 + 1], [b0 + 1, a0 + 1, a0]);
+  }
+  return { verts, rw, tris };
+}
+
+/**
+ * Append a fines apron to an already-normalised variant geometry.
+ * Skirt vertices carry the body's base heightFrac and no cavity, so every
+ * shader term that keys off the rock surface switches itself off across them.
+ */
+export function attachSkirt(geo, opts) {
+  const s = buildSkirt(geo, opts);
+  const nrm = smoothNormals(s.verts, s.tris);
+  const oldCount = geo.attributes.position.count;
+  const add = s.tris.length * 3;
+  const pos = new Float32Array((oldCount + add) * 3);
+  const nor = new Float32Array((oldCount + add) * 3);
+  const rk = new Float32Array((oldCount + add) * 4);
+  pos.set(geo.attributes.position.array);
+  nor.set(geo.attributes.normal.array);
+  rk.set(geo.attributes.aRock.array);
+  let w = oldCount;
+  for (const t of s.tris) {
+    for (const vi of t) {
+      const v = s.verts[vi];
+      const n = nrm[vi];
+      pos[w * 3] = v.x; pos[w * 3 + 1] = v.y; pos[w * 3 + 2] = v.z;
+      // Bias the collar's normal skyward: it is a sand drift, and shading it off
+      // its own steep flank makes it read as a plastic funnel.
+      nor[w * 3] = n.x * 0.4;
+      nor[w * 3 + 1] = Math.abs(n.y) * 0.5 + 0.7;
+      nor[w * 3 + 2] = n.z * 0.4;
+      const l = Math.hypot(nor[w * 3], nor[w * 3 + 1], nor[w * 3 + 2]) || 1;
+      nor[w * 3] /= l; nor[w * 3 + 1] /= l; nor[w * 3 + 2] /= l;
+      rk[w * 4] = 0;
+      rk[w * 4 + 1] = 0.25 * s.rw[vi];
+      rk[w * 4 + 2] = 0;
+      rk[w * 4 + 3] = s.rw[vi];
+      w++;
+    }
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('aRock', new THREE.BufferAttribute(rk, 4));
+  out.computeBoundingBox();
+  out.computeBoundingSphere();
+  return out;
 }
 
 /**
@@ -361,6 +547,16 @@ export function buildRockGeometry(rng, opts = {}) {
     grooveDepth = 0.055,
     seed = 1,
     angle = 34,
+    ledges = 0,
+    ledgeDepth = 0.05,
+    // Deliberately low. At 0.45 the Laplacian eats the cleaved facets as well as
+    // the shoulders and the body comes out a soap bar — "rounded" is not the
+    // goal, "rounded *edges* on a faceted block" is. This blunts the edge and
+    // leaves the face.
+    weather = 0.24,
+    hero = 0,
+    /** Minimum hull dimension as a fraction of the longest. 0 disables. */
+    aspectFloor = 0.52,
   } = opts;
 
   const faces = makeRockPolytope(rng, { planeCount, aniso, cleaves, bedding, joints, tightness });
@@ -370,9 +566,34 @@ export function buildRockGeometry(rng, opts = {}) {
   const box = new THREE.Box3();
   for (const v of pv) box.expandByPoint(v);
   const centre = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(...box.getSize(new THREE.Vector3()).toArray()) * 0.5;
+  const ext = box.getSize(new THREE.Vector3());
+  const radius = Math.max(ext.x, ext.y, ext.z) * 0.5;
   const k = 1 / Math.max(1e-4, radius);
   for (const v of pv) v.sub(centre).multiplyScalar(k);
+
+  // --- aspect floor -------------------------------------------------------
+  // Authoring `aniso` only sets the *pre-cleave* proportions. Three or four deep
+  // cleaves through an already-slim block routinely leave a blade, which is how
+  // round 1 shipped monoliths that read edge-on as sheets of card even though
+  // the family's depth had been floored. Measuring the hull that actually came
+  // out and inflating any axis that fell under the floor is a guarantee rather
+  // than a hope, and it costs one pass over the vertices.
+  //
+  // `slab` relaxes the floor for chips, which genuinely are flakes.
+  if (aspectFloor > 0) {
+    const b2 = new THREE.Box3();
+    for (const v of pv) b2.expandByPoint(v);
+    const e = b2.getSize(new THREE.Vector3());
+    const longest = Math.max(e.x, e.y, e.z);
+    const axes = ['x', 'y', 'z'];
+    for (const ax of axes) {
+      const want = longest * aspectFloor;
+      if (e[ax] >= want || e[ax] < 1e-4) continue;
+      const s = want / e[ax];
+      const mid = (b2.min[ax] + b2.max[ax]) * 0.5;
+      for (const v of pv) v[ax] = mid + (v[ax] - mid) * s;
+    }
+  }
 
   // Cleave planes of the normalised hull, kept for the occlusion bake.
   const planes = pf.map((f) => {
@@ -398,6 +619,11 @@ export function buildRockGeometry(rng, opts = {}) {
 
   let { verts, tris } = chamferPolyhedron(pv, pf, chamfer);
   if (lod === 0) tris = subdivide(verts, tris);
+  // `hero` buys a second subdivision for the near-field mesh only. It is the
+  // difference between a rock whose outline is eight straight segments and one
+  // whose outline is broken at every scale — the tell a player standing next to
+  // it cannot un-see. Off for anything the player never gets close to.
+  if (lod === 0 && hero > 0) tris = subdivide(verts, tris);
 
   // Weathering. Low frequency lumps break the convexity of the hull; the higher
   // octave puts erosion pits into the flat faces so they are not mirror-flat.
@@ -408,8 +634,17 @@ export function buildRockGeometry(rng, opts = {}) {
     const l = (fbm3(v.x * 1.05 + off, v.y * 1.05, v.z * 1.05 - off, 3) - 0.5) * lump;
     const m = (fbm3(v.x * 2.7 - off, v.y * 2.7, v.z * 2.7 + off, 2) - 0.5) * lump * 0.5;
     const g = lod === 0 ? (noise3(v.x * 5.4 + off, v.y * 5.4, v.z * 5.4) - 0.5) * grain : 0;
-    v.addScaledVector(nrm[i], l + m + g);
+    // Only the hero mesh has the vertex density to carry a high octave; on the
+    // mid LOD it would just be noise on eight-metre triangles.
+    const f = lod === 0 && hero > 0
+      ? (fbm3(v.x * 11.0 - off, v.y * 11.0 + off, v.z * 11.0, 2) - 0.5) * lump * 0.55
+      : 0;
+    v.addScaledVector(nrm[i], l + m + g + f);
   }
+
+  // Silhouette-level bedding, before the grooves so the joints cut across the
+  // courses rather than being erased by them.
+  if (ledges > 0 && lod < 2) beddingLedges(verts, tris, ledges, ledgeDepth, seed * 0.618);
 
   // Joints. A convex body has no concavities at all, so the baked cavity
   // channel has nothing to find and the rock shades like a pebble. Pressing a
@@ -437,9 +672,17 @@ export function buildRockGeometry(rng, opts = {}) {
     }
   }
 
+  // Blunt the exposed shoulders last, so it acts on the real weathered surface
+  // and not on the pristine hull. Cleaved faces and joint grooves keep their edge.
+  if (lod < 2) weatherEdges(verts, tris, weather);
+
   const nrm2 = smoothNormals(verts, tris);
   const { cav, ao } = bakeCurvature(verts, tris, nrm2, planes);
-  return toGeometry(verts, tris, cav, ao, angle);
+  // The hero mesh needs a wider smoothing group. Its triangles are a quarter the
+  // size, so displacement of the same amplitude bends neighbouring faces past a
+  // 36 deg threshold and the surface splits into a shading lattice that reads as
+  // chicken wire. Cleave facets are 60 deg or more apart and still stay crisp.
+  return toGeometry(verts, tris, cav, ao, lod === 0 && hero > 0 ? angle + 16 : angle);
 }
 
 /** Concatenate non-indexed rock geometries, applying a matrix to each. */
@@ -448,7 +691,7 @@ export function mergeRockGeometries(entries) {
   for (const e of entries) total += e.geo.attributes.position.count;
   const pos = new Float32Array(total * 3);
   const nor = new Float32Array(total * 3);
-  const rk = new Float32Array(total * 3);
+  const rk = new Float32Array(total * 4);
   const v = new THREE.Vector3();
   const nm = new THREE.Matrix3();
   let w = 0;
@@ -464,16 +707,17 @@ export function mergeRockGeometries(entries) {
       pos[w * 3] = v.x; pos[w * 3 + 1] = v.y; pos[w * 3 + 2] = v.z;
       v.set(nn[i * 3], nn[i * 3 + 1], nn[i * 3 + 2]).applyMatrix3(nm).normalize();
       nor[w * 3] = v.x; nor[w * 3 + 1] = v.y; nor[w * 3 + 2] = v.z;
-      rk[w * 3] = rr[i * 3];
-      rk[w * 3 + 1] = rr[i * 3 + 1];
-      rk[w * 3 + 2] = rr[i * 3 + 2];
+      rk[w * 4] = rr[i * 4];
+      rk[w * 4 + 1] = rr[i * 4 + 1];
+      rk[w * 4 + 2] = rr[i * 4 + 2];
+      rk[w * 4 + 3] = rr[i * 4 + 3];
       w++;
     }
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-  geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 3));
+  geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 4));
   return geo;
 }
 
@@ -491,7 +735,7 @@ export function finaliseGeometry(geo, { originAtBase = true } = {}) {
     p[i * 3] -= cx;
     p[i * 3 + 1] -= oy;
     p[i * 3 + 2] -= cz;
-    rk[i * 3 + 2] = (p[i * 3 + 1] + oy - b.min.y) * invH;
+    rk[i * 4 + 2] = (p[i * 3 + 1] + oy - b.min.y) * invH;
   }
   geo.attributes.position.needsUpdate = true;
   geo.attributes.aRock.needsUpdate = true;

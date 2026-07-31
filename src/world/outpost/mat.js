@@ -30,6 +30,7 @@ export const MODE = {
   WOOD: 3,
   CLOTH: 4,
   GROUND: 5,
+  MASONRY: 6,
 };
 
 export const NOISE_GLSL = /* glsl */ `
@@ -74,6 +75,9 @@ uniform float uScale;
 uniform float uMetal;
 uniform float uCorrFreq;
 uniform float uCorrAmp;
+uniform vec3 uDadoCol;
+uniform vec2 uDado;
+uniform vec3 uBounce;
 `;
 
 /** Shared prologue: fetch the cues every mode needs. */
@@ -85,7 +89,13 @@ const PROLOGUE = /* glsl */ `
   float up = clamp(wn.y, 0.0, 1.0);
   float side = 1.0 - up;
   float y01 = clamp(vOPW.x, 0.0, 1.0);
-  float wear = clamp(uWear + vOPW.y + vOPV.x, 0.0, 1.5);
+  // Wear arrives from three places — the material, the object's bake, and the
+  // per-instance variation — and round 1 simply summed them. On a container
+  // that came to 1.6, which drives every rust threshold negative and paints the
+  // whole compound the same uniform orange. The baked and per-instance terms are
+  // MODULATION, not addition, so they are scaled down: the point of them is that
+  // no two objects match, not that everything is maximally corroded.
+  float wear = clamp(uWear + vOPW.y * 0.55 + vOPV.x * 0.60, 0.0, 1.25);
   // Pick the horizontal axis that runs ALONG the face so streaks stay thin.
   float sx = abs(wn.x) > abs(wn.z) ? vOPP.z : vOPP.x;
 
@@ -96,15 +106,26 @@ const PROLOGUE = /* glsl */ `
   // Streaks: noise stretched ~30:1 vertically, only on near-vertical faces,
   // strongest just under the top edge and fading out before the ground.
   float st = opn2(vec2(sx * 3.1 * uScale, vOPP.y * 0.10));
-  float streak = smoothstep(0.46, 0.90, st * 0.72 + m1 * 0.45);
-  streak *= smoothstep(1.05, 0.28, y01) * side;
+  float streak = smoothstep(0.42, 0.86, st * 0.76 + m1 * 0.45);
+  streak *= smoothstep(1.05, 0.24, y01) * side;
+  // Narrow hard-edged runs. Thirty years of monsoon off one bracket makes a
+  // 40mm stripe with a crisp boundary, not a soft wash — and it is the crisp
+  // ones the eye reads as history rather than as a noise texture.
+  float rn = opn2(vec2(sx * 13.0 * uScale, 7.3));
+  float run = smoothstep(0.80, 0.94, rn) * smoothstep(1.02, 0.10, y01) * side;
+  run *= 0.35 + 0.9 * smoothstep(0.30, 0.75, opn2(vec2(sx * 2.0, vOPP.y * 0.07)));
+  // Water sheeting off an unguttered roof soaks a dark band right under the eave.
+  float topWash = smoothstep(0.80, 1.0, y01) * side * (0.5 + 0.9 * m2);
   float splash = smoothstep(0.16, 0.0, y01) * side;
+  // South elevations take twice the UV dose. Bleaching one side of every
+  // building is what stops a compound reading as a single flat-lit maquette.
+  float southFace = clamp(-wn.z * 0.72 + wn.x * 0.38, 0.0, 1.0);
   vec3 nrm = wn;
 `;
 
 /** Shared epilogue: the unifying desert dust film + gentle value jitter. */
 const EPILOGUE = /* glsl */ `
-  float dustMask = uDustAmt * (0.30 + 0.55 * up) * (0.45 + 0.75 * m1);
+  float dustMask = uDustAmt * (0.28 + 0.42 * up) * (0.40 + 0.85 * m1);
   dustMask += uDustAmt * splash * 0.7;
   c = mix(c, uDust * (0.8 + 0.4 * m2), clamp(dustMask, 0.0, 0.85));
   gRough = clamp(mix(gRough, 0.96, clamp(dustMask, 0.0, 1.0) * 0.55), 0.05, 1.0);
@@ -114,20 +135,46 @@ const EPILOGUE = /* glsl */ `
   gNorm = normalize(nrm);
 `;
 
+/**
+ * The painted socle. Every Soviet institutional building on earth has a band of
+ * oil paint — ochre, sage or that particular municipal blue — from the ground to
+ * about 1.4m, with a hard line where the painter's roller stopped. It is the
+ * single most recognisable thing about the interior *and* exterior of these
+ * buildings, and it costs one lerp. `uDado` is (top height as a fraction of the
+ * object, strength); strength 0 leaves the wall bare.
+ */
+const DADO = /* glsl */ `
+  if (uDado.y > 0.001) {
+    // The line wavers by a couple of centimetres — it was cut in by hand.
+    float wob = (opn2(vec2(sx * 1.7, 4.0)) - 0.5) * 0.035;
+    float band = smoothstep(uDado.x + wob + 0.012, uDado.x + wob - 0.012, y01) * side;
+    vec3 dc = uDadoCol * (0.82 + 0.34 * m2);
+    // Oil paint on a damp masonry wall blisters off from the bottom up.
+    float lost = smoothstep(0.52, 0.86, m2 * 0.7 + m3 * 0.5 + splash * 0.5 + 0.2 * wear);
+    dc = mix(dc, c * 1.05, lost * 0.75);
+    dc *= 1.0 - 0.30 * streak;
+    c = mix(c, dc, band * uDado.y);
+    // A gloss band reads as paint rather than as a differently-coloured wall.
+    gRough = mix(gRough, 0.62, band * uDado.y * (1.0 - lost) * 0.7);
+  }
+`;
+
 const BODY = {
   [MODE.CONCRETE]: /* glsl */ `
     // Patch history first: pours from different decades, different cement.
     float pourAge = optri(vOPP, wn, 0.055 * uScale, 3);
-    vec3 c = mix(uBase, uBase3, smoothstep(0.42, 0.78, pourAge) * 0.45);
-    c = mix(c, uBase2, clamp(m1 * 1.45 - 0.22, 0.0, 1.0));
-    c *= 0.84 + 0.32 * m2;
+    vec3 c = mix(uBase, uBase3, smoothstep(0.38, 0.80, pourAge) * 0.72);
+    c = mix(c, uBase2, clamp(m1 * 1.70 - 0.26, 0.0, 1.0));
+    c *= 0.76 + 0.46 * m2;
     // Shuttering board seams every 850mm.
     float seam = 1.0 - smoothstep(0.0, 0.030, abs(fract(vOPP.y / 0.85 + 0.5) - 0.5));
     c *= 1.0 - 0.20 * seam * side;
     // Dirt washing down the face — the single strongest "this is not CG" cue.
     c *= 1.0 - 0.52 * streak * (0.45 + wear);
-    // Splash zone: mud and salt at the bottom of every wall.
-    c = mix(c, uBase * 0.42 * (0.7 + 0.6 * m3), splash * 0.92);
+    // Splash zone: mud and salt at the bottom of every wall. Deliberately dark —
+    // a compound whose every value sits inside a 30-level band reads as fog, and
+    // the base of a wall is the one place a real photograph always has a black.
+    c = mix(c, uBase * 0.30 * (0.6 + 0.6 * m3), splash * 0.95);
     // Sun-bleached tops.
     c = mix(c, c * 1.22 + 0.02, up * 0.5);
     // Spalled edges: exposed aggregate near the top, with rust bleed from rebar.
@@ -135,14 +182,57 @@ const BODY = {
     chip = clamp(chip, 0.0, 1.0);
     c = mix(c, uBase * 0.55 + vec3(0.02, 0.017, 0.014), chip * 0.7);
     c = mix(c, uRust * 0.8, clamp(chip * streak * 1.6, 0.0, 0.6));
+    // Water sheeting off the roof edge, and the hard rust runs off fixings.
+    c *= 1.0 - 0.30 * topWash;
+    c = mix(c, uRust * 0.85 * (0.6 + 0.5 * m2), clamp(run * (0.35 + 0.9 * wear), 0.0, 0.72));
+    // Sun-bleached south elevation: chalked, lower contrast, slightly warmer.
+    c = mix(c, c * 1.20 + vec3(0.028, 0.024, 0.014), southFace * 0.42);
     // Fine pinholing and aggregate at arm's length.
     float fine = optri(vOPP, wn, 26.0 * uScale, 2);
     c *= 0.93 + 0.14 * fine;
     gRough = clamp(0.90 + (m2 - 0.5) * 0.18, 0.5, 1.0);
     gMetal = 0.0;
+    ${DADO}
     // Relief so a shaded facade still catches a gradient from the sky.
     nrm = normalize(wn + vec3(m3 - 0.5, m2 - 0.5, m2 - 0.5) * 0.22 * (0.4 + chip)
                        - vec3(0.0, seam * side * 0.12, 0.0));
+  `,
+  [MODE.MASONRY]: /* glsl */ `
+    // Rendered/whitewashed blockwork: 390x190 blocks under a lime skim that has
+    // been patched and re-limed for decades and is now failing in big flakes.
+    vec2 mw = vec2(sx, vOPP.y);
+    float course = floor(mw.y / 0.20);
+    float stagger = mod(course, 2.0) * 0.20;
+    float bx = fract((mw.x + stagger) / 0.40);
+    float by = fract(mw.y / 0.20);
+    float joint = max(
+      1.0 - smoothstep(0.0, 0.022, min(by, 1.0 - by) * 0.20),
+      1.0 - smoothstep(0.0, 0.011, min(bx, 1.0 - bx) * 0.40));
+    joint *= side;
+    float blockVar = ophash(vec2(floor((mw.x + stagger) / 0.40), course));
+
+    vec3 lime = uBase3 * (0.92 + 0.16 * m2);
+    vec3 block = uBase2 * (0.86 + 0.30 * blockVar);
+    // Where the lime has come off: big soft-edged patches, worst low down and
+    // under the eave where the wall stays wet. Kept to a minority of the wall —
+    // a fully exposed course pattern reads as decorative ashlar, not as a
+    // painted building that is losing its paint.
+    float fail = smoothstep(0.50, 0.82, m1 * 0.70 + m2 * 0.40 + splash * 0.45 + topWash * 0.30 + 0.18 * wear);
+    vec3 c = mix(lime, block, clamp(fail, 0.0, 0.78));
+    // The joint only shows where the lime has gone; a limewashed wall skims it.
+    c *= 1.0 - 0.34 * joint * (0.25 + 0.75 * fail);
+    c *= 0.88 + 0.26 * m3;
+    c *= 1.0 - 0.44 * streak * (0.4 + wear);
+    c *= 1.0 - 0.34 * topWash;
+    c = mix(c, uRust * 0.9, clamp(run * (0.3 + 0.8 * wear), 0.0, 0.7));
+    c = mix(c, uBase * 0.45 * (0.7 + 0.6 * m3), splash * 0.85);
+    c = mix(c, c * 1.24 + vec3(0.03, 0.026, 0.014), southFace * 0.48);
+    gRough = clamp(0.88 + (m2 - 0.5) * 0.16 + joint * 0.08, 0.5, 1.0);
+    gMetal = 0.0;
+    ${DADO}
+    nrm = normalize(wn
+      + tangentFromGrain(wn, 0.5, joint * 0.40 * (0.3 + 0.7 * fail))
+      + vec3(m3 - 0.5, m2 - 0.5, m3 - 0.5) * 0.16 * fail);
   `,
   [MODE.METAL]: /* glsl */ `
     vec3 pal = vOPV.y < 0.34 ? uBase : (vOPV.y < 0.67 ? uBase2 : uBase3);
@@ -153,9 +243,14 @@ const BODY = {
     rustM = clamp(rustM + streak * 1.05 * wear + splash * 0.75 * wear, 0.0, 1.0);
     vec3 rust = mix(uRust, uRust * 0.45, m3) * (0.82 + 0.42 * m2);
     vec3 c = mix(paint, rust, rustM);
-    gRough = clamp(mix(0.46, 0.94, rustM) + (m3 - 0.5) * 0.08, 0.08, 1.0);
-    gMetal = mix(uMetal, 0.04, rustM);
+    // Hard runs bleeding down out of every bolt, bracket and seam.
+    c = mix(c, uRust * 1.05 * (0.55 + 0.6 * m2), clamp(run * (0.4 + wear), 0.0, 0.85));
+    c *= 1.0 - 0.22 * topWash;
+    c = mix(c, c * 1.16 + vec3(0.02, 0.017, 0.01), southFace * 0.34);
+    gRough = clamp(mix(0.46, 0.94, rustM) + (m3 - 0.5) * 0.08 + run * 0.35, 0.08, 1.0);
+    gMetal = mix(uMetal, 0.04, max(rustM, run * 0.8));
     nrm = normalize(wn + vec3(m3 - 0.5, 0.0, m2 - 0.5) * 0.14 * rustM);
+    ${DADO}
   `,
   [MODE.CORRUGATED]: /* glsl */ `
     // Corrugation runs perpendicular to the horizontal ridge line of the face,
@@ -175,7 +270,16 @@ const BODY = {
     vec3 rust = mix(uRust, uRust * 0.45, m3) * (0.82 + 0.42 * m2);
     vec3 c = mix(paint, rust, rustM);
     c *= 0.86 + 0.30 * (0.5 + 0.5 * prof);
-    gRough = clamp(mix(0.50, 0.95, rustM), 0.1, 1.0);
+    // Fixings every 6th rib: a bright washer with a rust tail under it.
+    float fixRow = 1.0 - smoothstep(0.0, 0.09, abs(fract(vOPP.y / 0.90 + 0.5) - 0.5) * 0.90);
+    float fixCol = smoothstep(0.55, 0.95, valley);
+    float fix = fixRow * fixCol * side;
+    c = mix(c, uRust * 1.15 * (0.5 + 0.6 * m2),
+            clamp(smoothstep(0.0, 0.55, y01) * fixCol * smoothstep(0.55, 0.0, fract(vOPP.y / 0.90)) * (0.35 + wear) * 0.9, 0.0, 0.8));
+    c = mix(c, c * 1.5 + 0.02, fix * 0.35);
+    c *= 1.0 - 0.20 * topWash;
+    c = mix(c, c * 1.18 + vec3(0.02, 0.017, 0.009), southFace * 0.36);
+    gRough = clamp(mix(0.50, 0.95, rustM) - fix * 0.25, 0.1, 1.0);
     gMetal = mix(uMetal, 0.04, rustM);
     nrm = normalize(wn + tdir * cos(ph) * uCorrAmp);
   `,
@@ -207,17 +311,46 @@ const BODY = {
     nrm = normalize(wn + tangentFromGrain(wn, grain, gap) + vec3(0.0, (bvar - 0.5) * 0.06, 0.0));
   `,
   [MODE.CLOTH]: /* glsl */ `
-    vec3 c = mix(uBase, uBase2, clamp(m1 * 1.3 - 0.1, 0.0, 1.0));
-    // Coarse weave, plus big slack folds.
-    float weave = 0.5 + 0.5 * sin(vOPP.x * 130.0) * sin(vOPP.z * 130.0);
+    // Every bag in a revetment was filled by a different pair of hands out of a
+    // different pallet of hessian: vOPV.y picks the bolt of cloth, so no two
+    // adjacent bags are the same value even before the weathering runs.
+    vec3 pal = vOPV.y < 0.30 ? uBase : (vOPV.y < 0.62 ? uBase2 : uBase3);
+    vec3 c = mix(pal, uBase2, clamp(m1 * 1.2 - 0.15, 0.0, 1.0));
+    // Hessian: a real 3mm warp/weft, faded out well before it can alias. Beyond
+    // about 12m a woven bag is a smooth bag, and pretending otherwise produces
+    // the crawling moire that gives procedural cloth away instantly.
+    float dcamC = length(vOPP - cameraPosition);
+    float wfade = 1.0 - smoothstep(4.0, 13.0, dcamC);
+    if (wfade > 0.01) {
+      vec3 tw = cross(wn, vec3(0.0, 1.0, 0.0));
+      float twl = length(tw);
+      tw = twl > 0.10 ? tw / twl : vec3(1.0, 0.0, 0.0);
+      vec3 bw = cross(wn, tw);
+      float wu = dot(vOPP, tw) * 330.0;
+      float wv = dot(vOPP, bw) * 330.0;
+      float weave = 0.5 + 0.5 * (sin(wu) * 0.6 + sin(wv) * 0.6 + sin(wu) * sin(wv) * 0.5);
+      c *= 1.0 + 0.20 * (weave - 0.5) * wfade;
+      // Slubs and pulled threads.
+      c *= 1.0 - 0.16 * smoothstep(0.72, 0.95, opn2(vec2(wu * 0.09, wv * 0.09))) * wfade;
+      nrm = normalize(wn + (tw * cos(wu) + bw * cos(wv)) * 0.10 * wfade);
+    }
     float fold = optri(vOPP, wn, 0.9 * uScale, 3);
-    c *= 0.86 + 0.22 * weave;
-    c *= 0.82 + 0.36 * fold;
-    c = mix(c, uBase3, smoothstep(0.55, 0.95, m2) * 0.5);
-    c *= 1.0 - 0.25 * streak * wear;
-    gRough = 0.97;
+    c *= 0.84 + 0.34 * fold;
+    // Sun-rot: the up-facing half of a bag goes pale and brittle, the underside
+    // stays dark and damp. That vertical value gradient is what makes a stacked
+    // course read as rounded volumes rather than a printed brick pattern. Kept
+    // deliberately restrained — a revetment that ends up brighter than the
+    // gravel it stands on reads as polystyrene, which is what the first pass did.
+    c = mix(c, uBase3 * 1.02, clamp(up * 0.34 + smoothstep(0.55, 0.95, m2) * 0.22, 0.0, 0.62));
+    c = mix(c, pal * 0.34, clamp((1.0 - up) * 0.55 * (1.0 - y01 * 0.6), 0.0, 0.72));
+    // Ambient occlusion between courses: the crack between two bags never sees
+    // the sky, and putting a dark line there is most of what separates them.
+    c *= 0.72 + 0.28 * smoothstep(0.0, 0.35, y01);
+    // Split seams weep sand down the face of the course.
+    c = mix(c, uDust * 1.25, clamp(run * 0.85 + streak * 0.35 * wear, 0.0, 0.7));
+    gRough = 0.98;
     gMetal = 0.0;
-    nrm = normalize(wn + vec3(fold - 0.5, 0.0, m2 - 0.5) * 0.55);
+    nrm = normalize(nrm + vec3(fold - 0.5, 0.0, m2 - 0.5) * 0.50);
   `,
   [MODE.GROUND]: /* glsl */ `
     float road = clamp(vOPT.x, 0.0, 1.0);
@@ -331,6 +464,9 @@ export function createSurface(opts = {}) {
     roughness = 0.9,
     corrFreq = 26.0,
     corrAmp = 0.55,
+    dado = 0,
+    dadoStrength = 0.92,
+    dadoColor = [0.115, 0.098, 0.048],
     side = THREE.FrontSide,
     map = null,
     alphaTest = 0,
@@ -368,6 +504,9 @@ export function createSurface(opts = {}) {
     uMetal: { value: metalness },
     uCorrFreq: { value: corrFreq },
     uCorrAmp: { value: corrAmp },
+    uDadoCol: { value: toV3(dadoColor) },
+    uDado: { value: new THREE.Vector2(dado, dado > 0 ? dadoStrength : 0) },
+    uBounce: { value: new THREE.Vector3(0, 0, 0) },
   };
 
   mat.customProgramCacheKey = () => `op${mode}|${side}|${alphaTest > 0 ? 'a' : ''}|${map ? 'm' : ''}`;
@@ -433,6 +572,28 @@ export function createSurface(opts = {}) {
            ${PROLOGUE}
            ${BODY[mode]}
            ${EPILOGUE}
+         }`,
+      )
+      // Bounced light off sunlit sand.
+      //
+      // This is the fix for the coldest defect in round 1: the PMREM probe is
+      // generated from the SKY DOME ONLY, so every downward- and side-facing
+      // surface in the compound was being lit by pure Rayleigh blue with no
+      // ground term whatsoever, and the whole outpost measured bluer than it
+      // measured red in broad daylight. In Afghanistan the lower hemisphere is
+      // dominated by sunlit khaki gravel at a very high albedo, and that warm
+      // bounce is most of what fills a shadow. `uBounce` is driven from the
+      // time of day so it dies with the sun instead of glowing at midnight.
+      .replace(
+        '#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+         {
+           vec3 bn = normalize(vOPN);
+           #ifdef DOUBLE_SIDED
+             bn *= (float(gl_FrontFacing) * 2.0 - 1.0);
+           #endif
+           float lower = clamp(0.55 - 0.55 * bn.y, 0.0, 1.0);
+           reflectedLight.indirectDiffuse += diffuseColor.rgb * uBounce * lower;
          }`,
       )
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\n roughnessFactor = gRough;`)

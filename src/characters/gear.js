@@ -18,6 +18,57 @@ import { headSurface, HEAD_CENTRE } from './body.js';
 
 const V = (x, y, z) => new THREE.Vector3(x, y, z);
 
+/**
+ * A side-release buckle: a body block, a narrower tongue and a retaining lip.
+ * Three boxes, ~90 triangles, and it is the difference between webbing and a
+ * painted stripe. Every load-bearing strap on a soldier terminates in one of
+ * these, and the eye reads their regular hard-edged rhythm long before it can
+ * resolve the strap itself.
+ */
+function buckle(p, opts = {}) {
+  const w = opts.w ?? 0.032;
+  const h = opts.h ?? 0.024;
+  const rot = opts.rotY ?? 0;
+  const zone = opts.zone ?? MZ.DARKPOLY;
+  const at = (dx, dy, dz) =>
+    new THREE.Matrix4().makeRotationY(rot).setPosition(p.x + dx, p.y + dy, p.z + dz);
+  return [
+    { surface: roundedBox(w, h, 0.013, 0.004, { zone, radial: 6, segs: 5 }).transform(at(0, 0, 0)), mat: 'metal' },
+    {
+      surface: roundedBox(w * 0.62, h * 0.42, 0.017, 0.003, { zone, radial: 6, segs: 4 }).transform(at(0, -h * 0.62, 0)),
+      mat: 'metal',
+    },
+    {
+      surface: roundedBox(w * 1.06, h * 0.16, 0.016, 0.003, { zone, radial: 6, segs: 4 }).transform(at(0, h * 0.42, 0)),
+      mat: 'metal',
+    },
+  ];
+}
+
+/**
+ * A ladder of MOLLE webbing. Rows of 25 mm tape stitched across a panel is what
+ * every modern load-bearing surface actually looks like, and the horizontal
+ * banding survives to any distance where the character is more than a few
+ * pixels wide.
+ */
+function molle(y0, rows, spacing, span, z, zone = Z.WEBBING, bulge = 0.0) {
+  const out = [];
+  for (let r = 0; r < rows; r++) {
+    const y = y0 - r * spacing;
+    out.push({
+      surface: strap(
+        [V(-span, y, z), V(-span * 0.5, y, z + bulge), V(0, y, z + bulge * 1.15), V(span * 0.5, y, z + bulge), V(span, y, z)],
+        0.021,
+        0.006,
+        zone,
+        { stations: 9 },
+      ),
+      mat: 'cloth',
+    });
+  }
+  return out;
+}
+
 // -------------------------------------------------------------------------
 // Torso rig / webbing
 // -------------------------------------------------------------------------
@@ -138,6 +189,44 @@ export function buildChestRig(o = {}) {
     ),
     mat: 'cloth',
   });
+  for (const sgn of [-1, 1]) parts.push(...buckle(V(sgn * 0.168, 1.113, -0.05), { w: 0.03, h: 0.03, rotY: sgn * 1.3 }));
+
+  // --- the BACK of the carrier -------------------------------------------
+  // The third-person camera spends the entire game looking at this panel, and
+  // in round 1 it was blank. MOLLE ladders, a utility pouch, a drag handle and
+  // the shoulder-strap adjusters are all silhouette-adjacent detail that reads
+  // from directly behind.
+  parts.push(...molle(1.305, 3, 0.05, 0.115, 0.13, Z.WEBBING, 0.008));
+  parts.push({
+    surface: roundedBox(0.14, 0.1, 0.052, 0.014, { zone: Z.POUCH, radial: 12 }).transform(
+      new THREE.Matrix4().setPosition(0, 1.17, 0.155),
+    ),
+    mat: 'cloth',
+  });
+  parts.push({
+    surface: strap(
+      [V(-0.062, 1.222, 0.148), V(-0.03, 1.228, 0.176), V(0.03, 1.228, 0.176), V(0.062, 1.222, 0.148)],
+      0.022,
+      0.007,
+      Z.WEBBING,
+      { stations: 9 },
+    ),
+    mat: 'cloth',
+  });
+  // Drag handle across the shoulder blades.
+  parts.push({
+    surface: strap(
+      [V(-0.055, 1.4, 0.115), V(-0.03, 1.418, 0.142), V(0.03, 1.418, 0.142), V(0.055, 1.4, 0.115)],
+      0.03,
+      0.011,
+      Z.WEBBING,
+      { stations: 10 },
+    ),
+    mat: 'cloth',
+  });
+  for (const sgn of [-1, 1]) {
+    parts.push(...buckle(V(sgn * 0.088, 1.325, 0.128), { w: 0.028, h: 0.022, rotY: sgn * 0.15 }));
+  }
   return parts;
 }
 
@@ -163,9 +252,34 @@ export function buildBelt(o = {}) {
   });
   // Rear belt pouches — reads well from behind, which is the gameplay camera.
   for (const x of o.pouches ?? [-0.11, 0.11]) {
+    const rotY = x > 0 ? -0.5 : 0.5;
     parts.push({
       surface: roundedBox(0.085, 0.075, 0.055, 0.012, { zone: Z.POUCH, radial: 12 }).transform(
-        new THREE.Matrix4().makeRotationY(x > 0 ? -0.5 : 0.5).setPosition(x * 1.1, 0.965, 0.1),
+        new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 0.965, 0.1),
+      ),
+      mat: 'cloth',
+    });
+    // Flap and retention tab: a pouch with no lid is a block.
+    parts.push({
+      surface: roundedBox(0.088, 0.02, 0.06, 0.008, { zone: Z.POUCH, radial: 10 }).transform(
+        new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 1.005, 0.1),
+      ),
+      mat: 'cloth',
+    });
+    parts.push({
+      surface: strap([V(0, 0.028, -0.03), V(0, 0.016, 0.032), V(0, -0.03, 0.03)], 0.014, 0.005, Z.WEBBING, {
+        stations: 8,
+      }).transform(new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 0.985, 0.1)),
+      mat: 'cloth',
+    });
+  }
+  // Belt keepers: four short loops holding the belt to the trouser waistband.
+  for (const a of [-0.9, -0.3, 0.3, 0.9, 2.4, 3.9]) {
+    const px = Math.sin(a) * 0.152;
+    const pz = -Math.cos(a) * 0.113;
+    parts.push({
+      surface: roundedBox(0.016, 0.05, 0.014, 0.004, { zone: Z.WEBBING, radial: 8 }).transform(
+        new THREE.Matrix4().makeRotationY(-a).setPosition(px * 1.06, 0.972, pz * 1.06),
       ),
       mat: 'cloth',
     });
@@ -200,6 +314,16 @@ export function buildHolster(side = 1) {
   return parts;
 }
 
+/**
+ * The rucksack.
+ *
+ * Round 1's was, accurately, "a rounded box". The fix is not more subdivisions —
+ * it is that a real pack is an assembly: a main body, a separate lid that
+ * overhangs it, side pockets that break the flanks, MOLLE ladders across the
+ * back panel, compression straps that pull the profile in at two heights, and
+ * buckles wherever a strap ends. All of that is silhouette and horizontal
+ * banding, which is what survives to the distance the gameplay camera sits at.
+ */
 export function buildBackpack(o = {}) {
   const parts = [];
   const back = 0.185;
@@ -217,19 +341,80 @@ export function buildBackpack(o = {}) {
     ),
     mat: 'cloth',
   });
-  // Top lid + compression straps.
+  // Top lid, overhanging the body so it casts a line of shadow across it.
   parts.push({
-    surface: roundedBox(0.26, 0.05, 0.15, 0.02, { zone: Z.PACK, radial: 14 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.435, back),
+    surface: loftKeys(
+      [
+        { p: V(0, 1.462, back - 0.006), rx: 0.118, rz: 0.056, n: 3.4, zone: Z.PACK },
+        { p: V(0, 1.44, back + 0.004), rx: 0.142, rz: 0.075, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.415, back + 0.006), rx: 0.146, rz: 0.079, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.392, back + 0.002), rx: 0.138, rz: 0.073, n: 3.8, zone: Z.PACK },
+      ],
+      9,
+      { radial: 18, capStart: true, capEnd: true },
     ),
     mat: 'cloth',
   });
-  for (const y of [1.14, 1.29]) {
+  // Lid closure straps running down onto the back panel, each ending in a buckle.
+  for (const sx of [-0.062, 0.062]) {
     parts.push({
-      surface: strap([V(-0.155, y, back + 0.02), V(-0.12, y, back + 0.088), V(0, y, back + 0.098), V(0.12, y, back + 0.088), V(0.155, y, back + 0.02)], 0.03, 0.008, Z.WEBBING, { stations: 14 }),
+      surface: strap(
+        [V(sx, 1.455, back + 0.03), V(sx, 1.418, back + 0.082), V(sx, 1.36, back + 0.096), V(sx, 1.318, back + 0.09)],
+        0.024,
+        0.007,
+        Z.WEBBING,
+        { stations: 10 },
+      ),
+      mat: 'cloth',
+    });
+    parts.push(...buckle(V(sx, 1.322, back + 0.098), { w: 0.028, h: 0.022 }));
+  }
+
+  // Side pockets: the flanks are where a pack's silhouette is judged.
+  for (const sgn of [-1, 1]) {
+    parts.push({
+      surface: loftKeys(
+        [
+          { p: V(sgn * 0.148, 1.09, back + 0.03), rx: 0.032, rz: 0.052, n: 3.6, zone: Z.PACK },
+          { p: V(sgn * 0.158, 1.14, back + 0.036), rx: 0.038, rz: 0.062, n: 3.8, zone: Z.PACK },
+          { p: V(sgn * 0.158, 1.21, back + 0.036), rx: 0.038, rz: 0.062, n: 3.8, zone: Z.PACK },
+          { p: V(sgn * 0.148, 1.26, back + 0.03), rx: 0.03, rz: 0.05, n: 3.6, zone: Z.PACK },
+        ],
+        9,
+        { radial: 14, capStart: true, capEnd: true },
+      ),
+      mat: 'cloth',
+    });
+    parts.push({
+      surface: strap(
+        [V(sgn * 0.132, 1.245, back + 0.03), V(sgn * 0.172, 1.25, back + 0.036), V(sgn * 0.17, 1.2, back + 0.078)],
+        0.02,
+        0.006,
+        Z.WEBBING,
+        { stations: 9 },
+      ),
       mat: 'cloth',
     });
   }
+
+  // MOLLE ladders across the back panel.
+  parts.push(...molle(1.3, 4, 0.048, 0.108, back + 0.086, Z.WEBBING, 0.012));
+
+  // Horizontal compression straps, cinched with buckles on the character's left.
+  for (const y of [1.135, 1.285]) {
+    parts.push({
+      surface: strap(
+        [V(-0.157, y, back + 0.02), V(-0.12, y, back + 0.09), V(0, y, back + 0.1), V(0.12, y, back + 0.09), V(0.157, y, back + 0.02)],
+        0.028,
+        0.008,
+        Z.WEBBING,
+        { stations: 14 },
+      ),
+      mat: 'cloth',
+    });
+    parts.push(...buckle(V(-0.086, y, back + 0.104), { w: 0.03, h: 0.022 }));
+  }
+
   // Bedroll lashed under the pack.
   parts.push({
     surface: loftKeys(
@@ -243,7 +428,20 @@ export function buildBackpack(o = {}) {
     ),
     mat: 'cloth',
   });
-  // Shoulder straps over the front.
+  for (const sx of [-0.075, 0.075]) {
+    parts.push({
+      surface: strap(
+        [V(sx, 1.03, back + 0.055), V(sx, 0.995, back + 0.09), V(sx, 0.958, back + 0.055)],
+        0.018,
+        0.006,
+        Z.WEBBING,
+        { stations: 8 },
+      ),
+      mat: 'cloth',
+    });
+  }
+
+  // Shoulder straps over the front, each with a sternum-height adjuster.
   for (const sgn of [-1, 1]) {
     parts.push({
       surface: strap(
@@ -261,7 +459,9 @@ export function buildBackpack(o = {}) {
       ),
       mat: 'cloth',
     });
+    parts.push(...buckle(V(sgn * 0.082, 1.215, -0.142), { w: 0.03, h: 0.024, rotY: sgn * 0.2 }));
   }
+  void o;
   return parts;
 }
 
@@ -440,12 +640,56 @@ export function buildBandana() {
   return parts;
 }
 
+/**
+ * A band wrapped onto the actual skull surface at a given latitude.
+ *
+ * Anything worn on the head has to follow `headSurface`, not a cylinder: the
+ * temples and eye sockets are recessed by up to 17 mm, so a straight ring
+ * floats off the head exactly where it is most visible. `tilt` lifts the band
+ * toward the front, which is how a strap clears the brow instead of cutting
+ * across the eye.
+ */
+function skullBand(opts = {}) {
+  const s = new Surface();
+  const R = opts.segments ?? 26;
+  const rows = opts.rows ?? [-0.5, 0.0, 0.5];
+  const lat = opts.lat ?? 0.36;
+  const halfWidth = opts.halfWidth ?? 0.012;
+  const tilt = opts.tilt ?? 0;
+  const stand = opts.stand ?? 0.005;
+  const zone = opts.zone ?? Z.LEATHER;
+  const dir = new THREE.Vector3();
+  const p3 = new THREE.Vector3();
+  for (let j = 0; j < rows.length; j++) {
+    for (let i = 0; i <= R; i++) {
+      const th = (i / R) * Math.PI * 2;
+      // -cos(th) peaks at the front of the head (-Z), so `tilt` raises the band
+      // over the brow and drops it behind the ears.
+      const cy = lat + rows[j] * 2 * halfWidth + tilt * -Math.cos(th);
+      const s2 = Math.sqrt(Math.max(0, 1 - cy * cy));
+      dir.set(Math.cos(th) * s2, cy, Math.sin(th) * s2);
+      headSurface(dir, p3, {});
+      p3.sub(HEAD_CENTRE);
+      const len = p3.length() || 1;
+      p3.multiplyScalar(1 + stand / len).add(HEAD_CENTRE);
+      s.vert(p3.x, p3.y, p3.z, (i / R) * 0.5, j * halfWidth, zone, i / R, j === 0 || j === rows.length - 1 ? 0 : 0.02);
+    }
+  }
+  for (let j = 0; j < rows.length - 1; j++) {
+    for (let i = 0; i < R; i++) {
+      const a = j * (R + 1) + i;
+      s.quad(a, a + 1, a + R + 2, a + R + 1);
+    }
+  }
+  return s;
+}
+
 /** Eyepatch over the right eye. */
 export function buildEyepatch() {
   const parts = [];
   const patch = displacedSphere(
     (dir, out) => {
-      out.set(0.036 + 0.032 * dir.x, 1.692 + 0.03 * dir.y, -0.07 + 0.013 * dir.z - 0.012 * dir.x);
+      out.set(0.036 + 0.033 * dir.x, 1.690 + 0.031 * dir.y, -0.0715 + 0.012 * dir.z - 0.013 * dir.x);
     },
     14,
     10,
@@ -453,13 +697,18 @@ export function buildEyepatch() {
     0.2,
   );
   parts.push({ surface: patch, mat: 'cloth' });
+  // The strap wraps the skull ABOVE the brow line. Round 1 routed it through
+  // (-0.05, 1.678, -0.072) — straight across the left eye — which read as a
+  // black bar over the whole mid-face.
+  parts.push({ surface: skullBand({ lat: 0.30, halfWidth: 0.006, tilt: 0.115, stand: 0.0045 }), mat: 'cloth' });
+  // Short tab joining the strap down onto the patch itself.
   parts.push({
     surface: strap(
-      [V(0.052, 1.672, -0.072), V(0.083, 1.681, 0.0), V(0.03, 1.7, 0.09), V(-0.05, 1.7, 0.082), V(-0.079, 1.688, -0.008), V(-0.05, 1.678, -0.072)],
-      0.011,
+      [V(0.052, 1.716, -0.068), V(0.060, 1.703, -0.070), V(0.056, 1.688, -0.068)],
+      0.012,
       0.005,
       Z.LEATHER,
-      { stations: 20 },
+      { stations: 6 },
     ),
     mat: 'cloth',
   });

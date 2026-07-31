@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { QUALITY, TIME_OF_DAY } from '../config/ArtDirection.js';
+import { QUALITY, TIME_OF_DAY, LIGHT_TRANSPORT } from '../config/ArtDirection.js';
 
 /**
  * Lighting — sun/moon, cascaded shadow maps, IBL, and the atmosphere numbers
@@ -24,10 +24,21 @@ import { QUALITY, TIME_OF_DAY } from '../config/ArtDirection.js';
  * coordinate contains it. Weights are carried down the unrolled light loop and
  * cross-faded at the borders, so transitions are invisible instead of popping.
  *
- * The filter is PCSS: an 8-tap blocker search sizes the penumbra, then a 16-tap
+ * The filter is PCSS: a 12-tap blocker search sizes the penumbra, then a 20-tap
  * Vogel disc filters at that size. Contact points stay razor sharp and the
  * shadow softens with distance from the caster, which is the entire read of a
  * low sun raking across a ridge.
+ *
+ * ## Ambient
+ *
+ * Diffuse ambient is a `LightProbe` carrying an L2 spherical-harmonic
+ * projection of the sky dome plus the ground bounce (see `_computeSkySH`), NOT
+ * a constant. The diffuse contribution of the environment cube is deliberately
+ * removed from the shared `lights_fragment_maps` chunk so the two can never
+ * double-count; the PMREM cube survives as specular IBL only. The practical
+ * consequence is that a cast shadow's colour is the sky's colour by
+ * construction — round 1 shipped a white sky casting navy shadows because the
+ * two numbers lived in different files.
  *
  * NOTE for other authors: any *additional* shadow-casting DirectionalLight added
  * to the scene would be absorbed into this cascade scheme and misbehave. Use
@@ -40,6 +51,50 @@ import { QUALITY, TIME_OF_DAY } from '../config/ArtDirection.js';
 
 const CSM_SHADOW_FN = /* glsl */ `
 #ifdef USE_SHADOWMAP
+
+  // Cloud shadows. xy = deck pan, z = coverage threshold, w = strength.
+  // x = deck altitude (m), y = horizontal frequency.
+  // Both are shared plain-object uniforms owned by Lighting.js; a shader that
+  // never receives them leaves them at zero, and w = 0 disables the term.
+  uniform vec4 uSkyCloudPan;
+  uniform vec4 uSkyCloudDeck;
+
+  float csmHash21( vec2 p ) {
+    vec3 q = fract( vec3( p.xyx ) * vec3( 0.1031, 0.1030, 0.0973 ) );
+    q += dot( q, q.yzx + 33.33 );
+    return fract( ( q.x + q.y ) * q.z );
+  }
+
+  float csmVNoise( vec2 p ) {
+    vec2 i = floor( p );
+    vec2 f = fract( p );
+    f = f * f * ( 3.0 - 2.0 * f );
+    return mix( mix( csmHash21( i ), csmHash21( i + vec2( 1.0, 0.0 ) ), f.x ),
+                mix( csmHash21( i + vec2( 0.0, 1.0 ) ), csmHash21( i + vec2( 1.0, 1.0 ) ), f.x ), f.y );
+  }
+
+  /**
+   * Cloud shadow at a world point.
+   *
+   * Round 1 drew full cumulus cover overhead and then lit the valley floor with
+   * perfectly uniform unoccluded sun — the loudest "this is a renderer" tell in
+   * the wide shots. The receiver is projected up the sun ray onto the cloud
+   * deck and the deck is sampled there, so the patches skew correctly under a
+   * low sun, stay locked to the world as the camera moves, and keep working far
+   * beyond the last shadow cascade (which is where they matter most).
+   */
+  float csmCloudShadow( vec3 wp, vec3 L ) {
+    if ( uSkyCloudPan.w <= 0.001 ) return 1.0;
+    float t = ( uSkyCloudDeck.x - wp.y ) / max( L.y, 0.12 );
+    vec2 q = ( wp.xz + L.xz * t ) * uSkyCloudDeck.y + uSkyCloudPan.xy;
+    float n = csmVNoise( q ) * 0.54
+            + csmVNoise( q * 2.13 + 7.7 ) * 0.29
+            + csmVNoise( q * 4.61 - 3.1 ) * 0.17;
+    // A kilometre-wide occluder a kilometre up has an enormous penumbra, so the
+    // threshold is deliberately soft — hard-edged cloud shadow reads as a decal.
+    float c = smoothstep( uSkyCloudPan.z - 0.11, uSkyCloudPan.z + 0.17, n );
+    return 1.0 - uSkyCloudPan.w * ( 1.0 - c );
+  }
 
   /**
    * PCSS with a Vogel-disc filter. penumbraK is smuggled in through the
@@ -84,31 +139,47 @@ const CSM_SHADOW_FN = /* glsl */ `
     mat2 rotM = mat2( cr, sr, -sr, cr );
 
     // ---- blocker search ----
+    // The search radius is the hard ceiling on the penumbra: a filter can only
+    // widen as far as it found a blocker. Round 1 searched 4 texels and then
+    // allowed a 9-texel filter, so every penumbra past ~10 cm silently
+    // collapsed to a hard edge and a barrel and a warehouse looked identical.
+    // 11 texels of search buys ~32 cm of penumbra in the near cascade, which is
+    // an 9 m occluder at the sun's effective angular size.
+    const float SEARCH_TEXELS = 11.0;
+    const float MAX_PEN_TEXELS = 13.0;
     float blockerSum = 0.0;
     float blockerCount = 0.0;
-    float search = 4.0 * texel.x;
-    for ( int i = 0; i < 8; i ++ ) {
-      float r = sqrt( ( float( i ) + 0.5 ) / 8.0 );
+    float search = SEARCH_TEXELS * texel.x;
+    for ( int i = 0; i < 12; i ++ ) {
+      float r = sqrt( ( float( i ) + 0.5 ) / 12.0 );
       float th = float( i ) * 2.39996323;
       vec2 o = rotM * ( vec2( cos( th ), sin( th ) ) * r * search );
       float d = unpackRGBAToDepth( texture2D( shadowMap, sc.xy + o ) );
-      if ( d < z0 + dot( o, rp ) - length( o ) * curv ) { blockerSum += d; blockerCount += 1.0; }
+      if ( d < z0 + dot( o, rp ) - length( o ) * curv ) {
+        // Weight the average toward blockers found close in: a distant tap that
+        // happens to catch a tall wall must not inflate the penumbra of a
+        // contact point right next to it.
+        float w = 1.0 - 0.55 * r;
+        blockerSum += d * w;
+        blockerCount += w;
+      }
     }
-    if ( blockerCount < 0.5 ) return 1.0;
+    if ( blockerCount < 0.001 ) return 1.0;
 
     float avgBlocker = blockerSum / blockerCount;
-    float pen = clamp( ( z0 - avgBlocker ) * penumbraK, texel.x * 0.85, texel.x * 9.0 );
+    float pen = clamp( ( z0 - avgBlocker ) * penumbraK,
+                       texel.x * 0.75, texel.x * MAX_PEN_TEXELS );
 
     float sum = 0.0;
-    for ( int i = 0; i < 16; i ++ ) {
-      float r = sqrt( ( float( i ) + 0.5 ) / 16.0 );
+    for ( int i = 0; i < 20; i ++ ) {
+      float r = sqrt( ( float( i ) + 0.5 ) / 20.0 );
       float th = float( i ) * 2.39996323 + 0.7;
       vec2 o = rotM * ( vec2( cos( th ), sin( th ) ) * r * pen );
       float d = unpackRGBAToDepth( texture2D( shadowMap, sc.xy + o ) );
       sum += step( z0 + dot( o, rp ) - length( o ) * curv, d );
     }
 
-    return mix( 1.0, sum * 0.0625, shadowIntensity );
+    return mix( 1.0, sum * 0.05, shadowIntensity );
   }
 
 #endif
@@ -145,9 +216,23 @@ const CSM_DIR_BLOCK = /* glsl */ `
 					csmS = mix( 1.0, csmS, csmFade );
 				#endif
 			}
-			directLight.color *= csmS * csmW;
+			// Cloud shade rides on the key light only. Summed over the cascades
+			// the weights are 1, so applying it in every iteration scales the
+			// total exactly once.
+			directLight.color *= csmS * csmW * csmCloud;
 		}
 `;
+
+/**
+ * Shared uniform values. `cloneUniforms` copies plain objects **by reference**
+ * (only THREE types and arrays are deep-copied), so a single object here is
+ * genuinely shared by every material's uniform set and can be updated once per
+ * frame instead of walked across the scene graph.
+ */
+export const SHARED_UNIFORMS = {
+  uSkyCloudPan: { x: 0, y: 0, z: LIGHT_TRANSPORT.cloudCoverage, w: 0 },
+  uSkyCloudDeck: { x: LIGHT_TRANSPORT.cloudDeck, y: LIGHT_TRANSPORT.cloudScale, z: 0, w: 0 },
+};
 
 let _chunksPatched = false;
 function installCSMChunks() {
@@ -156,15 +241,52 @@ function installCSMChunks() {
 
   THREE.ShaderChunk.shadowmap_pars_fragment = THREE.ShaderChunk.shadowmap_pars_fragment + CSM_SHADOW_FN;
 
+  // Every lit built-in shader gets the shared cloud uniforms. Materials that
+  // predate this (or raw ShaderMaterials) simply leave them at their GLSL
+  // default of zero, which the shader reads as "clouds off".
+  for (const id of ['physical', 'standard', 'lambert', 'phong', 'toon']) {
+    const lib = THREE.ShaderLib[id];
+    if (!lib) continue;
+    lib.uniforms.uSkyCloudPan = { value: SHARED_UNIFORMS.uSkyCloudPan };
+    lib.uniforms.uSkyCloudDeck = { value: SHARED_UNIFORMS.uSkyCloudDeck };
+  }
+
+  // Diffuse irradiance now comes from the sky SH light probe. Leaving the
+  // environment cube's diffuse term in as well would double-count it and
+  // decouple the shadow colour from the sky again.
+  const maps = THREE.ShaderChunk.lights_fragment_maps;
+  const iblLine = '\t\tiblIrradiance += getIBLIrradiance( geometryNormal );';
+  if (maps.includes(iblLine)) {
+    THREE.ShaderChunk.lights_fragment_maps = maps.replace(
+      iblLine,
+      '\t\t// diffuse IBL intentionally dropped: the sky SH light probe owns it (Lighting.js)',
+    );
+  } else {
+    console.warn('Lighting: lights_fragment_maps shape changed; diffuse IBL not suppressed.');
+  }
+
   const src = THREE.ShaderChunk.lights_fragment_begin;
 
   // Declare the cascade accumulator + a per-pixel rotation for the Vogel disc.
   // Interleaved gradient noise decorrelates the filter across pixels; TAA then
   // resolves it to a clean penumbra instead of a fixed dither pattern.
+  //
+  // The cloud term is evaluated ONCE here rather than per cascade: reconstruct
+  // the world position from the view-space one (viewMatrix is rigid, so its
+  // inverse rotation is a transposed multiply) and the world sun direction from
+  // cascade 0, which by construction shares its direction with every cascade.
   const decl = `	DirectionalLight directionalLight;`;
   const declNew = `	DirectionalLight directionalLight;
 	float csmRemain = 1.0;
-	float csmRot = fract( 52.9829189 * fract( dot( gl_FragCoord.xy, vec2( 0.06711056, 0.00583715 ) ) ) ) * 6.2831853;`;
+	float csmRot = fract( 52.9829189 * fract( dot( gl_FragCoord.xy, vec2( 0.06711056, 0.00583715 ) ) ) ) * 6.2831853;
+	float csmCloud = 1.0;
+	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	{
+		vec3 csmWorldPos = cameraPosition + geometryPosition * mat3( viewMatrix );
+		vec3 csmSunW = normalize( directionalLights[ 0 ].direction * mat3( viewMatrix ) );
+		csmCloud = csmCloudShadow( csmWorldPos, csmSunW );
+	}
+	#endif`;
 
   const oldShadowLine =
     'directLight.color *= ( directLight.visible && receiveShadow ) ? getShadow( directionalShadowMap[ i ], directionalLightShadow.shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadow.shadowBias, directionalLightShadow.shadowRadius, vDirectionalShadowCoord[ i ] ) : 1.0;';
@@ -305,6 +427,48 @@ function scatterCPU(ro, rd, sunDir, mieG, rayScale, mieScale) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Sky -> spherical harmonics
+// ---------------------------------------------------------------------------
+
+/** Unit directions spread evenly over the sphere (Fibonacci spiral). */
+function fibonacciSphere(n) {
+  const dirs = [];
+  const ga = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const y = 1 - ((i + 0.5) / n) * 2;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const th = ga * i;
+    dirs.push(new THREE.Vector3(Math.cos(th) * r, y, Math.sin(th) * r));
+  }
+  return dirs;
+}
+
+/**
+ * 384 directions is well past the point where an L2 projection stops changing
+ * (the basis cannot resolve anything sharper than a ~60 degree lobe) but it
+ * keeps the *irradiance sums* used for the key:fill calibration quiet.
+ */
+const SH_DIRS = fibonacciSphere(384);
+const SH_BASIS = new Array(9).fill(0);
+
+const LUMA = [0.2126, 0.7152, 0.0722];
+const lum3 = (c) => c[0] * LUMA[0] + c[1] * LUMA[1] + c[2] * LUMA[2];
+
+/** Accept whatever shape Sky.js hands back: array, Vector3 or Color. */
+function readRGB(v) {
+  if (!v) return null;
+  let c;
+  if (Array.isArray(v)) c = [v[0], v[1], v[2]];
+  else if (v.isColor) c = [v.r, v.g, v.b];
+  else if (typeof v.x === 'number') c = [v.x, v.y, v.z];
+  else return null;
+  for (let i = 0; i < 3; i++) {
+    if (!Number.isFinite(c[i]) || c[i] < 0) return null;
+  }
+  return c;
+}
+
 /**
  * Lighting system.
  */
@@ -319,7 +483,7 @@ export class Lighting {
     // Angular size of the light source as seen from the ground, in radians.
     // Larger than the real sun on purpose: it is what makes the penumbra grow
     // visibly along a 40 m shadow instead of staying pin-sharp.
-    this.lightAngularSize = 0.028;
+    this.lightAngularSize = LIGHT_TRANSPORT.sunAngularSize;
 
     const mapSizes = [QUALITY.shadowMapSize, QUALITY.shadowMapSize, QUALITY.shadowMapSize, 1024];
     // How often each cascade is re-rendered, in frames. The far cascades cover
@@ -357,11 +521,25 @@ export class Lighting {
     this.sun = this.cascades[0];
     this.sunTarget = this.cascades[0].target;
 
+    // Kept at zero and kept around: several tools (tools/calibrate.mjs) drive
+    // `lighting.hemi.intensity`, and a stray hemisphere light on top of the SH
+    // probe would double-count the sky.
     this.hemi = new THREE.HemisphereLight(0x9fb6d8, 0x6b5c46, 0.0);
     engine.scene.add(this.hemi);
 
+    /**
+     * Diffuse ambient. Every coefficient is a projection of the sky dome plus
+     * the ground bounce, recomputed on each time-of-day change, so the fill
+     * light's colour is the sky's colour and cannot drift from it.
+     */
+    this.probe = new THREE.LightProbe(new THREE.SphericalHarmonics3(), 1.0);
+    engine.scene.add(this.probe);
+
     // Bounce light: sand kicks a lot of warm light back up into undersides.
-    this.bounce = new THREE.DirectionalLight(0xc9a878, 0.55);
+    // The hemispherical part of that now lives in the SH probe; this survives
+    // as a small extra kick straight up, which reads on the flat undersides of
+    // vehicles and crates where an L2 probe is too smooth to make an edge.
+    this.bounce = new THREE.DirectionalLight(0xc9a878, 0.0);
     this.bounce.position.set(0, -1, 0);
     engine.scene.add(this.bounce);
 
@@ -414,6 +592,9 @@ export class Lighting {
     const maz = az + Math.PI * 0.82;
     this.moonDirection.set(Math.cos(mel) * Math.sin(maz), Math.sin(mel), Math.cos(mel) * Math.cos(maz)).normalize();
     this.keyDirection.copy(night > 0.5 ? this.moonDirection : this.sunDirection);
+    // The moon has no aureole worth speaking of, so its shadows stay crisp.
+    this.lightAngularSize =
+      night > 0.5 ? LIGHT_TRANSPORT.moonAngularSize : LIGHT_TRANSPORT.sunAngularSize;
 
     for (const l of this.cascades) {
       l.color.setRGB(...p.sunColor, THREE.LinearSRGBColorSpace);
@@ -423,16 +604,16 @@ export class Lighting {
     this.hemi.color.setRGB(...p.ambientColor, THREE.LinearSRGBColorSpace);
     this.hemi.intensity = 0.0;
     this.hemi.groundColor.setRGB(0.3, 0.255, 0.19, THREE.LinearSRGBColorSpace);
-    this.bounce.intensity = 0.4 * p.ambientIntensity;
-    // Sky IBL is the *only* fill on a vertical surface (the bounce light points
-    // straight up, so it reaches undersides and nothing else). At 0.8 a concrete
-    // wall turned away from the sun landed at 2/255 — the one thing the art
-    // direction explicitly forbids. Auto-exposure re-normalises the mean, so
-    // this reads as lifted shadows rather than a brighter picture.
-    this.envIntensity = 1.15 * p.ambientIntensity;
+    // The environment cube is specular-only now (its diffuse term is stripped
+    // out of lights_fragment_maps), so this no longer sets the fill level.
+    this.envIntensity = LIGHT_TRANSPORT.specularIBL;
     this.engine.scene.environmentIntensity = this.envIntensity;
 
     this.sky.apply(p, this.sunDirection, this.moonDirection, night);
+
+    // Sky must be applied first: `radianceInDirection` (when Sky.js provides it)
+    // reads the uniforms we just wrote.
+    this._computeSkySH();
 
     // Distance haze is done properly in the post stack (see RenderPipeline's
     // aerial perspective). A thin exponential fog is kept only so alpha-blended
@@ -447,6 +628,183 @@ export class Lighting {
   }
 
   /**
+   * Radiance of the sky dome in one direction, in the same linear units the
+   * scene's DirectionalLight uses.
+   *
+   * Prefers `sky.radianceInDirection` when Sky.js exposes it, and falls back to
+   * the CPU mirror of the same raymarch otherwise. Either way the key:fill
+   * calibration below re-normalises the overall level, so only the *shape* and
+   * *colour* of the dome need to agree — a unit mismatch cannot break the look.
+   */
+  _skyRadiance(dir, ctx) {
+    if (ctx.useApi) {
+      const c = readRGB(this.sky.radianceInDirection(dir));
+      if (c) return c;
+      // One bad answer is enough: stop asking, do not spend 384 try/catches.
+      ctx.useApi = false;
+    }
+    const s = scatterCPU(ctx.ro, [dir.x, dir.y, dir.z], ctx.sd, ctx.mieG, ctx.rayScale, ctx.mieScale);
+    const k = ctx.sunIrr * ctx.unit;
+    const out = [s[0] * k, s[1] * k, s[2] * k];
+    if (ctx.night > 0.001) {
+      // Mirror of Sky.js's moonlit-air term: Rayleigh blue, thicker toward the
+      // horizon, brighter toward the moon. Without it a night preset projects to
+      // an all-black probe and every unlit surface crushes.
+      const thick = 0.45 + 0.55 * Math.exp(-Math.max(dir.y, 0) * 2.6);
+      const muM = dir.dot(this.moonDirection);
+      const g = ctx.night * thick * (0.55 + 0.75 * Math.max(0, muM)) * ctx.unit;
+      out[0] += 0.030 * g;
+      out[1] += 0.052 * g;
+      out[2] += 0.115 * g;
+    }
+    return out;
+  }
+
+  /**
+   * Project the sky dome (plus the ground bounce it causes) into L2 spherical
+   * harmonics and hand the result to the scene's LightProbe.
+   *
+   * The three things that make this read as MGSV rather than as "IBL from a
+   * skybox":
+   *
+   *  1. The lower hemisphere is not black. It is sunlit ground: albedo times the
+   *     irradiance the ground actually receives. That is the warm kick that
+   *     gives a barrel's shade side any form at all.
+   *  2. The bottom `ridgeElevation` degrees of the *upper* hemisphere are also
+   *     ground. In a valley the local horizon is rock, not sky, and sin^2 of
+   *     that angle is the share of a horizontal surface's fill that arrives warm
+   *     instead of blue. This is most of the difference between a navy shadow
+   *     and a dusty one.
+   *  3. A rough-ground interreflection pedestal. A perfectly flat Lambertian
+   *     plane cannot see itself; gravel can, and does.
+   *
+   * The projection is then scaled by ONE scalar so the key:fill ratio lands on
+   * the art-directed value. Scaling cannot change the hue, so the shadow colour
+   * stays the sky's colour by construction while the contrast is dialled.
+   */
+  _computeSkySH() {
+    const p = this.preset;
+    const LT = LIGHT_TRANSPORT;
+    const N = SH_DIRS.length;
+    const dOmega = (4 * Math.PI) / N;
+
+    const ctx = {
+      useApi: typeof this.sky.radianceInDirection === 'function',
+      ro: [0, Rg + 400, 0],
+      sd: [this.sunDirection.x, this.sunDirection.y, this.sunDirection.z],
+      rayScale: p.rayleigh / 1.9,
+      mieScale: (p.mieCoefficient / 0.0058) * (0.55 + 0.14 * p.skyTurbidity),
+      mieG: Math.min(p.mieDirectionalG, 0.82),
+      unit: this.sky.material.uniforms.uSkyExposure.value * SKY_SCALE,
+      sunIrr: this.sky.material.uniforms.uSunIrradiance.value,
+      night: this.night,
+    };
+
+    // --- pass 1: sky radiance, and the irradiance it lays on flat ground -----
+    const skyL = new Array(N);
+    const eSky = [0, 0, 0];
+    for (let i = 0; i < N; i++) {
+      const d = SH_DIRS[i];
+      if (d.y <= 0) continue;
+      const c = this._skyRadiance(d, ctx);
+      skyL[i] = c;
+      for (let k = 0; k < 3; k++) eSky[k] += c[k] * d.y * dOmega;
+    }
+
+    // --- the key light, and therefore the ground's own radiance --------------
+    const keyDir = this.night > 0.5 ? this.moonDirection : this.sunDirection;
+    const eKey = [0, 0, 0];
+    const cosKey = Math.max(0, keyDir.y);
+    for (let k = 0; k < 3; k++) eKey[k] = p.sunIntensity * p.sunColor[k] * cosKey;
+
+    // Cloud cover shades a fair share of the landscape, so the *average* ground
+    // is dimmer than a sunlit patch. Using the average here keeps the bounce
+    // consistent with what the cloud-shadow term actually does to the sun.
+    const cloudMean = 1 - LT.cloudShadowStrength * LT.cloudCoverage;
+    const alb = LT.groundAlbedo;
+    const groundL = [0, 0, 0];
+    for (let k = 0; k < 3; k++) {
+      groundL[k] = (alb[k] * (eKey[k] * cloudMean + eSky[k])) / Math.PI;
+    }
+    const pedestal = groundL.map((v) => v * LT.groundCoupling);
+    const sinRidge = Math.sin(THREE.MathUtils.degToRad(LT.ridgeElevation));
+
+    // --- pass 2: full-sphere radiance -> SH, and the up-facing irradiance ----
+    const sh = this.probe.sh;
+    sh.zero();
+    const coeff = sh.coefficients;
+    const eUp = [0, 0, 0];
+    const L = [0, 0, 0];
+    for (let i = 0; i < N; i++) {
+      const d = SH_DIRS[i];
+      if (d.y > 0) {
+        const t = THREE.MathUtils.smoothstep(d.y, 0, sinRidge);
+        const s = skyL[i];
+        for (let k = 0; k < 3; k++) L[k] = groundL[k] + (s[k] - groundL[k]) * t + pedestal[k];
+        for (let k = 0; k < 3; k++) eUp[k] += L[k] * d.y * dOmega;
+      } else {
+        for (let k = 0; k < 3; k++) L[k] = groundL[k] + pedestal[k];
+      }
+      THREE.SphericalHarmonics3.getBasisAt(d, SH_BASIS);
+      for (let j = 0; j < 9; j++) {
+        const w = SH_BASIS[j] * dOmega;
+        coeff[j].x += L[0] * w;
+        coeff[j].y += L[1] * w;
+        coeff[j].z += L[2] * w;
+      }
+    }
+
+    // --- key:fill calibration ------------------------------------------------
+    // A hazy desert midday sits about two stops between lit sand and its own
+    // cast shadow. Low sun flattens toward the sky taking over.
+    let ratio;
+    if (this.night > 0.5) ratio = LT.keyFillNight;
+    else {
+      const t = THREE.MathUtils.smoothstep(cosKey, 0.06, 0.55);
+      ratio = LT.keyFillLow + (LT.keyFillHigh - LT.keyFillLow) * t;
+    }
+    const targetUp = lum3(eKey) / Math.max(ratio - 1, 0.25);
+    const rawUp = Math.max(lum3(eUp), 1e-6);
+    // The clamp is a seatbelt, not a knob. If it engages, the sky dome's
+    // exposure and the sun's intensity disagree by more than a factor of six and
+    // that is a bug worth knowing about, not something to quietly grade around.
+    const scale = THREE.MathUtils.clamp(targetUp / rawUp, 0.16, 6.0);
+    for (let j = 0; j < 9; j++) coeff[j].multiplyScalar(scale);
+    for (let k = 0; k < 3; k++) eUp[k] *= scale;
+
+    this.probe.intensity = 1.0;
+
+    /**
+     * Published so the post stack, the AO tint and the harness all read the same
+     * ambient the geometry is lit by. `irradianceUp` is what a flat unoccluded
+     * patch of ground in shadow receives; `skyRadiance` is its radiance form.
+     */
+    this.ambient = {
+      irradianceUp: eUp,
+      radiance: eUp.map((v) => v / Math.PI),
+      keyIrradiance: eKey,
+      groundRadiance: groundL,
+      ratio,
+      scale,
+      blueOverRed: eUp[2] / Math.max(eUp[0], 1e-6),
+      /**
+       * What the *haze* is lit by, as opposed to what surfaces are filled by.
+       *
+       * Two deliberate differences from `radiance`. It is not rescaled by the
+       * key:fill scalar — that scalar is a statement about surface contrast, not
+       * about how much light is in the air, and aerial perspective has to match
+       * the sky dome it dissolves into or a ridge stops fading into the sky
+       * behind it. And it is the *sky only*: no ridge lift, no ground pedestal.
+       * A surface is filled by the sky plus everything warm around it, but the
+       * dust column between the camera and a ridge two kilometres out is lit by
+       * the sky, and that is precisely why distant ridges in Afghanistan wash
+       * to pale dusty blue-grey while the sand at your feet stays khaki.
+       */
+      hazeRadiance: eSky.map((v) => v / Math.PI),
+    };
+  }
+
+  /**
    * Evaluate the atmosphere on the CPU and hand the post stack the numbers it
    * needs so its aerial perspective is the same physics as the sky dome: the
    * sun radiance surviving to ground level, and the average sky radiance.
@@ -454,17 +812,9 @@ export class Lighting {
   _pushAtmosphere() {
     const p = this.preset;
     const pipeline = this.engine.pipeline;
-    const skyExposure = this.sky.material.uniforms.uSkyExposure.value;
-    const unit = skyExposure * SKY_SCALE;
-    const sunIrradiance = this.sky.material.uniforms.uSunIrradiance.value;
-
     const rayScale = p.rayleigh / 1.9;
     const mieScale = (p.mieCoefficient / 0.0058) * (0.55 + 0.14 * p.skyTurbidity);
     const mieG = Math.min(p.mieDirectionalG, 0.82);
-
-    const alt = 400;
-    const ro = [0, Rg + alt, 0];
-    const sd = [this.sunDirection.x, this.sunDirection.y, this.sunDirection.z];
 
     // Irradiance the haze is lit by, expressed in the SAME units the scene's
     // DirectionalLight uses. Deriving it from the light rather than from the
@@ -478,22 +828,14 @@ export class Lighting {
       for (let c = 0; c < 3; c++) sunRad[c] = 0;
     }
 
-    // Average sky radiance over the upper hemisphere — the ambient term that
-    // fills haze on the shadow side.
-    const skyAvg = [0, 0, 0];
-    const dirs = [];
-    for (let a = 0; a < 8; a++) {
-      const th = (a / 8) * Math.PI * 2;
-      for (const elev of [0.06, 0.35]) {
-        dirs.push([Math.cos(elev) * Math.sin(th), Math.sin(elev), Math.cos(elev) * Math.cos(th)]);
-      }
-    }
-    dirs.push([0, 1, 0]);
-    for (const d of dirs) {
-      const s = scatterCPU(ro, d, sd, mieG, rayScale, mieScale);
-      for (let c = 0; c < 3; c++) skyAvg[c] += s[c] * sunIrradiance * unit;
-    }
-    for (let c = 0; c < 3; c++) skyAvg[c] /= dirs.length;
+    // Ambient radiance the haze is filled by. This is the SAME number the
+    // geometry's fill light is built from (the SH probe's up-facing irradiance
+    // over pi), so a hazy ridge and the shadow at your feet cannot disagree
+    // about what colour the sky is — which is exactly how round 1 ended up with
+    // a white sky and navy shadows.
+    const skyAvg = this.ambient
+      ? this.ambient.hazeRadiance.slice()
+      : [0.09, 0.11, 0.16];
 
     // At night the moon is the only source; scale a cool ambient off it.
     if (this.night > 0.01) {
@@ -553,6 +895,13 @@ export class Lighting {
   /** Force every cascade to redraw on the next frame (shot cut, time change). */
   invalidateShadows() {
     for (const l of this.cascades) l.shadow.needsUpdate = true;
+    // Local lights are allowed to cache their shadow map (a lamp on a mast over
+    // a compound that does not move re-rasterises the same depth every frame).
+    // Anything that opted out of three's per-frame refresh still has to redraw
+    // when the key light moves, or a shot cut leaves a stale pool of shadow.
+    this.engine.scene.traverse((o) => {
+      if (o.isLight && o.castShadow && o.shadow && o.shadow.autoUpdate === false) o.shadow.needsUpdate = true;
+    });
     this._frame = 0;
   }
 
@@ -686,11 +1035,29 @@ export class Lighting {
 
     this._fitCascades(engine.camera);
 
-    // The bounce light tracks the key so undersides stay filled from below.
-    this.bounce.position.set(0, -1, 0);
+    this._updateCloudShadow(engine.elapsed);
 
     if (this.engine.pipeline && this.atmosphere) {
       this.engine.pipeline.setAtmosphere(this.atmosphere);
     }
+  }
+
+  /**
+   * Drift the cloud deck. The uniform objects are shared by reference across
+   * every material's uniform set (see SHARED_UNIFORMS), so one write here moves
+   * the shade patches on the terrain, the outpost and the characters at once.
+   */
+  _updateCloudShadow(elapsed) {
+    const LT = LIGHT_TRANSPORT;
+    const u = SHARED_UNIFORMS.uSkyCloudPan;
+    const s = SHARED_UNIFORMS.uSkyCloudDeck;
+    s.x = LT.cloudDeck;
+    s.y = LT.cloudScale;
+    u.x = elapsed * LT.cloudSpeed[0] * LT.cloudScale;
+    u.y = elapsed * LT.cloudSpeed[1] * LT.cloudScale;
+    u.z = LT.cloudCoverage;
+    // No sun below the horizon means no cloud shadows to cast; the moon's are
+    // far too weak to read and would only mottle the night grade.
+    u.w = this.night > 0.5 ? 0.0 : LT.cloudShadowStrength * (1 - this.night);
   }
 }

@@ -3,15 +3,25 @@ import * as THREE from 'three';
 /**
  * VegField — the shared ground query used by every vegetation scatter.
  *
- * Terrain bakes a real drainage simulation (`flow`), bedrock exposure (`rock`)
- * and talus (`scree`) into its near grid. That is far better placement data than
- * anything vegetation could infer on its own, so this class just republishes it:
- * float textures for the grass vertex shader, and thin CPU wrappers for the props
- * that genuinely need a JS transform per instance.
+ * Two data sources, and getting the second one wrong is what made round 1's
+ * vegetation invisible:
  *
- * Coverage is the terrain's *near* grid (2 m cells, +/-1280 m). Vegetation stops
- * at its edge; the grass field is only ~120 m across and every prop sits well
- * inside, so the boundary is never reachable from the playable area.
+ *  1. Terrain bakes a real drainage simulation (`flow`), bedrock exposure
+ *     (`rock`) and talus (`scree`) into its near grid. That is far better
+ *     placement data than anything vegetation could infer on its own.
+ *
+ *  2. The outpost does not sit *on* the terrain — it grades a platform into it.
+ *     `outpost.heightAt()` is up to **33 m above** `terrain.heightAt()` at the
+ *     compound, and the graded apron reaches ~240 m out. Vegetation rooted on
+ *     the natural heightfield is therefore buried a full storey underground
+ *     across the whole area every canonical camera looks at, which is exactly
+ *     what happened. The finished ground is `terrain + lift`, and `lift` is what
+ *     the pad map below bakes.
+ *
+ * The outpost installs *after* vegetation, so the pad map cannot be built during
+ * install(). `attach()` is called on the first simulation tick instead, and the
+ * pad texture is allocated (zeroed) up front so the shaders never see a
+ * uniform appear or disappear.
  */
 
 /** Deterministic RNG — placement must be identical on every boot for the shot harness. */
@@ -29,6 +39,15 @@ const ZERO_SURFACE = { flow: 0, rock: 0, scree: 0, ao: 1 };
 
 const FALLBACK_N = 1024;
 const FALLBACK_CELL = 2.5;
+
+/**
+ * Pad map resolution. 1.75 m cells over +/-252 m: fine enough that a tuft on the
+ * 1:3 embankment sits within a couple of centimetres of the graded surface, and
+ * wide enough to contain the access ramp, which the outpost drags out to ~230 m.
+ * ~83k probes of outpost.heightAt, measured at 1.7 us each — under 200 ms, once.
+ */
+const PAD_N = 288;
+const PAD_CELL = 1.75;
 
 /**
  * Read Terrain's near clipmap grid if it exposes one, otherwise rebuild an
@@ -107,41 +126,359 @@ export class VegField {
     this.surfTex.needsUpdate = true;
 
     this.info = new THREE.Vector4(this.origin, this.cell, n, 1 / n);
+
+    // Pad map — allocated zeroed so every shader binds the same texture object
+    // for the whole run. R lift (metres above natural ground), G development
+    // (0 wild .. 1 engineered platform), B shelter (lee of a rock or a wall).
+    this.padN = PAD_N;
+    this.padCell = PAD_CELL;
+    this.padOrigin = -(PAD_N * PAD_CELL) / 2;
+    this.pad = new Float32Array(PAD_N * PAD_N * 4);
+    this.padTex = new THREE.DataTexture(this.pad, PAD_N, PAD_N, THREE.RGBAFormat, THREE.FloatType);
+    this.padTex.minFilter = THREE.NearestFilter;
+    this.padTex.magFilter = THREE.NearestFilter;
+    this.padTex.wrapS = this.padTex.wrapT = THREE.ClampToEdgeWrapping;
+    this.padTex.generateMipmaps = false;
+    this.padTex.colorSpace = THREE.NoColorSpace;
+    this.padTex.needsUpdate = true;
+    this.padInfo = new THREE.Vector4(this.padOrigin, PAD_CELL, PAD_N, 1 / PAD_N);
+
+    this.outpost = null;
+    this.attached = false;
   }
 
+  /**
+   * Bake the pad map. Called once, on the first simulation tick, when modules
+   * that install after vegetation have published their handles.
+   *
+   * `registry.outpost` may be missing (a module that throws is caught and the
+   * game still boots), in which case the map stays zero and vegetation simply
+   * sits on the natural terrain — correct, just less interesting.
+   */
+  attach(registry) {
+    if (this.attached) return;
+    this.attached = true;
+
+    const op = registry?.outpost ?? registry?.outpostGround ?? null;
+    this.outpost = op && typeof op.heightAt === 'function' ? op : null;
+
+    const n = this.padN;
+    const cell = this.padCell;
+    const o = this.padOrigin;
+    const pad = this.pad;
+
+    if (this.outpost) {
+      const devAt = typeof this.outpost.developmentAt === 'function' ? this.outpost.developmentAt : () => 0;
+      for (let j = 0; j < n; j++) {
+        const wz = o + j * cell;
+        for (let i = 0; i < n; i++) {
+          const c = (j * n + i) * 4;
+          const wx = o + i * cell;
+          // The outpost's finished height dips 0.44 m *below* natural ground off
+          // the platform, where its mesh is hidden under the terrain; only the
+          // positive difference is real, so clamp.
+          pad[c] = Math.max(0, this.outpost.heightAt(wx, wz) - this.terrain.heightAt(wx, wz));
+          pad[c + 1] = Math.min(1, Math.max(0, devAt(wx, wz)));
+        }
+      }
+      this._bakeCompoundShelter();
+      this._bakeStructureShelter(op.group);
+    }
+
+    this._bakeRockShelter(registry?.rocks);
+    this.padTex.needsUpdate = true;
+    return this;
+  }
+
+  /**
+   * Weeds against structures. This is what makes an occupied compound read as
+   * occupied rather than swept: nothing ever drives or walks within half a metre
+   * of a wall, a container or a stack of sandbags, so that half-metre is the one
+   * strip inside the wire where anything grows.
+   *
+   * Splat the world footprint of every solid in the outpost into the shelter
+   * channel as a band just outside it. Cheap — a few hundred boxes against a
+   * 288-square grid — and it needs no knowledge of what the outpost actually
+   * built, which matters because that file is not mine and changes weekly.
+   */
+  _bakeStructureShelter(group) {
+    if (!group) return;
+    // Modules install before the first render, so world matrices are stale here.
+    group.updateWorldMatrix(true, true);
+    const box = new THREE.Box3();
+    const m = new THREE.Matrix4();
+    const inst = new THREE.Matrix4();
+    let budget = 24000;
+    group.traverse((o) => {
+      const geo = o.geometry;
+      if (!geo || budget <= 0) return;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      const gb = geo.boundingBox;
+      if (!gb) return;
+      if (o.isInstancedMesh) {
+        const n = Math.min(o.count, budget);
+        for (let i = 0; i < n; i++) {
+          o.getMatrixAt(i, inst);
+          this._splatFootprint(box.copy(gb).applyMatrix4(m.multiplyMatrices(o.matrixWorld, inst)));
+        }
+        budget -= n;
+      } else {
+        this._splatFootprint(box.copy(gb).applyMatrix4(o.matrixWorld));
+        budget--;
+      }
+    });
+  }
+
+  _splatFootprint(b) {
+    const hy = b.max.y - b.min.y;
+    const sx = b.max.x - b.min.x;
+    const sz = b.max.z - b.min.z;
+    // Skip ground plates and anything so large it *is* the terrain (the pad
+    // mesh itself), and skip anything too low to shelter a plant.
+    // Keep barrels, sandbag courses and fence posts — those are exactly what
+    // weeds grow against — but skip ground plates and anything so large it *is*
+    // the terrain. The halo is narrow and noise-broken, so including small
+    // objects dresses the yard rather than carpeting it.
+    if (hy < 0.45 || sx > 70 || sz > 70) return;
+    if (Math.min(sx, sz) < 0.28) return;
+    const REACH = 1.35;
+    const n = this.padN;
+    const cell = this.padCell;
+    const o = this.padOrigin;
+    const pad = this.pad;
+    const i0 = Math.max(0, Math.floor((b.min.x - REACH - o) / cell));
+    const i1 = Math.min(n - 1, Math.ceil((b.max.x + REACH - o) / cell));
+    const j0 = Math.max(0, Math.floor((b.min.z - REACH - o) / cell));
+    const j1 = Math.min(n - 1, Math.ceil((b.max.z + REACH - o) / cell));
+    for (let j = j0; j <= j1; j++) {
+      const wz = o + j * cell;
+      const dz = Math.max(b.min.z - wz, wz - b.max.z);
+      for (let i = i0; i <= i1; i++) {
+        const wx = o + i * cell;
+        const dx = Math.max(b.min.x - wx, wx - b.max.x);
+        const d = dx > 0 && dz > 0 ? Math.hypot(dx, dz) : Math.max(dx, dz);
+        if (d > REACH) continue;
+        // Nothing grows *under* the object; the band starts at its edge.
+        const s = smooth01(d, -0.25, 0.12) * (1 - smooth01(d, 0.35, REACH));
+        const c = (j * n + i) * 4 + 2;
+        if (s > pad[c]) pad[c] = s;
+      }
+    }
+  }
+
+  /**
+   * Weeds line the inside of a perimeter fence because nothing drives over the
+   * last two metres of ground. Derive the compound rectangle by probing
+   * `isInside` rather than hard-coding it — that constant lives in another
+   * author's file and has moved before.
+   */
+  _bakeCompoundShelter() {
+    const op = this.outpost;
+    if (typeof op.isInside !== 'function' || typeof op.toWorld !== 'function' || typeof op.toLocal !== 'function') return;
+    const scan = (axis) => {
+      let lo = 0;
+      let hi = 0;
+      for (let t = -160; t <= 160; t += 0.5) {
+        const [x, z] = axis === 0 ? op.toWorld(t, 0) : op.toWorld(0, t);
+        if (op.isInside(x, z)) {
+          if (t < lo) lo = t;
+          if (t > hi) hi = t;
+        }
+      }
+      return [lo, hi];
+    };
+    const [u0, u1] = scan(0);
+    const [v0, v1] = scan(1);
+    if (u1 - u0 < 4 || v1 - v0 < 4) return;
+    this.compoundRect = { u0, u1, v0, v1 };
+
+    const n = this.padN;
+    const cell = this.padCell;
+    const o = this.padOrigin;
+    const pad = this.pad;
+    for (let j = 0; j < n; j++) {
+      const wz = o + j * cell;
+      for (let i = 0; i < n; i++) {
+        const wx = o + i * cell;
+        const [u, v] = op.toLocal(wx, wz);
+        // Signed distance to the compound rectangle: negative inside.
+        const du = Math.max(u0 - u, u - u1);
+        const dv = Math.max(v0 - v, v - v1);
+        const d = du > 0 && dv > 0 ? Math.hypot(du, dv) : Math.max(du, dv);
+        // A metre and a half either side of the wall line, tapering out to four.
+        const s = 1 - smooth01(Math.abs(d + 1.4), 1.2, 4.2);
+        const c = (j * n + i) * 4;
+        if (s > pad[c + 2]) pad[c + 2] = s;
+      }
+    }
+  }
+
+  /**
+   * Rocks shelter their own downwind side: seed piles up there, and the shadow
+   * keeps the ground damp a few hours longer. Splat every rock instance's
+   * footprint into the shelter channel.
+   */
+  _bakeRockShelter(rocks) {
+    const meshes = rocks?.meshes;
+    if (!meshes) return;
+    const n = this.padN;
+    const cell = this.padCell;
+    const o = this.padOrigin;
+    const lim = o + (n - 1) * cell;
+    const pad = this.pad;
+    const m = new THREE.Matrix4();
+    for (const mesh of meshes) {
+      if (!mesh.isInstancedMesh) continue;
+      // A near-field bake: distant rocks are outside the pad map anyway.
+      for (let k = 0; k < mesh.count; k++) {
+        mesh.getMatrixAt(k, m);
+        const x = m.elements[12];
+        const z = m.elements[14];
+        if (x < o || x > lim || z < o || z > lim) continue;
+        const sx = Math.hypot(m.elements[0], m.elements[1], m.elements[2]);
+        const r = Math.min(9, Math.max(1.2, sx * 1.9));
+        const i0 = Math.max(0, Math.floor((x - r - o) / cell));
+        const i1 = Math.min(n - 1, Math.ceil((x + r - o) / cell));
+        const j0 = Math.max(0, Math.floor((z - r - o) / cell));
+        const j1 = Math.min(n - 1, Math.ceil((z + r - o) / cell));
+        for (let j = j0; j <= j1; j++) {
+          const dz = o + j * cell - z;
+          for (let i = i0; i <= i1; i++) {
+            const dx = o + i * cell - x;
+            const d = Math.hypot(dx, dz);
+            if (d > r) continue;
+            // Zero inside the rock itself — nothing grows through granite.
+            const s = smooth01(d, r * 0.42, r * 0.62) * (1 - smooth01(d, r * 0.72, r));
+            const c = (j * n + i) * 4 + 2;
+            if (s > pad[c]) pad[c] = s;
+          }
+        }
+      }
+    }
+  }
+
+  /** Bilinear fetch from the pad map; zero outside it. */
+  padAt(wx, wz, out) {
+    const n = this.padN;
+    const fx = (wx - this.padOrigin) / this.padCell;
+    const fz = (wz - this.padOrigin) / this.padCell;
+    if (fx < 0 || fz < 0 || fx > n - 1.001 || fz > n - 1.001) {
+      out.lift = 0;
+      out.dev = 0;
+      out.shelter = 0;
+      return out;
+    }
+    const i = fx | 0;
+    const j = fz | 0;
+    const tx = fx - i;
+    const tz = fz - j;
+    const p = this.pad;
+    const a = (j * n + i) * 4;
+    const b = (j * n + i + 1) * 4;
+    const c = ((j + 1) * n + i) * 4;
+    const d = ((j + 1) * n + i + 1) * 4;
+    const mix = (k) => {
+      const t = p[a + k] * (1 - tx) + p[b + k] * tx;
+      const u = p[c + k] * (1 - tx) + p[d + k] * tx;
+      return t * (1 - tz) + u * tz;
+    };
+    out.lift = mix(0);
+    out.dev = mix(1);
+    out.shelter = mix(2);
+    return out;
+  }
+
+  /** Natural heightfield only — almost never what you want; use surfaceY. */
   heightAt(wx, wz) {
     return this.terrain.heightAt(wx, wz);
   }
 
+  /** The height of the ground you can actually stand on, graded platform included. */
+  surfaceY(wx, wz) {
+    return this.terrain.heightAt(wx, wz) + this.padAt(wx, wz, _pad).lift;
+  }
+
   normalAt(wx, wz, e = 2.0) {
-    return this.terrain.normalAt(wx, wz, e);
+    const hL = this.surfaceY(wx - e, wz);
+    const hR = this.surfaceY(wx + e, wz);
+    const hD = this.surfaceY(wx, wz - e);
+    const hU = this.surfaceY(wx, wz + e);
+    return new THREE.Vector3(hL - hR, 2 * e, hD - hU).normalize();
   }
 
   /**
-   * CPU mirror of vegDensity() in shaderLib. Grass follows water: dense in the
-   * drainage lines, patchy on the flats, gone on bedrock and steep ground.
+   * CPU mirror of vegDensity() in shaderLib. Keep the two in step: grass follows
+   * water, thins on the graded platform, and collects in the lee of anything
+   * that breaks the wind.
    */
   density(wx, wz) {
     const s = this.terrain.surfaceAt ? this.terrain.surfaceAt(wx, wz) : ZERO_SURFACE;
+    const p = this.padAt(wx, wz, _pad);
     const n = this.normalAt(wx, wz, 2.0);
     const slope = 1 - n.y;
     const macro = fbm2(wx * 0.0085 + 41, wz * 0.0085 + 41, 3);
     const meso = fbm2(wx * 0.052 - 12, wz * 0.052 - 12, 2);
     const clump = fbm2(wx * 0.42 + 7, wz * 0.42 + 7, 2);
-    const raw = 0.46 + s.flow * 0.85 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.3;
-    let d = THREE.MathUtils.smoothstep(raw, 0.06, 0.52) * THREE.MathUtils.smoothstep(clump, 0.30, 0.60);
-    d *= 1 - THREE.MathUtils.smoothstep(slope, 0.13, 0.48);
-    d *= 1 - THREE.MathUtils.smoothstep(Math.max(s.rock, s.scree * 0.6), 0.15, 0.62);
+    const raw = 0.30 + s.flow * 1.00 + (macro - 0.5) * 1.7 + (meso - 0.5) * 1.9;
+    const base = smooth01(raw, 0.0, 0.62) * smooth01(clump, 0.24, 0.58);
+    const rocky = Math.max(s.rock, s.scree * 0.6);
+    let d = base;
+    d *= 1 - smooth01(slope, 0.16, 0.52);
+    d *= 1 - smooth01(rocky, 0.18, 0.68);
+    d = applyDevelopment(wx, wz, d, p.dev, p.shelter, slope);
+    // Woody plants are far more tolerant than tussock: a thorn bush roots in a
+    // crack in bedrock and holds a talus slope no grass could sit on. Rejecting
+    // scrub with the grass mask is what left every hillside in the vista bare.
+    let w = 0.26 + base * 0.74; // a floor: bushes persist where tussock gives up
+    w *= 1 - smooth01(slope, 0.36, 0.78);
+    w *= 1 - smooth01(rocky, 0.52, 0.98);
+    w = applyDevelopment(wx, wz, w, p.dev, p.shelter, slope);
     return {
-      density: THREE.MathUtils.clamp(d, 0, 1),
+      density: Math.min(1, Math.max(0, d)),
+      woody: Math.min(1, Math.max(0, w)),
       slope,
-      height: this.heightAt(wx, wz),
+      height: this.surfaceY(wx, wz),
       flow: s.flow,
       rock: s.rock,
       scree: s.scree,
+      dev: p.dev,
+      shelter: p.shelter,
       normal: n,
     };
   }
+}
+
+const _pad = { lift: 0, dev: 0, shelter: 0 };
+
+/**
+ * The engineered platform, as vegetation sees it. Three separate effects, and
+ * all three are visible in reference photography of any occupied FOB:
+ *   - the graded yard is driven on daily and is essentially sterile,
+ *   - except right against the walls, where nothing ever drives,
+ *   - and the cut embankment around it is the *richest* ground on the map,
+ *     because that is where the wind drops everything it was carrying.
+ */
+function applyDevelopment(x, z, d, dev, shelter, slope) {
+  const yard = smooth01(dev, 0.40, 0.92);
+  const shoulder = Math.max(0, 1 - Math.abs(dev - 0.42) * 2.2);
+  const ok = 1 - smooth01(slope, 0.28, 0.62);
+  let out = d * (1 - yard * 0.985);
+  // Shelter *adds* rather than scales: the strip against a wall is fertile
+  // regardless of what the fertility noise says about the open ground. It is
+  // still broken up by a metre-scale noise, or every object in the compound
+  // ends up wearing a continuous fringe and the whole yard reads as a decal.
+  const patch = smooth01(fbm2(x * 0.55 - 19, z * 0.55 - 19, 2), 0.30, 0.72);
+  out += shelter * 0.52 * ok * patch;
+  // Weeds in the cracks of the hardstand. A perfectly sterile slab is as
+  // wrong as a lawn; a graded yard gets a tuft wherever the surface split.
+  out += yard * 0.30 * ok * smooth01(fbm2(x * 1.15 + 55, z * 1.15 + 55, 2), 0.58, 0.90);
+  out += shoulder * 0.62 * ok;
+  return out;
+}
+
+function smooth01(x, a, b) {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
 }
 
 // --- CPU value noise (only used for prop scatter; the GPU has its own) -------

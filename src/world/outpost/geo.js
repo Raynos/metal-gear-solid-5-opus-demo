@@ -84,14 +84,147 @@ export function xform(g, o = {}) {
   return g;
 }
 
-/** Box centred on (x,y,z). */
+/**
+ * Chamfered box. Every concrete pour has a 20mm arris knocked off it and every
+ * folded-steel edge has a radius; a true 90° edge is the single loudest "this is
+ * CG" cue there is, because it produces a mathematically perfect one-pixel
+ * transition from lit to shaded at every distance. A 1–2cm chamfer instead
+ * catches a sliver of specular along the whole length of the edge, which is what
+ * the eye actually reads as "solid object lit by a real sun".
+ *
+ * 6 face quads + 12 edge quads + 8 corner tris = 44 triangles, flat-shaded.
+ */
+function chamferBox(w, h, d, c) {
+  const H = [w / 2, h / 2, d / 2];
+  const I = [H[0] - c, H[1] - c, H[2] - c];
+  const verts = [];
+  const tri = (p, q, r, nx, ny, nz) => {
+    // Auto-orient: the caller supplies the intended outward normal and we flip
+    // the winding if the cross product disagrees. Cheaper than getting 26
+    // facets' vertex orders right by hand.
+    const ux = q[0] - p[0];
+    const uy = q[1] - p[1];
+    const uz = q[2] - p[2];
+    const vx = r[0] - p[0];
+    const vy = r[1] - p[1];
+    const vz = r[2] - p[2];
+    const cx = uy * vz - uz * vy;
+    const cy = uz * vx - ux * vz;
+    const cz = ux * vy - uy * vx;
+    const a = cx * nx + cy * ny + cz * nz < 0 ? [p, r, q] : [p, q, r];
+    for (const t of a) verts.push(t[0], t[1], t[2]);
+  };
+  const quad = (p, q, r, s, n) => {
+    tri(p, q, r, n[0], n[1], n[2]);
+    tri(p, r, s, n[0], n[1], n[2]);
+  };
+  const mk = (v) => [v[0], v[1], v[2]];
+
+  // Six inset faces.
+  for (let a = 0; a < 3; a++) {
+    for (const s of [-1, 1]) {
+      const b = (a + 1) % 3;
+      const e = (a + 2) % 3;
+      const n = [0, 0, 0];
+      n[a] = s;
+      const corner = (sb, se) => {
+        const p = [0, 0, 0];
+        p[a] = s * H[a];
+        p[b] = sb * I[b];
+        p[e] = se * I[e];
+        return mk(p);
+      };
+      quad(corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1), n);
+    }
+  }
+  // Twelve edge chamfers.
+  for (let a = 0; a < 3; a++) {
+    const b = (a + 1) % 3;
+    const e = (a + 2) % 3;
+    for (const sa of [-1, 1]) {
+      for (const sb of [-1, 1]) {
+        const n = [0, 0, 0];
+        n[a] = sa * Math.SQRT1_2;
+        n[b] = sb * Math.SQRT1_2;
+        const pt = (outerA, se) => {
+          const p = [0, 0, 0];
+          p[a] = sa * (outerA ? H[a] : I[a]);
+          p[b] = sb * (outerA ? I[b] : H[b]);
+          p[e] = se * I[e];
+          return mk(p);
+        };
+        quad(pt(true, -1), pt(true, 1), pt(false, 1), pt(false, -1), n);
+      }
+    }
+  }
+  // Eight corner triangles.
+  const k = 1 / Math.sqrt(3);
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        tri(
+          [sx * H[0], sy * I[1], sz * I[2]],
+          [sx * I[0], sy * H[1], sz * I[2]],
+          [sx * I[0], sy * I[1], sz * H[2]],
+          sx * k, sy * k, sz * k,
+        );
+      }
+    }
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  g.computeVertexNormals();
+  // Planar UV off the two largest axes; nothing here samples a map, but merges
+  // need the attribute to exist and to be finite.
+  const pos = g.attributes.position;
+  const uv = new Float32Array(pos.count * 2);
+  for (let i = 0; i < pos.count; i++) {
+    uv[i * 2] = pos.getX(i);
+    uv[i * 2 + 1] = pos.getY(i);
+  }
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  return g;
+}
+
+/**
+ * Box centred on (x,y,z), automatically chamfered.
+ *
+ * The chamfer scales with the smallest dimension so a 6m panel gets its full
+ * 22mm arris while a 30mm bolt head does not dissolve into one. Below 90mm the
+ * box stays sharp: at that size the chamfer is sub-pixel at every distance the
+ * object is ever seen from, and it would only cost triangles.
+ */
 export function box(w, h, d, o = {}) {
-  return xform(new THREE.BoxGeometry(w, h, d), o);
+  const aw = Math.abs(w);
+  const ah = Math.abs(h);
+  const ad = Math.abs(d);
+  const m = Math.min(aw, ah, ad);
+  // A chamfer costs 32 extra triangles and is worth it wherever the edge is a
+  // real silhouette the player can walk up to. On a 40mm cable clip or a 60mm
+  // conduit bracket it is sub-pixel at every distance and would only be paid for
+  // four times over in the shadow cascades, so those stay sharp.
+  if (o.sharp || m < 0.10 || Math.max(aw, ah, ad) < 0.40) {
+    return xform(new THREE.BoxGeometry(w, h, d), o);
+  }
+  const c = Math.min(0.022, Math.max(0.008, m * 0.10));
+  return xform(chamferBox(aw, ah, ad, c), o);
 }
 
 /** Box whose BASE sits at y — how buildings and posts are actually dimensioned. */
 export function post(w, h, d, x, y, z, ry = 0) {
-  return xform(new THREE.BoxGeometry(w, h, d), { x, y: y + h / 2, z, ry });
+  return box(w, h, d, { x, y: y + h / 2, z, ry });
+}
+
+/** Point-in-polygon, for the irregular compound outline. */
+export function inPoly(u, v, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i];
+    const [xj, yj] = poly[j];
+    if ((yi > v) !== (yj > v) && u < ((xj - xi) * (v - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 export function cyl(r, h, seg = 12, o = {}) {
@@ -222,6 +355,63 @@ export function catenary(a, b, sag, r = 0.022, seg = 12) {
   }
   const curve = new THREE.CatmullRomCurve3(pts);
   return new THREE.TubeGeometry(curve, seg, r, 4, false);
+}
+
+/**
+ * Height field of a membrane pinned at a set of support points and hanging under
+ * its own weight everywhere else — a real catenary surface, not a cosine bump.
+ *
+ * Solved by relaxation on the sample grid: each pass averages a cell with its
+ * four neighbours (which is exactly the discrete Laplacian a slack membrane
+ * settles into) then subtracts the load, with the pinned cells clamped back.
+ * That gives the sharp cusp at each pole and the deep swag between them that a
+ * separable cos() sag can never produce.
+ */
+export function membraneSag({ nx, nz, pins, sag = 1.0, passes = 260 }) {
+  const w = nx + 1;
+  const h = nz + 1;
+  const pin = new Uint8Array(w * h);
+  const pinY = new Float32Array(w * h);
+  for (const p of pins) {
+    const i = Math.round(p.i);
+    const j = Math.round(p.j);
+    if (i < 0 || j < 0 || i >= w || j >= h) continue;
+    pin[j * w + i] = 1;
+    pinY[j * w + i] = p.y;
+  }
+  const relax = (load) => {
+    const y = new Float32Array(w * h);
+    for (let k = 0; k < y.length; k++) if (pin[k]) y[k] = pinY[k];
+    for (let it = 0; it < passes; it++) {
+      for (let j = 0; j < h; j++) {
+        for (let i = 0; i < w; i++) {
+          const k = j * w + i;
+          if (pin[k]) continue;
+          let s = 0;
+          let n = 0;
+          if (i > 0) { s += y[k - 1]; n++; }
+          if (i < w - 1) { s += y[k + 1]; n++; }
+          if (j > 0) { s += y[k - w]; n++; }
+          if (j < h - 1) { s += y[k + w]; n++; }
+          y[k] = s / n - load;
+        }
+      }
+    }
+    return y;
+  };
+  // Solve twice: once weightless (the harmonic surface the pins alone imply)
+  // and once loaded, then scale the difference so the deepest swag is exactly
+  // `sag` metres. Guessing a load constant that produces a given sag on an
+  // arbitrary pin layout is not possible in closed form, and being an order of
+  // magnitude out drops the whole net through the floor.
+  const ref = relax(0);
+  const wet = relax(1);
+  let maxD = 0;
+  for (let k = 0; k < ref.length; k++) maxD = Math.max(maxD, ref[k] - wet[k]);
+  const s = maxD > 1e-6 ? sag / maxD : 0;
+  const out = new Float32Array(ref.length);
+  for (let k = 0; k < ref.length; k++) out[k] = ref[k] - (ref[k] - wet[k]) * s;
+  return out;
 }
 
 /** Razor-wire coil: a helix run between two points. */

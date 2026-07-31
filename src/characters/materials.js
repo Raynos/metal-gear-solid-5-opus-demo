@@ -3,19 +3,26 @@ import * as THREE from 'three';
 /**
  * Character materials.
  *
- * All three are MeshStandard/MeshPhysical + onBeforeCompile so they inherit
+ * All four are MeshStandard/MeshPhysical + onBeforeCompile so they inherit
  * cascade shadows, the sky PMREM and exponential fog for free (the house
  * pattern from Terrain.js).
  *
  * The trick that makes procedural surfacing hold up under animation: every
  * pattern is evaluated in **bind space** (`vBind`, the pre-skinning vertex
- * position) rather than world or view space. Camo, dirt, stubble and face
+ * position) rather than world or view space. Camo, dirt, folds, seams and face
  * features are therefore glued to the body and do not swim when the character
  * moves — which is exactly what a UV-mapped texture would do, without a texture.
  *
- * Per-vertex `aZone` selects a garment region (jacket / sleeve / webbing /
- * pouch / boot / …). Kit reading as separate materials is most of what makes a
- * silhouette read as a soldier rather than a mannequin.
+ * Per-vertex inputs the shaders key off:
+ *   aZone — garment region (jacket / sleeve / webbing / pouch / boot / …).
+ *   aAO   — baked contact occlusion from skinning.js.
+ *   aEdge — (angle around the cross-section, metres to the piece's cut edge).
+ *           This is what draws *tailoring*: panel seams sit at fixed angles, and
+ *           a stitched border sits a few mm in from every cut edge.
+ *
+ * COLOUR RULE, measured off the round-1 frames: red must exceed blue in every
+ * daylight shot. Afghanistan is sunbaked warm khaki, not a cold grey quarry.
+ * Every albedo below is warm-biased and every indirect term is warm-biased.
  */
 
 // --- cloth zone ids ------------------------------------------------------
@@ -37,6 +44,10 @@ export const Z = {
   SHIRT: 14,
   CAP: 15,
   HAIR: 16,
+  // Boot uppers are their own zone: desert boots are a mid tan suede, and
+  // sharing LEATHER with the holster and the eyepatch forced all three to the
+  // same near-black that made the critics call the boots "solid black blobs".
+  BOOT: 17,
 };
 
 // --- skin zone ids -------------------------------------------------------
@@ -72,6 +83,12 @@ float ch_fbm(vec3 p, int oct) {
   }
   return s / n;
 }
+// Ridged variant. Cloth folds are CREASES — sharp valleys with broad flanks —
+// so a smooth fbm reads as dirt while 1-|2n-1| reads as fabric.
+float ch_ridge(vec3 p, int oct) {
+  float n = ch_fbm(p, oct);
+  return 1.0 - abs(n * 2.0 - 1.0);
+}
 // Screen-space cotangent frame: works on skinned geometry with no tangent
 // attribute, which is what we need since the mesh deforms every frame.
 mat3 ch_frame(vec3 N, vec3 p, vec2 uvv) {
@@ -91,6 +108,8 @@ varying vec3 vBind;
 varying float vZone;
 varying float vAO;
 varying vec2 vUvC;
+varying vec2 vEdge;
+varying vec3 vBindN;
 `;
 
 function injectVertex(shader) {
@@ -100,74 +119,249 @@ function injectVertex(shader) {
       `#include <common>
        attribute float aZone;
        attribute float aAO;
+       attribute vec2 aEdge;
        ${VARYINGS}`,
     )
+    // The BIND-pose normal, before skinning. "Which way was this panel facing on
+    // the body" is what sun bleach and dust need; the deformed normal would make
+    // both crawl over the garment as the character moves.
+    .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>\n       vBindN = objectNormal;`)
     .replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
        vBind = position;
        vZone = aZone;
        vAO = aAO;
-       vUvC = uv;`,
+       vUvC = uv;
+       vEdge = aEdge;`,
     );
+}
+
+// -------------------------------------------------------------------------
+// Shared character lighting response
+// -------------------------------------------------------------------------
+//
+// Two terms, applied identically to cloth, skin, metal and rubber, and they are
+// the whole answer to "the characters render as flat black cutouts with no
+// internal form and no separation from the shadowed ground behind them":
+//
+//  1. Sand bounce. The desert floor is an enormous warm reflector. It is
+//     derived from the indirect the scene has ALREADY computed rather than
+//     being a constant, so it tracks time of day for free and cannot glow at
+//     midnight. It is warm-biased on purpose — it is the term that keeps red
+//     above blue on a body that is standing in its own shadow.
+//  2. A fresnel rim. Sky wrap tinted by the actual environment plus a tight
+//     backlit edge off the key. Together they hold the silhouette against a
+//     dark background without reading as a plastic halo.
+
+const CHAR_LIGHT_PARS = /* glsl */ `
+uniform vec3 uBounceColor;
+uniform float uBounceAmt;
+uniform float uWarmMix;
+uniform vec3 uRimColor;
+uniform float uRimAmt;
+uniform float uSunRim;
+float gAO = 1.0;
+const vec3 CH_LUMA = vec3(0.2126, 0.7152, 0.0722);
+`;
+
+const CHAR_BOUNCE = /* glsl */ `
+{
+  // How much key light there is at all. Everything below scales with it, so the
+  // desert response fades out at night instead of glowing orange under a moon.
+  float chKey = 0.0;
+  #if NUM_DIR_LIGHTS > 0
+    chKey = dot(directionalLights[0].color, CH_LUMA);
+  #endif
+  float chDay = saturate(chKey * 0.5);
+
+  // Luminance-preserving warm rotation of the indirect. A soldier standing in a
+  // sand valley is lit indirectly by a vast warm reflector as much as by the
+  // sky; weighting the sky alone is precisely why round 1 measured blue over
+  // red in every daylight frame. Applied to BOTH terms because three drives the
+  // diffuse IBL off iblIrradiance, not off irradiance.
+  vec3 chTint = uBounceColor / max(1e-4, dot(uBounceColor, CH_LUMA));
+  float chW = uWarmMix * mix(0.45, 1.0, chDay);
+  irradiance = mix(irradiance, dot(irradiance, CH_LUMA) * chTint, chW);
+  iblIrradiance = mix(iblIrradiance, dot(iblIrradiance, CH_LUMA) * chTint, chW);
+
+  // Ground bounce on top: undersides see the floor almost fully, vertical
+  // panels about half, the tops of shoulders almost none.
+  vec3 chInd = irradiance + iblIrradiance;
+  float chUp = geometryNormal.y * 0.5 + 0.5;
+  irradiance += dot(chInd, CH_LUMA) * chTint * uBounceAmt * mix(1.15, 0.28, chUp) * mix(0.55, 1.0, gAO) * mix(0.5, 1.0, chDay);
+}
+`;
+
+const CHAR_RIM = /* glsl */ `
+{
+  float chF = 1.0 - saturate(dot(geometryNormal, geometryViewDir));
+  float chRim = chF * chF * chF;
+  reflectedLight.indirectSpecular +=
+    chRim * uRimAmt * uRimColor * (irradiance * 0.35 + iblIrradiance * 0.65) * gAO;
+  #if NUM_DIR_LIGHTS > 0
+    // Backlit edge: only where the key is genuinely behind the subject.
+    float chBack = saturate(-dot(directionalLights[0].direction, geometryViewDir));
+    reflectedLight.indirectSpecular +=
+      chF * chF * chF * chF * chBack * chBack * uSunRim * directionalLights[0].color * gAO;
+  #endif
+}
+`;
+
+/** Defaults shared by every character material; per-material overrides merge in. */
+function lightUniforms(o = {}) {
+  return {
+    uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.70, 0.40])) },
+    uBounceAmt: { value: o.bounce ?? 0.50 },
+    uWarmMix: { value: o.warmMix ?? 0.80 },
+    uRimColor: { value: new THREE.Vector3(...(o.rimColor ?? [1.0, 0.94, 0.86])) },
+    uRimAmt: { value: o.rim ?? 0.30 },
+    uSunRim: { value: o.sunRim ?? 0.11 },
+  };
+}
+
+/** Wire the two shared terms into a compiled shader. */
+function injectLighting(shader) {
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <lights_fragment_maps>', `#include <lights_fragment_maps>\n${CHAR_BOUNCE}`)
+    .replace('#include <aomap_fragment>', `#include <aomap_fragment>\n${CHAR_RIM}`);
 }
 
 // -------------------------------------------------------------------------
 // Cloth
 // -------------------------------------------------------------------------
 
-/** Linear-space base colours per zone. Dusty, low-saturation — MGSV Afghanistan. */
+/**
+ * Linear-space base colours per zone.
+ *
+ * Round 1 authored the whole kit between 0.013 and 0.05 linear — that is below
+ * the albedo of coal, and it is why the critics saw "boots rendered as solid
+ * black blobs" and "flat black cutouts". Nothing a soldier wears is that dark.
+ * Field-worn nylon webbing is ~0.08, a sun-bleached uniform ~0.23, dusty
+ * leather ~0.10. Pouches are deliberately LIGHTER than the carrier they sit on:
+ * without that value step the whole chest rig merges into one slab.
+ */
 function defaultClothPalette() {
-  const c = new Array(18).fill(null).map(() => new THREE.Vector3(0.3, 0.29, 0.23));
-  // Reference: a sunlit sand surface is around 0.55 linear. Fatigues are much
-  // darker than the ground they stand on — that value separation is most of what
-  // makes a soldier pop out of an Afghan hillside instead of dissolving into it.
-  c[Z.JACKET] = new THREE.Vector3(0.158, 0.145, 0.095);
-  c[Z.SLEEVE] = new THREE.Vector3(0.165, 0.151, 0.099);
-  c[Z.TROUSER] = new THREE.Vector3(0.138, 0.126, 0.082);
-  c[Z.VEST] = new THREE.Vector3(0.044, 0.043, 0.031);
-  c[Z.WEBBING] = new THREE.Vector3(0.031, 0.03, 0.024);
-  c[Z.POUCH] = new THREE.Vector3(0.05, 0.047, 0.034);
-  c[Z.LEATHER] = new THREE.Vector3(0.03, 0.025, 0.02);
-  c[Z.GLOVE] = new THREE.Vector3(0.024, 0.021, 0.018);
-  c[Z.KNEEPAD] = new THREE.Vector3(0.013, 0.013, 0.013);
-  c[Z.PACK] = new THREE.Vector3(0.07, 0.066, 0.045);
-  c[Z.HELMCOVER] = new THREE.Vector3(0.088, 0.084, 0.056);
+  const c = new Array(18).fill(null).map(() => new THREE.Vector3(0.2, 0.176, 0.12));
+  c[Z.JACKET] = new THREE.Vector3(0.202, 0.171, 0.110);
+  c[Z.SLEEVE] = new THREE.Vector3(0.209, 0.177, 0.114);
+  c[Z.TROUSER] = new THREE.Vector3(0.185, 0.156, 0.099);
+  c[Z.COLLAR] = new THREE.Vector3(0.176, 0.149, 0.096);
+  c[Z.SHIRT] = new THREE.Vector3(0.134, 0.115, 0.082);
+  c[Z.VEST] = new THREE.Vector3(0.090, 0.079, 0.053);
+  c[Z.WEBBING] = new THREE.Vector3(0.074, 0.063, 0.043);
+  c[Z.POUCH] = new THREE.Vector3(0.128, 0.109, 0.071);
+  c[Z.BELT] = new THREE.Vector3(0.063, 0.053, 0.037);
+  c[Z.LEATHER] = new THREE.Vector3(0.083, 0.059, 0.038);
+  c[Z.GLOVE] = new THREE.Vector3(0.060, 0.050, 0.037);
+  c[Z.KNEEPAD] = new THREE.Vector3(0.049, 0.044, 0.037);
+  c[Z.PACK] = new THREE.Vector3(0.154, 0.131, 0.084);
+  c[Z.HELMCOVER] = new THREE.Vector3(0.150, 0.129, 0.084);
+  c[Z.CAP] = new THREE.Vector3(0.139, 0.118, 0.077);
   // Snake's bandana is the one saturated accent on an otherwise khaki character.
-  c[Z.BANDANA] = new THREE.Vector3(0.135, 0.017, 0.012);
-  c[Z.BELT] = new THREE.Vector3(0.022, 0.021, 0.017);
-  c[Z.COLLAR] = new THREE.Vector3(0.134, 0.123, 0.08);
-  c[Z.SHIRT] = new THREE.Vector3(0.082, 0.079, 0.066);
-  c[Z.CAP] = new THREE.Vector3(0.082, 0.078, 0.052);
-  c[Z.HAIR] = new THREE.Vector3(0.042, 0.032, 0.024);
+  c[Z.BANDANA] = new THREE.Vector3(0.168, 0.030, 0.021);
+  c[Z.HAIR] = new THREE.Vector3(0.058, 0.042, 0.029);
+  c[Z.BOOT] = new THREE.Vector3(0.121, 0.086, 0.053);
   return c;
 }
 
 const CLOTH_ROUGH = (() => {
   const r = new Array(18).fill(0.9);
-  r[Z.LEATHER] = 0.6;
-  r[Z.GLOVE] = 0.72;
-  r[Z.KNEEPAD] = 0.66;
-  r[Z.BELT] = 0.68;
-  r[Z.POUCH] = 0.84;
-  r[Z.VEST] = 0.86;
+  r[Z.LEATHER] = 0.58;
+  r[Z.GLOVE] = 0.7;
+  r[Z.KNEEPAD] = 0.62;
+  r[Z.BELT] = 0.64;
+  r[Z.POUCH] = 0.82;
+  r[Z.VEST] = 0.84;
   r[Z.BANDANA] = 0.85;
-  r[Z.HAIR] = 0.78;
+  r[Z.HAIR] = 0.72;
+  r[Z.BOOT] = 0.72;
   return r;
 })();
 
 const CLOTH_SHEEN = (() => {
   const s = new Array(18).fill(0.5);
-  s[Z.LEATHER] = 0.1;
-  s[Z.GLOVE] = 0.18;
-  s[Z.KNEEPAD] = 0.12;
-  s[Z.BELT] = 0.15;
-  s[Z.JACKET] = 0.62;
-  s[Z.SLEEVE] = 0.62;
-  s[Z.TROUSER] = 0.6;
+  s[Z.LEATHER] = 0.08;
+  s[Z.GLOVE] = 0.16;
+  s[Z.KNEEPAD] = 0.1;
+  s[Z.BELT] = 0.12;
+  s[Z.JACKET] = 0.7;
+  s[Z.SLEEVE] = 0.7;
+  s[Z.TROUSER] = 0.68;
   s[Z.HAIR] = 0.9;
+  s[Z.BOOT] = 0.28;
   return s;
 })();
+
+/**
+ * Where fabric actually gathers, in bind space. Wrinkle amplitude is driven by
+ * this, not sprayed evenly: a uniform noise field over a whole garment is the
+ * single clearest "procedural" tell. Heights are read straight off the rig —
+ * elbow 1.19, wrist 0.96, knee 0.51, blouse 0.25, belt 0.99, collar 1.48.
+ */
+const CLOTH_GATHER = /* glsl */ `
+float ch_gather(vec3 b) {
+  float ax = abs(b.x);
+  float g = 0.0;
+  float arm = smoothstep(0.19, 0.29, ax);
+  // Inside of the elbow, and the cuff bunching back off the wrist.
+  g += 1.30 * arm * exp(-pow((b.y - 1.185) / 0.075, 2.0));
+  g += 0.95 * arm * exp(-pow((b.y - 0.985) / 0.045, 2.0));
+  // Shoulder gather where the sleeve head is set into the body.
+  g += 0.85 * smoothstep(0.11, 0.19, ax) * exp(-pow((b.y - 1.415) / 0.055, 2.0));
+  float leg = smoothstep(0.02, 0.085, ax) * step(b.y, 0.95);
+  // Back of the knee, and the blouse cinched over the boot.
+  g += 1.20 * leg * exp(-pow((b.y - 0.505) / 0.070, 2.0));
+  g += 1.05 * leg * exp(-pow((b.y - 0.255) / 0.050, 2.0));
+  // Small of the back: pushed up by the belt, pulled down by the rig. Only at
+  // the back (+z), which is the half the gameplay camera actually sees.
+  g += 1.25 * smoothstep(0.01, 0.075, b.z) * exp(-pow((b.y - 1.045) / 0.065, 2.0));
+  // Under the chest rig, where the straps compress the jacket.
+  g += 0.80 * exp(-pow((b.y - 1.45) / 0.045, 2.0));
+  // Hang of the jacket hem over the belt.
+  g += 0.95 * exp(-pow((b.y - 0.905) / 0.045, 2.0));
+  return g;
+}
+`;
+
+/**
+ * Panel seams. `vEdge.x` is the angle around the cross-section — 0 the
+ * character's right, 0.25 front, 0.5 left, 0.75 back — so a side seam and a
+ * centre-back seam are one smoothstep each. Add the shoulder yoke as a
+ * horizontal band and a garment starts reading as something that was *cut and
+ * sewn* rather than extruded.
+ */
+const CLOTH_SEAM = /* glsl */ `
+float ch_seamLine(float a, float centre, float w) {
+  float d = abs(fract(a - centre + 0.5) - 0.5);
+  return 1.0 - smoothstep(w * 0.35, w, d);
+}
+float ch_seams(vec3 b, float a, int zi) {
+  float s = 0.0;
+  if (zi == 0 || zi == 2 || zi == 13) {
+    // Torso / trousers: side seams and a centre-back seam.
+    s = max(s, ch_seamLine(a, 0.0, 0.010));
+    s = max(s, ch_seamLine(a, 0.5, 0.010));
+    s = max(s, ch_seamLine(a, 0.75, 0.008) * 0.8);
+  }
+  if (zi == 1) {
+    // Sleeve: one seam under the arm.
+    s = max(s, ch_seamLine(a, 0.75, 0.012));
+  }
+  if (zi == 0) {
+    // Yoke across the shoulder blades, and the hem stitch.
+    s = max(s, (1.0 - smoothstep(0.004, 0.011, abs(b.y - 1.335))) * 0.9);
+    s = max(s, (1.0 - smoothstep(0.004, 0.010, abs(b.y - 0.888))) * 0.8);
+  }
+  if (zi == 2) {
+    // Trouser waistband and the knee-reinforcement panel.
+    s = max(s, (1.0 - smoothstep(0.004, 0.010, abs(b.y - 1.012))) * 0.85);
+    s = max(s, (1.0 - smoothstep(0.004, 0.010, abs(b.y - 0.575))) * 0.7);
+    s = max(s, (1.0 - smoothstep(0.004, 0.010, abs(b.y - 0.445))) * 0.7);
+  }
+  return s;
+}
+`;
 
 export function makeClothMaterial(opts = {}) {
   const mat = new THREE.MeshPhysicalMaterial({
@@ -177,9 +371,9 @@ export function makeClothMaterial(opts = {}) {
     // Cloth sheen: a broad, rough retroreflective rim instead of a specular
     // hotspot. Without it fabric reads as painted plastic.
     sheen: 1.0,
-    sheenRoughness: 0.88,
+    sheenRoughness: 0.9,
     sheenColor: new THREE.Color(0.5, 0.47, 0.42),
-    specularIntensity: 0.22,
+    specularIntensity: 0.2,
     envMapIntensity: 1.0,
     dithering: true,
   });
@@ -195,12 +389,14 @@ export function makeClothMaterial(opts = {}) {
     uSeed: { value: opts.seed ?? 0 },
     uDust: { value: opts.dust ?? 0.55 },
     uWeave: { value: opts.weave ?? 1.0 },
+    ...lightUniforms(opts),
   };
   mat.userData.uniforms = uniforms;
 
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     injectVertex(shader);
+    injectLighting(shader);
 
     shader.fragmentShader = shader.fragmentShader
       .replace(
@@ -208,6 +404,9 @@ export function makeClothMaterial(opts = {}) {
         `#include <common>
          ${VARYINGS}
          ${NOISE}
+         ${CLOTH_GATHER}
+         ${CLOTH_SEAM}
+         ${CHAR_LIGHT_PARS}
          uniform vec3 uZoneColor[18];
          uniform float uZoneRough[18];
          uniform float uZoneSheen[18];
@@ -216,6 +415,9 @@ export function makeClothMaterial(opts = {}) {
          uniform float uWeave;
          float gRough = 0.9;
          float gSheen = 0.5;
+         float gGather = 0.0;
+         float gStitch = 0.0;
+         float gPix = 0.001;
          vec3 gSheenCol = vec3(0.5);`,
       )
       .replace(
@@ -226,47 +428,82 @@ export function makeClothMaterial(opts = {}) {
            vec3 base = uZoneColor[zi];
            float rough = uZoneRough[zi];
            gSheen = uZoneSheen[zi];
+           float ao = clamp(vAO, 0.0, 1.0);
+           gAO = mix(0.35, 1.0, ao);
+
+           // Metres covered by one pixel. Everything below thread scale is faded
+           // out with it — procedural detail that survives to sub-pixel is just
+           // shimmer, and shimmer is the loudest CG tell there is.
+           gPix = max(fwidth(vUvC.x), fwidth(vUvC.y)) + 1e-6;
 
            vec3 bp = vBind * 1.0 + uSeed;
+           bool garment = (zi == 0 || zi == 1 || zi == 2 || zi == 13 || zi == 14);
 
            // Dye lot / sun-bleach variation: large soft patches, then a finer
-           // fibre-level mottle. Uniforms are never one flat colour.
-           float macro = ch_fbm(bp * 3.1, 3);
-           float meso = ch_fbm(bp * 13.0, 3);
-           // Subtle: field uniforms are a solid dye lot with wear, not camouflage.
-           base *= 0.92 + macro * 0.15 + meso * 0.06;
-           // Sun bleach lifts and desaturates the upward-facing panels.
-           float bleach = smoothstep(0.15, 0.75, ch_fbm(bp * 1.7 + 4.0, 2));
-           base = mix(base, mix(base, vec3(dot(base, vec3(0.33))) * 1.22, 0.5), bleach * 0.3);
+           // fibre-level mottle. Kept SUBTLE — round 1 ran this so hard the
+           // uniform read as blotchy camouflage instead of a solid dye lot.
+           float macro = ch_fbm(bp * 2.6, 3);
+           float meso = ch_fbm(bp * 11.0, 3);
+           base *= 0.965 + macro * 0.075 + meso * 0.03;
+           // Sun bleach lifts the upward-facing panels toward pale sand — it
+           // must warm them, not grey them out.
+           float bleach = smoothstep(0.2, 0.8, ch_fbm(bp * 1.6 + 4.0, 2)) *
+                          smoothstep(-0.2, 0.7, vBindN.y);
+           base = mix(base, base * vec3(1.26, 1.16, 1.00), bleach * 0.28);
 
-           // Thread-level weave: two crossed gratings, in metres via vUvC.
-           float wu = sin(vUvC.x * 620.0) * 0.5 + 0.5;
-           float wv = sin(vUvC.y * 620.0) * 0.5 + 0.5;
+           // Thread-level weave. A ripstop lattice at 7.5 mm (which survives to
+           // gameplay distance) over a 1.4 mm plain weave (which does not, and
+           // is faded out by footprint).
+           float micro = 1.0 - smoothstep(0.00016, 0.00042, gPix);
+           vec2 rs = abs(fract(vUvC / 0.0075) - 0.5);
+           float ripstop = (1.0 - smoothstep(0.06, 0.16, rs.x)) + (1.0 - smoothstep(0.06, 0.16, rs.y));
+           float wu = sin(vUvC.x * 4400.0) * 0.5 + 0.5;
+           float wv = sin(vUvC.y * 4400.0) * 0.5 + 0.5;
            float weave = (wu * wv + (1.0 - wu) * (1.0 - wv));
-           base *= 0.94 + weave * 0.12 * uWeave;
+           base *= 1.0 + (ripstop * 0.035 + (weave - 0.5) * 0.10 * micro) * uWeave * (garment ? 1.0 : 0.4);
+
+           // Folds. Amplitude comes from where fabric really gathers, so the
+           // creases land at the elbow, the back of the knee, the small of the
+           // back and under the rig instead of being sprayed evenly.
+           gGather = garment ? ch_gather(vBind) : 0.35;
+           float foldScale = garment ? 1.0 : 1.8;
+           vec3 fp = vec3(vBind.x * 26.0, vBind.y * 78.0, vBind.z * 26.0) * foldScale + uSeed * 3.0;
+           float fold = ch_ridge(fp, 3);
+           // Creases hold dirt and shade themselves; ridges catch the light.
+           float creaseAmt = clamp(0.20 + gGather * 0.45 + (1.0 - ao) * 0.30, 0.0, 1.0);
+           base *= 1.0 + (fold - 0.55) * 0.13 * creaseAmt;
+
+           // Tailoring. Seams are a hair darker with a thread highlight beside
+           // them; stitched borders run a few mm in from every cut edge.
+           float seam = ch_seams(vBind, vEdge.x, zi);
+           base *= 1.0 - seam * 0.20;
+           float border = 1.0 - smoothstep(0.0030, 0.0055, abs(vEdge.y - 0.0042));
+           float dash = step(0.42, fract(vUvC.x / 0.0026));
+           gStitch = border * dash * (garment ? 0.25 : 1.0);
+           base = mix(base, base * 1.5 + vec3(0.010, 0.009, 0.006), gStitch * 0.55);
 
            // Ground-in dust: settles low on the body, in the creases, and on
-           // anything that touches the ground.
-           float low = smoothstep(0.95, 0.05, vBind.y);
-           float dirtN = ch_fbm(bp * 6.5 + 11.0, 4);
-           float dirt = clamp(low * 0.85 + (1.0 - vAO) * 0.75, 0.0, 1.0) * smoothstep(0.28, 0.8, dirtN) * uDust;
-           base = mix(base, vec3(0.128, 0.108, 0.078), dirt * 0.62);
-           rough = mix(rough, 0.97, dirt * 0.7);
+           // anything that touches the ground. It LIGHTENS and warms — round 1
+           // mixed toward a dark grey, which is soot, not Afghan dust.
+           float low = smoothstep(0.85, 0.02, vBind.y);
+           float dirtN = ch_fbm(bp * 5.5 + 11.0, 4);
+           float dust = clamp(low * 0.85 + (1.0 - ao) * 0.4, 0.0, 1.0) *
+                        smoothstep(0.32, 0.82, dirtN) * uDust;
+           base = mix(base, vec3(0.290, 0.245, 0.166), dust * 0.24);
+           rough = mix(rough, 0.97, dust * 0.6);
+           // A darker grime in the deep creases keeps it from looking floured.
+           base *= 1.0 - 0.10 * (1.0 - ao) * smoothstep(0.55, 0.2, fold);
 
-           // Fold shadowing in albedo as well as normal: creases in worn cotton
-           // hold dirt and read darker even under flat light.
-           float crease = ch_fbm(bp * 62.0, 3);
-           base *= 1.0 - 0.085 * smoothstep(0.6, 0.3, crease);
-
-           // Baked contact occlusion.
-           float ao = clamp(vAO, 0.0, 1.0);
-           base *= mix(0.36, 1.0, pow(ao, 1.15));
+           // Baked contact occlusion. Kept well off zero: an AO term that can
+           // reach 0.35 is doing the job of a shadow map and turns armpits,
+           // strap undersides and boot tops into holes.
+           base *= mix(0.58, 1.0, pow(ao, 1.1));
 
            diffuseColor.rgb *= base;
-           gRough = clamp(rough + (meso - 0.5) * 0.1, 0.25, 1.0);
+           gRough = clamp(rough + (meso - 0.5) * 0.09 - seam * 0.06, 0.25, 1.0);
            // Sheen is a *whisper*. Cranked up it lights the whole garment from
            // the environment and fatigues turn into pale nylon.
-           gSheenCol = mix(vec3(0.018, 0.017, 0.015), vec3(0.062, 0.059, 0.054), ao) * gSheen;
+           gSheenCol = mix(vec3(0.020, 0.018, 0.015), vec3(0.078, 0.072, 0.062), ao) * gSheen;
          }`,
       )
       .replace(
@@ -278,23 +515,45 @@ export function makeClothMaterial(opts = {}) {
         '#include <normal_fragment_maps>',
         `#include <normal_fragment_maps>
          {
-           // Fabric normal: fine weave + folds. Fold amplitude is driven by the
-           // baked AO, so wrinkles gather where the garment actually bunches —
-           // inside elbows, behind knees, under the chest rig.
            mat3 tbn = ch_frame(normal, -vViewPosition, vUvC);
-           float th = sin(vUvC.x * 620.0) * sin(vUvC.y * 620.0);
-           vec2 nWeave = vec2(cos(vUvC.x * 620.0) * sin(vUvC.y * 620.0),
-                              sin(vUvC.x * 620.0) * cos(vUvC.y * 620.0)) * 0.055 * uWeave;
+           int zi = int(vZone + 0.5);
+           bool garment = (zi == 0 || zi == 1 || zi == 2 || zi == 13 || zi == 14);
+           float ao = clamp(vAO, 0.0, 1.0);
 
-           float foldAmp = mix(0.5, 1.6, 1.0 - clamp(vAO, 0.0, 1.0));
-           vec3 fp = vBind * 26.0 + uSeed * 3.0;
-           float e = 0.09;
-           float h0 = ch_fbm(fp, 3);
-           float hx = ch_fbm(fp + vec3(e, 0.0, 0.0), 3);
-           float hy = ch_fbm(fp + vec3(0.0, e, 0.0), 3);
-           vec2 nFold = vec2(h0 - hx, h0 - hy) * 13.0 * foldAmp;
+           // Ripstop lattice — a real, visible 7.5 mm grid of doubled threads.
+           vec2 rs = fract(vUvC / 0.0075) - 0.5;
+           vec2 nRip = vec2(-rs.x * (1.0 - smoothstep(0.06, 0.20, abs(rs.x))),
+                            -rs.y * (1.0 - smoothstep(0.06, 0.20, abs(rs.y)))) * 1.7 * uWeave;
+           // Plain weave under it, faded once it goes sub-pixel.
+           float micro = 1.0 - smoothstep(0.00016, 0.00042, gPix);
+           vec2 nWeave = vec2(cos(vUvC.x * 4400.0) * sin(vUvC.y * 4400.0),
+                              sin(vUvC.x * 4400.0) * cos(vUvC.y * 4400.0)) * 0.10 * uWeave * micro;
 
-           vec3 tn = normalize(vec3(nWeave + nFold, 1.0));
+           // Folds: stretched hard along the body axis so the creases run ACROSS
+           // a limb the way real cloth gathers, and ridged so they are creases
+           // rather than lumps.
+           float foldScale = garment ? 1.0 : 1.8;
+           vec3 fp = vec3(vBind.x * 26.0, vBind.y * 78.0, vBind.z * 26.0) * foldScale + uSeed * 3.0;
+           float amp = clamp(0.16 + gGather * 0.42 + (1.0 - ao) * 0.28, 0.0, 0.95);
+           float e = 0.30;
+           float h0 = ch_ridge(fp, 3);
+           float hx = ch_ridge(fp + vec3(e, 0.0, 0.0), 3);
+           float hy = ch_ridge(fp + vec3(0.0, e * 2.4, 0.0), 3);
+           vec2 nFold = vec2(h0 - hx, h0 - hy) * 2.6 * amp;
+
+           // A second, much larger fold octave: the big diagonal drape a jacket
+           // takes across the back. Sub-pixel wrinkles alone still read flat.
+           vec3 gp = vec3(vBind.x * 7.0, vBind.y * 16.0, vBind.z * 7.0) + uSeed;
+           float g0 = ch_fbm(gp, 2);
+           vec2 nDrape = vec2(g0 - ch_fbm(gp + vec3(0.25, 0.0, 0.0), 2),
+                              g0 - ch_fbm(gp + vec3(0.0, 0.25, 0.0), 2)) * 2.2 * (garment ? 1.0 : 0.3);
+
+           // Seams and stitching are geometry too: a shallow trench with the
+           // thread standing proud of it.
+           float seam = ch_seams(vBind, vEdge.x, zi);
+           float stitchN = gStitch * 0.55 - seam * 0.35;
+
+           vec3 tn = normalize(vec3(nRip + nWeave + nFold + nDrape + vec2(stitchN), 1.0));
            normal = normalize(tbn * tn);
          }`,
       )
@@ -302,7 +561,7 @@ export function makeClothMaterial(opts = {}) {
         '#include <lights_physical_fragment>',
         `#include <lights_physical_fragment>
          material.sheenColor = gSheenCol;
-         material.sheenRoughness = 0.9;`,
+         material.sheenRoughness = 0.92;`,
       );
 
     mat.userData.shader = shader;
@@ -317,29 +576,33 @@ export function makeClothMaterial(opts = {}) {
 export function makeSkinMaterial(opts = {}) {
   const mat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
-    roughness: 0.55,
+    roughness: 0.52,
     metalness: 0.0,
     // Skin's specular is broad and weak. A default dielectric F0 with low
     // roughness is exactly the "wet plastic doll" look we must avoid.
-    specularIntensity: 0.35,
-    envMapIntensity: 0.95,
+    specularIntensity: 0.42,
+    envMapIntensity: 1.0,
     dithering: true,
   });
   mat.name = 'char-skin';
 
   const uniforms = {
-    uSkin: { value: new THREE.Vector3(...(opts.tone ?? [0.30, 0.188, 0.138])) },
-    uSSS: { value: new THREE.Vector3(...(opts.sss ?? [0.62, 0.30, 0.22])) },
-    uSSSAmount: { value: opts.sssAmount ?? 0.22 },
+    uSkin: { value: new THREE.Vector3(...(opts.tone ?? [0.395, 0.252, 0.182])) },
+    uSSS: { value: new THREE.Vector3(...(opts.sss ?? [0.72, 0.30, 0.20])) },
+    uSSSAmount: { value: opts.sssAmount ?? 0.34 },
     uSeed: { value: opts.seed ?? 0 },
     uStubble: { value: opts.stubble ?? 0.5 },
     uBrow: { value: opts.brow ?? 1.0 },
+    // Skin wants a warmer, weaker rim than cloth: a cold sky rim on a face
+    // reads as a chrome edge.
+    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.26, sunRim: 0.14, bounce: 0.4, warmMix: 0.45, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     injectVertex(shader);
+    injectLighting(shader);
 
     shader.fragmentShader = shader.fragmentShader
       .replace(
@@ -347,13 +610,14 @@ export function makeSkinMaterial(opts = {}) {
         `#include <common>
          ${VARYINGS}
          ${NOISE}
+         ${CHAR_LIGHT_PARS}
          uniform vec3 uSkin;
          uniform vec3 uSSS;
          uniform float uSSSAmount;
          uniform float uSeed;
          uniform float uStubble;
          uniform float uBrow;
-         float gRough = 0.55;`,
+         float gRough = 0.52;`,
       )
       .replace(
         '#include <map_fragment>',
@@ -361,13 +625,21 @@ export function makeSkinMaterial(opts = {}) {
          {
            vec3 c = uSkin;
            vec3 bp = vBind * 1.0 + uSeed * 0.7;
+           float ao = clamp(vAO, 0.0, 1.0);
+           // The AO bake voxel is 22 mm, and a bandana, a hair shell and an
+           // eyepatch strap all sit within 5 mm of the skull — so the bake
+           // occludes the entire face against headgear that is physically
+           // touching it. Floor it: a face has real contact shadow only in the
+           // eye sockets and under the jaw, not across the cheeks.
+           if (vZone < 0.5) ao = max(ao, 0.72);
+           gAO = mix(0.5, 1.0, ao);
 
            // Dermal mottling: blotchy melanin + a finer capillary red.
            float m1 = ch_fbm(bp * 9.0, 3);
            float m2 = ch_fbm(bp * 34.0, 3);
-           c *= 0.9 + m1 * 0.2;
-           c = mix(c, c * vec3(1.16, 0.9, 0.86), smoothstep(0.45, 0.85, m1) * 0.55);
-           c *= 0.96 + m2 * 0.08;
+           c *= 0.94 + m1 * 0.13;
+           c = mix(c, c * vec3(1.14, 0.9, 0.87), smoothstep(0.45, 0.85, m1) * 0.5);
+           c *= 0.97 + m2 * 0.06;
 
            // Face features, keyed to bind space so they never swim.
            vec3 hp = vBind - vec3(0.0, 1.655, -0.012);
@@ -377,70 +649,73 @@ export function makeSkinMaterial(opts = {}) {
              vec2 iv = vec2(ax2 - 0.0325, hp.y - 0.006);
              float fwd = smoothstep(-0.061, -0.069, hp.z);
              float ir = length(vec2(iv.x, iv.y * 1.03));
-             vec3 sclera = vec3(0.30, 0.272, 0.252) * (0.85 + 0.24 * ch_fbm(vBind * 900.0, 2));
-             vec3 iris = vec3(0.055, 0.036, 0.021) * (0.7 + 0.9 * ch_fbm(vBind * 2600.0, 2));
+             vec3 sclera = vec3(0.62, 0.575, 0.545) * (0.9 + 0.16 * ch_fbm(vBind * 900.0, 2));
+             vec3 iris = vec3(0.085, 0.062, 0.038) * (0.7 + 0.9 * ch_fbm(vBind * 2600.0, 2));
              vec3 c2 = mix(sclera, iris, smoothstep(0.0064, 0.0048, ir) * fwd);
-             c2 = mix(c2, vec3(0.005), smoothstep(0.0028, 0.0019, ir) * fwd);
+             c2 = mix(c2, vec3(0.004), smoothstep(0.0028, 0.0019, ir) * fwd);
              // Painted lids: outside the almond aperture the eyeball is shaded
              // as skin, so the sphere merges into the socket without needing
              // separate eyelid geometry.
              float aperture = smoothstep(0.0072, 0.0050, abs(iv.y) + max(0.0, abs(iv.x) - 0.0026) * 0.62);
              float open = aperture * fwd;
-             vec3 lid = uSkin * 0.62;
+             vec3 lid = uSkin * 0.68;
              c2 = mix(lid, c2, open);
-             c2 *= mix(0.22, 1.0, clamp(vAO, 0.0, 1.0));
+             c2 *= mix(0.45, 1.0, ao);
              diffuseColor.rgb *= c2;
-             gRough = mix(0.6, 0.13, open);
+             gRough = mix(0.58, 0.13, open);
            } else {
            float isHead = smoothstep(-0.14, -0.06, hp.y) * step(vZone, 0.5);
            if (isHead > 0.0) {
              float ax = abs(hp.x);
-             // Brow ridge shadow + eyebrow.
-             // Eyebrow: a 9 mm hair band, not a mask. Too generous here and the
-             // whole mid-face goes dark.
-             float brow = smoothstep(0.048, 0.030, ax) *
-                          smoothstep(0.013, 0.004, abs(hp.y - 0.0295 + ax * 0.12)) *
+             // Eyebrow: a 9 mm hair band, not a mask. Round 1 painted this so
+             // wide and so dark that the whole mid-face went black.
+             float brow = smoothstep(0.046, 0.028, ax) *
+                          smoothstep(0.011, 0.004, abs(hp.y - 0.0295 + ax * 0.12)) *
                           smoothstep(-0.055, -0.072, hp.z);
-             c = mix(c, vec3(0.055, 0.04, 0.032), clamp(brow, 0.0, 1.0) * 0.8 * uBrow * isHead);
+             c = mix(c, vec3(0.075, 0.052, 0.038), clamp(brow, 0.0, 1.0) * 0.62 * uBrow * isHead);
              // Soft shadow under the brow ridge.
              float browShade = smoothstep(0.055, 0.02, ax) *
-                               smoothstep(0.022, 0.006, abs(hp.y - 0.021)) *
+                               smoothstep(0.020, 0.006, abs(hp.y - 0.021)) *
                                smoothstep(-0.05, -0.068, hp.z);
-             c *= 1.0 - 0.22 * clamp(browShade, 0.0, 1.0) * isHead;
-             // Lash line only — the eye itself is real geometry now. Painting a
-             // 20 mm dark disc per eye on top of it turned the whole mid-face
-             // into a mask.
+             c *= 1.0 - 0.11 * clamp(browShade, 0.0, 1.0) * isHead;
+             // Lash line only — the eye itself is real geometry.
              vec2 ev = vec2(ax - 0.032, hp.y - 0.008);
-             float lash = smoothstep(0.016, 0.010, length(ev * vec2(0.8, 2.6))) *
+             float lash = smoothstep(0.013, 0.009, length(ev * vec2(0.85, 3.6))) *
                           smoothstep(-0.050, -0.066, hp.z);
-             c = mix(c, vec3(0.05, 0.04, 0.035), clamp(lash, 0.0, 1.0) * 0.7 * isHead);
+             c = mix(c, vec3(0.07, 0.055, 0.048), clamp(lash, 0.0, 1.0) * 0.40 * isHead);
              // Nostril + philtrum shadow.
-             float nose = smoothstep(0.016, 0.006, abs(ax - 0.011)) *
-                          smoothstep(0.012, 0.004, abs(hp.y + 0.030)) *
+             float nose = smoothstep(0.015, 0.006, abs(ax - 0.011)) *
+                          smoothstep(0.011, 0.004, abs(hp.y + 0.030)) *
                           smoothstep(-0.075, -0.09, hp.z);
-             c = mix(c, vec3(0.05, 0.032, 0.026), clamp(nose, 0.0, 1.0) * 0.8 * isHead);
-             // Mouth line.
-             float lip = smoothstep(0.030, 0.008, ax) *
-                         smoothstep(0.008, 0.001, abs(hp.y + 0.052)) *
+             c = mix(c, vec3(0.085, 0.050, 0.038), clamp(nose, 0.0, 1.0) * 0.7 * isHead);
+             // Mouth line, and lips a shade redder than the surrounding skin.
+             float lipBody = smoothstep(0.026, 0.006, ax) *
+                             smoothstep(0.016, 0.004, abs(hp.y + 0.052)) *
+                             smoothstep(-0.062, -0.075, hp.z);
+             c = mix(c, uSkin * vec3(1.06, 0.72, 0.66), clamp(lipBody, 0.0, 1.0) * 0.6 * isHead);
+             float lip = smoothstep(0.028, 0.008, ax) *
+                         smoothstep(0.005, 0.001, abs(hp.y + 0.052)) *
                          smoothstep(-0.066, -0.078, hp.z);
-             c = mix(c, vec3(0.13, 0.055, 0.048), clamp(lip, 0.0, 1.0) * 0.75 * isHead);
-             // Stubble across the jaw and upper lip.
-             float beardRegion = smoothstep(-0.020, -0.060, hp.y) * smoothstep(0.10, 0.045, ax + max(0.0, hp.z + 0.02));
+             c = mix(c, vec3(0.115, 0.055, 0.048), clamp(lip, 0.0, 1.0) * 0.7 * isHead);
+             // Stubble across the jaw and upper lip. A tint, NOT a black mask:
+             // shaved hair under skin is a cool grey shift of maybe 25%.
+             float beardRegion = smoothstep(-0.024, -0.062, hp.y) *
+                                 smoothstep(0.105, 0.05, ax + max(0.0, hp.z + 0.02));
              float grain = smoothstep(0.35, 0.75, ch_fbm(vBind * 420.0, 2));
-             c = mix(c, c * vec3(0.52, 0.55, 0.58), clamp(beardRegion, 0.0, 1.0) * (0.35 + grain * 0.5) * uStubble * isHead);
+             c = mix(c, c * vec3(0.80, 0.815, 0.845),
+                     clamp(beardRegion, 0.0, 1.0) * (0.22 + grain * 0.34) * uStubble * isHead);
            }
 
            if (vZone > 0.5 && vZone < 1.5) {
-             // Neck: shaded by the collar and the jaw.
-             c *= mix(0.42, 1.0, smoothstep(1.5, 1.585, vBind.y));
+             // Neck: shaded by the collar and the jaw, but never crushed.
+             c *= mix(0.66, 1.0, smoothstep(1.49, 1.585, vBind.y));
            }
-           float ao = clamp(vAO, 0.0, 1.0);
-           c *= mix(0.55, 1.0, pow(ao, 1.0));
+           c *= mix(0.76, 1.0, pow(ao, 0.85));
            diffuseColor.rgb *= c;
 
            // Oilier on the forehead and nose, drier on the cheeks and hands.
            float oily = smoothstep(-0.02, 0.06, hp.y) * isHead;
-           gRough = clamp(mix(0.62, 0.42, oily) + (m2 - 0.5) * 0.12, 0.3, 0.9);
+           gRough = clamp(mix(0.60, 0.40, oily) + (m2 - 0.5) * 0.10, 0.3, 0.9);
            }
          }`,
       )
@@ -454,11 +729,17 @@ export function makeSkinMaterial(opts = {}) {
         `#include <normal_fragment_maps>
          {
            mat3 tbn = ch_frame(normal, -vViewPosition, vUvC);
+           float pix = max(fwidth(vUvC.x), fwidth(vUvC.y)) + 1e-6;
+           // Pores fade out once they go sub-pixel; the coarser skin folds stay.
+           float fine = 1.0 - smoothstep(0.0002, 0.0009, pix);
            vec3 pp = vBind * 300.0;
            float e = 0.6;
            float h0 = ch_fbm(pp, 2);
            vec2 g = vec2(h0 - ch_fbm(pp + vec3(e, 0.0, 0.0), 2), h0 - ch_fbm(pp + vec3(0.0, e, 0.0), 2));
-           normal = normalize(tbn * normalize(vec3(g * 1.6, 1.0)));
+           vec3 cp = vBind * 55.0;
+           float c0 = ch_ridge(cp, 2);
+           vec2 gc = vec2(c0 - ch_ridge(cp + vec3(0.2, 0.0, 0.0), 2), c0 - ch_ridge(cp + vec3(0.0, 0.2, 0.0), 2));
+           normal = normalize(tbn * normalize(vec3(g * 1.8 * fine + gc * 1.1, 1.0)));
          }`,
       )
       // Subsurface: wrapped diffuse with a blood-red tint in the terminator.
@@ -479,7 +760,7 @@ export function makeSkinMaterial(opts = {}) {
            // light scattered *through* the skin. Must go through the same
            // 1/PI normalisation as the lambert lobe or it swamps it and the
            // character turns into raw meat.
-           float wrapped = saturate((ndl + 0.42) / 1.42);
+           float wrapped = saturate((ndl + 0.45) / 1.45);
            reflectedLight.directDiffuse += (wrapped - lam) * directLight.color * uSSS * uSSSAmount * BRDF_Lambert(material.diffuseColor);
          }
          #undef RE_Direct
@@ -506,21 +787,23 @@ export function makeMetalMaterial(opts = {}) {
   mat.name = 'char-metal';
 
   const colors = [
-    new THREE.Vector3(0.052, 0.053, 0.056), // gunmetal, phosphate-black
-    new THREE.Vector3(0.082, 0.021, 0.017), // prosthetic: matte oxide red
-    new THREE.Vector3(0.36, 0.26, 0.11), // brass
-    new THREE.Vector3(0.028, 0.028, 0.03), // polymer furniture (dielectric)
-    new THREE.Vector3(0.03, 0.05, 0.06), // optic glass
+    new THREE.Vector3(0.135, 0.133, 0.130), // gunmetal, phosphate-black
+    new THREE.Vector3(0.145, 0.048, 0.036), // prosthetic: matte oxide red
+    new THREE.Vector3(0.52, 0.40, 0.19), // brass
+    new THREE.Vector3(0.048, 0.047, 0.045), // polymer furniture (dielectric)
+    new THREE.Vector3(0.035, 0.055, 0.065), // optic glass
   ];
   const uniforms = {
     uMetalColor: { value: colors },
     uSeed: { value: opts.seed ?? 0 },
+    ...lightUniforms({ rim: 0.32, sunRim: 0.10, bounce: 0.32, warmMix: 0.62, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     injectVertex(shader);
+    injectLighting(shader);
 
     shader.fragmentShader = shader.fragmentShader
       .replace(
@@ -528,6 +811,7 @@ export function makeMetalMaterial(opts = {}) {
         `#include <common>
          ${VARYINGS}
          ${NOISE}
+         ${CHAR_LIGHT_PARS}
          uniform vec3 uMetalColor[5];
          uniform float uSeed;
          float gRough = 0.55;
@@ -540,14 +824,15 @@ export function makeMetalMaterial(opts = {}) {
            int zi = int(vZone + 0.5);
            vec3 base = uMetalColor[zi];
            float ao = clamp(vAO, 0.0, 1.0);
+           gAO = mix(0.4, 1.0, ao);
 
            // Anodised / phosphated finishes are MATTE — the read is a soft wide
            // highlight, never a mirror. Roughness stays high; variation comes
            // from handling wear, not from a gloss coat.
-           float rough = 0.62;
+           float rough = 0.6;
            float metal = 1.0;
-           if (zi == 1) { rough = 0.74; metal = 0.55; }
-           if (zi == 3) { rough = 0.72; metal = 0.0; }
+           if (zi == 1) { rough = 0.7; metal = 0.6; }
+           if (zi == 3) { rough = 0.68; metal = 0.0; }
            if (zi == 4) { rough = 0.12; metal = 0.0; }
 
            float grain = ch_fbm(vBind * 900.0 + uSeed, 2);
@@ -558,11 +843,11 @@ export function makeMetalMaterial(opts = {}) {
            rough -= smoothstep(0.62, 0.9, scr) * 0.2;
 
            // Edge wear: exposed geometry (high AO) polishes down to bright steel.
-           float wear = smoothstep(0.86, 1.0, ao) * smoothstep(0.4, 0.75, ch_fbm(vBind * 55.0 + 3.0, 3));
-           base = mix(base, vec3(0.34, 0.335, 0.325), wear * 0.55 * (zi == 4 ? 0.0 : 1.0));
-           rough = mix(rough, 0.3, wear * 0.5);
+           float wear = smoothstep(0.9, 1.0, ao) * smoothstep(0.55, 0.85, ch_fbm(vBind * 90.0 + 3.0, 3));
+           base = mix(base, vec3(0.38, 0.375, 0.365), wear * 0.35 * (zi == 4 ? 0.0 : 1.0));
+           rough = mix(rough, 0.28, wear * 0.5);
 
-           base *= mix(0.3, 1.0, pow(ao, 1.15));
+           base *= mix(0.52, 1.0, pow(ao, 1.1));
            diffuseColor.rgb *= base;
            gRough = clamp(rough, 0.06, 1.0);
            gMetal = metal;
@@ -597,37 +882,56 @@ export function makeMetalMaterial(opts = {}) {
 }
 
 /** Boot soles, rifle grips, kneepad rubber. */
-export function makeRubberMaterial() {
+export function makeRubberMaterial(opts = {}) {
   const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(0.026, 0.025, 0.024),
-    roughness: 0.86,
+    color: new THREE.Color(0.048, 0.045, 0.041),
+    roughness: 0.84,
     metalness: 0.0,
-    envMapIntensity: 0.55,
+    envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
+  const uniforms = lightUniforms({ rim: 0.32, sunRim: 0.08, bounce: 0.55, warmMix: 0.5, ...opts });
+  mat.userData.uniforms = uniforms;
   mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
     injectVertex(shader);
+    injectLighting(shader);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${VARYINGS}\n${NOISE}`)
+      .replace('#include <common>', `#include <common>\n${VARYINGS}\n${NOISE}\n${CHAR_LIGHT_PARS}\nfloat gRough = 0.84;`)
       .replace(
         '#include <map_fragment>',
         `#include <map_fragment>
          {
            float ao = clamp(vAO, 0.0, 1.0);
-           float dust = smoothstep(0.4, 0.85, ch_fbm(vBind * 40.0, 3));
-           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.16, 0.14, 0.11), dust * 0.5);
-           diffuseColor.rgb *= mix(0.4, 1.0, ao);
+           gAO = mix(0.45, 1.0, ao);
+           // A sole that has been walked on in a desert is caked, not black.
+           float dust = smoothstep(0.32, 0.8, ch_fbm(vBind * 34.0, 3));
+           float low = smoothstep(0.16, 0.0, vBind.y);
+           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.235, 0.198, 0.138), dust * (0.35 + low * 0.5));
+           diffuseColor.rgb *= mix(0.6, 1.0, ao);
+           gRough = mix(0.84, 0.96, dust);
          }`,
+      )
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+         roughnessFactor = gRough;`,
       )
       .replace(
         '#include <normal_fragment_maps>',
         `#include <normal_fragment_maps>
          {
            mat3 tbn = ch_frame(normal, -vViewPosition, vUvC);
+           // Lug pattern: a real 11 mm chevron block tread, not noise.
+           vec2 lug = vUvC / vec2(0.013, 0.011);
+           lug.x += floor(lug.y) * 0.5;
+           vec2 lf = abs(fract(lug) - 0.5);
+           vec2 nLug = vec2(-sign(fract(lug).x - 0.5) * (1.0 - smoothstep(0.28, 0.46, lf.x)),
+                            -sign(fract(lug).y - 0.5) * (1.0 - smoothstep(0.28, 0.46, lf.y))) * 0.9;
            vec3 pp = vBind * 220.0;
            float h0 = ch_fbm(pp, 2);
            vec2 g = vec2(h0 - ch_fbm(pp + vec3(0.6, 0.0, 0.0), 2), h0 - ch_fbm(pp + vec3(0.0, 0.6, 0.0), 2));
-           normal = normalize(tbn * normalize(vec3(g * 2.4, 1.0)));
+           normal = normalize(tbn * normalize(vec3(g * 2.0 + nLug, 1.0)));
          }`,
       );
   };
@@ -639,6 +943,6 @@ export function makeMaterialSet(opts = {}) {
     cloth: makeClothMaterial(opts.cloth ?? {}),
     skin: makeSkinMaterial(opts.skin ?? {}),
     metal: makeMetalMaterial(opts.metal ?? {}),
-    rubber: makeRubberMaterial(),
+    rubber: makeRubberMaterial(opts.rubber ?? {}),
   };
 }

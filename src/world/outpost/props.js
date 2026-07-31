@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { box, post, cyl, strut, xform, flip, bakeWeather, merge, lattice, catenary } from './geo.js';
+import { box, post, cyl, strut, xform, flip, bakeWeather, merge, lattice, catenary, membraneSag } from './geo.js';
 import { newBag } from './buildings.js';
 
 /**
@@ -144,13 +144,23 @@ export function jerryCanGeo() {
   return bake(b, h, 0.7);
 }
 
-export function tyreGeo() {
+/** Scrap tyre lying flat. Same tread generator as the trucks — it is the same tyre. */
+export function tyreGeo(variant = 0) {
   const b = newBag();
-  const g = new THREE.TorusGeometry(0.42, 0.155, 7, 16);
+  const r = 0.46 + variant * 0.035;
+  const wdt = 0.30 + (variant % 2) * 0.07;
+  const g = tyreProfile({ r, width: wdt, lugs: 11 + variant, shoulder: 0.10, flat: 0.045, bead: false });
   g.rotateX(Math.PI / 2);
-  g.translate(0, 0.155, 0);
+  // A dead tyre off the rim collapses into an oval — nothing about a scrap pile
+  // is circular.
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    p.setXYZ(i, p.getX(i) * (1 + 0.10 * variant * 0.3), p.getY(i) * 0.86, p.getZ(i) * (1 - 0.06 * variant * 0.3));
+  }
+  g.computeVertexNormals();
+  g.translate(0, wdt * 0.44, 0);
   b.rubber.push(g);
-  return bake(b, 0.31, 0.5);
+  return bake(b, wdt * 0.9, 0.5);
 }
 
 /** Broken slab and rubble — scattered where concrete has been knocked about. */
@@ -170,29 +180,83 @@ export function rubbleGeo(seed = 1) {
 }
 
 /**
- * Sandbag: a slumped, boxy pillow rather than a pebble. The superellipsoid
- * exponent is the whole trick — a plain squashed sphere stacks into a pile of
- * eggs, whereas flattening the sides lets a course read as masonry.
+ * Sandbag.
+ *
+ * Round 1 shipped one bag, instanced 1300 times with ±8% uniform scale, and the
+ * revetment read as a grid of identical pillows — which is exactly what it was.
+ * A filled hessian bag is not a primitive: it has a seam that runs the long way,
+ * ears at both ends where the corners of the sack fold up, a flat top wherever
+ * something is stacked on it, a lumpy sand-shaped belly, and it takes the shape
+ * of whatever it was dropped onto.
+ *
+ * So there are now SEVEN bag meshes with genuinely different silhouettes, each
+ * with its own end-fold treatment, belly lumps and slump direction, and the
+ * placement code hands out non-uniform per-instance scale on top of that. The
+ * cost is seven InstancedMesh draws instead of one — the cheapest possible price
+ * for killing the single most-noticed artefact on the site.
  */
-export function sandbagGeo() {
+export function sandbagGeo(variant = 0) {
   const b = newBag();
-  // 8x5 is the floor before the superellipse pinch stops reading; 1200 bags
-  // shipped 100 triangles each into the main pass and three shadow cascades.
+  let s = (variant * 2654435761 + 17) >>> 0;
+  const r = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
+
   const g = new THREE.SphereGeometry(1, 8, 5);
   const p = g.attributes.position;
-  const box3 = (v, e) => Math.sign(v) * Math.pow(Math.abs(v), e);
+  const sup = (v, e) => Math.sign(v) * Math.pow(Math.abs(v), e);
+
+  // Per-variant character. The proportions matter more than anything else here:
+  // a filled 14"x26" sack is roughly 560 x 340 x 200mm, which is a CHUNKY
+  // object — nearly as tall as it is half-wide. The first attempt used a
+  // half-height of 90mm and a superellipse exponent near 0.5, and the result was
+  // a flying saucer. Volume first, character second.
+  const ex = 0.68 + r() * 0.16;      // plan boxiness (higher = rounder)
+  const ey = 0.66 + r() * 0.20;      // section boxiness
+  const L = 0.255 + r() * 0.052;     // half-length
+  const W = 0.152 + r() * 0.030;     // half-width
+  const Hh = 0.106 + r() * 0.026;    // half-height
+  const slumpX = (r() - 0.5) * 0.12;
+  const slumpZ = (r() - 0.5) * 0.11;
+  const earDrop = 0.30 + r() * 0.50; // the empty corners of the sack flop DOWN
+  const lumpA = 0.13 + r() * 0.14;
+  const flatTop = r() < 0.45 ? 0.78 + r() * 0.16 : 1.0; // squashed by the course above
+  const ph = [r() * 6.3, r() * 6.3, r() * 6.3];
+
   for (let i = 0; i < p.count; i++) {
     const x = p.getX(i);
     const y = p.getY(i);
     const z = p.getZ(i);
-    const pinch = 1.0 - 0.22 * Math.pow(Math.abs(x), 2.2);
-    p.setXYZ(i, box3(x, 0.62) * 0.28, box3(y, 0.55) * 0.098 * pinch, box3(z, 0.62) * 0.165 * pinch);
+    const t = Math.abs(x);
+    // The ends of a filled sack are not full of sand: they taper hard and the
+    // slack corner folds over and hangs. That fold is the whole silhouette.
+    const pinch = 1.0 - 0.42 * Math.pow(t, 2.4);
+    let px = sup(x, ex) * L;
+    let py = sup(y, ey) * Hh * pinch;
+    let pz = sup(z, ex) * W * pinch;
+    py -= Math.pow(t, 3.4) * earDrop * Hh * 0.85;
+    // Sand does not fill a sack evenly: a few low-frequency lobes of belly.
+    const lump =
+      Math.sin(px * 9.0 + ph[0]) * Math.cos(pz * 15.0 + ph[1]) * 0.5 +
+      Math.sin(px * 19.0 + ph[2]) * 0.30 +
+      Math.cos(pz * 24.0 + ph[0]) * 0.24;
+    const belly = 1.0 + lump * lumpA * (0.40 + 0.60 * (1.0 - t));
+    py *= belly;
+    pz *= belly;
+    if (py > 0) py *= flatTop;
+    px += slumpX * y * 0.5;
+    pz += slumpZ * y;
+    p.setXYZ(i, px, py, pz);
   }
   g.computeVertexNormals();
-  g.translate(0, 0.098, 0);
+  g.translate(0, Hh * 1.02, 0);
   b.cloth.push(g);
-  return bake(b, 0.196, 0.45, -0.09);
+  // y0 at the very bottom of the bag so the shader's y01 term can put a contact
+  // shadow in the crack between courses; with y0 offset below the mesh the
+  // gradient never reaches zero and every bag floats.
+  return bake(b, Hh * 2.05, 0.45, 0);
 }
+
+/** How many distinct bag meshes exist; placement code buckets instances by this. */
+export const SANDBAG_VARIANTS = 7;
 
 // ------------------------------------------------------------- floodlight ---
 
@@ -346,156 +410,468 @@ export function pipeGeo() {
 // ----------------------------------------------------------------- truck ----
 
 /**
- * Ural-style 6x6 cargo truck. Big, boxy, high-clearance — the silhouette that
- * says "Soviet military" faster than any decal could.
+ * Off-road military tyre.
+ *
+ * Round 1 used a bare torus: a featureless black doughnut, which is the reason
+ * the truck read as a toy. A real 1200x500 military tyre is a *cylinder* with a
+ * rounded shoulder, a sidewall that carries lettering-depth relief and a bulge
+ * where the load flattens it, and — above everything — a coarse directional
+ * tread whose blocks catch a highlight on the top of the arc and go black
+ * underneath. That highlight running round the crown is the thing that makes a
+ * wheel read as rubber.
  */
-export function truckGeo({ tilt = true } = {}) {
+function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.11, flat = 0.03, bead = true }) {
+  const parts = [];
+  // Carcass: a lathed section so the shoulder is a real radius, not a chamfer.
+  const pts = [];
+  const N = 6;
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const a = -Math.PI / 2 + t * Math.PI;
+    pts.push(new THREE.Vector2(r - shoulder + Math.cos(a) * shoulder * 0.98, (Math.sin(a) * width) / 2));
+  }
+  pts.unshift(new THREE.Vector2(r * 0.55, -width / 2 + 0.02));
+  pts.push(new THREE.Vector2(r * 0.55, width / 2 - 0.02));
+  const carcass = new THREE.LatheGeometry(pts, 16);
+  carcass.rotateZ(Math.PI / 2);
+  parts.push(carcass);
+  // Sidewall bead ring, both faces. Skipped on scrap tyres in a stack, where the
+  // sidewall is never the silhouette and 35 of them add up.
+  if (bead) {
+    for (const sz of [-1, 1]) {
+      const ring = new THREE.TorusGeometry(r * 0.74, 0.035, 4, 14);
+      ring.rotateY(Math.PI / 2);
+      ring.translate(0, 0, (sz * width) / 2 - sz * 0.03);
+      parts.push(xform(ring, {}));
+    }
+  }
+  // Tread: staggered lug blocks round the crown. The tangential length has to
+  // be most of the pitch — at a 30% duty cycle they read as gear teeth rather
+  // than as tread, which is exactly how the first attempt failed.
+  const pitch = (2 * Math.PI * r) / lugs;
+  for (let i = 0; i < lugs; i++) {
+    const a = (i / lugs) * Math.PI * 2;
+    const stag = i % 2 === 0 ? 1 : -1;
+    for (const half of [-1, 1]) {
+      const g = box(pitch * 0.62, 0.038, width * 0.42, {
+        x: Math.cos(a) * (r + 0.004),
+        y: Math.sin(a) * (r + 0.004),
+        z: half * width * 0.235,
+        rz: a + stag * 0.26 * half,
+        sharp: true,
+      });
+      parts.push(g);
+    }
+  }
+  // The contact patch: squash the bottom of the tyre so it sits on the ground
+  // instead of touching it at one mathematical point.
+  const out = merge(parts);
+  const p = out.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const y = p.getY(i);
+    if (y < -(r - flat)) p.setY(i, -(r - flat) - (y + (r - flat)) * 0.25);
+  }
+  out.computeVertexNormals();
+  return out;
+}
+
+/** Steel disc wheel: rim, dish, hub, ten studs and a valve. */
+function hubGeo({ r = 0.30, width = 0.40 }) {
+  const parts = [];
+  parts.push(xform(cyl(r, width * 0.55, 12), { rz: Math.PI / 2 }));
+  for (const sz of [-1, 1]) {
+    parts.push(xform(cyl(r * 0.95, 0.05, 12), { rz: Math.PI / 2, z: (sz * width) / 2 - sz * 0.06 }));
+    parts.push(xform(cyl(r * 0.42, 0.10, 10), { rz: Math.PI / 2, z: (sz * width) / 2 }));
+    // Lightening holes read as holes because there is a dark disc behind them.
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2 + 0.3;
+      parts.push(xform(cyl(0.055, 0.06, 6), {
+        rz: Math.PI / 2, x: Math.cos(a) * r * 0.66, y: Math.sin(a) * r * 0.66, z: (sz * width) / 2 - sz * 0.03,
+      }));
+    }
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      parts.push(box(0.045, 0.045, 0.05, {
+        x: Math.cos(a) * r * 0.30, y: Math.sin(a) * r * 0.30, z: (sz * width) / 2 + sz * 0.03, rz: a, sharp: true,
+      }));
+    }
+  }
+  return parts;
+}
+
+/**
+ * Ural-style 6x6 cargo truck.
+ *
+ * Everything the critic listed as missing is here: tread and sidewall, disc
+ * wheels with studs, live axles on leaf springs with shackles, a glazed and
+ * framed cab with opening doors, handles, hinges and mirrors, a vertical
+ * exhaust stack with a heat shield, a canvas tilt on real hoops with lashing
+ * eyes, mudflaps, and a spare on the headboard. The truck is the object a
+ * player walks right up to, so it is the object that has to survive being
+ * walked right up to.
+ */
+export function truckGeo({ tilt = true, rng = null } = {}) {
   const b = newBag();
   const wheelR = 0.62;
-  const axleY = wheelR;
+  const width = 0.42;
+  const axleY = wheelR - 0.03;
+  const track = 1.02;
+  const rnd = rng ?? (() => 0.5);
+  void rnd;
 
-  // Chassis.
-  for (const sz of [-1, 1]) b.metal.push(box(6.9, 0.2, 0.15, { y: 0.78, z: sz * 0.44 }));
-  b.metal.push(box(0.5, 0.16, 0.95, { x: -2.0, y: 0.78 }));
-
-  // Cab: lower body, glazed band, roof.
-  b.metal.push(box(2.0, 0.98, 2.32, { x: 2.3, y: 1.42 }));
-  b.glass.push(box(1.86, 0.62, 2.2, { x: 2.3, y: 2.22 }));
-  b.glass.push(box(1.9, 0.66, 0.05, { x: 3.26, y: 2.2 }));
-  b.metal.push(box(2.1, 0.12, 2.4, { x: 2.3, y: 2.58 }));
-  for (const sz of [-1, 1]) b.metal.push(box(2.0, 0.66, 0.06, { x: 2.3, y: 2.22, z: sz * 1.17 }));
-  b.metal.push(box(0.08, 0.66, 2.2, { x: 1.31, y: 2.22 }));
-  // Bonnet, grille, bumper, lights.
-  b.metal.push(box(1.15, 0.82, 2.05, { x: 3.9, y: 1.5 }));
-  b.metal.push(box(0.1, 0.66, 1.55, { x: 4.48, y: 1.42 }));
-  for (let i = 0; i < 7; i++) b.metal.push(box(0.14, 0.6, 0.06, { x: 4.52, y: 1.42, z: -0.68 + i * 0.226 }));
-  b.metal.push(box(0.2, 0.24, 2.3, { x: 4.55, y: 0.86 }));
+  // ------------------------------------------------------------- chassis ----
   for (const sz of [-1, 1]) {
-    b.metal.push(xform(cyl(0.16, 0.16, 10), { rz: Math.PI / 2, x: 4.46, y: 1.72, z: sz * 0.78 }));
-    b.glow.push(xform(cyl(0.13, 0.05, 10), { rz: Math.PI / 2, x: 4.55, y: 1.72, z: sz * 0.78 }));
-    // Fenders and mirrors.
-    b.metal.push(box(1.35, 0.14, 0.62, { x: 3.55, y: 1.06, z: sz * 1.0 }));
-    b.metal.push(strut(new THREE.Vector3(1.5, 2.35, sz * 1.2), new THREE.Vector3(1.75, 2.55, sz * 1.55), 0.028, 5));
-    b.metal.push(box(0.06, 0.42, 0.22, { x: 1.78, y: 2.5, z: sz * 1.6 }));
+    b.metal.push(box(6.9, 0.24, 0.10, { y: 0.80, z: sz * 0.46 }));
+    b.metal.push(box(6.9, 0.06, 0.16, { y: 0.91, z: sz * 0.46 }));
+    b.metal.push(box(6.9, 0.06, 0.16, { y: 0.69, z: sz * 0.46 }));
   }
-  // Fuel tank and exhaust.
-  b.metal.push(xform(cyl(0.28, 1.1, 12), { rz: Math.PI / 2, x: 0.9, y: 0.85, z: -1.05 }));
-  b.metal.push(cyl(0.075, 2.2, 8, { x: 1.25, y: 1.9, z: 1.02 }));
+  for (const cx of [2.6, 0.3, -1.9, -3.2]) b.metal.push(box(0.14, 0.20, 1.02, { x: cx, y: 0.80 }));
+  // Transfer case, propshafts, silencer.
+  b.metal.push(box(0.70, 0.42, 0.52, { x: 0.55, y: 0.70 }));
+  for (const [x0, x1] of [[1.9, 0.9], [0.2, -1.2], [-1.5, -2.6]]) {
+    b.metal.push(strut(new THREE.Vector3(x0, 0.70, 0), new THREE.Vector3(x1, axleY, 0), 0.045, 6));
+  }
+  b.metal.push(xform(cyl(0.16, 1.5, 10), { rz: Math.PI / 2, x: 0.4, y: 0.60, z: 0.62 }));
 
-  // Cargo bed.
-  const bedX = -1.5;
-  b.wood.push(box(4.3, 0.14, 2.3, { x: bedX, y: 1.18 }));
-  for (const sz of [-1, 1]) b.wood.push(box(4.3, 0.62, 0.09, { x: bedX, y: 1.55, z: sz * 1.15 }));
-  b.wood.push(box(0.09, 0.75, 2.3, { x: bedX + 2.15, y: 1.62 }));
-  b.wood.push(box(0.09, 0.6, 2.3, { x: bedX - 2.15, y: 1.5 }));
+  // ------------------------------------------------------------ cab -------
+  const cabX = 2.35;
+  b.mil.push(box(2.05, 1.02, 2.30, { x: cabX, y: 1.44 }));
+  // Doors: a real 4mm shut line, a window frame, a handle, two hinges and a step.
   for (const sz of [-1, 1]) {
+    const zf = sz * 1.155;
+    b.mil.push(box(1.30, 1.62, 0.05, { x: cabX - 0.06, y: 1.75, z: zf }));
+    for (const sy of [1.06, 2.30]) b.metal.push(box(0.10, 0.16, 0.05, { x: cabX + 0.55, y: sy, z: zf + sz * 0.03 }));
+    b.metal.push(box(0.20, 0.05, 0.05, { x: cabX - 0.52, y: 1.72, z: zf + sz * 0.05 }));
+    // Window aperture: painted frame, dark interior, glass proud of the interior.
+    b.dark.push(box(1.02, 0.62, 0.03, { x: cabX - 0.06, y: 2.18, z: zf - sz * 0.10 }));
+    b.glass.push(box(1.02, 0.62, 0.02, { x: cabX - 0.06, y: 2.18, z: zf + sz * 0.026 }));
+    for (const sy of [-0.34, 0.34]) b.mil.push(box(1.12, 0.06, 0.07, { x: cabX - 0.06, y: 2.18 + sy, z: zf + sz * 0.02 }));
+    for (const sx of [-0.53, 0.53]) b.mil.push(box(0.06, 0.70, 0.07, { x: cabX - 0.06 + sx, y: 2.18, z: zf + sz * 0.02 }));
+    // Step under the door and a grab handle on the A-pillar.
+    b.metal.push(box(0.55, 0.05, 0.20, { x: cabX - 0.1, y: 0.92, z: sz * 1.28 }));
+    b.metal.push(cyl(0.022, 0.60, 5, { x: cabX + 0.66, y: 2.05, z: sz * 1.22 }));
+    // Mirror on a proper double-arm bracket.
+    b.metal.push(strut(new THREE.Vector3(cabX + 0.72, 2.36, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.62, sz * 1.62), 0.022, 5));
+    b.metal.push(strut(new THREE.Vector3(cabX + 0.72, 1.98, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.20, sz * 1.62), 0.022, 5));
+    b.mil.push(box(0.09, 0.52, 0.24, { x: cabX + 0.58, y: 2.40, z: sz * 1.66 }));
+    b.glass.push(box(0.02, 0.44, 0.19, { x: cabX + 0.63, y: 2.40, z: sz * 1.66 }));
+  }
+  // Windscreen: two panes with a centre bar, raked, with a dark cab behind.
+  b.dark.push(box(1.86, 0.70, 0.04, { x: cabX + 0.94, y: 2.20 }));
+  for (const sz of [-1, 1]) {
+    b.glass.push(box(0.03, 0.66, 0.86, { x: cabX + 1.00, y: 2.20, z: sz * 0.48 }));
+  }
+  b.mil.push(box(0.09, 0.74, 0.09, { x: cabX + 1.00, y: 2.20 }));
+  b.mil.push(box(0.12, 0.10, 2.26, { x: cabX + 0.99, y: 2.56 }));
+  b.mil.push(box(0.12, 0.10, 2.26, { x: cabX + 0.99, y: 1.84 }));
+  for (const sz of [-1, 1]) b.metal.push(box(0.05, 0.03, 0.55, { x: cabX + 1.03, y: 1.94, z: sz * 0.45, rz: 0.25 }));
+  b.mil.push(box(0.09, 1.72, 2.30, { x: cabX - 1.00, y: 1.76 }));
+  b.dark.push(box(0.04, 1.60, 2.16, { x: cabX - 0.94, y: 1.76 }));
+  b.mil.push(box(2.20, 0.14, 2.38, { x: cabX, y: 2.60 }));
+  b.metal.push(box(0.30, 0.16, 0.30, { x: cabX - 0.7, y: 2.72, z: 0.7 }));
+
+  // ------------------------------------------------- bonnet / front end ----
+  b.mil.push(box(1.20, 0.86, 2.02, { x: 3.94, y: 1.52 }));
+  b.metal.push(box(0.06, 0.60, 1.90, { x: 4.56, y: 1.58 }));
+  b.dark.push(box(0.06, 0.56, 1.48, { x: 4.53, y: 1.46 }));
+  for (let i = 0; i < 9; i++) b.metal.push(box(0.10, 0.56, 0.05, { x: 4.57, y: 1.46, z: -0.70 + i * 0.175 }));
+  b.metal.push(box(0.26, 0.26, 2.34, { x: 4.62, y: 0.86 }));
+  for (const sz of [-1, 1]) {
+    b.metal.push(box(0.34, 0.30, 0.14, { x: 4.72, y: 0.86, z: sz * 0.85 }));
+    b.metal.push(xform(cyl(0.17, 0.18, 10), { rz: Math.PI / 2, x: 4.50, y: 1.78, z: sz * 0.76 }));
+    b.glow.push(xform(cyl(0.14, 0.05, 10), { rz: Math.PI / 2, x: 4.60, y: 1.78, z: sz * 0.76 }));
+    b.paintWarn.push(xform(cyl(0.07, 0.05, 8), { rz: Math.PI / 2, x: 4.58, y: 1.44, z: sz * 0.98 }));
+    // Wing, and a mudflap behind the front wheel.
+    b.mil.push(box(1.50, 0.10, 0.66, { x: 3.60, y: 1.10, z: sz * 1.00 }));
+    b.mil.push(box(0.14, 0.42, 0.66, { x: 2.88, y: 0.92, z: sz * 1.00 }));
+  }
+  b.metal.push(cyl(0.055, 0.42, 6, { x: 4.30, y: 2.02, z: -0.5 }));
+
+  // Vertical exhaust stack behind the cab, with a perforated heat shield.
+  b.metal.push(cyl(0.075, 2.45, 8, { x: 1.30, y: 2.02, z: 1.02 }));
+  b.metal.push(xform(cyl(0.10, 0.16, 8), { rz: 0.35, x: 1.34, y: 3.22, z: 1.02 }));
+  for (let i = 0; i < 5; i++) b.metal.push(box(0.16, 0.05, 0.05, { x: 1.30, y: 1.2 + i * 0.4, z: 1.10 }));
+
+  // Fuel tank on a strap, battery box, and a spare wheel on the headboard.
+  b.metal.push(xform(cyl(0.30, 1.25, 14), { rz: Math.PI / 2, x: 0.85, y: 0.86, z: -1.02 }));
+  for (const sx of [-0.4, 0.4]) b.metal.push(xform(cyl(0.33, 0.05, 14), { rz: Math.PI / 2, x: 0.85 + sx, y: 0.86, z: -1.02 }));
+  b.metal.push(box(0.62, 0.42, 0.44, { x: 1.55, y: 0.92, z: -1.00 }));
+
+  // ------------------------------------------------------------- bed ------
+  const bedX = -1.55;
+  b.wood.push(box(4.40, 0.16, 2.32, { x: bedX, y: 1.16 }));
+  for (const sz of [-1, 1]) {
+    // Drop sides made of real boards, with the gap between them.
+    for (let k = 0; k < 3; k++) {
+      b.wood.push(box(4.40, 0.20, 0.075, { x: bedX, y: 1.34 + k * 0.225, z: sz * 1.16 }));
+    }
     for (let i = 0; i < 4; i++) {
-      b.metal.push(box(0.07, 0.75, 0.09, { x: bedX - 1.9 + i * 1.27, y: 1.6, z: sz * 1.2 }));
+      b.metal.push(box(0.07, 0.80, 0.10, { x: bedX - 1.90 + i * 1.27, y: 1.60, z: sz * 1.21 }));
+      b.metal.push(box(0.16, 0.06, 0.14, { x: bedX - 1.90 + i * 1.27, y: 1.22, z: sz * 1.24 }));
     }
   }
+  b.wood.push(box(0.10, 0.92, 2.32, { x: bedX + 2.20, y: 1.66 }));
+  b.wood.push(box(0.10, 0.62, 2.32, { x: bedX - 2.20, y: 1.50 }));
+  b.metal.push(box(4.5, 0.09, 0.12, { x: bedX, y: 1.09, z: 0 }));
 
   if (tilt) {
-    const canopy = new THREE.CylinderGeometry(1.22, 1.22, 4.3, 16, 1, true, 0, Math.PI);
-    xform(canopy, { rz: Math.PI / 2, x: bedX, y: 1.9 });
-    b.cloth.push(canopy);
-    b.cloth.push(box(0.06, 1.25, 2.44, { x: bedX - 2.15, y: 1.9 }));
-    for (let i = 0; i <= 4; i++) {
-      const t = new THREE.TorusGeometry(1.22, 0.035, 4, 12, Math.PI);
+    // Canvas tilt on five hoops. The canvas sags between the hoops and the
+    // ridge scallops — a smooth half-cylinder is the giveaway that it is a
+    // primitive rather than cloth over a frame.
+    const hoopN = 5;
+    const span = 4.30;
+    const R0 = 1.24;
+    const seg = 11;
+    const rows = 16;
+    const gt = new THREE.PlaneGeometry(span, 1, rows, seg);
+    const gp = gt.attributes.position;
+    for (let i = 0; i < gp.count; i++) {
+      const col = i % (rows + 1);
+      const row = Math.floor(i / (rows + 1));
+      const t = col / rows;
+      const a = (row / seg) * Math.PI;
+      // Sag: zero at each hoop, maximum midway between.
+      const hoopPhase = Math.abs(Math.sin(t * (hoopN - 1) * Math.PI));
+      const sag = hoopPhase * 0.075 * Math.sin(a);
+      const rr = R0 - sag;
+      gp.setXYZ(i, bedX - span / 2 + t * span, 1.86 + Math.sin(a) * rr, -Math.cos(a) * rr);
+    }
+    gt.computeVertexNormals();
+    b.cloth.push(gt);
+    // Tail curtain, rolled up and lashed on one side.
+    b.cloth.push(box(0.06, 1.30, 2.44, { x: bedX - 2.18, y: 1.94 }));
+    b.cloth.push(xform(cyl(0.16, 2.30, 8), { rz: Math.PI / 2, x: bedX - 2.20, y: 2.72 }));
+    for (let i = 0; i < hoopN; i++) {
+      const t = new THREE.TorusGeometry(R0 + 0.015, 0.032, 4, 14, Math.PI);
       t.rotateY(Math.PI / 2);
-      t.translate(bedX - 2.15 + i * 1.075, 1.9, 0);
+      t.translate(bedX - span / 2 + (i * span) / (hoopN - 1), 1.86, 0);
       b.metal.push(t);
     }
+    // Lashing eyes and rope along the hem.
+    for (const sz of [-1, 1]) {
+      for (let i = 0; i < 8; i++) {
+        b.metal.push(box(0.05, 0.05, 0.05, { x: bedX - 2.0 + i * 0.57, y: 1.84, z: sz * 1.245 }));
+      }
+      b.metal.push(catenary(
+        new THREE.Vector3(bedX - 2.15, 1.84, sz * 1.25),
+        new THREE.Vector3(bedX + 2.15, 1.84, sz * 1.25), 0.05, 0.016, 8,
+      ));
+    }
   } else {
-    b.rubber.push(xform(new THREE.TorusGeometry(0.44, 0.16, 6, 14), { x: bedX + 1.9, y: 1.72, z: -0.8 }));
+    // Flatbed: spare wheel flat on the deck, and a coil of rope.
+    b.rubber.push(xform(tyreProfile({ r: 0.60, width: 0.40, lugs: 16 }), { rx: Math.PI / 2, x: bedX + 1.5, y: 1.44, z: -0.6 }));
+    for (const g of hubGeo({ r: 0.29, width: 0.38 })) {
+      b.metal.push(xform(g, { rx: Math.PI / 2, x: bedX + 1.5, y: 1.44, z: -0.6 }));
+    }
+    b.cloth.push(xform(new THREE.TorusGeometry(0.30, 0.075, 5, 12), { rx: Math.PI / 2, x: bedX - 1.2, y: 1.31, z: 0.7 }));
   }
 
-  // Wheels: one steer axle up front, a bogie at the back.
-  for (const ax of [3.3, -1.35, -2.75]) {
+  // ---------------------------------------------------------- running gear --
+  const tyre = tyreProfile({ r: wheelR, width, lugs: 17 });
+  const hub = merge(hubGeo({ r: 0.30, width: width * 0.95 }));
+  for (const ax of [3.28, -1.32, -2.72]) {
     for (const sz of [-1, 1]) {
-      const t = new THREE.TorusGeometry(0.44, 0.175, 7, 16);
-      t.rotateY(Math.PI / 2);
-      t.translate(ax, axleY, sz * 1.06);
-      b.rubber.push(t);
-      b.metal.push(xform(cyl(0.29, 0.34, 12), { rz: Math.PI / 2, x: ax, y: axleY, z: sz * 1.06 }));
-      b.metal.push(xform(cyl(0.11, 0.4, 8), { rz: Math.PI / 2, x: ax, y: axleY, z: sz * 1.06 }));
+      b.rubber.push(xform(tyre.clone(), { x: ax, y: axleY, z: sz * track }));
+      b.metal.push(xform(hub.clone(), { x: ax, y: axleY, z: sz * track }));
+      // Leaf spring pack, spring seat and a shackle at each end.
+      for (let k = 0; k < 3; k++) {
+        b.metal.push(box(1.35 - k * 0.22, 0.035, 0.09, { x: ax, y: 0.60 + k * 0.045, z: sz * 0.52, rz: 0 }));
+      }
+      b.metal.push(box(0.20, 0.18, 0.14, { x: ax, y: 0.66, z: sz * 0.52 }));
+      for (const sx of [-1, 1]) {
+        b.metal.push(box(0.08, 0.26, 0.10, { x: ax + sx * 0.66, y: 0.70, z: sz * 0.52 }));
+      }
+      // Damper.
+      b.metal.push(strut(
+        new THREE.Vector3(ax + 0.10, 0.62, sz * 0.60), new THREE.Vector3(ax + 0.30, 1.00, sz * 0.50), 0.035, 5,
+      ));
     }
-    b.metal.push(xform(cyl(0.09, 2.0, 8), { rz: Math.PI / 2, x: ax, y: axleY }));
-    b.metal.push(box(0.5, 0.34, 0.44, { x: ax, y: axleY }));
+    // Live axle: tube, banjo housing and the diff cover.
+    b.metal.push(xform(cyl(0.075, track * 2 - 0.2, 8), { rz: Math.PI / 2, x: ax, y: axleY }));
+    b.metal.push(xform(cyl(0.20, 0.34, 10), { rz: Math.PI / 2, x: ax, y: axleY }));
+    b.metal.push(xform(cyl(0.155, 0.22, 10), { x: ax - 0.02, y: axleY, z: 0.20, rx: Math.PI / 2 }));
   }
-  return bake(b, 2.9, 0.45);
+  // Rear mudflaps behind the bogie.
+  for (const sz of [-1, 1]) b.rubber.push(box(0.03, 0.50, 0.56, { x: -3.30, y: 0.70, z: sz * track }));
+  // Low bake wear: a serviceable truck in daily use is dirty, not derelict.
+  return bake(b, 2.9, 0.12);
 }
 
 // ------------------------------------------------------------- camo netting --
 
 /**
- * Camo net stretched over a frame, sagging between the poles. Alpha-tested so
- * light and shadow break through it — that dapple is most of the effect.
+ * Camo net over a pole frame.
+ *
+ * The round-1 net was a flat plane held rigid, and it is worth being precise
+ * about why that fails: a net has no bending stiffness at all. It cannot be
+ * flat. Its shape is entirely determined by where it is pinned and by gravity,
+ * which means a deep swag between every pair of supports and a hard cusp AT
+ * each support — and that alternating cusp/swag rhythm along the roofline is
+ * the whole silhouette. So the surface is solved as a real slack membrane
+ * (`membraneSag`) pinned at the pole heads, rather than shaped by a formula.
+ *
+ * The second half is the shadow. Alpha-tested with a genuinely open scrim, this
+ * throws the moving dappled light-pool that is a signature MGSV image; getting
+ * it requires castShadow on, an alphaTest the depth pass will honour, and — the
+ * bit that is easy to miss — holes big enough for the shadow cascade to resolve.
  */
-export function camoNet({ w = 12, d = 9, h = 3.1, sag = 0.55 }) {
+export function camoNet({ w = 12, d = 9, h = 3.1, sag = 0.55, rng = null }) {
   const b = newBag();
-  const nx = 10;
-  const nz = 8;
+  const nx = 16;
+  const nz = 12;
+  const rnd = rng ?? (() => 0.5);
+
+  // Pole heads: corners plus mid-edges plus one interior prop, each at its own
+  // height. A net whose supports are all the same height is a tent, not camo.
+  const heads = [
+    { i: 0, j: 0, y: h },
+    { i: nx, j: 0, y: h - 0.30 },
+    { i: nx, j: nz, y: h + 0.22 },
+    { i: 0, j: nz, y: h - 0.12 },
+    { i: Math.round(nx * 0.5), j: 0, y: h + 0.34 },
+    { i: Math.round(nx * 0.5), j: nz, y: h + 0.10 },
+    { i: 0, j: Math.round(nz * 0.5), y: h - 0.20 },
+    { i: nx, j: Math.round(nz * 0.55), y: h + 0.05 },
+    { i: Math.round(nx * 0.62), j: Math.round(nz * 0.45), y: h + 0.55 },
+  ];
+  for (const p of heads) p.y += (rnd() - 0.5) * 0.22;
+
+  const field = membraneSag({ nx, nz, pins: heads.map((p) => ({ i: p.i, j: p.j, y: p.y })), sag, passes: 300 });
+
   const g = new THREE.PlaneGeometry(w, d, nx, nz);
   g.rotateX(-Math.PI / 2);
   const p = g.attributes.position;
-  for (let i = 0; i < p.count; i++) {
-    const x = p.getX(i) / (w / 2);
-    const z = p.getZ(i) / (d / 2);
-    const s = Math.cos((x * Math.PI) / 2) * Math.cos((z * Math.PI) / 2);
-    p.setY(i, h - sag * s - 0.25 * (1 - s));
+  // PlaneGeometry rows run +u then +v; after rotateX(-90) v maps to +z.
+  for (let j = 0; j <= nz; j++) {
+    for (let i = 0; i <= nx; i++) {
+      const idx = j * (nx + 1) + i;
+      p.setY(idx, field[j * (nx + 1) + i]);
+    }
   }
   g.computeVertexNormals();
   const uv = g.attributes.uv;
-  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * (w / 3.2), uv.getY(i) * (d / 3.2));
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * (w / 3.4), uv.getY(i) * (d / 3.4));
   b.net.push(g);
-  // Skirts hanging off two edges.
-  for (const sz of [-1, 1]) {
-    const s = new THREE.PlaneGeometry(w, 1.0, nx, 2);
+
+  // Skirts down all four edges, following the swag they hang from and cut to
+  // ragged lengths.
+  const edgeY = (i, j) => field[j * (nx + 1) + i];
+  const skirt = (along, fixed, axis, sz) => {
+    const n = axis === 0 ? nx : nz;
+    const len = axis === 0 ? w : d;
+    const s = new THREE.PlaneGeometry(len, 1.0, n, 2);
     const sp = s.attributes.position;
-    for (let i = 0; i < sp.count; i++) {
-      const yy = sp.getY(i);
-      sp.setXYZ(i, sp.getX(i), h - 0.25 + yy - 0.5, sz * (d / 2) + Math.sin(sp.getX(i) * 0.9) * 0.12);
+    for (let k = 0; k < sp.count; k++) {
+      const col = k % (n + 1);
+      const row = Math.floor(k / (n + 1));
+      const t = col / n;
+      const y0 = axis === 0 ? edgeY(col, fixed) : edgeY(fixed, col);
+      const drop = (0.55 + 0.55 * Math.abs(Math.sin(t * 7.3 + sz * 2.1))) * (row === 0 ? 1 : row === 1 ? 0.5 : 0);
+      const posAlong = -len / 2 + t * len;
+      const wobble = Math.sin(t * 9.0 + sz) * 0.10;
+      if (axis === 0) sp.setXYZ(k, posAlong, y0 - drop, sz * (d / 2) + wobble);
+      else sp.setXYZ(k, sz * (w / 2) + wobble, y0 - drop, posAlong);
     }
     s.computeVertexNormals();
     const su = s.attributes.uv;
-    for (let i = 0; i < su.count; i++) su.setXY(i, su.getX(i) * (w / 3.2), su.getY(i) * 0.5);
+    for (let k = 0; k < su.count; k++) su.setXY(k, su.getX(k) * (len / 3.4), su.getY(k) * 0.5);
     b.net.push(s);
+    void along;
+  };
+  skirt(0, 0, 0, -1);
+  skirt(0, nz, 0, 1);
+  skirt(0, 0, 1, -1);
+  skirt(0, nx, 1, 1);
+
+  // Poles under each head, out of scaffold tube with a spike foot, plus guys.
+  for (const hd of heads) {
+    const x = -w / 2 + (hd.i / nx) * w;
+    const z = -d / 2 + (hd.j / nz) * d;
+    const y = field[hd.j * (nx + 1) + hd.i];
+    b.metal.push(cyl(0.045, y + 0.12, 7, { x, y: (y + 0.12) / 2, z }));
+    b.metal.push(cyl(0.075, 0.07, 8, { x, y: y + 0.10, z }));
+    b.metal.push(cyl(0.13, 0.05, 8, { x, y: 0.025, z }));
   }
-  // Poles and guy lines.
+  // Guys off the four corners into ground pickets.
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
-      b.metal.push(post(0.09, h, 0.09, sx * (w / 2), 0, sz * (d / 2)));
-      const a = new THREE.Vector3(sx * (w / 2), h, sz * (d / 2));
-      const anch = new THREE.Vector3(sx * (w / 2 + 1.9), 0.05, sz * (d / 2 + 1.5));
-      b.metal.push(strut(a, anch, 0.014, 4));
-      b.metal.push(post(0.07, 0.35, 0.07, anch.x, 0, anch.z));
+      const a = new THREE.Vector3(sx * (w / 2), field[(sz > 0 ? nz : 0) * (nx + 1) + (sx > 0 ? nx : 0)], sz * (d / 2));
+      const anch = new THREE.Vector3(sx * (w / 2 + 1.9), 0.06, sz * (d / 2 + 1.5));
+      b.metal.push(strut(a, anch, 0.012, 4));
+      b.metal.push(xform(cyl(0.035, 0.55, 5), { rz: sx * 0.35, x: anch.x, y: 0.2, z: anch.z }));
     }
   }
-  b.metal.push(post(0.09, h + 0.2, 0.09, 0, 0, -d / 2));
-  b.metal.push(post(0.09, h + 0.2, 0.09, 0, 0, d / 2));
-  return bake(b, h + 0.4, 0.4);
+  return bake(b, h + 0.6, 0.4);
 }
 
-/** A tarp thrown over a stack of stores, tied down at the corners. */
-export function tarpGeo({ w = 2.6, d = 2.0, h = 1.3 }) {
+/**
+ * A tarp thrown over a stack of stores and roped down.
+ *
+ * The round-1 tarp was a smooth cosine dome, which is the one thing a sheet of
+ * canvas over a pile of boxes never is. Real tarpaulin does three things: it
+ * takes the CORNERS of whatever is underneath, so the silhouette has hard
+ * points; it hangs in straight-line creases radiating from each of those
+ * points; and it is pulled into a waist wherever a rope crosses it. All three
+ * are here, plus the rope.
+ */
+export function tarpGeo({ w = 2.6, d = 2.0, h = 1.3, seed = 3 }) {
   const b = newBag();
-  const g = new THREE.PlaneGeometry(w, d, 8, 7);
+  let s = seed >>> 0;
+  const rnd = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
+  const nx = 12;
+  const nz = 10;
+  const g = new THREE.PlaneGeometry(w, d, nx, nz);
   g.rotateX(-Math.PI / 2);
   const p = g.attributes.position;
+  // The load underneath: two or three crates at different heights.
+  const lumps = [];
+  for (let i = 0; i < 3; i++) {
+    lumps.push({
+      x: (rnd() - 0.5) * w * 0.55,
+      z: (rnd() - 0.5) * d * 0.55,
+      hx: w * (0.16 + rnd() * 0.16),
+      hz: d * (0.16 + rnd() * 0.16),
+      y: h * (0.62 + rnd() * 0.38),
+    });
+  }
+  const ropes = [-0.28 + rnd() * 0.1, 0.26 + rnd() * 0.1];
   for (let i = 0; i < p.count; i++) {
-    const x = Math.abs(p.getX(i)) / (w / 2);
-    const z = Math.abs(p.getZ(i)) / (d / 2);
-    const r = Math.max(x, z);
-    const dome = Math.cos(Math.min(1, r) * Math.PI * 0.5);
-    const wrinkle = Math.sin(p.getX(i) * 5.0) * Math.cos(p.getZ(i) * 4.3) * 0.035;
-    p.setY(i, h * dome + wrinkle);
-    if (r > 0.92) {
-      p.setX(i, p.getX(i) * 1.06);
-      p.setZ(i, p.getZ(i) * 1.06);
+    const x = p.getX(i);
+    const z = p.getZ(i);
+    // Height is the upper envelope of the boxes underneath — a max(), which is
+    // what produces the hard ridge lines a smooth dome cannot have.
+    let y = 0;
+    for (const L of lumps) {
+      const q = Math.max(Math.abs(x - L.x) / L.hx, Math.abs(z - L.z) / L.hz);
+      y = Math.max(y, L.y * Math.max(0, 1 - Math.max(0, q - 1) * 0.9) * (q <= 1 ? 1 : 1));
     }
+    // Creases: sharp, straight, and aligned to the sheet, not noise.
+    const crease = (Math.abs(Math.sin(x * 4.1 + z * 1.3)) ** 3) * 0.055
+                 + (Math.abs(Math.sin(z * 5.3 - x * 0.9)) ** 3) * 0.040;
+    y = y * (1 - crease) - crease * 0.04;
+    // Rope waists.
+    for (const rz of ropes) {
+      y -= 0.075 * Math.exp(-((z / (d / 2) - rz * 2) ** 2) * 26.0) * (y > 0.12 ? 1 : 0);
+    }
+    const edge = Math.max(Math.abs(x) / (w / 2), Math.abs(z) / (d / 2));
+    if (edge > 0.86) {
+      p.setX(i, x * 1.10);
+      p.setZ(i, z * 1.10);
+      y *= 0.25;
+    }
+    p.setY(i, Math.max(0.01, y));
   }
   g.computeVertexNormals();
   b.cloth.push(g);
+  // Lashing rope over the top and a couple of ground pegs.
+  for (const rz of ropes) {
+    const z = rz * d;
+    b.metal.push(catenary(
+      new THREE.Vector3(-w / 2 - 0.15, 0.04, z),
+      new THREE.Vector3(w / 2 + 0.15, 0.04, z),
+      -h * 0.88, 0.014, 9,
+    ));
+  }
   return bake(b, h, 0.5);
 }
 

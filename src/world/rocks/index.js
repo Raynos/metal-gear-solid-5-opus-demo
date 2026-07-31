@@ -27,13 +27,24 @@ export async function install(world) {
 
   let instances = 0;
   let triangles = 0;
+  // Per-LOD breakdown: the hero mesh is 4x the triangles of the mid one, so a
+  // band-0 population that quietly grows is the fastest way to blow the budget.
+  const perLod = [0, 0, 0];
+  const instLod = [0, 0, 0];
   for (const m of meshes) {
+    const tri = (m.geometry.attributes.position.count / 3) * m.count;
     instances += m.count;
-    triangles += (m.geometry.attributes.position.count / 3) * m.count;
+    triangles += tri;
+    const lod = +(m.name.match(/lod(\d)/)?.[1] ?? 0);
+    perLod[lod] += tri;
+    instLod[lod] += m.count;
   }
   console.log(
     `[rocks] ${meshes.length} draws, ${instances} instances, ` +
-      `${(triangles / 1e6).toFixed(2)}M tris, ${Math.round(performance.now() - t0)}ms`,
+      `${(triangles / 1e6).toFixed(2)}M tris, ${Math.round(performance.now() - t0)}ms` +
+      ` | lod0 ${instLod[0]}i/${(perLod[0] / 1e6).toFixed(2)}M` +
+      ` lod1 ${instLod[1]}i/${(perLod[1] / 1e6).toFixed(2)}M` +
+      ` lod2 ${instLod[2]}i/${(perLod[2] / 1e6).toFixed(2)}M`,
   );
 
   const tmp = new THREE.Matrix4();

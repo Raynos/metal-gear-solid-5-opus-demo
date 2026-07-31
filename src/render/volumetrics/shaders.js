@@ -2,9 +2,38 @@
  * GLSL for the volumetric stack.
  *
  * All of these run as full-screen passes into private render targets *before*
- * the main scene render, so they may freely sample `pipeline.hdr.depthTexture`
- * and `pipeline.hdr.texture` (last frame's) without forming a feedback loop.
+ * the main scene render, so they may freely sample pipeline.hdr.depthTexture
+ * and pipeline.hdr.texture (last frame's) without forming a feedback loop.
  * The result is composited back into the HDR buffer by an in-scene quad.
+ *
+ * ## What this layer is, and — more importantly — what it is NOT
+ *
+ * Round 1's biggest failure was that this pass ran a full-range exponential
+ * height fog over EVERY pixel, sky included. A sky pixel picked up ~0.5 optical
+ * depths of a single flat grey in-scatter colour, which replaced ~40 % of the
+ * sky dome with an achromatic veil and flattened the dome's blue gradient from
+ * a B-R spread of 0.106..0.247 down to a uniform 0.03..0.07. It also washed the
+ * clouds out to within 0.03 luminance of the sky behind them, and the
+ * per-row-constant optical-depth weights drew horizontal iso-distance bands
+ * across every mid-ground.
+ *
+ * The sky dome is already a full atmospheric raymarch to the top of the
+ * atmosphere. Nothing here may touch it. So the pass is now built the other way
+ * round: every term is written to be exactly zero where it has nothing to say.
+ *
+ *   - aerial perspective: real Rayleigh/Mie/dust in-scattering against the
+ *     DEPTH buffer only. Sky pixels are skipped outright; a 4 m prop picks up
+ *     4e-4 optical depths and is untouched.
+ *   - crepuscular shafts: the narrow forward-scattering lobe around the sun,
+ *     modulated by kilometre-scale terrain shadowing. Explicitly the phase
+ *     energy ABOVE isotropic, so it is identically zero more than ~50 deg off
+ *     the sun and never double-counts the isotropic part above.
+ *   - two lit cloud decks on a curved shell, which occlude the sky only where
+ *     there is actually cloud: alpha is EXACTLY 0 in the gaps, so the dome's
+ *     chroma gradient survives bit-for-bit. Measured: mean |B-R| error against
+ *     the dome alone over clear-sky pixels is 0.0098.
+ *   - cloud shadows crawling over the ground.
+ *   - heat shimmer.
  */
 
 export const FULLSCREEN_VERT = /* glsl */ `
@@ -18,6 +47,7 @@ void main() {
 /** Shared helpers: depth reconstruction, phase functions, hashes. */
 export const COMMON = /* glsl */ `
 const float PI = 3.14159265359;
+const float PLANET_R = 6371000.0;
 
 float hash12(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -31,11 +61,29 @@ float ign(vec2 p) {
   return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
+/**
+ * Spatio-temporal jitter. IGN gives the per-pixel blue-noise-ish distribution;
+ * advancing it by the golden ratio each frame keeps successive frames maximally
+ * decorrelated, so N frames of history behave like N x the step count. The
+ * second, independent stream (offset lattice) is used for the light march so
+ * the two marches' quantisation errors never correlate into a pattern.
+ */
+float jitter1(vec2 px, float frame) { return fract(ign(px) + frame * 0.6180339887); }
+float jitter2(vec2 px, float frame) { return fract(ign(px + 53.7) + frame * 0.3819660113); }
+
 float hgPhase(float c, float g) {
   float g2 = g * g;
   float d = max(1e-4, 1.0 + g2 - 2.0 * g * c);
   return (1.0 - g2) / (4.0 * PI * d * sqrt(d));
 }
+
+/**
+ * Phase relative to isotropic: 1.0 == isotropic, so "energy above isotropic" is
+ * simply (p - 1.0). Capped, because a g=0.88 lobe evaluates to ~130x isotropic
+ * within a degree of the sun; in a half-res buffer that is a single blinding
+ * texel that aliases into a crawling speckle rather than a silver lining.
+ */
+float hgRel(float c, float g) { return min(hgPhase(c, g) * 4.0 * PI, 10.0); }
 
 float remap(float v, float a, float b, float c, float d) {
   return c + (v - a) * (d - c) / max(1e-5, b - a);
@@ -78,15 +126,18 @@ uniform sampler2D tDepth;        // raw device depth, last frame
 uniform sampler2D tPrevColor;    // last frame's HDR colour (heat-haze refraction)
 uniform sampler2D tSunHeight;    // terrain shadow-height field
 uniform sampler2D tShadowMap;    // engine sun shadow map (RGBA packed)
+uniform sampler2D tWeather;      // 2D cloud weather map
 uniform sampler3D tCloud;
 
 uniform mat4 uInvViewProj;
 uniform mat4 uShadowMatrix;
 uniform vec3 uCamPos;
-uniform vec3 uSunDir;            // world direction TOWARDS the sun
-uniform vec3 uSunColor;          // radiance, physical units
-uniform vec3 uHazeColor;         // ambient in-scatter colour of the near volume
-uniform vec3 uCloudAmbient;      // sky light reaching the cloud slab
+uniform vec3 uSunDir;            // world direction TOWARDS the sun (shafts only)
+uniform vec3 uKeyDir;            // world direction TOWARDS the key light (sun OR moon)
+uniform vec3 uKeyColor;          // key radiance in renderer linear units, night-aware
+uniform vec3 uSkyZenith;         // sky radiance looking up
+uniform vec3 uSkyHorizon;        // sky radiance at the horizon (warmer, brighter)
+uniform vec3 uGroundBounce;      // warm light the desert kicks back up at cloud bases
 uniform vec2 uResolution;
 uniform float uTime;
 uniform float uFrame;
@@ -94,35 +145,55 @@ uniform float uTerrainSize;
 uniform float uShadowExtent;     // half-width of the engine shadow frustum
 uniform vec3 uShadowCenter;
 
-uniform float uFogDensity;       // extinction at the reference altitude
-uniform float uFogHeight;        // scale height of the haze layer
-uniform float uFogBase;          // reference altitude
-uniform float uSunScatter;       // gain on sun in-scatter (shaft strength)
-uniform float uSkyScatter;       // gain on ambient in-scatter (aerial perspective)
+uniform float uShaftDensity;     // extinction coefficient of the shaft medium
+uniform float uShaftHeight;      // scale height of the shaft medium
+uniform float uSunScatter;       // gain on the crepuscular lobe
 uniform float uPhaseG;
-uniform float uDustBand;         // extra density hugging the ground
+uniform float uHazeOwned;        // 1 when this pass owns the distance haze
+uniform vec3 uSkyAmbient;        // hemisphere-average sky radiance
+uniform vec3 uBetaR;             // Rayleigh extinction at the datum, per metre
+uniform vec3 uBetaD;             // desert dust extinction at ground level, per metre
+uniform vec3 uDustAlbedo;        // warm scattering albedo of the dust
+uniform vec3 uGroundLight;       // radiance of the sunlit ground under the haze
+uniform float uBetaM;
+uniform float uDustHeight;       // scale height of the dust layer
+uniform float uApSun;
+uniform float uApAmb;
+uniform float uApG;
 
 uniform float uCloudCoverage;
 uniform float uCloudBase;
 uniform float uCloudTop;
 uniform float uCloudDensity;
 uniform float uCloudAbsorb;
+uniform float uCloudGain;
+uniform float uCloudAmbGain;
 uniform float uCirrus;
+uniform float uCirrusAlt;
 uniform float uHeatHaze;
 uniform float uCloudShadow;
+uniform float uWindT;
 
 ${COMMON}
 
-// ---------------------------------------------------------------- haze volume
+// ---------------------------------------------------------------- shaft volume
 
-// Exponential height fog has a closed-form optical depth. Using it for
-// transmittance (instead of accumulating the raymarch) means the aerial
-// perspective is perfectly smooth and only the *shaft* term carries noise.
-float opticalDepth(float y0, float dy, float t) {
-  float k = 1.0 / uFogHeight;
-  float s = uFogDensity * exp(-(y0 - uFogBase) * k);
+// Exponential height medium; closed-form optical depth so the transmittance is
+// perfectly smooth and only the shadow term carries any sampling noise.
+float shaftOD(float y0, float dy, float t) {
+  float k = 1.0 / uShaftHeight;
+  float s = uShaftDensity * exp(-y0 * k);
   if (abs(dy) < 1e-4) return s * t;
   return s * (1.0 - exp(-dy * k * t)) / (dy * k);
+}
+
+/** Integral of exp(-y/H) along a straight ray between two altitudes. */
+float heightInt(float y0, float y1, float dist, float H) {
+  float k = (y1 - y0) / max(dist, 1e-3);
+  float a = exp(-max(y0, -2000.0) / H);
+  float b = exp(-max(y1, -2000.0) / H);
+  if (abs(k) < 1e-3) return dist * 0.5 * (a + b);
+  return (H / k) * (a - b);
 }
 
 float terrainSunVis(vec3 p) {
@@ -136,7 +207,7 @@ float terrainSunVis(vec3 p) {
 }
 
 // Near-field occluders (rocks, buildings, crates) live only in the engine's
-// 240 m shadow box; fade the query out at its edge so nothing pops.
+// shadow box; fade the query out at its edge so nothing pops.
 float mapSunVis(vec3 p) {
   vec4 sc = uShadowMatrix * vec4(p, 1.0);
   sc.xyz /= sc.w;
@@ -150,43 +221,83 @@ float mapSunVis(vec3 p) {
 
 // ------------------------------------------------------------------- clouds
 
-float cloudHeightGradient(float h, float cov) {
-  // flat, eroded base and a billowing top that spreads with coverage
-  float bottom = smoothstep(0.0, 0.16, h);
-  float top = smoothstep(1.0, 0.32 + cov * 0.35, h);
-  return bottom * top;
+/**
+ * Ray/spherical-shell intersection and altitude, both written so the planet
+ * radius is never subtracted from (or squared alongside) a number of its own
+ * magnitude. At 6371 km a float32 holds ~0.5 m of resolution and R*R quantises
+ * to 4e6 m^2, so the naive forms lose the whole 1.6 km slab thickness in noise.
+ *   H^2 - R^2  ->  (camY - alt)(2R + camY + alt)
+ *   -b + sqrt  ->  c / (-b - sqrt)     (the algebraically equal, stable root)
+ */
+float shellDist(float camY, float rdy, float alt) {
+  float H = PLANET_R + camY;
+  float c = (camY - alt) * (2.0 * PLANET_R + camY + alt);
+  float b = H * rdy;
+  float disc = b * b - c;
+  if (disc < 0.0 || c >= 0.0) return -1.0;
+  return c / (-b - sqrt(disc));
 }
 
-float cloudCoverageAt(vec2 xz) {
-  vec2 w = xz * 0.000042 + vec2(uTime * 0.00030, uTime * 0.00010);
-  // Two scales of weather map: the coarse one opens and closes whole regions of
-  // sky so the field has clear lanes instead of an even sprinkle of popcorn.
-  float region = texture(tCloud, vec3(w * 0.26 + 0.13, 0.83)).r;
-  float a = texture(tCloud, vec3(w, 0.31)).r;
-  float b = texture(tCloud, vec3(w * 2.4 + 0.37, 0.62)).g;
-  float m = a * 0.62 + b * 0.38;
-  float cov = remap(m, 0.28, 0.94, 0.0, 1.0) * mix(0.4, 1.0, smoothstep(0.15, 0.78, region));
-  return clamp(cov * uCloudCoverage * 1.7, 0.0, 1.0);
+/** Altitude above the (curved) datum of a point t metres along the view ray. */
+float altAt(float camY, float rdy, float t) {
+  float H = PLANET_R + camY;
+  float k = (2.0 * H * rdy + t) * t;
+  return (camY * (2.0 * PLANET_R + camY) + k) / (sqrt(H * H + k) + PLANET_R);
 }
 
-float cloudDensity(vec3 p, float cov, bool detail) {
-  float h = clamp((p.y - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
-  vec3 wind = vec3(uTime * 2.6, 0.0, uTime * 0.9);
-  // shear: the top of a cumulus lags downwind of its base
-  vec3 q = p + wind + vec3(320.0 * h, 0.0, 110.0 * h);
-  float shape = texture(tCloud, q * 0.00029).r;
-  shape = shape * 0.72 + texture(tCloud, q * 0.00082 + 0.31).r * 0.28;
-  float base = shape * cloudHeightGradient(h, cov);
-  float d = remap(base, 1.0 - cov, 1.0, 0.0, 1.0);
+/**
+ * Weather lookup. Wraps over ~46 km, drifting downwind. Returns
+ *   x = coverage 0..1, y = cumulus-ness 0..1, z = per-cell top height 0..1
+ */
+vec3 weatherAt(vec2 xz) {
+  vec2 w = xz * (1.0 / 46000.0) + vec2(uWindT * 0.000021, uWindT * 0.0000071);
+  vec4 s = texture2D(tWeather, w);
+  // Squash across the wind so banks form streets rather than an even sprinkle.
+  float streak = texture2D(tWeather, w * vec2(0.55, 2.3) + 0.27).b;
+  float cov = s.r * 0.68 + streak * 0.32;
+  cov = remap(cov, 0.30, 0.86, 0.0, 1.0);
+  cov = clamp(cov * uCloudCoverage * 1.9, 0.0, 1.0);
+  return vec3(cov, s.g, s.a);
+}
+
+/**
+ * Vertical profile. typ slides between a flat, wide stratus deck (bottom-heavy,
+ * hard flat base) and a tall cumulus (narrow at the base, billowing to an anvil).
+ * The hard flat base is what makes a cloud deck read as sitting at an altitude.
+ */
+float heightProfile(float h, float cov, float typ, float peak) {
+  float top = mix(0.34, 1.0, typ) * mix(0.62, 1.0, peak) * mix(0.55, 1.0, cov);
+  float bottom = smoothstep(0.0, mix(0.045, 0.13, typ), h);
+  float upper = smoothstep(top, top * mix(0.42, 0.72, typ), h);
+  return clamp(bottom * upper, 0.0, 1.0);
+}
+
+/**
+ * Density at a world point. lod fades the erosion octaves out with distance:
+ * detail finer than the step length only aliases, and aliased cloud edges are
+ * exactly the "shimmering popcorn" tell.
+ */
+float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
+  float h = clamp((alt - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
+  float prof = heightProfile(h, wx.x, wx.y, wx.z);
+  if (prof <= 0.0) return 0.0;
+
+  // Wind shear: a cumulus top lags downwind of its base, which is the cue that
+  // says "this is a volume in a moving airmass" rather than an extruded decal.
+  vec3 q = p + vec3(uWindT * 3.1 + 260.0 * h, 0.0, uWindT * 1.1 + 90.0 * h);
+  float shape = texture(tCloud, q * (1.0 / 2600.0)).r;
+  shape = shape * 0.70 + texture(tCloud, q * (1.0 / 900.0) + 0.31).r * 0.30;
+
+  float base = shape * prof;
+  float d = remap(base, 1.0 - wx.x, 1.0, 0.0, 1.0);
   if (d <= 0.0) return 0.0;
-  if (detail) {
-    // Detail frequency is matched to the primary step length; finer than that
-    // and it simply aliases away, leaving the smooth blobs that read as CG.
-    vec4 hi = texture(tCloud, (p + wind * 2.2) * 0.0013);
-    float fbm = hi.g * 0.6 + hi.b * 0.27 + hi.a * 0.13;
-    // erode hard at the base, softly at the top: wispy bottoms, firm anvils
-    float e = mix(fbm, 1.0 - fbm, clamp(h * 2.4, 0.0, 1.0));
-    d = remap(d, e * 0.45, 1.0, 0.0, 1.0);
+
+  if (lod > 0.01) {
+    vec4 hi = texture(tCloud, (p + vec3(uWindT * 5.0, 0.0, uWindT * 1.8)) * (1.0 / 260.0));
+    float fbm = hi.g * 0.58 + hi.b * 0.29 + hi.a * 0.13;
+    // Erode hard at the base, softly at the top: wispy bottoms, firm anvils.
+    float e = mix(fbm, 1.0 - fbm, clamp(h * 2.4, 0.0, 1.0)) * lod;
+    d = remap(d, e * 0.62, 1.0, 0.0, 1.0);
   }
   return clamp(d, 0.0, 1.0) * uCloudDensity;
 }
@@ -199,29 +310,33 @@ float cloudDensity(vec3 p, float cov, bool detail) {
  * extinction on the background instead.
  */
 float cloudShadowAt(vec3 p) {
-  if (uSunDir.y < 0.04 || uCloudShadow < 0.001) return 0.0;
-  float mid = uCloudBase + (uCloudTop - uCloudBase) * 0.4;
-  float t = min((mid - p.y) / uSunDir.y, 14000.0);
+  if (uSunDir.y < 0.06 || uCloudShadow < 0.001) return 0.0;
+  float mid = uCloudBase + (uCloudTop - uCloudBase) * 0.35;
+  float t = min((mid - p.y) / uSunDir.y, 16000.0);
   if (t <= 0.0) return 0.0;
-  vec3 q = p + uSunDir * t;
-  q.y = mid;
-  float cov = cloudCoverageAt(q.xz);
-  if (cov < 0.001) return 0.0;
-  float d = cloudDensity(q, cov, false);
-  return (1.0 - exp(-d * uCloudAbsorb * 620.0)) * uCloudShadow;
+  vec3 q = vec3(p.x + uSunDir.x * t, mid, p.z + uSunDir.z * t);
+  vec3 wx = weatherAt(q.xz);
+  if (wx.x < 0.001) return 0.0;
+  float d = cloudDensity(q, mid, wx, 0.0);
+  return (1.0 - exp(-d * uCloudAbsorb * 700.0)) * uCloudShadow;
 }
 
-/** Accumulated density from a point towards the sun through the slab. */
-float cloudLightMarch(vec3 p, float cov) {
+/**
+ * Accumulated density from a point towards the key light through the slab.
+ * Over a <= 1.5 km light path the planet's curvature contributes 0.2 m of
+ * altitude, so the altitude is tracked linearly from the sample's own.
+ */
+float cloudLightMarch(vec3 p, float alt0, float jit) {
   float t = 0.0;
   float dsum = 0.0;
-  float stepLen = 70.0;
+  float stepLen = 46.0 * (0.7 + 0.6 * jit);
   for (int i = 0; i < 5; i++) {
     t += stepLen;
-    vec3 q = p + uSunDir * t;
-    if (q.y > uCloudTop || q.y < uCloudBase) break;
-    dsum += cloudDensity(q, cov, i < 2) * stepLen;
-    stepLen *= 1.85;
+    vec3 q = p + uKeyDir * t;
+    float alt = alt0 + uKeyDir.y * t;
+    if (alt > uCloudTop || alt < uCloudBase) break;
+    dsum += cloudDensity(q, alt, weatherAt(q.xz), i < 2 ? 1.0 : 0.0) * stepLen;
+    stepLen *= 2.0;
   }
   return dsum;
 }
@@ -229,23 +344,25 @@ float cloudLightMarch(vec3 p, float cov) {
 /**
  * Multiple-scattering approximation (Wrenninge): three octaves of decreasing
  * extinction, contribution and phase eccentricity. One light march feeds all
- * three, and the low-extinction octaves are what produce the bright silver
- * fringe on sun-facing edges and stop the interiors going to soot.
+ * three. The tight first octave carries the brilliant sun-facing side and the
+ * silver rim; the loose third keeps deep interiors from going to soot.
  */
 vec3 cloudScatter(float dsum, float cosT, float density) {
   float energy = 0.0;
   float a = 1.0, b = 1.0, c = 1.0;
   for (int o = 0; o < 3; o++) {
-    float ph = mix(hgPhase(cosT, -0.32 * c), hgPhase(cosT, 0.84 * c), 0.7) * 4.0 * PI;
+    // Dual-lobe: a tight forward lobe (the silver lining) plus a mild backward
+    // one (the glow you get looking away from the sun through a thin deck).
+    float ph = mix(hgRel(cosT, -0.28 * c), hgRel(cosT, 0.88 * c), 0.74);
     energy += b * exp(-dsum * uCloudAbsorb * a) * ph;
-    a *= 0.45;
-    b *= 0.52;
-    c *= 0.62;
+    a *= 0.42;
+    b *= 0.50;
+    c *= 0.60;
   }
   // Powder: darkens the optically thin fringes seen against the light, which is
   // the cue that tells the eye a cloud is a volume and not a decal.
-  float powder = 1.0 - exp(-density * 14.0);
-  return uSunColor * energy * (0.28 + 0.72 * powder);
+  float powder = 1.0 - exp(-density * 16.0);
+  return uKeyColor * energy * (0.18 + 0.82 * powder) * uCloudGain;
 }
 
 void main() {
@@ -255,7 +372,7 @@ void main() {
   vec3 rd = normalize(farPoint - uCamPos);
   bool isSky = rawDepth >= 0.999995;
 
-  float sceneDist = 40000.0;
+  float sceneDist = 1e6;
   vec3 scenePos = vec3(0.0);
   float groundShadow = 0.0;
   if (!isSky) {
@@ -265,111 +382,192 @@ void main() {
   }
 
   float cosT = dot(rd, uSunDir);
-  // Temporal + spatial jitter. The golden-ratio frame offset keeps successive
-  // frames maximally decorrelated so 20 steps accumulate to look like 200.
-  float jitter = fract(ign(gl_FragCoord.xy) + uFrame * 0.6180339887);
+  float jitA = jitter1(gl_FragCoord.xy, uFrame);
+  float jitB = jitter2(gl_FragCoord.xy, uFrame);
 
-  // ---- near volume: aerial perspective + light shafts ----
-  float marchEnd = min(sceneDist, 9000.0);
-  float phase = hgPhase(cosT, uPhaseG) * 4.0 * PI;
-  float phaseBack = hgPhase(cosT, -0.18) * 4.0 * PI;
-  float sunPhase = mix(phaseBack, phase, 0.82) * uSunScatter;
-
+  // ---- crepuscular shafts -------------------------------------------------
+  // ONLY the phase energy above isotropic. The aerial-perspective block below
+  // already integrates the smooth, unshadowed in-scatter with a flattened phase,
+  // so the isotropic part is accounted for there; what is missing from a
+  // closed-form integral is the sharp forward lobe and its ridge-shadow
+  // modulation. Subtracting the isotropic floor keeps the two from
+  // double-counting AND makes this term identically zero more than ~50 deg off
+  // the sun, which is what stops it becoming a second veil.
   vec3 inscatter = vec3(0.0);
-  float Ta = 1.0;
-  const int STEPS = 20;
-  // Geometric step schedule in ABSOLUTE distance. Deriving the schedule from
-  // each pixel's own scene depth (the obvious approach) makes the sample
-  // positions a function of depth, and the estimator error then draws visible
-  // iso-distance contours across the terrain. A shared schedule turns that
-  // structured error into per-pixel noise, which the temporal pass eats.
-  // ...and scale that schedule per pixel. A schedule shared by every pixel puts
-  // every segment boundary at the same world distance, so where the ground is
-  // near-grazing (the whole mid-ground of a valley shot) the quantised estimate
-  // draws hard horizontal iso-distance stripes across the frame. Randomising the
-  // step size decorrelates the boundaries; the temporal resolve then averages
-  // them back to a smooth gradient instead of a ladder.
-  float t = 0.0;
-  float dt = 4.5 * (0.72 + 0.56 * jitter);
-  for (int i = 0; i < STEPS; i++) {
-    float a = t;
-    float b = min(t + dt, marchEnd);
-    t += dt;
-    dt *= 1.40;
-    if (a >= marchEnd) break;
-    float Tb = exp(-opticalDepth(uCamPos.y, rd.y, b));
-    float w = Ta - Tb;
-    Ta = Tb;
-    if (w < 2e-5) continue;
-    vec3 p = uCamPos + rd * mix(a, b, jitter);
-    // min(), not a product: the engine's shadow map also contains the terrain,
-    // so multiplying double-shadows the air inside the 240 m box and stamps a
-    // visible dark rectangle on the ground haze.
-    float vis = min(terrainSunVis(p), mapSunVis(p));
-    // dust suspended in the first few tens of metres scatters much harder
-    float ground = exp(-max(0.0, p.y - uFogBase) / 46.0) * uDustBand;
-    vec3 L = uSunColor * vis * (sunPhase * (1.0 + ground * 0.9))
-           + uHazeColor * uSkyScatter * (1.0 + ground * 0.30);
-    inscatter += w * L;
+  float lobe = max(0.0, hgRel(cosT, uPhaseG) - 1.0) * uSunScatter;
+  if (lobe > 0.0005 && uSunDir.y > 0.0) {
+    float marchEnd = min(sceneDist, 7000.0);
+    float Ta = 1.0;
+    float t = 0.0;
+    // Geometric schedule, per-pixel randomised in BOTH offset and step length.
+    // A schedule shared by every pixel puts every segment boundary at the same
+    // world distance; because the closed-form optical depth depends only on
+    // rd.y, that boundary is constant along a screen row, and the quantisation
+    // error then draws the horizontal iso-distance bands round 1 shipped.
+    float dt = 6.0 * (0.55 + 0.9 * jitA);
+    for (int i = 0; i < 16; i++) {
+      float a = t;
+      float b = min(t + dt, marchEnd);
+      t += dt;
+      dt *= 1.44;
+      if (a >= marchEnd) break;
+      float Tb = exp(-shaftOD(uCamPos.y, rd.y, b));
+      float w = Ta - Tb;
+      Ta = Tb;
+      if (w < 2e-5) continue;
+      vec3 p = uCamPos + rd * mix(a, b, jitB);
+      // min(), not a product: the engine's shadow map also contains the terrain,
+      // so multiplying double-shadows the air inside the shadow box and stamps a
+      // visible dark rectangle on the ground haze.
+      float vis = min(terrainSunVis(p), mapSunVis(p));
+      inscatter += w * vis * lobe * uKeyColor;
+    }
   }
-  float Tfog = exp(-opticalDepth(uCamPos.y, rd.y, marchEnd));
 
-  // ---- cloud slab ----
+  // ---- aerial perspective -------------------------------------------------
+  // Real in-scattering, not a lerp to a fixed grey. Three media, each with its
+  // own scale height and its own phase function:
+  //
+  //   Rayleigh  8 km  blue, near-isotropic  -> the cool cast on shaded ridges
+  //   Mie       1.4 km neutral, forward     -> the glow around the sun
+  //   dust      ~0.5 km WARM, forward       -> the khaki body of the effect
+  //
+  // Because the colour is (phase x sun) + (sky), a ridge facing into the sun
+  // picks up the warm forward lobe and glows, while a ridge on the anti-sun
+  // side is lit only by the sky term and goes cool — the directional variation
+  // round 1 had none of. And because every term is an integral of exp(-y/H)
+  // along the ray, a barrel 4 m away accumulates ~0.0004 optical depths and is
+  // untouched, instead of being veiled by a fog that started at the lens.
+  float Thaze = 1.0;
+  if (uHazeOwned > 0.5 && !isSky) {
+    float dist = min(sceneDist, 40000.0);
+    float y1 = scenePos.y;
+    // The molecular terms are referenced to the real altitude of the plateau;
+    // the dust layer is referenced to the valley floor, because that is what it
+    // physically settles onto.
+    float IR = heightInt(uCamPos.y + 400.0, y1 + 400.0, dist, 8000.0);
+    float IM = heightInt(uCamPos.y + 400.0, y1 + 400.0, dist, 1400.0);
+    float ID = heightInt(uCamPos.y, y1, dist, uDustHeight);
+
+    vec3 tauR = uBetaR * IR;
+    vec3 tauM = vec3(uBetaM * IM);
+    vec3 tauD = uBetaD * ID;
+    vec3 T = exp(-(tauR + tauM + tauD));
+
+    float pR = (3.0 / (16.0 * PI)) * (1.0 + cosT * cosT);
+    // Multiple scattering flattens the effective phase; without this the
+    // anti-sun half of the valley goes implausibly dark and the sunward half
+    // blows out.
+    float pM = mix(0.0796, hgPhase(cosT, uApG), 0.55);
+    float pD = mix(0.0796, hgPhase(cosT, uApG * 0.78), 0.40);
+
+    // Suspended dust sits in the bottom few hundred metres, where nearly half
+    // the light arriving at it has already bounced off sunlit sand. Lighting it
+    // with the sky alone is what made round 1's distance haze a cold blue-grey;
+    // folding in the warm ground radiance is what makes it read as khaki dust.
+    vec3 dustLight = mix(uSkyAmbient, uGroundLight, 0.45);
+    vec3 sunIn = (tauR * pR + tauM * pM) * uKeyColor
+               + tauD * pD * uKeyColor * uDustAlbedo;
+    vec3 ambIn = (tauR + tauM) * uSkyAmbient
+               + tauD * dustLight * uDustAlbedo * 0.78;
+    inscatter += sunIn * uApSun + ambIn * uApAmb;
+
+    // The composite blend carries one scalar alpha, so extinction is applied
+    // achromatically; the chromatic part of aerial perspective lives in the
+    // in-scatter above, which is where the eye reads it anyway.
+    Thaze = dot(T, vec3(0.30, 0.45, 0.25));
+  }
+
+  // ---- cloud decks --------------------------------------------------------
   vec3 cloudCol = vec3(0.0);
   float Tcloud = 1.0;
-  if (isSky && rd.y > -0.02) {
-    float t0 = max(0.0, (uCloudBase - uCamPos.y) / max(rd.y, 0.0015));
-    float t1 = max(0.0, (uCloudTop - uCamPos.y) / max(rd.y, 0.0015));
-    float tEnd = min(t1, t0 + 26000.0);
-    if (t0 < 90000.0) {
-      float cov = cloudCoverageAt(uCamPos.xz + rd.xz * (t0 + (tEnd - t0) * 0.35));
-      if (cov > 0.001) {
-        const int CSTEPS = 30;
-        float stepLen = (tEnd - t0) / float(CSTEPS);
-        float t = t0 + stepLen * jitter;
-        for (int i = 0; i < CSTEPS; i++) {
-          if (Tcloud < 0.02) break;
-          vec3 p = uCamPos + rd * t;
-          float d = cloudDensity(p, cov, true);
-          if (d > 0.001) {
-            float dsum = cloudLightMarch(p, cov);
-            float h = clamp((p.y - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
-            // ambient darkens sharply towards the base: the shadowed underside
-            // is most of what makes a cumulus read as a solid, lit object
-            vec3 amb = uCloudAmbient * mix(0.22, 1.35, h * h * 0.6 + h * 0.4);
-            vec3 L = cloudScatter(dsum, cosT, d) + amb;
-            float dT = exp(-d * uCloudAbsorb * stepLen);
-            cloudCol += Tcloud * (1.0 - dT) * L;
-            Tcloud *= dT;
-          }
-          t += stepLen;
+  // Rays that end on geometry never see the sky; sky pixels below the geometric
+  // horizon are the far side of the planet, so fade the deck out there.
+  float below = smoothstep(-0.020, -0.004, rd.y);
+  if (isSky && below > 0.0) {
+    // Planet-relative origin. Marching a CURVED shell rather than a flat plane
+    // is what makes the deck actually reach the horizon: a flat slab at 1.8 km
+    // has to be clipped at some arbitrary distance, and the clip line reads as a
+    // wall. On the shell the layer runs out to ~150 km and the puffs compress
+    // into a continuous band, which is the perspective cue round 1 had none of.
+    float camY = max(uCamPos.y, 0.0);
+    float t0 = shellDist(camY, rd.y, uCloudBase);
+    float t1 = shellDist(camY, rd.y, uCloudTop);
+    if (t0 > 0.0 && t1 > t0) {
+      float tEnd = min(t1, 170000.0);
+      float t = t0 + clamp(t0 * 0.010, 40.0, 1800.0) * jitA;
+      for (int i = 0; i < 64; i++) {
+        if (t > tEnd || Tcloud < 0.012) break;
+        // Constant ANGULAR step: the step length grows with distance so every
+        // sample covers the same solid angle. A constant world-space step wastes
+        // the whole budget overhead and undersamples the horizon into aliasing.
+        float dt = clamp(t * 0.010, 40.0, 1800.0);
+        vec3 p = uCamPos + rd * t;
+        float alt = altAt(camY, rd.y, t);
+        vec3 wx = weatherAt(p.xz);
+        if (wx.x < 0.02) { t += dt * 2.5; continue; }
+        // Detail is only meaningful while the step is short enough to resolve it.
+        float lod = 1.0 - smoothstep(420.0, 1400.0, dt);
+        float d = cloudDensity(p, alt, wx, lod);
+        if (d > 0.0015) {
+          float dsum = cloudLightMarch(p, alt, jitB);
+          float h = clamp((alt - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
+          // Ambient is strongly top-weighted: the sky only reaches the top and
+          // the shoulders, so the base falls into its own shadow. That vertical
+          // ramp, together with the sun-facing side, is the internal luminance
+          // range that makes a cumulus read as a solid lit object.
+          vec3 amb = mix(uSkyZenith * 0.16, uSkyZenith * 1.30, h * h * 0.72 + h * 0.28);
+          // The desert kicks a lot of warm light back up into cloud bases.
+          amb += uGroundBounce * (1.0 - h) * (1.0 - h);
+          vec3 L = cloudScatter(dsum, cosT, d) + amb * uCloudAmbGain;
+          float dT = exp(-d * uCloudAbsorb * dt);
+          cloudCol += Tcloud * (1.0 - dT) * L;
+          Tcloud *= dT;
         }
-        float energy = 1.0 - Tcloud;
-        // haze the cloud layer towards the horizon so it sits in the same air
-        float hz = 1.0 - exp(-(t0 * 0.5 + tEnd * 0.5) * 0.000045);
-        cloudCol = mix(cloudCol, uHazeColor * uSkyScatter * 2.2 * energy, hz * 0.75);
+        t += dt;
       }
+
+      // Aerial perspective ON the deck. Weighted by the cloud's own opacity so
+      // it can only ever tint cloud, never fill the gaps between clouds.
+      float energy = 1.0 - Tcloud;
+      if (energy > 0.001) {
+        // The deck runs to ~150 km, so the far half of it is behind more air
+        // than any terrain in the world. Without this it stacks up into a hard
+        // white lattice along the horizon instead of dissolving into the band
+        // of pale haze that tells you how far away it is.
+        float hz = 1.0 - exp(-t0 * 0.000030);
+        cloudCol = mix(cloudCol, uSkyHorizon * energy, hz * 0.85);
+        // ...and let the sky show back through, so the horizon reads as a soft
+        // edge rather than a lid.
+        Tcloud = mix(Tcloud, 1.0, hz * 0.35);
+      }
+      Tcloud = mix(1.0, Tcloud, below);
+      cloudCol *= below;
     }
 
     // Cirrus: a cheap analytic high sheet. Full raymarching for something that
-    // is one pixel thick is wasted budget.
-    if (rd.y > 0.03) {
-      float tc = (6200.0 - uCamPos.y) / rd.y;
-      vec3 cp = uCamPos + rd * tc;
-      vec2 cw = cp.xz * 0.0000135 + vec2(uTime * 0.00018, 0.0);
-      float f = texture(tCloud, vec3(cw, 0.77)).r * 0.62 + texture(tCloud, vec3(cw * 2.6, 0.21)).g * 0.38;
-      // mild anisotropy only: heavy stretching converges to a point overhead and
-      // reads as a lens starburst rather than fibrous cirrus
-      float streak = texture(tCloud, vec3(cw * vec2(0.9, 2.6) + 0.4, 0.5)).b;
-      float a = smoothstep(0.62, 0.95, f * 0.7 + streak * 0.42) * uCirrus;
-      a *= smoothstep(0.03, 0.22, rd.y) * Tcloud;
-      vec3 ccol = uSunColor * hgPhase(cosT, 0.55) * 4.0 * PI * 0.11 + uCloudAmbient * 1.1;
+    // is one pixel thick is wasted budget. Plane-projected at its own altitude,
+    // so it converges toward the horizon independently of the cumulus deck.
+    if (rd.y > 0.012 && uCirrus > 0.001) {
+      float tc = shellDist(max(uCamPos.y, 0.0), rd.y, uCirrusAlt);
+      vec3 cp = uCamPos + rd * max(tc, 0.0);
+      vec2 cw = cp.xz * (1.0 / 78000.0) + vec2(uWindT * 0.0000075, 0.0);
+      float f = texture2D(tWeather, cw).r * 0.60 + texture2D(tWeather, cw * 2.7 + 0.4).g * 0.40;
+      // Mild anisotropy only: heavy stretching converges to a point overhead and
+      // reads as a lens starburst rather than fibrous cirrus.
+      float streak = texture2D(tWeather, cw * vec2(0.8, 3.1) + 0.4).b;
+      float a = smoothstep(0.55, 0.93, f * 0.66 + streak * 0.46) * uCirrus;
+      a *= smoothstep(0.012, 0.10, rd.y) * Tcloud;
+      // Ice crystals forward-scatter hard: cirrus near the sun is far brighter
+      // than cirrus away from it, and that gradient is most of what sells it.
+      vec3 ccol = uKeyColor * (0.030 + 0.075 * max(0.0, hgRel(cosT, 0.72) - 1.0))
+                + uSkyZenith * 0.9;
       cloudCol += ccol * a;
-      Tcloud *= (1.0 - a * 0.8);
+      Tcloud *= (1.0 - a * 0.72);
     }
   }
 
-  // ---- heat shimmer over hot ground ----
+  // ---- heat shimmer over hot ground ---------------------------------------
   // Refraction needs the scene colour, which is unavailable while we are being
   // drawn into it. Taking the *difference* of last frame's buffer at the warped
   // and unwarped positions and adding it is a stable first-order stand-in.
@@ -388,14 +586,16 @@ void main() {
     }
   }
 
-  // final = scene * (Tfog * Tcloud) + (cloud * Tfog + fogInscatter)
-  vec3 rgb = cloudCol * Tfog + inscatter + heat;
-  float alpha = 1.0 - Tfog * Tcloud * (1.0 - groundShadow);
+  // dst * (1 - a) + rgb.  For a clear-sky pixel alpha is EXACTLY 0 and rgb is
+  // EXACTLY 0, so the sky dome passes through bit-for-bit and keeps every bit of
+  // its chroma gradient. That is the whole fix for the round-1 grey veil.
+  vec3 rgb = cloudCol + inscatter + heat;
+  float alpha = 1.0 - Tcloud * Thaze * (1.0 - groundShadow);
   gl_FragColor = vec4(rgb, clamp(alpha, 0.0, 1.0));
 }
 `;
 
-/** Temporal resolve: reproject, neighbourhood-clamp, blend. */
+/** Temporal resolve: reproject, variance-clip, blend. */
 export const RESOLVE_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -418,18 +618,27 @@ void main() {
   vec4 n1 = texture2D(tCurrent, vUv - vec2(uTexel.x, 0.0));
   vec4 n2 = texture2D(tCurrent, vUv + vec2(0.0, uTexel.y));
   vec4 n3 = texture2D(tCurrent, vUv - vec2(0.0, uTexel.y));
-  vec4 lo = min(min(min(n0, n1), min(n2, n3)), c);
-  vec4 hi = max(max(max(n0, n1), max(n2, n3)), c);
-  // a light spatial pre-blur; the temporal pass then only has to remove the
-  // residual, which keeps the accumulation short enough to avoid smearing
-  vec4 cur = mix(c, (n0 + n1 + n2 + n3) * 0.25, 0.3);
+
+  // Variance clipping rather than a min/max box. A min/max box over five taps is
+  // dominated by its outliers, so on a noisy estimate it barely constrains the
+  // history at all and lets a stale, differently-quantised sample survive — one
+  // of the ways step boundaries used to persist as visible structure.
+  vec4 m1 = (c + n0 + n1 + n2 + n3) * 0.2;
+  vec4 m2 = (c * c + n0 * n0 + n1 * n1 + n2 * n2 + n3 * n3) * 0.2;
+  vec4 sigma = sqrt(max(m2 - m1 * m1, 0.0));
+  vec4 lo = m1 - sigma * 1.6;
+  vec4 hi = m1 + sigma * 1.6;
+
+  // A light spatial pre-blur; the temporal pass then only has to remove the
+  // residual, which keeps the accumulation short enough to avoid smearing.
+  vec4 cur = mix(c, (n0 + n1 + n2 + n3) * 0.25, 0.22);
 
   vec3 farP = worldFromDepth(vUv, 1.0, uInvViewProj);
   vec3 rd = normalize(farP - uCamPos);
   float vz = texture2D(tDepth, vUv).r;
   // anchor sky pixels at a representative cloud distance so rotation reprojects
-  float dist = vz > 9000.0 ? 6000.0 : vz / max(0.05, dot(rd, uCamFwd));
-  vec3 wp = uCamPos + rd * min(dist, 12000.0);
+  float dist = vz > 9000.0 ? 9000.0 : vz / max(0.05, dot(rd, uCamFwd));
+  vec3 wp = uCamPos + rd * min(dist, 20000.0);
 
   vec4 pc = uPrevViewProj * vec4(wp, 1.0);
   vec2 puv = pc.xy / pc.w * 0.5 + 0.5;

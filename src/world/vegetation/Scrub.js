@@ -1,15 +1,25 @@
 import * as THREE from 'three';
-import { GLSL_NOISE, GLSL_WIND } from './shaderLib.js';
+import { GLSL_DRY_SHADING, GLSL_NOISE, GLSL_WIND } from './shaderLib.js';
 import { mulberry32 } from './VegField.js';
-import { brushParams, deadTreeParams, growPlant, scrubParams } from './Branching.js';
+import { buildTuft } from './Grass.js';
+import { brushParams, deadTreeParams, deadTreeParamsL1, growPlant, scrubParams } from './Branching.js';
 
 /**
  * Scrub — the woody half of the vegetation: thorny shrubs, dry brush balls and
  * the occasional dead tree. These carry the silhouette work that grass cannot;
- * a bare tree against a ridgeline is the single most legible MGSV composition.
+ * a bare tree against a ridgeline is the single most legible MGSV composition,
+ * and low dead scrub dotted across a slope is what tells you the slope is a
+ * slope rather than a shaded triangle.
  *
- * Everything is instanced per variant, casts and receives shadow, and sways on
- * the same gust field as the grass so the whole landscape moves as one system.
+ * Round 1 put 656 bushes over a 380 m disc — one per 700 square metres, which
+ * is optically nothing. This scatters ~31,000 over a 1 km disc in three tiers,
+ * for about four times the triangles, because the distant tiers are ribbon
+ * clumps at 10-24 triangles rather than branch skeletons at 416.
+ *
+ * Everything is instanced, buckets spatially so the frustum can discard the
+ * four fifths of the field behind the camera, casts shadow only within a few
+ * tens of metres, and sways on the same gust field as the grass so the whole
+ * landscape moves as one system.
  */
 
 const _v = new THREE.Vector3();
@@ -70,15 +80,61 @@ function injectBranchWind(mat, uniforms, flexAmount) {
   };
 }
 
+/**
+ * Dead wood under a hard sun has the same problem grass does: a twig is a
+ * cylinder two centimetres across, so half of it is blown out and half is a
+ * black line. The same translucency + wrapped-sky term the grass uses lifts the
+ * shadow side, at a fraction of the strength — bark transmits, but not much.
+ */
+function injectBranchShading(mat) {
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (shader) => {
+    prev.call(mat, shader);
+    // The stock `normal` varying is in view space; the sun direction is in world
+    // space. Carry a world-space normal and position of our own rather than
+    // transforming the sun per fragment.
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vVegWorld;\nvarying vec3 vVegNW;')
+      .replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+         {
+           #ifdef USE_INSTANCING
+             mat4 vegM = modelMatrix * instanceMatrix;
+           #else
+             mat4 vegM = modelMatrix;
+           #endif
+           vVegWorld = (vegM * vec4(transformed, 1.0)).xyz;
+           vVegNW = normalize(mat3(vegM) * objectNormal);
+         }`,
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\nvarying vec3 vVegWorld;\nvarying vec3 vVegNW;\n${GLSL_DRY_SHADING}`)
+      .replace('#include <shadowmap_pars_fragment>', '#include <shadowmap_pars_fragment>\n#include <shadowmask_pars_fragment>')
+      .replace('#include <lights_fragment_begin>', '#include <lights_fragment_begin>\nfloat vegSunVis = getShadowMask();')
+      .replace(
+        '#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+         // A fifth of the grass gain: bark is a millimetre of dead cellulose,
+         // not a membrane. Enough to keep the shadow side off black, not enough
+         // to make a dead bush glow like a lampshade.
+         reflectedLight.directDiffuse +=
+           vegDryShading(normalize(vVegNW), normalize(cameraPosition - vVegWorld), diffuseColor.rgb, 0.22, vegSunVis);`,
+      );
+    mat.userData.shader = shader;
+  };
+}
+
 function branchMaterial(uniforms, color, flex, roughness = 0.88) {
   const mat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setRGB(color[0], color[1], color[2], THREE.LinearSRGBColorSpace),
     roughness,
     metalness: 0.0,
-    envMapIntensity: 0.8,
+    envMapIntensity: 0.9,
     dithering: true,
   });
   injectBranchWind(mat, uniforms, flex);
+  injectBranchShading(mat);
   return mat;
 }
 
@@ -89,152 +145,203 @@ function matchingDepthMaterial(uniforms, flex) {
   return d;
 }
 
-function makeInstanced(geo, mat, depthMat, count, name) {
-  const mesh = new THREE.InstancedMesh(geo, mat, count);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  mesh.customDepthMaterial = depthMat;
-  mesh.name = name;
-  mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-  return mesh;
-}
-
 /**
- * Scatter woody plants. Candidates are rejected by the same drainage/slope mask
- * the grass uses, biased differently per kind: scrub likes the *margins* of the
- * wet lines, trees want a visible spot with root water, brush collects on flats.
+ * Sample candidate points uniformly *by area* over an annulus and keep the ones
+ * the ground accepts. Uniform-by-area matters: sampling r linearly piles
+ * everything into the middle and leaves the outer ring — which is most of the
+ * frame in a wide shot — empty.
  */
-function scatter({ field, rng, count, radius, accept, variants, tilt, scaleRange, falloff = 0.5 }) {
+function scatterAnnulus({ field, rng, rInner, rOuter, candidates, accept, variants, tilt, scaleRange, sink = 0 }) {
   const perVariant = variants.map(() => []);
-  for (let i = 0; i < count; i++) {
+  const r2i = rInner * rInner;
+  const r2o = rOuter * rOuter;
+  for (let i = 0; i < candidates; i++) {
     const a = rng() * Math.PI * 2;
-    // falloff 0.5 spreads candidates uniformly over the disc; pushing it toward
-    // 1 concentrates them near the playable centre and lets the outer field
-    // thin out gradually instead of ending on a visible circle.
-    const r = radius * Math.pow(rng(), falloff);
+    const r = Math.sqrt(r2i + (r2o - r2i) * rng());
     const x = Math.cos(a) * r;
     const z = Math.sin(a) * r;
     const s = field.density(x, z);
-    if (!accept(s, rng, x, z)) continue;
+    if (!accept(s, rng, x, z, r)) continue;
     const v = Math.floor(rng() * variants.length);
     const scale = scaleRange[0] + (scaleRange[1] - scaleRange[0]) * rng();
     _q.setFromUnitVectors(_up, s.normal).slerp(_qIdentity, 1 - tilt);
     _q.multiply(_qYaw.setFromAxisAngle(_up, rng() * Math.PI * 2));
-    _v.set(x, s.height, z);
-    _scale.set(scale * (0.9 + rng() * 0.2), scale, scale * (0.9 + rng() * 0.2));
+    _v.set(x, s.height - sink * scale, z);
+    _scale.set(scale * (0.86 + rng() * 0.28), scale, scale * (0.86 + rng() * 0.28));
     perVariant[v].push(_m.compose(_v, _q, _scale).clone());
   }
   return perVariant;
 }
 
+/**
+ * One InstancedMesh has a single bounding sphere, so a world-spanning one is
+ * never frustum-culled and is re-submitted for every shadow cascade. Splitting a
+ * tier onto a coarse spatial grid costs a handful of draw calls and lets the
+ * frustum discard most of the field — which is the only reason several thousand
+ * distant bushes fit in the triangle budget at all.
+ */
+function buildTiles(geo, mats, mat, depthMat, name, tile, shadowRadius = 0) {
+  // Shadow casting is bucketed with the geometry, not switched per tier: a bush
+  // 150 m from the compound casts a shadow that is not one pixel of anything,
+  // but it is still re-submitted once per cascade. Splitting at `shadowRadius`
+  // costs one draw call and takes most of the field out of three depth passes.
+  const r2 = shadowRadius * shadowRadius;
+  const buckets = new Map();
+  for (const m of mats) {
+    const x = m.elements[12];
+    const z = m.elements[14];
+    const bx = Math.floor(x / tile);
+    const bz = Math.floor(z / tile);
+    const near = r2 > 0 && x * x + z * z <= r2;
+    const key = (bx * 4096 + bz) * 2 + (near ? 1 : 0);
+    let list = buckets.get(key);
+    if (!list) buckets.set(key, (list = []));
+    list.push(m);
+  }
+  const meshes = [];
+  let tris = 0;
+  for (const [key, list] of buckets) {
+    const mesh = new THREE.InstancedMesh(geo, mat, list.length);
+    list.forEach((m, k) => mesh.setMatrixAt(k, m));
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+    mesh.computeBoundingSphere();
+    const casts = (key & 1) === 1;
+    mesh.castShadow = casts;
+    mesh.receiveShadow = true;
+    if (casts) mesh.customDepthMaterial = depthMat;
+    mesh.name = `${name}-${key}`;
+    meshes.push(mesh);
+    tris += (geo.index.count / 3) * list.length;
+  }
+  return { meshes, tris };
+}
+
+/**
+ * Three distance tiers of thorny scrub, plus brush balls and dead trees.
+ * Geometry detail and shadow casting both fall off with range; instance density
+ * does not, because a slope that is bare at 300 m and dotted at 80 m reads as a
+ * bug.
+ */
 export function createScrub(field, uniforms, seed = 20260731) {
   const rng = mulberry32(seed);
-  const group = [];
+  const meshes = [];
   let tris = 0;
+  const counts = {};
 
-  const countTris = (geo, instances) => {
-    tris += (geo.index.count / 3) * instances;
+  const add = (r) => {
+    meshes.push(...r.meshes);
+    tris += r.tris;
   };
 
-  // ---- thorny scrub -------------------------------------------------------
-  const scrubGeos = [0, 1, 2, 3, 4].map((i) => growPlant(scrubParams(4100 + i * 137)));
-  const scrubMat = branchMaterial(uniforms, [0.510, 0.448, 0.310], 0.055, 0.92);
+  // ---- thorny scrub, near: full branch structure, casts shadow -------------
+  // Scale tops out just under 1.6: this is *low* dead scrub, knee to waist. A
+  // 2.5 m specimen reads as a dead sapling and steals the dead trees' job.
+  const scrubGeos = [0, 1, 2, 3].map((i) => growPlant(scrubParams(4100 + i * 137)));
+  const scrubMat = branchMaterial(uniforms, [0.330, 0.272, 0.176], 0.055, 0.92);
   const scrubDepth = matchingDepthMaterial(uniforms, 0.055);
-  const scrubSets = scatter({
-    field,
-    rng,
-    count: 8000,
-    radius: 380,
-    falloff: 0.95,
-    // Scrub survives where grass is only patchy — the drier margins.
-    accept: (s, r) => s.slope < 0.36 && r() < 0.014 + s.density * 0.072,
-    variants: scrubGeos,
-    tilt: 0.5,
-    scaleRange: [0.60, 2.35],
+  const near = scatterAnnulus({
+    field, rng, rInner: 0, rOuter: 62, candidates: 1500,
+    // Scrub survives where grass is only patchy — the drier margins — and it is
+    // the one thing that keeps growing on ground too steep for tussock.
+    accept: (s, r) => s.slope < 0.46 && r() < 0.10 + s.density * 1.05,
+    variants: scrubGeos, tilt: 0.5, scaleRange: [0.55, 1.55], sink: 0.05,
   });
+  scrubGeos.forEach((g, i) => add(buildTiles(g, near[i], scrubMat, scrubDepth, `scrub-n${i}`, 500, 62)));
+  counts.scrubNear = near.reduce((a, b) => a + b.length, 0);
+
+  // ---- massed bush clumps, three tiers ------------------------------------
+  // A branching skeleton is the wrong LOD for distance. Its branches are two
+  // centimetres across, which is a third of a pixel at 150 m — round 1's
+  // "thousands of bushes" were mathematically present and optically absent.
+  // What has to survive at range is *projected area*, so the distant tiers are
+  // domes of wide arching ribbons instead: a metre and a half of silhouette for
+  // ten triangles.
+  const bushMat = branchMaterial(uniforms, [0.300, 0.244, 0.152], 0.05, 0.94);
+  bushMat.side = THREE.DoubleSide;
+  const bushDepth = matchingDepthMaterial(uniforms, 0.05);
+  bushDepth.side = THREE.DoubleSide;
+
+  const bushGeoNear = [0, 1].map((i) => buildTuft({
+    blades: 9, segments: 3, seed: 8810 + i * 57,
+    minH: 0.34, maxH: 0.66, width: 0.075, spread: 0.16, curve: 1.15, dome: 0.7,
+  }));
+  const bushNear = scatterAnnulus({
+    field, rng, rInner: 0, rOuter: 145, candidates: 13000,
+    accept: (s, r) => s.slope < 0.60 && r() < 0.02 + s.woody * 0.50,
+    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.75, 1.90], sink: 0.05,
+  });
+  bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMat, bushDepth, `bush-n${i}`, 500, 48)));
+  counts.bushNear = bushNear.reduce((a, b) => a + b.length, 0);
+
+  // One segment, not two: past 130 m the arc of a branch is under a pixel of
+  // curvature and only its width and mass survive, so the second segment is
+  // 100k triangles buying nothing.
+  const bushGeoMid = buildTuft({
+    blades: 6, segments: 1, seed: 9021,
+    minH: 0.42, maxH: 0.86, width: 0.185, spread: 0.26, curve: 1.25, dome: 0.85,
+  });
+  const bushMid = scatterAnnulus({
+    field, rng, rInner: 130, rOuter: 340, candidates: 26000,
+    accept: (s, r) => s.slope < 0.70 && r() < 0.03 + s.woody * 0.50,
+    variants: [bushGeoMid], tilt: 0.5, scaleRange: [0.95, 2.30], sink: 0.06,
+  });
+  add(buildTiles(bushGeoMid, bushMid[0], bushMat, null, 'bush-m', 400));
+  counts.bushMid = bushMid[0].length;
+
+  const bushGeoFar = buildTuft({
+    blades: 5, segments: 1, seed: 9313,
+    minH: 0.65, maxH: 1.15, width: 0.40, spread: 0.52, curve: 1.30, dome: 0.95,
+  });
+  const bushFar = scatterAnnulus({
+    field, rng, rInner: 320, rOuter: 1050, candidates: 95000,
+    accept: (s, r) => s.slope < 0.78 && r() < 0.02 + s.woody * 0.42,
+    variants: [bushGeoFar], tilt: 0.45, scaleRange: [1.25, 3.00], sink: 0.10,
+  });
+  add(buildTiles(bushGeoFar, bushFar[0], bushMat, null, 'bush-f', 560));
+  counts.bushFar = bushFar[0].length;
 
   // ---- dry brush balls ----------------------------------------------------
   const brushGeos = [0, 1, 2].map((i) => growPlant(brushParams(7700 + i * 91)));
-  const brushMat = branchMaterial(uniforms, [0.560, 0.485, 0.330], 0.03, 0.95);
+  const brushMat = branchMaterial(uniforms, [0.430, 0.352, 0.210], 0.03, 0.95);
   const brushDepth = matchingDepthMaterial(uniforms, 0.03);
-  const brushSets = scatter({
-    field,
-    rng,
-    count: 6500,
-    radius: 340,
-    falloff: 0.92,
-    // Brush blows about and snags on flat, open ground rather than in the wet lines.
-    accept: (s, r) => s.slope < 0.24 && r() < 0.016 + (1.0 - s.density) * 0.048,
-    variants: brushGeos,
-    tilt: 0.85,
-    scaleRange: [0.70, 1.55],
+  const brush = scatterAnnulus({
+    field, rng, rInner: 0, rOuter: 190, candidates: 3000,
+    // Brush blows about and snags on open ground and against anything that
+    // breaks the wind, rather than sitting in the wet lines.
+    accept: (s, r) => s.slope < 0.30 && r() < 0.04 + (1 - s.density) * 0.16 + s.shelter * 0.55,
+    variants: brushGeos, tilt: 0.85, scaleRange: [0.60, 1.35],
   });
+  brushGeos.forEach((g, i) => add(buildTiles(g, brush[i], brushMat, brushDepth, `brush-${i}`, 600)));
+  counts.brush = brush.reduce((a, b) => a + b.length, 0);
 
   // ---- dead trees ---------------------------------------------------------
-  const treeGeos = [0, 1, 2, 3].map((i) => growPlant(deadTreeParams(3300 + i * 211)));
-  const treeMat = branchMaterial(uniforms, [0.490, 0.438, 0.355], 0.045, 0.82);
+  const treeGeos = [0, 1].map((i) => growPlant(deadTreeParams(3300 + i * 211)));
+  const treeMat = branchMaterial(uniforms, [0.352, 0.296, 0.222], 0.045, 0.84);
   const treeDepth = matchingDepthMaterial(uniforms, 0.045);
-  const treeSets = scatter({
-    field,
-    rng,
-    count: 3200,
-    radius: 460,
-    // Rare, and only where there is enough water to have grown one — plus a
-    // deliberate bias onto breaks of slope, where they read against the sky.
-    accept: (s, r) => s.slope < 0.30 && s.density > 0.30 && r() < 0.006 + s.density * 0.020,
-    variants: treeGeos,
-    tilt: 0.35,
-    scaleRange: [1.05, 2.60],
+  const treeNear = scatterAnnulus({
+    field, rng, rInner: 0, rOuter: 175, candidates: 2600,
+    // Rare, and only where there is enough water to have grown one.
+    accept: (s, r) => s.slope < 0.34 && s.density > 0.26 && r() < 0.010 + s.density * 0.050,
+    variants: treeGeos, tilt: 0.35, scaleRange: [1.05, 2.40], sink: 0.08,
   });
+  treeGeos.forEach((g, i) => add(buildTiles(g, treeNear[i], treeMat, treeDepth, `tree-n${i}`, 500, 130)));
 
-  /**
-   * One InstancedMesh has a single world-spanning bounding sphere, so nothing in
-   * it is ever frustum-culled and the whole set is re-submitted for every shadow
-   * cascade. Splitting each variant at `shadowRadius` costs one extra draw call
-   * in the main pass and takes the outer 85% of the bushes out of three shadow
-   * passes — the shadow of a bush 300 m away is not a pixel of anything.
-   */
-  const build = (geos, sets, mat, depth, label, shadowRadius = 120) => {
-    const meshes = [];
-    geos.forEach((geo, i) => {
-      const list = sets[i];
-      if (!list.length) return;
-      const near = [];
-      const far = [];
-      const r2 = shadowRadius * shadowRadius;
-      for (const m of list) {
-        const x = m.elements[12];
-        const z = m.elements[14];
-        (x * x + z * z <= r2 ? near : far).push(m);
-      }
-      for (const [part, sub, cast] of [['', near, true], ['-far', far, false]]) {
-        if (!sub.length) continue;
-        const mesh = makeInstanced(geo, mat, depth, sub.length, `${label}-${i}${part}`);
-        sub.forEach((m, k) => mesh.setMatrixAt(k, m));
-        mesh.instanceMatrix.needsUpdate = true;
-        mesh.computeBoundingSphere();
-        mesh.castShadow = cast;
-        countTris(geo, sub.length);
-        meshes.push(mesh);
-      }
-    });
-    return meshes;
-  };
+  const treeL1 = [growPlant(deadTreeParamsL1(3901))];
+  const treeFar = scatterAnnulus({
+    field, rng, rInner: 165, rOuter: 760, candidates: 9000,
+    // Bias hard onto breaks of slope out here: a bare tree only pays for itself
+    // when it is standing against the sky.
+    accept: (s, r) => s.slope > 0.05 && s.slope < 0.40 && s.density > 0.20 && r() < 0.006 + s.density * 0.035,
+    variants: treeL1, tilt: 0.3, scaleRange: [1.30, 2.90], sink: 0.10,
+  });
+  add(buildTiles(treeL1[0], treeFar[0], treeMat, null, 'tree-f', 560));
+  counts.trees = treeNear.reduce((a, b) => a + b.length, 0) + treeFar[0].length;
 
-  group.push(...build(scrubGeos, scrubSets, scrubMat, scrubDepth, 'scrub', 110));
-  const brushMeshes = build(brushGeos, brushSets, brushMat, brushDepth, 'brush');
-  for (const m of brushMeshes) m.castShadow = false;
-  group.push(...brushMeshes);
-  group.push(...build(treeGeos, treeSets, treeMat, treeDepth, 'deadtree', 180));
+  counts.tris = Math.round(tris);
+  counts.draws = meshes.length;
 
-  const counts = {
-    scrub: scrubSets.reduce((a, b) => a + b.length, 0),
-    brush: brushSets.reduce((a, b) => a + b.length, 0),
-    trees: treeSets.reduce((a, b) => a + b.length, 0),
-    tris: Math.round(tris),
-  };
-
-  return { meshes: group, counts, brushGeos, brushMat, brushDepth };
+  return { meshes, counts, brushGeos, brushMat, brushDepth };
 }
 
 /**
@@ -302,7 +409,7 @@ export function createTumbleweed(field, uniforms, geo, mat, depthMat, count = 22
         const dz = s.z - camera.position.z;
         if (dx * dx + dz * dz > 130 * 130) respawn(s, camera.position, wind, false);
 
-        const h = field.heightAt(s.x, s.z);
+        const h = field.surfaceY(s.x, s.z);
         // Bounce: it is a hollow ball of twigs, it never rolls smoothly.
         const hop = Math.abs(Math.sin(s.spin * 0.5)) * s.radius * 0.35;
         pos.set(s.x, h + s.radius * 0.85 + hop, s.z);
