@@ -127,9 +127,17 @@ export const GRADE = {
   // 1.10-1.20: a shadow that is visibly filled by sky against a lit surface at
   // B/R 0.60. The extra mid warmth is there so cooling a fifth of the pixels
   // does not cost the frame its measured red-over-blue.
-  shadowTint: [0.922, 0.976, 1.078],
-  midTint: [1.055, 1.002, 0.922],
-  highlightTint: [1.030, 1.0, 0.950],
+  //
+  // Round 4 pulled the mid warmth back hard (midTint R/B was 1.144, now 1.055).
+  // The LUT had been authored against a bug: it was applied to linear light and
+  // then sRGB-encoded, which crushed its effect, so every previous round
+  // compensated by pushing the tint further. With the LUT now applied in the
+  // display space it was written for, that compensation arrived at full
+  // strength and vista measured R-B +40 — the orange-blockbuster look the top
+  // of this file rules out. These are the values that land it back at +14.
+  shadowTint: [0.940, 0.980, 1.060],
+  midTint: [1.028, 1.000, 0.975],
+  highlightTint: [1.015, 1.0, 0.975],
   // Round 3: saturation 0.90 -> 0.86 and lift 0.034 -> 0.050. The warmth fix
   // landed (every daylight frame now measures red above blue) but it landed
   // hot: the dusk frame came back at R151/B94, which is the orange blockbuster

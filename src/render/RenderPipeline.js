@@ -1393,21 +1393,34 @@ export class RenderPipeline {
         color += bloom * dirt * uDirtStrength;
 
         color = acesFitted(color);
-        color = mix(color, sampleLUT(color), uLutStrength);
 
+        // Vignette is a lens light-falloff, so it belongs in linear light,
+        // before the display encode.
         float vig = 1.0 - uVignette * smoothstep(0.12, 0.92, dr2 * 2.0);
         color *= vig;
 
+        // --- display encode, THEN grade ---
+        // The LUT is authored in display-referred code values: its contrast
+        // pivot is 0.42, its shadow band ends at 0.30 luminance, and its toe
+        // lift is 0.05. Those numbers only mean what they say in gamma space.
+        // Applying it to linear light instead put the toe lift through the
+        // sRGB encode afterwards, turning a 5% lift into a ~24% black-point
+        // pedestal — every frame, night included, bottomed out at rgb(51,53,59)
+        // and nothing in the game could ever render darker than that.
+        color = max(color, 0.0);
+        vec3 disp = linearToSRGB(color);
+        disp = mix(disp, sampleLUT(disp), uLutStrength);
+
         // Film grain, luminance-weighted (more in the mids, like real stock)
-        // and slightly chromatic so it does not read as digital noise.
-        float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        // and slightly chromatic so it does not read as digital noise. Grain is
+        // a density variation on the print, so it too is a display-space term.
+        float lum = dot(disp, vec3(0.2126, 0.7152, 0.0722));
         float gw = 1.0 - abs(lum * 2.0 - 1.0);
         float g1 = hash21(gl_FragCoord.xy + fract(uTime) * 431.71) - 0.5;
         float g2 = hash21(gl_FragCoord.xy * 1.7 + fract(uTime) * 197.13) - 0.5;
-        color += vec3(g1, mix(g1, g2, 0.6), g2) * uGrain * gw;
+        disp += vec3(g1, mix(g1, g2, 0.6), g2) * uGrain * gw;
 
-        color = max(color, 0.0);
-        gl_FragColor = vec4(linearToSRGB(color), 1.0);
+        gl_FragColor = vec4(clamp(disp, 0.0, 1.0), 1.0);
       }
       `,
       {
