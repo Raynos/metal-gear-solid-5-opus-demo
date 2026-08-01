@@ -1,19 +1,47 @@
 import * as THREE from 'three';
 import { SHOTS } from '../debug/Shots.js';
 import { buildCharacterGeometry, Character } from './character.js';
+import { Behaviour, BEHAVIOURS } from './behaviour.js';
+import { CharacterLOD } from './lod.js';
+import { ACTIONS } from './actions.js';
 
 /**
  * characters module.
  *
- * Publishes { player, characters, spawnSoldier(pos), variants } so the
- * gameplay/AI module can take over driving anyone it likes. Any character with
- * `controlled = true` is left alone by the idle patrol behaviour in here.
- *
  * Everything is procedural: a lofted, skinned humanoid (see body.js / rig.js /
  * skinning.js), kit welded into the same skinned mesh so a full soldier costs
- * three draw calls, and a keyframe-free animation system (anim.js) that plants
- * feet on terrain.heightAt() and keeps the rifle locked in both hands.
+ * three or four draw calls, and a keyframe-free animation system (anim.js /
+ * locomotion.js / actions.js) that plants feet on `terrain.heightAt()` and
+ * keeps the rifle locked in both hands.
+ *
+ * THE ACTOR API. This is what gameplay and AI call; it is the whole contract.
+ * Every one of these takes an `actor`, which may be a Character, its name, or
+ * its index — resolve() is deliberately forgiving so callers never have to
+ * hold a handle they did not ask for.
+ *
+ *   characters.setStance(actor, stance)          'stand'|'crouch'|'prone'|'down'
+ *   characters.setLocomotion(actor, velocity)    world m/s; Vector3, array or {x,z}
+ *   characters.playAction(actor, name, opts)     see ACTION_NAMES
+ *   characters.setAimTarget(actor, worldPos)     null lowers the weapon
+ *
+ * and the rest of the surface:
+ *
+ *   characters.setFacing(actor, yaw)             body yaw in radians
+ *   characters.setAimWeight(actor, 0..1)         slung .. cheek weld
+ *   characters.setLookTarget(actor, worldPos)    null = idle sweep
+ *   characters.setBehaviour(actor, state, opts)  see BEHAVIOUR_STATES
+ *   characters.setControlled(actor, bool)        true = ambient behaviour off
+ *   characters.warp(actor, x, z, yaw)            teleport without foot drag
+ *   characters.stateOf(actor)                    { stance, locomotion, action, ... }
+ *   characters.spawnSoldier(pos, opts)           -> Character
+ *   characters.player / .characters / .ground / .group / .variants
+ *   characters.setLodBias(n) / .setAmbient(bool) / .stats()
  */
+
+/** Valid `playAction` names. Exposed so callers can validate rather than guess. */
+export const ACTION_NAMES = Object.keys(ACTIONS);
+/** Valid `setBehaviour` states. */
+export const BEHAVIOUR_STATES = BEHAVIOURS;
 
 /** Deterministic RNG — screenshots must be byte-reproducible. */
 function rng(seed) {
@@ -231,18 +259,30 @@ export async function install(world) {
 
   // Build one geometry per variant; instances share it and vary by material
   // uniforms and scale. Four AO bakes at boot instead of one per soldier.
+  //
+  // Plus one coarse build per variant for the distance LOD. It is the same
+  // authoring code at a lower tessellation, so it costs a second AO bake over
+  // ~a third as many vertices, and it takes ~70% of the triangles off every
+  // character past ~34 m. See `setDetail` in geometry.js for why that matters
+  // more than anything on the CPU side.
   const variants = {};
-  for (const key of Object.keys(LOADOUTS)) variants[key] = buildCharacterGeometry(LOADOUTS[key]);
+  const variantsLow = {};
+  for (const key of Object.keys(LOADOUTS)) {
+    variants[key] = buildCharacterGeometry(LOADOUTS[key]);
+    variantsLow[key] = buildCharacterGeometry(LOADOUTS[key], { detail: 0.5 });
+  }
 
   const group = new THREE.Group();
   group.name = 'characters';
   scene.add(group);
 
   const characters = [];
+  const byName = new Map();
 
   function makeCharacter(variantKey, opts = {}) {
     const built = variants[variantKey];
     const ch = new Character(built, {
+      low: variantsLow[variantKey],
       name: opts.name ?? variantKey,
       terrain: ground,
       scale: opts.scale ?? 1,
@@ -250,8 +290,11 @@ export async function install(world) {
       yaw: opts.yaw ?? 0,
       materials: instanceMaterials(rand, opts),
     });
+    ch.index = characters.length;
+    ch.behaviour = new Behaviour(ch, ground, characters.length * 2654435761 + 17);
     group.add(ch.root);
     characters.push(ch);
+    byName.set(ch.name, ch);
     return ch;
   }
 
@@ -301,11 +344,15 @@ export async function install(world) {
   });
   player.controlled = false;
   player.isPlayer = true;
+  // The player holds his own pose; the ambient guard behaviour must not walk
+  // him out of the canonical `gameplay` framing.
+  player.behaviour.setState('idle');
   // Low ready, not shouldered. `aim` blends toward the cheek weld, which pulls
   // the weapon up in front of the chest and squares the shoulders to the
   // target; a small amount reads as alert, more reads as a firing pose that the
   // camera is not framed for.
   player.anim.aim = 0.12;
+  player.anim.aimActive = true;
   const aimYaw = spawn.yaw - 0.62;
   player.anim.aimTarget.set(
     spawn.x - Math.sin(aimYaw) * 26,
@@ -333,10 +380,9 @@ export async function install(world) {
       // 1.72 m to 1.92 m. Height variation is the cheapest anti-clone measure.
       scale: opts.scale ?? 0.95 + rand() * 0.1,
     });
-    ch.stance = 'stand';
-    ch.patrol = opts.patrol ?? null;
-    ch.patrolIndex = 0;
-    ch.waitTimer = rand() * 4;
+    ch.setStance('stand');
+    if (opts.patrol) ch.behaviour.setState('patrol', { route: opts.patrol, index: 1 });
+    else ch.behaviour.setState('post', { yaw: ch.yaw });
     return ch;
   }
 
@@ -359,8 +405,7 @@ export async function install(world) {
     if (route.length < 2) continue;
     const start = route[0];
     const s = spawnSoldier([start.x, 0, start.z], {});
-    s.patrol = route;
-    s.patrolIndex = 1;
+    s.behaviour.setState('patrol', { route, index: 1 });
     garrisoned++;
   }
 
@@ -378,55 +423,157 @@ export async function install(world) {
     if (c.patrol) {
       const a = new THREE.Vector3(c.at[0], 0, c.at[1]);
       const b = a.clone().add(new THREE.Vector3(Math.sin(c.yaw) * -14, 0, Math.cos(c.yaw) * -14));
-      s.patrol = [a, b];
+      s.behaviour.setState('patrol', { route: [a, b], index: 1 });
     }
   });
 
   // --- per-frame ----------------------------------------------------------
-  const _v = new THREE.Vector3();
+  const lod = new CharacterLOD();
+  /** Ambient behaviour drives anyone gameplay/AI has not claimed. */
+  let ambient = true;
+  let animate = true;
+
   engine.addSystem({
     order: 20,
-    update(dt) {
+    update(dt, e) {
+      if (!animate) return;
+      lod.begin(e.camera);
       for (const ch of characters) {
-        if (!ch.controlled) idleBehaviour(ch, dt, _v);
-        ch.update(dt);
+        const job = lod.evaluate(ch, dt);
+        if (!job) continue;
+        if (ambient && !ch.controlled) ch.behaviour.update(job.dt);
+        ch.update(job.dt, job.ik);
       }
     },
   });
 
-  /** Minimal stand-in behaviour so nobody is a statue until AI takes over. */
-  function idleBehaviour(ch, dt, tmp) {
-    if (ch.isPlayer) {
-      ch.drive(dt, 0, ch.yaw);
-      return;
-    }
-    if (!ch.patrol) {
-      ch.drive(dt, 0, ch.yaw);
-      return;
-    }
-    const target = ch.patrol[ch.patrolIndex % ch.patrol.length];
-    tmp.set(target.x - ch.position.x, 0, target.z - ch.position.z);
-    const d = tmp.length();
-    if (d < 1.0) {
-      ch.waitTimer -= dt;
-      ch.drive(dt, 0, ch.yaw);
-      if (ch.waitTimer <= 0) {
-        ch.patrolIndex++;
-        ch.waitTimer = 2 + ((ch.patrolIndex * 37) % 5);
+  // The world renders behind the menu and under the free-fly camera, so the
+  // garrison keeps living in every mode. All the seam does is hand control of
+  // individual actors to gameplay: anything gameplay marks `controlled` is
+  // skipped by the ambient behaviour, and everything else carries on.
+  world.gameState?.onModeChange?.((mode) => {
+    if (mode !== 'play') {
+      for (const ch of characters) {
+        if (ch.controlled && !ch.isPlayer) {
+          ch.controlled = false;
+          ch.behaviour.setState('post', { yaw: ch.yaw });
+        }
       }
-      return;
     }
-    ch.drive(dt, 1.35, Math.atan2(-tmp.x, -tmp.z));
+  });
+
+  // --- actor API ----------------------------------------------------------
+  /** Character | name | index -> Character, or null. */
+  function resolve(actor) {
+    if (!actor) return null;
+    if (actor.isCharacterActor || actor instanceof Character) return actor;
+    if (typeof actor === 'string') return byName.get(actor) ?? null;
+    if (typeof actor === 'number') return characters[actor] ?? null;
+    return null;
   }
 
-  return {
+  const api = {
     player,
     characters,
+    byName,
     spawnSoldier,
     variants,
+    variantsLow,
     /** Where the framing solver put the player — handy for camera work. */
     playerSpawn: spawn,
     ground,
     group,
+    lod,
+    ACTION_NAMES,
+    BEHAVIOUR_STATES,
+    resolve,
+
+    setStance(actor, stance) {
+      const c = resolve(actor);
+      return c ? c.setStance(stance) : null;
+    },
+    setLocomotion(actor, velocity) {
+      const c = resolve(actor);
+      if (c) c.setLocomotion(velocity);
+      return c;
+    },
+    playAction(actor, name, opts) {
+      const c = resolve(actor);
+      return c ? c.playAction(name, opts) : false;
+    },
+    setAimTarget(actor, worldPos) {
+      const c = resolve(actor);
+      if (c) c.setAimTarget(worldPos);
+      return c;
+    },
+    setAimWeight(actor, w) {
+      const c = resolve(actor);
+      if (c) c.setAimWeight(w);
+      return c;
+    },
+    setFacing(actor, yaw) {
+      const c = resolve(actor);
+      if (c) c.setFacing(yaw);
+      return c;
+    },
+    setLookTarget(actor, worldPos) {
+      const c = resolve(actor);
+      if (c) c.setLookTarget(worldPos);
+      return c;
+    },
+    setBehaviour(actor, state, opts) {
+      const c = resolve(actor);
+      return c ? c.behaviour.setState(state, opts) : null;
+    },
+    setControlled(actor, on = true) {
+      const c = resolve(actor);
+      if (c) c.controlled = !!on;
+      return c;
+    },
+    warp(actor, x, z, yaw) {
+      const c = resolve(actor);
+      if (c) c.warp(x, z, yaw);
+      return c;
+    },
+    /** Everything a caller might want to read back, in one object. */
+    stateOf(actor) {
+      const c = resolve(actor);
+      if (!c) return null;
+      return {
+        name: c.name,
+        position: c.position,
+        yaw: c.yaw,
+        stance: c.anim.loco.stance,
+        locomotion: c.anim.loco.label,
+        speed: c.anim.loco.smoothSpeed,
+        action: c.anim.actions.action,
+        busy: c.busy,
+        downed: c.downed,
+        behaviour: c.behaviour.state,
+        aiming: c.anim.aimActive ? c.anim.aim : 0,
+        lodTier: c.lodState?.tier ?? 0,
+      };
+    },
+
+    /** Turn the built-in guard behaviour off when gameplay owns everyone. */
+    setAmbient(on) {
+      ambient = !!on;
+    },
+    /** < 1 pulls every LOD ring in; false disables LOD entirely. */
+    setLodBias(b) {
+      if (b === false) lod.enabled = false;
+      else {
+        lod.enabled = true;
+        lod.bias = b;
+      }
+    },
+    /** Used by the perf probe to price the animation system on its own. */
+    setAnimationEnabled(on) {
+      animate = !!on;
+    },
+    stats() {
+      return { count: characters.length, ...lod.stats() };
+    },
   };
+  return api;
 }

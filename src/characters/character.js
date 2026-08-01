@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { createRig } from './rig.js';
 import { assemble } from './skinning.js';
 import { makeMaterialSet, Z, SZ, MZ } from './materials.js';
-import { frameMatrix } from './geometry.js';
+import { frameMatrix, setDetail } from './geometry.js';
 import {
   buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
 } from './body.js';
@@ -11,6 +11,7 @@ import {
   buildBandana, buildEyepatch, buildProstheticArm, buildRifle, buildKneepads, buildPockets,
 } from './gear.js';
 import { Animator } from './anim.js';
+import { gateSkeleton } from './lod.js';
 
 const V = (x, y, z) => new THREE.Vector3(x, y, z);
 const HAND_GRIP_LOCAL = V(0, 0.088, 0.032);
@@ -18,8 +19,22 @@ const HAND_GRIP_LOCAL = V(0, 0.088, 0.032);
 /**
  * Assemble a complete character from a loadout, and wire up the attachment
  * frames the animator needs to keep the weapon locked in both hands.
+ *
+ * `opts.detail` < 1 builds the same character at a coarser tessellation for the
+ * distance LOD — same parts, same material list, same skeleton, fewer rings.
+ * The global is restored on the way out (including on a throw) so one coarse
+ * build can never leak into the next full one.
  */
-export function buildCharacterGeometry(loadout) {
+export function buildCharacterGeometry(loadout, opts = {}) {
+  const prevDetail = setDetail(opts.detail ?? 1);
+  try {
+    return buildCharacterGeometryImpl(loadout);
+  } finally {
+    setDetail(prevDetail);
+  }
+}
+
+function buildCharacterGeometryImpl(loadout) {
   const rig = createRig();
   const parts = [];
   const add = (list, group) => {
@@ -215,6 +230,15 @@ export class Character {
     this.materials = mats;
     const list = built.materialNames.map((n) => mats[n]);
 
+    // Distance geometry: identical parts at a coarser tessellation. Only
+    // adopted if its material list matches exactly, because the mesh's material
+    // array is indexed by group and a mismatch would repaint the man.
+    const low = opts.low;
+    this.geoHigh = built.geometry;
+    this.geoLow =
+      low && low.materialNames.join() === built.materialNames.join() ? low.geometry : null;
+    this.detailLow = false;
+
     this.mesh = new THREE.SkinnedMesh(built.geometry, list);
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
@@ -230,12 +254,47 @@ export class Character {
 
     this.position = new THREE.Vector3(...(opts.position ?? [0, 0, 0]));
     this.yaw = opts.yaw ?? 0;
+    this.desiredYaw = this.yaw;
     this.groundY = 0;
     this.velocity = new THREE.Vector3();
     this.controlled = false;
+    /** Turn rate in rad/s. Faster when stationary; a running man turns slowly. */
+    this.turnRate = 6.0;
 
     this.anim = new Animator(this, opts.terrain ?? null);
     this.anim.stance = opts.stance ?? 'stand';
+    // Gate the bone-texture rebuild behind a dirty flag; see lod.js.
+    gateSkeleton(this.rig.skeleton);
+
+    // Take the bones off automatic matrix maintenance.
+    //
+    // `WebGLRenderer.render` calls `scene.updateMatrixWorld()` every frame.
+    // With `matrixAutoUpdate` on, that re-composes the local matrix of every
+    // one of 27 bones per character — and `updateMatrix()` sets
+    // `matrixWorldNeedsUpdate`, so it then also re-multiplies all 27 world
+    // matrices, whether or not a single joint moved. Across a 15-man garrison
+    // that is ~800 matrix operations per frame duplicating work the animator
+    // already did, and it is paid in full for characters the LOD scheduler
+    // deliberately skipped. The animator composes explicitly instead
+    // (`_composeAll`), so the renderer's walk becomes a pure traversal.
+    for (const b of this.rig.bones) b.matrixAutoUpdate = false;
+    this.mesh.matrixAutoUpdate = false;
+    this.mesh.updateMatrix();
+    this.root.matrixAutoUpdate = false;
+
+    this._moveDir = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    this._tmp = new THREE.Vector3();
+  }
+
+  /**
+   * Swap between the authored geometry and the distance geometry. A pointer
+   * write — the skeleton binding, the material array and the bounding sphere
+   * are all identical between the two.
+   */
+  setDetailLow(on) {
+    if (!this.geoLow || on === this.detailLow) return;
+    this.detailLow = on;
+    this.mesh.geometry = on ? this.geoLow : this.geoHigh;
   }
 
   /** Head/eye world position — handy for AI line-of-sight and camera framing. */
@@ -244,43 +303,167 @@ export class Character {
     return out;
   }
 
+  // --- the public actor API ------------------------------------------------
+  // These four names are the contract the gameplay and AI modules build
+  // against. `characters.setStance` and friends in index.js are thin wrappers
+  // that resolve an actor handle and call straight through to here.
+
+  /** 'stand' | 'crouch' | 'prone' | 'down'. */
   setStance(s) {
-    this.anim.stance = s;
+    return this.anim.loco.setStance(s);
   }
 
+  /**
+   * Desired world velocity in m/s. Magnitude picks the gait; direction is the
+   * direction of travel, which does NOT have to be the facing — a soldier
+   * backing away from a threat keeps the weapon on it. Position is integrated
+   * from the *smoothed* speed in `update()`, so the stride and the ground
+   * always agree and the feet never slide.
+   */
+  setLocomotion(v) {
+    this.anim.loco.setVelocity(v);
+    return this;
+  }
+
+  /** Where the body should be pointing. Yaw is approached at `turnRate`. */
+  setFacing(yaw) {
+    if (Number.isFinite(yaw)) this.desiredYaw = yaw;
+    return this;
+  }
+
+  /**
+   * Aim at a world point, or `null` to lower the weapon. Sets the shoulder
+   * blend as well as the target, so a caller only ever needs this one call.
+   */
+  setAimTarget(p) {
+    const a = this.anim;
+    if (!p) {
+      a.aimActive = false;
+      a.aimGoal = 0;
+      return this;
+    }
+    a.aimActive = true;
+    a.aimTarget.copy(p);
+    if (a.aimGoal === null || a.aimGoal < 0.05) a.aimGoal = 1;
+    return this;
+  }
+
+  /** Fine control over how shouldered the weapon is, 0 (slung) .. 1 (cheek weld). */
+  setAimWeight(w) {
+    this.anim.aimGoal = THREE.MathUtils.clamp(w, 0, 1);
+    return this;
+  }
+
+  /** 'fire' | 'reload' | 'cqc' | 'takedown' | 'throw' | 'hit' | 'tranq' | 'wake' | 'checkWatch'. */
+  playAction(name, opts) {
+    if (name === 'hit' && opts?.dir) {
+      this.anim.hit(opts.dir);
+      return true;
+    }
+    const ok = this.anim.play(name, opts);
+    // A man who has just been put to sleep is not patrolling. Keep the
+    // behaviour layer in step so it does not try to walk a body around.
+    if (ok && this.behaviour) {
+      if (name === 'tranq') {
+        this.setLocomotion(null);
+        this.setAimTarget(null);
+        this.setLookTarget(null);
+        this.behaviour.setState('downed');
+      } else if (name === 'wake') {
+        this.behaviour.setState('post', { yaw: this.yaw });
+      }
+    }
+    return ok;
+  }
+
+  /** Look at a world point, or `null` to return to the animator's own idle sweep. */
+  setLookTarget(v) {
+    this.anim.lookTarget = v ? (this.anim.lookTarget ?? new THREE.Vector3()).copy(v) : null;
+    return this;
+  }
+
+  /** Drop the actor exactly here without dragging its planted feet along. */
+  warp(x, z, yaw) {
+    this.position.x = x;
+    this.position.z = z;
+    if (yaw !== undefined) {
+      this.yaw = yaw;
+      this.desiredYaw = yaw;
+    }
+    this.anim.footTargets.R.planted = false;
+    this.anim.footTargets.L.planted = false;
+    this.anim._lastPos.set(NaN, NaN, NaN);
+    return this;
+  }
+
+  get busy() {
+    return this.anim.actions.busy;
+  }
+
+  get downed() {
+    return this.anim.actions.downT > 0.5;
+  }
+
+  /** One word describing what the body is currently doing. */
+  get locomotionState() {
+    return this.anim.loco.label;
+  }
+
+  // --- back-compat ---------------------------------------------------------
   setAim(on, target) {
-    this.anim.aim = on ? 1 : 0;
     if (target) this.anim.aimTarget.copy(target);
+    this.anim.aimActive = !!(on && (target || this.anim.aimActive));
+    this.anim.aimGoal = on ? 1 : 0;
   }
 
   lookAt(v) {
-    this.anim.lookTarget = v ? (this.anim.lookTarget ?? new THREE.Vector3()).copy(v) : null;
+    return this.setLookTarget(v);
   }
 
   takeHit(dirWorld) {
     this.anim.hit(dirWorld ?? new THREE.Vector3(0, 0, 1));
   }
 
-  /** Move at `speed` m/s toward `yaw`; the gait follows automatically. */
+  /** Move at `speed` m/s toward `yaw`. Kept for callers written before the
+   *  velocity API existed; it just fills in the same inputs. */
   drive(dt, speed, yaw) {
-    this.anim.speed = speed;
-    if (yaw !== undefined) {
-      let d = yaw - this.yaw;
-      d = Math.atan2(Math.sin(d), Math.cos(d));
-      this.yaw += d * Math.min(1, dt * 5);
-    }
-    if (speed > 0.01) {
-      this.position.x += -Math.sin(this.yaw) * speed * dt;
-      this.position.z += -Math.cos(this.yaw) * speed * dt;
-    }
+    if (yaw !== undefined) this.desiredYaw = yaw;
+    const y = yaw !== undefined ? yaw : this.yaw;
+    this._tmp.set(-Math.sin(y) * speed, 0, -Math.cos(y) * speed);
+    this.setLocomotion(this._tmp);
+    void dt;
   }
 
-  update(dt) {
-    this.anim.update(dt);
+  /**
+   * `ik` comes from the LOD scheduler: 2 full, 1 reduced, 0 legs on FK.
+   * Position is integrated here rather than by the caller so that translation
+   * and the gait cycle are computed from the same smoothed speed.
+   */
+  update(dt, ik = 2) {
+    const L = this.anim.loco;
+    const locked = this.anim.actions.lockLoco;
+
+    // Facing. A stationary man pivots quickly; a running one leans into it.
+    let d = this.desiredYaw - this.yaw;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    const rate = this.turnRate * (1 - 0.55 * Math.min(1, L.smoothSpeed / 4));
+    const step = d * Math.min(1, dt * rate);
+    this.yaw += step;
+    L.yawRate = dt > 0 ? step / dt : 0;
+
+    if (locked) L.setVelocity(null);
+    else if (L.velocity.lengthSq() > 1e-6) this._moveDir.copy(L.velocity).setY(0).normalize();
+
+    this.anim.update(dt, ik);
+
+    if (!locked && L.smoothSpeed > 0.005) {
+      this.position.addScaledVector(this._moveDir, L.smoothSpeed * dt);
+    }
   }
 
   dispose() {
-    this.mesh.geometry.dispose();
+    // Geometry is shared between every instance of a variant; only the
+    // per-instance materials belong to this character.
     for (const m of Object.values(this.materials)) m.dispose();
   }
 }

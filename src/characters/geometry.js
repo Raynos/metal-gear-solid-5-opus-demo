@@ -150,8 +150,57 @@ function sectionPoint(sec, th, out) {
  * never twists, and the section's local +X/+Z stay glued to the character's
  * right/forward for straight vertical runs.
  */
-export function loft(spine, sections, opts = {}) {
-  const radial = opts.radial ?? 18;
+/**
+ * Global tessellation scale, 1 = the authored density.
+ *
+ * A finished soldier is ~44 000 triangles, 80% of it lofted cloth. That is a
+ * fine number for the character the third-person camera is two metres behind
+ * and a terrible one for the eleven other men standing around an outpost:
+ * measured, forty extra guards added 2.6 M triangles and 240 draw calls to a
+ * frame with a 4 M budget, and cost 11.6 ms — while the CPU-side animation for
+ * all forty measured at the noise floor. The cost of a garrison is geometry,
+ * not animation.
+ *
+ * So the same authoring code builds a second, coarser geometry per variant that
+ * the LOD scheduler swaps in past ~34 m. Scaling the RING COUNT (and, more
+ * gently, the station count) is the right knob because it changes only how
+ * finely a shape is sampled, never the shape itself, never which parts exist,
+ * and never the material list — so the low geometry binds to the same skeleton
+ * and draws with the same material array, and the swap is a pointer write.
+ *
+ * Set through `buildCharacterGeometry(loadout, { detail })`, which restores it
+ * afterwards. Nothing else should touch it.
+ */
+let DETAIL = 1;
+export function setDetail(d) {
+  const prev = DETAIL;
+  DETAIL = d;
+  return prev;
+}
+/** Scale a segment count, never below a floor that keeps the shape readable. */
+function seg(n, min) {
+  return DETAIL >= 1 ? n : Math.max(min, Math.round(n * DETAIL));
+}
+
+export function loft(spineIn, sectionsIn, opts = {}) {
+  // Stations come down more gently than rings: a limb's silhouette is defined
+  // along its length, and dropping stations is what starts to visibly straighten
+  // a curved shape. sqrt() halves the exponent.
+  let spine = spineIn;
+  let sections = sectionsIn;
+  if (DETAIL < 1 && spineIn.length >= 6) {
+    const keep = Math.max(4, Math.round(spineIn.length * Math.sqrt(DETAIL)));
+    if (keep < spineIn.length) {
+      spine = [];
+      sections = [];
+      for (let i = 0; i < keep; i++) {
+        const j = Math.round((i * (spineIn.length - 1)) / (keep - 1));
+        spine.push(spineIn[j]);
+        sections.push(sectionsIn[j]);
+      }
+    }
+  }
+  const radial = seg(opts.radial ?? 18, 6);
   const zone = opts.zone ?? 0;
   const capStart = opts.capStart ?? false;
   const capEnd = opts.capEnd ?? false;
@@ -335,7 +384,9 @@ export function resampleSpine(points, n) {
  * heads and helmets, where the shape is a handful of anatomical features layered
  * onto an ellipsoid rather than a swept profile.
  */
-export function displacedSphere(fn, segU = 28, segV = 20, zone = 0, uvScale = 0.55) {
+export function displacedSphere(fn, segUIn = 28, segVIn = 20, zone = 0, uvScale = 0.55) {
+  const segU = seg(segUIn, 10);
+  const segV = seg(segVIn, 8);
   const s = new Surface();
   const dir = new THREE.Vector3();
   const out = new THREE.Vector3();

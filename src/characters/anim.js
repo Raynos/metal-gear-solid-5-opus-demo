@@ -1,23 +1,38 @@
 import * as THREE from 'three';
+import { Locomotion } from './locomotion.js';
+import { ActionLayer } from './actions.js';
 
 /**
  * Procedural animation.
  *
  * There are no keyframes. Every pose is computed each frame from a small set of
- * signals — gait phase, speed, stance, aim, a decaying hit impulse — and then
- * resolved against the world with IK:
+ * signals — the locomotion blend space, the upper-body action layer, aim, a
+ * decaying hit impulse — and then resolved against the world with IK:
  *
- *  - Feet are placed by a gait function in character space and then *planted* on
- *    `terrain.heightAt()`. During stance the foot travels backward at exactly
- *    body speed, so it never slides; a stride that lands on the actual ground is
- *    the single biggest tell between "animated" and "sliding decal".
+ *  - Feet are placed by a gait function in character space, *planted* on
+ *    `terrain.heightAt()`, and then LATCHED for the duration of the stance
+ *    phase. The analytic gait already travels the stance foot backward at
+ *    exactly body speed, which is slide-free at constant velocity; the latch is
+ *    what keeps it slide-free while accelerating, decelerating and turning,
+ *    which is most of the time in a game.
+ *  - The hips solve against the feet: if a foot ends up further from its hip
+ *    than the leg is long — a step, a slope, a kerb — the pelvis drops until it
+ *    is reachable, instead of the leg silently snapping straight and the foot
+ *    hovering.
  *  - The weapon has its own authored transform per state. Both arms are then
  *    solved to it — firing hand to the pistol grip, support hand to the
  *    handguard — so the rifle is locked in the hands in every state, including
- *    mid-stagger, which is where hand-authored rigs usually fall apart.
+ *    mid-stagger. The action layer can pull the support hand off the weapon
+ *    (mag change, CQC grab, throw) by overriding that one IK target.
+ *  - The upper body tracks the aim direction: the yaw between the character's
+ *    facing and its aim point is distributed up the spine and into the neck,
+ *    so a soldier covering an angle he is not walking toward reads correctly.
  *  - Secondary motion (breathing, idle weight shift, head look-at split across
  *    neck and head, spring-damped weapon sway, torso counter-rotation against
  *    the hips) is layered on top.
+ *
+ * `update(dt, ik)` takes an IK level from the LOD scheduler: 2 full, 1 without
+ * the per-foot ground-normal query, 0 with the legs on pure FK. See lod.js.
  */
 
 const clamp = THREE.MathUtils.clamp;
@@ -36,6 +51,9 @@ function setWorldQuaternion(bone, q) {
   } else {
     bone.quaternion.copy(q);
   }
+  // Bones run with `matrixAutoUpdate = false` (see Character), so the local
+  // matrix has to be composed by hand before the world update can use it.
+  bone.updateMatrix();
   bone.updateMatrixWorld(true);
 }
 
@@ -170,6 +188,27 @@ const WEAPON_POSES = {
 const _POLE_R = new THREE.Vector3(0.50, -0.16, 0.02);
 const _POLE_L = new THREE.Vector3(0.36, -0.20, -0.02);
 
+/**
+ * Deterministic per-instance phase offsets.
+ *
+ * This used to be `Math.random()`, which meant the idle weight shift, the
+ * breathing phase and the head sweep of every character in the scene were a
+ * different number on every page load — so the "byte-reproducible screenshot"
+ * the harness is built around was never actually byte-reproducible for anything
+ * with a person in it, and A/B comparisons of character work were being read
+ * through that noise. A counter-based hash keyed on construction order gives
+ * the same spread with none of that.
+ */
+let _instanceSeq = 0;
+function instanceNoise() {
+  const n = ++_instanceSeq;
+  let h = (n * 2654435761) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822519) >>> 0;
+  h ^= h >>> 13;
+  return [(h & 0xffff) / 65536, ((h >>> 16) & 0xffff) / 65536];
+}
+
 // -------------------------------------------------------------------------
 // Animator
 // -------------------------------------------------------------------------
@@ -181,29 +220,39 @@ export class Animator {
     this.rig = ch.rig;
     this.b = Object.fromEntries(ch.rig.bones.map((b) => [b.name, b]));
 
-    this.phase = Math.random();
-    this.t = Math.random() * 40;
-    this.speed = 0;
-    this.smoothSpeed = 0;
-    this.stance = 'stand';
-    this.stanceBlend = 0;
-    this.proneBlend = 0;
+    const [r0, r1] = instanceNoise();
+    this.loco = new Locomotion(this);
+    this.actions = new ActionLayer(this);
+    this.loco.phase = r0;
+    this.t = r1 * 40;
+    this.breath = r0 * 10;
+
+    /** 0..1 weapon-shouldered blend. Assign directly, or drive via `aimGoal`. */
     this.aim = 0;
+    this.aimGoal = null;
+    /** `aim` after the action layer has pulled the weapon out of the shoulder. */
+    this._aimEff = 0;
     this.aimTarget = new THREE.Vector3();
+    this.aimActive = false;
     this.lookTarget = null;
     this.lookBlend = new THREE.Vector2();
-    this.hitTime = 1e3;
-    this.hitDir = new THREE.Vector3();
+    this.torsoAim = new THREE.Vector2(); // smoothed (yaw, pitch) toward the aim point
     this.bobY = 0;
-    this.breath = Math.random() * 10;
+    this.hipDrop = 0;
+    this.lungeZ = 0;
     this.weaponSway = new THREE.Vector3();
     this.weaponSwayVel = new THREE.Vector3();
 
     const bw = ch.rig.bindWorld;
     this.armLen = { upper: bw.get('armR').distanceTo(bw.get('forearmR')), lower: bw.get('forearmR').distanceTo(bw.get('handR')) };
     this.legLen = { upper: bw.get('upLegR').distanceTo(bw.get('lowLegR')), lower: bw.get('lowLegR').distanceTo(bw.get('footR')) };
+    this.legReach = this.legLen.upper + this.legLen.lower;
 
-    this.footTargets = { R: { pos: new THREE.Vector3(), ground: 0 }, L: { pos: new THREE.Vector3(), ground: 0 } };
+    this.footTargets = {
+      R: { pos: new THREE.Vector3(), lock: new THREE.Vector3(), planted: false, ground: 0 },
+      L: { pos: new THREE.Vector3(), lock: new THREE.Vector3(), planted: false, ground: 0 },
+    };
+    this._lastPos = new THREE.Vector3(NaN, NaN, NaN);
     this._weaponM = new THREE.Matrix4();
     this._basisM = new THREE.Matrix4();
 
@@ -214,41 +263,85 @@ export class Animator {
     this._t2 = new THREE.Vector3();
     this._t3 = new THREE.Vector3();
     this._t4 = new THREE.Vector3();
+    this._t5 = new THREE.Vector3();
     this._qa = new THREE.Quaternion();
     this._qb = new THREE.Quaternion();
     this._up = new THREE.Vector3(0, 1, 0);
   }
 
+  // --- compatibility surface ---------------------------------------------
+  // Locomotion owns the gait state now, but `anim.speed` / `anim.stance` were
+  // the public handles for three rounds and the outpost/gameplay code still
+  // uses them. Forward rather than break callers.
+  get speed() { return this.loco.velocity.length(); }
+  set speed(v) {
+    const y = this.ch.yaw;
+    this.loco.velocity.set(-Math.sin(y) * v, 0, -Math.cos(y) * v);
+  }
+  get smoothSpeed() { return this.loco.smoothSpeed; }
+  get stance() { return this.loco.stance; }
+  set stance(s) { this.loco.setStance(s); }
+  get stanceBlend() { return this.loco.stanceBlend; }
+  get proneBlend() { return this.loco.proneBlend; }
+  get downBlend() { return this.loco.downBlend; }
+  get phase() { return this.loco.phase; }
+  get gaitCycle() { return this.loco.cycle; }
+  get action() { return this.actions.action; }
+
+  /** World-space impulse direction (pointing away from the shooter). */
   hit(dir) {
-    this.hitTime = 0;
-    this.hitDir.copy(dir).normalize();
+    this._t1.copy(dir ?? this._up).setY(0);
+    if (this._t1.lengthSq() < 1e-6) this._t1.set(0, 0, 1);
+    this._t1.normalize().applyAxisAngle(this._up, -this.ch.yaw);
+    this.actions.play('hit', { dir: this._t1.clone() });
   }
 
-  get gaitCycle() {
-    return lerp(1.06, 0.58, smoothstep(this.smoothSpeed, 1.0, 4.6));
+  play(name, opts) {
+    return this.actions.play(name, opts);
   }
 
-  update(dt) {
+  update(dt, ik = 2) {
+    if (dt > 0.25) dt = 0.25; // a long LOD gap must not launch the gait forward
     this.t += dt;
     this.breath += dt;
-    this.hitTime += dt;
-    this.smoothSpeed += (this.speed - this.smoothSpeed) * Math.min(1, dt * 7);
 
-    const crouchT = this.stance === 'crouch' ? 1 : 0;
-    const proneT = this.stance === 'prone' ? 1 : 0;
-    this.stanceBlend += (crouchT - this.stanceBlend) * Math.min(1, dt * 5);
-    this.proneBlend += (proneT - this.proneBlend) * Math.min(1, dt * 4);
+    this.actions.update(dt);
+    this.loco.forcedDown = this.actions.downT;
+    this.loco.update(dt);
 
-    const moving = smoothstep(this.smoothSpeed, 0.06, 0.7);
-    if (moving > 0.01) this.phase = (this.phase + (dt / this.gaitCycle) * moving) % 1;
+    if (this.aimGoal !== null) this.aim += (this.aimGoal - this.aim) * Math.min(1, dt * 7);
+    // Reload, CQC and a throw take the weapon out of the shoulder whatever the
+    // caller asked for; `aim` itself is left alone so it springs back after.
+    const aimEff = this.aim * (1 - this.actions.weaponBlend);
+    this._aimEff = aimEff;
+    this.lungeZ += (this.actions.stepZ - this.lungeZ) * Math.min(1, dt * 10);
+
+    // A teleport (spawn, respawn, a gameplay warp) must not drag the planted
+    // feet across the map behind the body.
+    if (!(Math.abs(this.ch.position.x - this._lastPos.x) < 1.6 && Math.abs(this.ch.position.z - this._lastPos.z) < 1.6)) {
+      this.footTargets.R.planted = false;
+      this.footTargets.L.planted = false;
+      this.hipDrop = 0;
+    }
+    this._lastPos.copy(this.ch.position);
+
+    const grounded = this.loco.downBlend < 0.55 && this.loco.proneBlend < 0.7;
+    const legIK = ik > 0 && grounded;
 
     this._resetPose();
-    this._poseBody(moving);
-    this._placeRoot(dt, moving);
+    this._poseBody();
+    if (!legIK) this._fkLegs(grounded);
+    this._placeRoot(dt);
+    this._composeAll();
     this.ch.root.updateMatrixWorld(true);
-    this._solveFeet(moving);
-    this._solveWeapon(dt, moving);
-    this._headLook(dt);
+    if (legIK) this._solveFeet(ik, dt);
+    this._solveWeapon(dt);
+    this._headLook(dt, ik);
+    // Tell the gated Skeleton.update() that the bone texture is stale. Frames
+    // on which the LOD scheduler skipped this character never raise it, so its
+    // 27 bone matrices are not rebuilt and re-uploaded for a pose that did not
+    // move. See gateSkeleton() in lod.js.
+    this.rig.skeleton.poseDirty = true;
   }
 
   _resetPose() {
@@ -258,14 +351,25 @@ export class Animator {
     }
   }
 
+  /** Compose every local matrix once, after all FK writes and before the
+   *  single world update. Replaces the renderer doing it every frame. */
+  _composeAll() {
+    this.ch.root.updateMatrix();
+    for (const b of this.rig.bones) b.updateMatrix();
+  }
+
   // --- body FK -----------------------------------------------------------
-  _poseBody(moving) {
+  _poseBody() {
     const b = this.b;
-    const ph = this.phase * Math.PI * 2;
-    const run = smoothstep(this.smoothSpeed, 1.6, 4.4);
-    const crouch = this.stanceBlend;
-    const prone = this.proneBlend;
-    const aim = this.aim;
+    const L = this.loco;
+    const A = this.actions.bone;
+    const ph = L.phase * Math.PI * 2;
+    const moving = L.moving;
+    const run = L.run01;
+    const crouch = L.stanceBlend;
+    const prone = L.proneBlend;
+    const down = L.downBlend;
+    const aim = this._aimEff ?? this.aim;
 
     const breathRate = lerp(0.26, 0.8, run);
     const br = Math.sin(this.breath * Math.PI * 2 * breathRate);
@@ -276,39 +380,42 @@ export class Animator {
 
     const hipYaw = Math.sin(ph) * lerp(0.1, 0.19, run) * moving;
     const hipRoll = Math.cos(ph) * lerp(0.045, 0.075, run) * moving + shift * 0.035;
-    const lean = lerp(0.03, 0.22, run) * moving + crouch * 0.17 + aim * 0.05;
+    const lean = lerp(0.03, 0.22, run) * moving + crouch * 0.17 + aim * 0.05 + L.sprint01 * 0.1;
 
-    b.root.rotation.set(lean * 0.25, hipYaw + shift2 * 0.03, hipRoll);
+    b.root.rotation.set(lean * 0.25 + A.rootX, hipYaw + shift2 * 0.03 + A.rootY - L.turnLead * 0.25, hipRoll + A.rootZ);
 
     const chestYaw = -Math.sin(ph) * lerp(0.13, 0.24, run) * moving;
     const bladed = -0.5 * aim;
-    b.spine1.rotation.set(lean * 0.3 + breathAmp * br * 0.2, hipYaw * -0.25 + chestYaw * 0.3 + bladed * 0.2 - shift * 0.02, -hipRoll * 0.25);
-    b.spine2.rotation.set(lean * 0.3 + breathAmp * br * 0.4, chestYaw * 0.35 + bladed * 0.35, -hipRoll * 0.3);
-    b.chest.rotation.set(lean * 0.2 - breathAmp * br * 0.7 + crouch * 0.06, chestYaw * 0.35 + bladed * 0.45, -hipRoll * 0.3 + shift2 * 0.02);
+    // Upper body tracks the aim direction: the yaw between where the feet point
+    // and where the weapon points is spread up the spine, weighted toward the
+    // chest, and the shoulders finish the job. This is the whole difference
+    // between a soldier covering a corner and a soldier facing a corner.
+    const ty = this.torsoAim.x;
+    const tp = this.torsoAim.y;
+    b.spine1.rotation.set(
+      lean * 0.3 + breathAmp * br * 0.2 + tp * 0.14 + A.spine1X,
+      hipYaw * -0.25 + chestYaw * 0.3 + bladed * 0.2 - shift * 0.02 + ty * 0.2 + L.turnLead * 0.3 + A.spine1Y,
+      -hipRoll * 0.25 + A.spine1Z,
+    );
+    b.spine2.rotation.set(
+      lean * 0.3 + breathAmp * br * 0.4 + tp * 0.2 + A.spine2X,
+      chestYaw * 0.35 + bladed * 0.35 + ty * 0.28 + L.turnLead * 0.35 + A.spine2Y,
+      -hipRoll * 0.3 + A.spine2Z,
+    );
+    b.chest.rotation.set(
+      lean * 0.2 - breathAmp * br * 0.7 + crouch * 0.06 + tp * 0.22 + A.chestX,
+      chestYaw * 0.35 + bladed * 0.45 + ty * 0.32 + L.turnLead * 0.35 + A.chestY,
+      -hipRoll * 0.3 + shift2 * 0.02 + A.chestZ,
+    );
 
-    b.clavR.rotation.set(-breathAmp * br * 0.5, -aim * 0.14, -aim * 0.1 - breathAmp * br * 0.3);
-    b.clavL.rotation.set(-breathAmp * br * 0.5, aim * 0.24, aim * 0.1 + breathAmp * br * 0.3);
+    b.clavR.rotation.set(-breathAmp * br * 0.5, -aim * 0.14, -aim * 0.1 - breathAmp * br * 0.3 + A.clavRZ);
+    b.clavL.rotation.set(-breathAmp * br * 0.5, aim * 0.24, aim * 0.1 + breathAmp * br * 0.3 + A.clavLZ);
 
-    b.neck.rotation.set(-lean * 0.5 - crouch * 0.08 - aim * 0.06, 0, 0);
-    b.head.rotation.set(-lean * 0.35 + aim * 0.12, 0, 0);
+    b.neck.rotation.set(-lean * 0.5 - crouch * 0.08 - aim * 0.06 + A.neckX, 0, 0);
+    b.head.rotation.set(-lean * 0.35 + aim * 0.12 + A.headX, A.headY, A.headZ);
 
     if (prone > 0.001) this._poseProne(prone);
-
-    if (this.hitTime < 1.0) {
-      const u = this.hitTime;
-      const env = Math.exp(-u * 5.5) * Math.sin(u * 22.0 + 0.6) * (1 - u);
-      const local = this._t1.copy(this.hitDir).applyAxisAngle(this._up, -this.ch.yaw);
-      const back = -local.z;
-      const side = local.x;
-      b.root.rotation.x += env * back * 0.5;
-      b.root.rotation.z += env * side * 0.45;
-      b.spine2.rotation.x += env * back * 0.7;
-      b.spine2.rotation.z += env * side * 0.6;
-      b.chest.rotation.x += env * back * 0.6;
-      b.neck.rotation.x += env * back * 0.9;
-      b.head.rotation.x += env * back * 0.7;
-      b.head.rotation.z += env * side * 0.5;
-    }
+    if (down > 0.001) this._poseDown(down);
   }
 
   _poseProne(w) {
@@ -319,38 +426,70 @@ export class Animator {
     b.chest.rotation.x += 0.3 * w;
     b.neck.rotation.x += 0.55 * w;
     b.head.rotation.x += 0.5 * w;
-    const ph = this.phase * Math.PI * 2;
-    const crawl = smoothstep(this.smoothSpeed, 0.05, 0.6);
+    const ph = this.loco.phase * Math.PI * 2;
+    const crawl = smoothstep(this.loco.smoothSpeed, 0.05, 0.6);
     b.upLegR.rotation.z += (0.24 + Math.sin(ph) * 0.3 * crawl) * w;
     b.upLegL.rotation.z += (-0.24 - Math.sin(ph) * 0.3 * crawl) * w;
     b.lowLegR.rotation.x += (-0.4 - Math.max(0, Math.sin(ph)) * 0.9 * crawl) * w;
     b.lowLegL.rotation.x += (-0.4 - Math.max(0, -Math.sin(ph)) * 0.9 * crawl) * w;
   }
 
+  /**
+   * The tranquillised heap. `downBlend` carries the collapse over ~1.7 s
+   * (driven by the tranq action) and then holds; the legs fold under, the spine
+   * curls and the whole figure ends up on its side. No solver: a canned fold is
+   * deterministic, costs four rotation writes, and does not require a physics
+   * step in a game that has none.
+   */
+  _poseDown(w) {
+    const b = this.b;
+    const roll = this.actions.downRoll || 1;
+    b.root.rotation.x += -1.35 * w;
+    b.root.rotation.z += roll * 0.55 * w;
+    b.spine1.rotation.x += 0.2 * w;
+    b.spine2.rotation.x += 0.3 * w;
+    b.chest.rotation.x += 0.22 * w;
+    b.neck.rotation.x += 0.4 * w;
+    b.head.rotation.x += 0.35 * w;
+    b.upLegR.rotation.x += 0.55 * w;
+    b.upLegL.rotation.x += 0.34 * w;
+    b.lowLegR.rotation.x += -1.15 * w;
+    b.lowLegL.rotation.x += -0.75 * w;
+    b.upLegR.rotation.z += 0.18 * w;
+    b.upLegL.rotation.z += -0.1 * w;
+  }
+
   // --- root placement ----------------------------------------------------
-  _placeRoot(dt, moving) {
+  _placeRoot(dt) {
     const ch = this.ch;
     const t = this.terrain;
-    const ph = this.phase * Math.PI * 2;
-    const run = smoothstep(this.smoothSpeed, 1.6, 4.4);
+    const L = this.loco;
+    const ph = L.phase * Math.PI * 2;
+    const run = L.run01;
 
-    const bob = -Math.abs(Math.cos(ph)) * lerp(0.022, 0.055, run) * moving;
+    const bob = -Math.abs(Math.cos(ph)) * lerp(0.022, 0.055, run) * L.moving;
     this.bobY += (bob - this.bobY) * Math.min(1, dt * 18);
 
-    const groundY = t ? t.heightAt(ch.position.x, ch.position.z) : 0;
+    // A CQC lunge moves the whole rig forward without moving the actor's
+    // logical position — gameplay's idea of where this soldier stands must not
+    // be perturbed by an animation.
+    const lz = this.lungeZ;
+    const px = ch.position.x - Math.sin(ch.yaw) * lz;
+    const pz = ch.position.z - Math.cos(ch.yaw) * lz;
+    const groundY = t ? t.heightAt(px, pz) : 0;
     ch.groundY = groundY;
-    ch.root.position.set(ch.position.x, groundY, ch.position.z);
+    ch.root.position.set(px, groundY, pz);
     ch.root.rotation.set(0, ch.yaw, 0);
 
-    const stanceDrop = this.stanceBlend * 0.34 + this.proneBlend * 0.72;
-    this.b.root.position.y = this.b.root.userData.rest.y - stanceDrop + this.bobY;
+    const stanceDrop = L.stanceBlend * 0.34 + L.proneBlend * 0.72 + L.downBlend * 0.86;
+    this.b.root.position.y = this.b.root.userData.rest.y - stanceDrop + this.bobY - this.hipDrop;
     // Contrapposto while idle: the pelvis drops toward the unweighted leg.
-    const idleW = 1 - smoothstep(this.smoothSpeed, 0.06, 0.7);
+    const idleW = 1 - L.moving;
     this.b.root.position.y -= idleW * 0.012 * (0.5 + 0.5 * Math.sin(this.t * 0.9));
-    if (this.proneBlend > 0.001) this.b.root.position.z += this.proneBlend * 0.07;
+    if (L.proneBlend > 0.001) this.b.root.position.z += L.proneBlend * 0.07;
 
     if (t) {
-      const n = t.normalAt(ch.position.x, ch.position.z, 0.9);
+      const n = t.normalAt(px, pz, 0.9);
       const fx = -Math.sin(ch.yaw);
       const fz = -Math.cos(ch.yaw);
       ch.root.rotation.x = Math.asin(clamp(-(n.x * fx + n.z * fz), -0.5, 0.5)) * 0.75;
@@ -359,29 +498,39 @@ export class Animator {
   }
 
   // --- feet --------------------------------------------------------------
-  _solveFeet(moving) {
+  /**
+   * Plant both feet and solve the legs.
+   *
+   * `ik` 2 samples the ground normal under each foot so the sole rolls with the
+   * slope; `ik` 1 skips that (four extra height queries per foot per frame that
+   * are worth nothing past ~30 m) and keeps everything else.
+   */
+  _solveFeet(ik, dt) {
     const ch = this.ch;
     const t = this.terrain;
-    const run = smoothstep(this.smoothSpeed, 1.6, 4.4);
-    const cycle = this.gaitCycle;
-    const duty = lerp(0.62, 0.42, run);
-    const stride = this.smoothSpeed * cycle * duty;
-    const lift = lerp(0.055, 0.17, run) * moving;
-    const stanceWidth = lerp(0.098, 0.086, run) + this.stanceBlend * 0.03 + this.proneBlend * 0.1;
+    const L = this.loco;
+    const moving = L.moving;
+    const cycle = L.cycle;
+    const duty = L.duty;
+    const stride = L.stride;
+    const lift = L.lift * moving;
+    const stanceWidth = lerp(0.098, 0.086, L.run01) + L.stanceBlend * 0.03 + L.proneBlend * 0.1;
 
     const cosY = Math.cos(ch.yaw);
     const sinY = Math.sin(ch.yaw);
-    if (this.proneBlend > 0.7) return;
+    const scale = ch.root.scale.x || 1;
+    let need = 0;
 
     for (const side of ['R', 'L']) {
       const sgn = side === 'R' ? 1 : -1;
       const ft = this.footTargets[side];
-      const p = (this.phase + (side === 'L' ? 0.5 : 0)) % 1;
+      const p = (L.phase + (side === 'L' ? 0.5 : 0)) % 1;
 
       let fwd = 0;
       let up = 0;
       let toeLift = 0;
-      if (p < duty) {
+      const stancePhase = p < duty;
+      if (stancePhase) {
         fwd = stride * (0.5 - p / duty);
         const u = p / duty;
         toeLift = -0.38 * smoothstep(u, 0.55, 1.0) + 0.2 * (1 - smoothstep(u, 0.0, 0.3));
@@ -394,6 +543,14 @@ export class Animator {
       fwd *= moving;
       toeLift *= moving;
 
+      // A turn-in-place pivot step lifts one foot clear and lets it re-plant at
+      // the new stance position under the rotated body.
+      const pivot = L.pivotLift(side);
+      if (pivot > 0) {
+        up += pivot * 0.055;
+        toeLift += pivot * 0.25;
+      }
+
       // Idle stance is deliberately ASYMMETRIC: one foot forward, weight on the
       // other, both toes turned out, and a slow drift between them. Two feet
       // planted square is the single loudest "this is a mannequin" cue there is.
@@ -401,34 +558,77 @@ export class Animator {
       const drift = Math.sin(this.t * 0.55 + (side === 'R' ? 0 : 1.7));
       const idleShift = idle * Math.sin(this.t * 0.9) * 0.012 * sgn;
       const lx = sgn * stanceWidth + idleShift;
-      const lz = -fwd + this.proneBlend * 0.34 + idle * (sgn > 0 ? -0.075 : 0.085) + idle * drift * 0.012;
-      const wx = ch.position.x + lx * cosY + lz * sinY;
-      const wz = ch.position.z - lx * sinY + lz * cosY;
+      const lzo = -fwd + L.proneBlend * 0.34 + idle * (sgn > 0 ? -0.075 : 0.085) + idle * drift * 0.012 + this.lungeZ;
+      let wx = ch.position.x + lx * cosY + lzo * sinY;
+      let wz = ch.position.z - lx * sinY + lzo * cosY;
+
+      // --- the plant latch -------------------------------------------------
+      // The analytic stance path above travels backward at exactly body speed,
+      // which is slide-free only while that speed is constant. Latching the
+      // world position at touchdown makes it slide-free unconditionally: under
+      // acceleration the body runs ahead of the planted foot (which is what a
+      // push-off IS), and under a turn the foot stays where it was put instead
+      // of being dragged around the pivot. Released over the last sixth of the
+      // stance so the foot is already moving when it leaves the ground.
+      if (stancePhase && moving > 0.02 && pivot === 0) {
+        if (!ft.planted) {
+          ft.planted = true;
+          ft.lock.set(wx, 0, wz);
+        }
+        const rel = smoothstep(p / duty, 0.82, 1.0);
+        wx = lerp(ft.lock.x, wx, rel);
+        wz = lerp(ft.lock.z, wz, rel);
+      } else {
+        ft.planted = false;
+      }
+
       const g = t ? t.heightAt(wx, wz) : 0;
-      ft.pos.set(wx, g + 0.082 + up, wz);
+      ft.pos.set(wx, g + 0.082 * scale + up, wz);
       ft.ground = g;
 
       const hip = this.b[side === 'R' ? 'upLegR' : 'upLegL'];
       const knee = this.b[side === 'R' ? 'lowLegR' : 'lowLegL'];
       const foot = this.b[side === 'R' ? 'footR' : 'footL'];
 
+      // How far BELOW the body's own ground plane did this foot end up? That
+      // — not the raw hip-to-foot distance — is what the pelvis owes.
+      //
+      // A first pass measured "distance from hip to foot, minus leg length" and
+      // it was wrong in a way worth recording: at a jog the stride is 1.2 m, so
+      // at each end of the stance the foot is 0.6 m fore or aft of the hip and
+      // the straight-line distance exceeds the 0.86 m leg by 19 cm through
+      // GEOMETRY ALONE, on dead flat ground. The pelvis would then have bobbed
+      // 19 cm twice per stride: a running squat. Stride extension is the gait's
+      // business and the IK's reach clamp already absorbs it. The pelvis is
+      // only responsible for TERRAIN — a step, a kerb, a side slope — which is
+      // exactly the vertical difference between where a foot had to be planted
+      // and where flat ground under the body would have put it.
+      //
+      // Measured here and applied on the NEXT frame: one frame of lag on a
+      // quantity that changes at walking pace is invisible, and solving it in
+      // place would need a second full matrix update of the character.
+      if (stancePhase || moving < 0.05) {
+        const below = (ch.groundY - ft.ground) / scale;
+        if (below > need) need = below;
+      }
+
       hip.getWorldPosition(this._t1);
-      const poleF = 0.95 + this.stanceBlend * 0.35;
+      const poleF = 0.95 + L.stanceBlend * 0.35;
       this._t2.set(
-        this._t1.x - sinY * poleF + sgn * 0.14 * this.stanceBlend,
+        this._t1.x - sinY * poleF + sgn * 0.14 * L.stanceBlend,
         this._t1.y - 0.28,
         this._t1.z - cosY * poleF,
       );
-      twoBoneIK(hip, knee, ft.pos, this._t2, this.legLen.upper, this.legLen.lower);
+      twoBoneIK(hip, knee, ft.pos, this._t2, this.legLen.upper * scale, this.legLen.lower * scale);
 
       // Sole follows the ground plane while planted, rolls through the swing.
       // Toe-out: about 12 degrees each way when standing, closing up at speed.
-      const toeOut = (sgn * (0.21 * (1 - moving) + 0.05)) * (1 - this.proneBlend);
+      const toeOut = (sgn * (0.21 * (1 - moving) + 0.05)) * (1 - L.proneBlend);
       const ca = Math.cos(ch.yaw + toeOut);
       const sa = Math.sin(ch.yaw + toeOut);
       const axis = foot.userData.axis;
       this._t3.set(axis.x * ca + axis.z * sa, axis.y, -axis.x * sa + axis.z * ca);
-      if (t && p < duty) {
+      if (t && ik >= 2 && stancePhase) {
         const n = t.normalAt(ft.pos.x, ft.pos.z, 0.6);
         this._qa.setFromUnitVectors(this._up, n);
         this._t3.applyQuaternion(this._qa);
@@ -436,14 +636,50 @@ export class Animator {
       this._t3.y += toeLift;
       aimBone(foot, this._t3);
     }
+
+    // --- hip adjustment ----------------------------------------------------
+    // A 15 mm deadband keeps the micro-relief in the heightfield out of it: on
+    // flat ground the bind pose is already within a centimetre of full leg
+    // extension, and reacting to every 5 mm ripple would give every character a
+    // permanent, faintly seasick squat.
+    const want = Math.max(0, need - 0.015);
+    // Fall into the drop faster than you climb out of it: a foot that cannot
+    // reach the ground is a visible error, a pelvis 2 cm low is not.
+    const rate = want > this.hipDrop ? 12 : 5;
+    this.hipDrop += (Math.min(want, 0.3) - this.hipDrop) * Math.min(1, dt * rate);
+    void cycle;
+  }
+
+  /**
+   * Legs on pure FK — no terrain queries, no IK, no plant latch. Used past
+   * ~34 m, where a soldier is under 40 px tall and the only thing that reads is
+   * that the legs are moving in time with the body, and by the prone/down poses
+   * which drive the legs themselves.
+   */
+  _fkLegs(grounded) {
+    if (!grounded) return;
+    const L = this.loco;
+    const m = L.moving;
+    if (m < 0.01) return;
+    const b = this.b;
+    const amp = lerp(0.3, 0.62, L.run01) * m;
+    for (const side of ['R', 'L']) {
+      const p = ((L.phase + (side === 'L' ? 0.5 : 0)) % 1) * Math.PI * 2;
+      const s = Math.sin(p);
+      const hip = b[side === 'R' ? 'upLegR' : 'upLegL'];
+      const knee = b[side === 'R' ? 'lowLegR' : 'lowLegL'];
+      hip.rotation.x += s * amp;
+      knee.rotation.x -= (0.1 + 0.75 * Math.max(0, -s)) * m;
+    }
   }
 
   // --- weapon + arms -----------------------------------------------------
   _weaponTargetPose() {
-    const aim = this.aim;
-    const prone = this.proneBlend;
-    const crouch = this.stanceBlend;
-    const run = smoothstep(this.smoothSpeed, 2.8, 5.0);
+    const L = this.loco;
+    const aim = this._aimEff ?? this.aim;
+    const prone = L.proneBlend;
+    const crouch = L.stanceBlend;
+    const run = L.sprint01;
 
     const pos = this._p.set(0, 0, 0);
     const dir = this._d.set(0, 0, 0);
@@ -467,11 +703,14 @@ export class Animator {
     dir.divideScalar(total).normalize();
   }
 
-  _solveWeapon(dt, moving) {
+  _solveWeapon(dt) {
     const ch = this.ch;
+    const L = this.loco;
+    const act = this.actions;
     this._weaponTargetPose();
-    const ph = this.phase * Math.PI * 2;
-    const run = smoothstep(this.smoothSpeed, 1.6, 4.4);
+    const ph = L.phase * Math.PI * 2;
+    const run = L.run01;
+    const moving = L.moving;
 
     const bobAmp = lerp(0.012, 0.042, run) * moving;
     const target = this._t1.set(
@@ -484,28 +723,26 @@ export class Animator {
     this.weaponSwayVel.multiplyScalar(Math.max(0, 1 - dt * 9));
     this.weaponSway.addScaledVector(this.weaponSwayVel, Math.min(1, dt * 12));
 
-    let pitch = 0;
-    if (this.aim > 0.01 && this.aimTarget.lengthSq() > 0) {
+    const aim = this._aimEff ?? this.aim;
+    let pitch = this.torsoAim.y * 0.45;
+    if (aim > 0.01 && this.aimActive) {
       this._t2.subVectors(this.aimTarget, ch.root.position);
-      pitch = clamp(Math.atan2(this._t2.y - 1.4, Math.hypot(this._t2.x, this._t2.z)), -0.5, 0.5) * this.aim;
+      pitch = clamp(Math.atan2(this._t2.y - 1.4, Math.hypot(this._t2.x, this._t2.z)), -0.5, 0.5) * aim;
     }
+    pitch += act.weaponPitch;
     const dir = this._d;
     if (pitch !== 0) dir.applyAxisAngle(this._t3.set(1, 0, 0), pitch).normalize();
-    if (this.hitTime < 1.0) {
-      const env = Math.exp(-this.hitTime * 6.0) * Math.sin(this.hitTime * 24.0);
-      dir.y += env * 0.3;
-      dir.normalize();
-    }
+    if (act.weaponYaw !== 0) dir.applyAxisAngle(this._up, act.weaponYaw).normalize();
 
-    const wpos = this._t1.copy(this._p).add(this.weaponSway);
+    const wpos = this._t1.copy(this._p).add(this.weaponSway).add(act.weaponPos);
     const up = this._t2.set(0, 1, 0).addScaledVector(dir, -dir.y).normalize();
+    if (act.weaponRoll !== 0) up.applyAxisAngle(dir, act.weaponRoll).normalize();
     const right = this._t3.crossVectors(dir, up);
     this._basisM.makeBasis(dir, up, right).setPosition(wpos);
     this._weaponM.multiplyMatrices(ch.root.matrixWorld, this._basisM);
 
     this._solveArm('R');
     this._solveArm('L');
-    void moving;
   }
 
   _solveArm(side) {
@@ -520,6 +757,15 @@ export class Animator {
     const q = quatFromAxisPair(a.handAxis1, a.handAxis2, ax1, ax2, this._qa);
 
     const wrist = this._t4.copy(a.wristToGrip).applyQuaternion(q).negate().add(grip);
+
+    // The action layer can take this hand off the weapon — a magazine change, a
+    // CQC grab, a thrown decoy. The override is authored in character space, so
+    // it goes through the character's own matrix, not the weapon's.
+    const ov = this.actions.hand[side];
+    if (ov.w > 0.001) {
+      this._t5.copy(ov.pos).applyMatrix4(ch.root.matrixWorld);
+      wrist.lerp(this._t5, ov.w);
+    }
 
     const shoulder = side === 'R' ? this.b.armR : this.b.armL;
     const elbow = side === 'R' ? this.b.forearmR : this.b.forearmL;
@@ -562,26 +808,46 @@ export class Animator {
       (this._t2.y + wrist.y) * 0.5 + pole.y,
       (this._t2.z + wrist.z) * 0.5 - sinY * lx + cosY * pole.z,
     );
-    twoBoneIK(shoulder, elbow, wrist, this._t3, this.armLen.upper, this.armLen.lower);
+    const scale = ch.root.scale.x || 1;
+    twoBoneIK(shoulder, elbow, wrist, this._t3, this.armLen.upper * scale, this.armLen.lower * scale);
     setWorldQuaternion(hand, q);
   }
 
   // --- head --------------------------------------------------------------
-  _headLook(dt) {
+  _headLook(dt, ik) {
     const ch = this.ch;
+    const L = this.loco;
     let yaw = 0;
     let pitch = 0;
-    if (this.lookTarget) {
+    const aim = this._aimEff ?? this.aim;
+
+    // Torso aim tracking runs off the same target as the head, so the two never
+    // disagree about which way the character is looking.
+    let ty = 0;
+    let tp = 0;
+    if (this.aimActive) {
+      this._t2.subVectors(this.aimTarget, ch.root.position).applyAxisAngle(this._up, -ch.yaw);
+      ty = clamp(Math.atan2(-this._t2.x, -this._t2.z), -1.15, 1.15) * aim;
+      tp = clamp(Math.atan2(this._t2.y - 1.4, Math.hypot(this._t2.x, this._t2.z)), -0.45, 0.4) * aim;
+    }
+    this.torsoAim.x += (ty - this.torsoAim.x) * Math.min(1, dt * 6);
+    this.torsoAim.y += (tp - this.torsoAim.y) * Math.min(1, dt * 6);
+
+    const look = this.lookTarget ?? (this.aimActive ? this.aimTarget : null);
+    if (look) {
       this.b.head.getWorldPosition(this._t1);
-      this._t2.subVectors(this.lookTarget, this._t1).applyAxisAngle(this._up, -ch.yaw);
+      this._t2.subVectors(look, this._t1).applyAxisAngle(this._up, -ch.yaw);
       yaw = clamp(Math.atan2(-this._t2.x, -this._t2.z), -0.95, 0.95);
       pitch = clamp(Math.atan2(this._t2.y, Math.hypot(this._t2.x, this._t2.z)), -0.5, 0.45);
+      // The torso already carried part of the turn; the head only owes the rest.
+      yaw -= this.torsoAim.x * 0.8;
     } else {
       yaw = Math.sin(this.t * 0.31) * 0.28 + Math.sin(this.t * 0.11 + 2.0) * 0.22;
       pitch = Math.sin(this.t * 0.19 + 1.0) * 0.06;
     }
-    yaw *= 1 - this.aim * 0.8;
-    pitch = pitch * (1 - this.aim * 0.8) - this.aim * 0.12;
+    yaw *= 1 - aim * 0.5;
+    pitch = pitch * (1 - aim * 0.8) - aim * 0.12;
+    yaw = clamp(yaw, -1.0, 1.0);
     this.lookBlend.x += (yaw - this.lookBlend.x) * Math.min(1, dt * 3.2);
     this.lookBlend.y += (pitch - this.lookBlend.y) * Math.min(1, dt * 3.2);
 
@@ -594,7 +860,11 @@ export class Animator {
     head.rotation.x -= this.lookBlend.y * 0.6;
     head.rotation.y += this.lookBlend.x * 0.62;
     head.rotation.z -= this.lookBlend.x * 0.1;
+    neck.updateMatrix();
+    head.updateMatrix();
     neck.updateMatrixWorld(true);
+    void ik;
+    void L;
   }
 }
 
