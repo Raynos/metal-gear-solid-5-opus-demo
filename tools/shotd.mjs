@@ -244,11 +244,42 @@ class World {
     this.height = 720;
   }
 
+  /**
+   * Bundle once, then serve the bundle.
+   *
+   * The dev server transforms 55 ES modules on demand — 10.4 MB over the wire
+   * and a request waterfall — for a page that is loaded exactly once and then
+   * thrown away. `vite build` costs 3.2 s and cuts time-to-ready from 25.7 s to
+   * 16.0 s (1 request, 419 KB). HMR is worthless here because a source change
+   * reloads the page anyway.
+   *
+   * It also moves syntax errors from a 25 s page load to a 3 s bundler failure
+   * that names the file and line, which is the difference between an agent
+   * waiting half a minute for a stack trace and getting one immediately.
+   */
+  async bundle() {
+    const t0 = Date.now();
+    const proc = spawn(
+      process.execPath,
+      [path.join(this.root, 'node_modules/vite/bin/vite.js'), 'build', '--logLevel', 'warn'],
+      { cwd: this.root, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let out = '';
+    proc.stdout.on('data', (d) => (out += d));
+    proc.stderr.on('data', (d) => (out += d));
+    const code = await new Promise((r) => proc.on('close', r));
+    if (code !== 0) {
+      throw new Error(`build is broken — vite build failed for ${this.root}:\n${out.trim().slice(0, 2000)}`);
+    }
+    log(`bundled ${this.root} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  }
+
   async startVite() {
+    await this.bundle();
     const port = await freePort();
     const proc = spawn(
       process.execPath,
-      [path.join(this.root, 'node_modules/vite/bin/vite.js'), '--port', String(port), '--strictPort', '--host', '127.0.0.1', '--clearScreen', 'false'],
+      [path.join(this.root, 'node_modules/vite/bin/vite.js'), 'preview', '--port', String(port), '--strictPort', '--host', '127.0.0.1'],
       { cwd: this.root, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
     );
     let out = '';
@@ -268,7 +299,7 @@ class World {
       await new Promise((r) => setTimeout(r, 100));
     }
     try { process.kill(-proc.pid, 'SIGKILL'); } catch {}
-    throw new Error(`vite failed to start for ${this.root}:\n${out}`);
+    throw new Error(`vite preview failed to start for ${this.root}:\n${out}`);
   }
 
   async attachPage() {
@@ -348,6 +379,7 @@ class World {
     const stamp = await newestSourceMtime(this.root);
     this.errors = [];
     if (!this.vite) await this.startVite();
+    else await this.bundle(); // sources moved: re-bundle before reloading the page
     if (!this.page || this.page.isClosed()) await this.attachPage();
 
     try {
