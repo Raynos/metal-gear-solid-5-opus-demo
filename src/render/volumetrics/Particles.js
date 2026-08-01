@@ -241,10 +241,17 @@ const SAND_FRAGMENT = /* glsl */ `
     float wisp = texture2D(tSprite, nuv).g * 0.62 + texture2D(tSprite, nuv * 2.3).b * 0.38;
     float sceneZ = texture2D(tSceneDepth, gl_FragCoord.xy * uInvRes).r;
     float fade = clamp((sceneZ - vViewDepth) / uSoftness, 0.0, 1.0);
-    float a = band * smoothstep(0.16, 0.86, wisp) * vAlpha * fade * 0.45;
+    // Round 4: the alpha ramp was smoothstep(0.16, 0.86) and the forward-scatter
+    // gain reached 5.5x. Measured on shots/r3/dawn.png — a shot that looks
+    // straight into a horizon sun, so every plume sits at maximum phase gain —
+    // the ribbons rendered as hard-edged white slashes across the ridges at
+    // luminance 91-98 over a ground at 64, which is the "confetti" read. A wider
+    // ramp gives the plume a soft body instead of an edge, and capping the gain
+    // at 2.6x keeps it a lit plume rather than a specular highlight.
+    float a = band * smoothstep(0.06, 0.94, wisp) * vAlpha * fade * 0.22;
     diffuseColor.a *= a;
     if (diffuseColor.a < 0.002) discard;
-    diffuseColor.rgb *= 0.95 + 0.9 * min(vPhaseGain, 5.0);
+    diffuseColor.rgb *= 0.95 + 0.35 * min(vPhaseGain, 2.4);
   }
 `;
 

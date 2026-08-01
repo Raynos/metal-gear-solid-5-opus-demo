@@ -406,37 +406,56 @@ export class VegField {
     return new THREE.Vector3(hL - hR, 2 * e, hD - hU).normalize();
   }
 
+  /** Mean curvature over a `e`-metre stencil; positive in a hollow. */
+  curvatureAt(wx, wz, e = 7.0) {
+    const h0 = this.surfaceY(wx, wz);
+    const s =
+      this.surfaceY(wx - e, wz) + this.surfaceY(wx + e, wz) +
+      this.surfaceY(wx, wz - e) + this.surfaceY(wx, wz + e);
+    return (s * 0.25 - h0) / e;
+  }
+
   /**
    * CPU mirror of vegDensity() in shaderLib. Keep the two in step: grass follows
    * water, thins on the graded platform, and collects in the lee of anything
    * that breaks the wind.
+   *
+   * Round 3 added the slope cut-off at 30 degrees, the curvature term and the
+   * 40 m stand field, and tripled the drainage weight. See the comment on
+   * vegDensity in shaderLib.js for why each of those exists.
    */
   density(wx, wz) {
     const s = this.terrain.surfaceAt ? this.terrain.surfaceAt(wx, wz) : ZERO_SURFACE;
     const p = this.padAt(wx, wz, _pad);
-    const n = this.normalAt(wx, wz, 2.0);
+    const n = this.normalAt(wx, wz, 7.0);
+    const curv = this.curvatureAt(wx, wz, 7.0);
     const slope = 1 - n.y;
     const macro = fbm2(wx * 0.0085 + 41, wz * 0.0085 + 41, 3);
     const meso = fbm2(wx * 0.052 - 12, wz * 0.052 - 12, 2);
     const clump = fbm2(wx * 0.42 + 7, wz * 0.42 + 7, 2);
-    const raw = 0.30 + s.flow * 1.00 + (macro - 0.5) * 1.7 + (meso - 0.5) * 1.9;
-    const base = smooth01(raw, 0.0, 0.62) * smooth01(clump, 0.24, 0.58);
+    const stand = fbm2(wx * 0.025 + 17, wz * 0.025 + 17, 2);
+    const raw = 0.24 + s.flow * 1.85 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
     const rocky = Math.max(s.rock, s.scree * 0.6);
-    let d = base;
-    d *= 1 - smooth01(slope, 0.16, 0.52);
-    d *= 1 - smooth01(rocky, 0.18, 0.68);
+    const collect = Math.min(1.85, Math.max(0.16, 0.72 + curv * 5.5));
+    // `stand` and `collect` are shared with the woody mask; only the slope and
+    // rock tolerances differ, because a thorn bush roots in a crack in bedrock
+    // and holds a talus slope no tussock could sit on. Rejecting scrub with the
+    // grass mask is what left every hillside in the vista bare.
+    let base = smooth01(raw, 0.0, 0.62) * smooth01(stand, 0.455, 0.630) * collect;
+    base *= 1 - smooth01(rocky, 0.18, 0.68);
+    let d = base * smooth01(clump, 0.24, 0.58);
+    d *= 1 - smooth01(slope, 0.075, 0.140);
     d = applyDevelopment(wx, wz, d, p.dev, p.shelter, slope);
-    // Woody plants are far more tolerant than tussock: a thorn bush roots in a
-    // crack in bedrock and holds a talus slope no grass could sit on. Rejecting
-    // scrub with the grass mask is what left every hillside in the vista bare.
-    let w = 0.26 + base * 0.74; // a floor: bushes persist where tussock gives up
-    w *= 1 - smooth01(slope, 0.36, 0.78);
+    let w = (0.14 + base * 0.86) * smooth01(stand, 0.400, 0.600) * Math.min(1.5, collect);
+    w *= 1 - smooth01(slope, 0.14, 0.34);
     w *= 1 - smooth01(rocky, 0.52, 0.98);
     w = applyDevelopment(wx, wz, w, p.dev, p.shelter, slope);
     return {
       density: Math.min(1, Math.max(0, d)),
       woody: Math.min(1, Math.max(0, w)),
       slope,
+      curv,
+      stand,
       height: this.surfaceY(wx, wz),
       flow: s.flow,
       rock: s.rock,
@@ -460,7 +479,14 @@ const _pad = { lift: 0, dev: 0, shelter: 0 };
  */
 function applyDevelopment(x, z, d, dev, shelter, slope) {
   const yard = smooth01(dev, 0.40, 0.92);
-  const shoulder = Math.max(0, 1 - Math.abs(dev - 0.42) * 2.2);
+  // 2.2 was wrong and it was wrong everywhere: at dev = 0 — which is all wild
+  // ground, i.e. the entire map outside the compound apron — it still evaluated
+  // to 0.076, and the `shoulder * 0.62` term below then added a 0.047 floor to
+  // the density of every square metre of the world. That floor is why the
+  // scatter had no genuinely bare ground in it no matter what the mask said.
+  // 2.8 puts the shoulder band where its name says it is: on the cut
+  // embankment, dev in 0.06 to 0.78, and nowhere else.
+  const shoulder = Math.max(0, 1 - Math.abs(dev - 0.42) * 2.8);
   const ok = 1 - smooth01(slope, 0.28, 0.62);
   let out = d * (1 - yard * 0.985);
   // Shelter *adds* rather than scales: the strip against a wall is fertile

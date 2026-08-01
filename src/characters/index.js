@@ -32,7 +32,12 @@ const LOADOUTS = {
     headgear: 'bandana',
     eyepatch: true,
     hair: true,
-    hairBack: true,
+    // Round 4: this was `true`, i.e. hair only on the BACK of the skull. With a
+    // bandana that sits as a 25 mm band across the brow, that left the entire
+    // crown as bare scalp — and scalp is skin, so from the gameplay camera the
+    // head rendered as a pale tan dome with a red ribbon on it. The bandana
+    // goes over the hair; there has to be hair under it.
+    hairBack: false,
     prosthetic: 'left',
     vest: true,
     backpack: true,
@@ -82,11 +87,17 @@ const LOADOUTS = {
   },
 };
 
+/**
+ * Linear-space base skin. Round 4 lifted these ~16%: a weathered mid-latitude
+ * face measures 0.34-0.42 diffuse reflectance in the red, and the shader stacks
+ * a mottle, a brow shade, a stubble tint and an AO term on top of whatever it
+ * is given — so an already-dark base arrives at the frame as a silhouette.
+ */
 const SKIN_TONES = [
-  [0.30, 0.188, 0.138],
-  [0.265, 0.162, 0.116],
-  [0.222, 0.128, 0.088],
-  [0.335, 0.215, 0.16],
+  [0.348, 0.220, 0.162],
+  [0.308, 0.190, 0.136],
+  [0.258, 0.150, 0.103],
+  [0.388, 0.252, 0.188],
 ];
 
 /** Per-instance uniform variation: different dye lot, dust load and skin. */
@@ -104,7 +115,7 @@ function instanceMaterials(rand, opts = {}) {
       seed: seed * 1.7,
       tone: [tone[0] * warm, tone[1] * warm, tone[2] * warm],
       stubble: 0.25 + rand() * 0.75,
-      sssAmount: 0.18 + rand() * 0.1,
+      sssAmount: 0.26 + rand() * 0.12,
     },
     metal: { seed: seed * 3.1 },
   };
@@ -249,25 +260,38 @@ export async function install(world) {
   const player = makeCharacter('player', {
     name: 'snake',
     position: [spawn.x, 0, spawn.z],
-    // Three-quarter away from the camera rather than square-on. A flat back is
-    // one silhouette and one value; turning ~30 degrees puts the chest rig,
-    // the holster and the far shoulder into the outline and gives the sun a
-    // different angle on each plane, which is most of what stops a backlit
-    // character reading as a cutout.
-    yaw: spawn.yaw + 0.52,
+    // Round 4: was +0.52 (30 deg off dead-away). At 30 degrees the rucksack is
+    // the entire subject — a row-scan across the back panel of the shipped
+    // frame returned 150 consecutive pixels of the same value, because that is
+    // literally all the camera could see. Turning him 63 degrees to camera-LEFT
+    // instead swings the whole weapon, the support arm, the chest rig and the
+    // near flank into the frame, and it faces him into the aim space the
+    // over-the-shoulder framing leaves open on the right. Negative, not
+    // positive: it is the prosthetic arm and the rifle that end up camera-side.
+    yaw: spawn.yaw - 1.10,
     scale: 1.02,
   });
   player.controlled = false;
   player.isPlayer = true;
-  // Weapon part-way up: an alert ready stance reads with far more intent than a
-  // neutral idle, and it is the pose the third-person camera is framed around.
-  player.anim.aim = 0.42;
+  // Low ready, not shouldered. `aim` blends toward the cheek weld, which pulls
+  // the weapon up in front of the chest and squares the shoulders to the
+  // target; a small amount reads as alert, more reads as a firing pose that the
+  // camera is not framed for.
+  player.anim.aim = 0.12;
+  const aimYaw = spawn.yaw - 1.10;
   player.anim.aimTarget.set(
-    spawn.x - Math.sin(spawn.yaw) * 26,
-    ground.heightAt(spawn.x, spawn.z) + 1.5,
-    spawn.z - Math.cos(spawn.yaw) * 26,
+    spawn.x - Math.sin(aimYaw) * 26,
+    ground.heightAt(spawn.x, spawn.z) + 1.2,
+    spawn.z - Math.cos(aimYaw) * 26,
   );
-  player.anim.lookTarget = new THREE.Vector3(spawn.x - 16, ground.heightAt(spawn.x - 16, spawn.z - 26) + 1.7, spawn.z - 26);
+  // Head turned a further ~25 degrees off the weapon line: eyes leading the
+  // muzzle is what separates a soldier scanning from a mannequin pointed at a
+  // wall, and it puts the profile of the face into the silhouette.
+  player.anim.lookTarget = new THREE.Vector3(
+    spawn.x - Math.sin(aimYaw - 0.44) * 22,
+    ground.heightAt(spawn.x, spawn.z) + 1.72,
+    spawn.z - Math.cos(aimYaw - 0.44) * 22,
+  );
 
   // --- enemy soldiers -----------------------------------------------------
   const soldierVariants = ['grunt', 'scout', 'officer'];

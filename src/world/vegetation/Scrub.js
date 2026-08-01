@@ -22,6 +22,27 @@ import { brushParams, deadTreeParams, deadTreeParamsL1, growPlant, scrubParams }
  * landscape moves as one system.
  */
 
+/**
+ * Woody albedo, linear.
+ *
+ * Round 2 ran these at 0.30-0.43, which is mineral territory — the same value
+ * range as the sand. Measured on the shipped night frame, branch pixels came
+ * back at display luminance 80.6 against a far darker ground: dead wood that
+ * out-reflected sunlit desert. Weathered dead wood is 0.10-0.16 linear and
+ * nearly neutral; the yellow-brown people remember from photographs is the
+ * *light* on it, not the surface.
+ *
+ * Luminances here: scrub 0.130, bush 0.117, brush 0.166 (bleached tumbleweed
+ * really is the palest thing in the set), tree 0.141 — against PALETTE.sandDark
+ * at 0.38 and sandLight at 0.53. Dry scrub is darker than sunlit sand, always.
+ */
+const BRANCH_COLORS = {
+  scrub: [0.152, 0.128, 0.094],
+  bush: [0.140, 0.115, 0.082],
+  brush: [0.196, 0.163, 0.108],
+  tree: [0.162, 0.140, 0.112],
+};
+
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _qIdentity = new THREE.Quaternion();
@@ -118,8 +139,12 @@ function injectBranchShading(mat) {
          // A fifth of the grass gain: bark is a millimetre of dead cellulose,
          // not a membrane. Enough to keep the shadow side off black, not enough
          // to make a dead bush glow like a lampshade.
-         reflectedLight.directDiffuse +=
-           vegDryShading(normalize(vVegNW), normalize(cameraPosition - vVegWorld), diffuseColor.rgb, 0.22, vegSunVis);`,
+         {
+           vec3 vegToCam = cameraPosition - vVegWorld;
+           float vegDist = length(vegToCam);
+           reflectedLight.directDiffuse +=
+             vegDryShading(normalize(vVegNW), vegToCam / max(vegDist, 1e-4), diffuseColor.rgb, 0.22, vegSunVis, vegDist);
+         }`,
       );
     mat.userData.shader = shader;
   };
@@ -130,7 +155,10 @@ function branchMaterial(uniforms, color, flex, roughness = 0.88) {
     color: new THREE.Color().setRGB(color[0], color[1], color[2], THREE.LinearSRGBColorSpace),
     roughness,
     metalness: 0.0,
-    envMapIntensity: 0.9,
+    // A twig inside a thorn bush sees a fraction of the sky; the bush shadows
+    // itself. 0.9 was close enough to open-sky that a dead bush held its own
+    // against sunlit sand at night, which is how the critics caught it.
+    envMapIntensity: 0.62,
     dithering: true,
   });
   injectBranchWind(mat, uniforms, flex);
@@ -155,6 +183,12 @@ function scatterAnnulus({ field, rng, rInner, rOuter, candidates, accept, varian
   const perVariant = variants.map(() => []);
   const r2i = rInner * rInner;
   const r2o = rOuter * rOuter;
+  // Log-uniform over the scale range. Round 2 drew it linearly over a 2x span,
+  // so nearly every instance came out within 30% of the mean and the field read
+  // as one stamped size at one density — the critics' third finding. A log draw
+  // over a 3x span spends as much of its budget on the runts as on the big ones,
+  // and the runts are what make the big ones look big.
+  const logRatio = Math.log(scaleRange[1] / scaleRange[0]);
   for (let i = 0; i < candidates; i++) {
     const a = rng() * Math.PI * 2;
     const r = Math.sqrt(r2i + (r2o - r2i) * rng());
@@ -163,11 +197,13 @@ function scatterAnnulus({ field, rng, rInner, rOuter, candidates, accept, varian
     const s = field.density(x, z);
     if (!accept(s, rng, x, z, r)) continue;
     const v = Math.floor(rng() * variants.length);
-    const scale = scaleRange[0] + (scaleRange[1] - scaleRange[0]) * rng();
+    const scale = scaleRange[0] * Math.exp(logRatio * rng());
     _q.setFromUnitVectors(_up, s.normal).slerp(_qIdentity, 1 - tilt);
     _q.multiply(_qYaw.setFromAxisAngle(_up, rng() * Math.PI * 2));
     _v.set(x, s.height - sink * scale, z);
-    _scale.set(scale * (0.86 + rng() * 0.28), scale, scale * (0.86 + rng() * 0.28));
+    // Squashed on two independent horizontal axes and in height: a handful of
+    // geometry variants all standing at the same proportions is still one shape.
+    _scale.set(scale * (0.76 + rng() * 0.46), scale * (0.80 + rng() * 0.44), scale * (0.76 + rng() * 0.46));
     perVariant[v].push(_m.compose(_v, _q, _scale).clone());
   }
   return perVariant;
@@ -238,14 +274,20 @@ export function createScrub(field, uniforms, seed = 20260731) {
   // Scale tops out just under 1.6: this is *low* dead scrub, knee to waist. A
   // 2.5 m specimen reads as a dead sapling and steals the dead trees' job.
   const scrubGeos = [0, 1, 2, 3].map((i) => growPlant(scrubParams(4100 + i * 137)));
-  const scrubMat = branchMaterial(uniforms, [0.330, 0.272, 0.176], 0.055, 0.92);
+  const scrubMat = branchMaterial(uniforms, BRANCH_COLORS.scrub, 0.055, 0.92);
   const scrubDepth = matchingDepthMaterial(uniforms, 0.055);
   const near = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 62, candidates: 1500,
+    field, rng, rInner: 0, rOuter: 62, candidates: 2600,
     // Scrub survives where grass is only patchy — the drier margins — and it is
     // the one thing that keeps growing on ground too steep for tussock.
-    accept: (s, r) => s.slope < 0.46 && r() < 0.10 + s.density * 1.05,
-    variants: scrubGeos, tilt: 0.5, scaleRange: [0.55, 1.55], sink: 0.05,
+    //
+    // The constant floors in every one of these tests used to be the whole
+    // problem: at `0.10 + density*1.05` a tenth of the candidates landed on
+    // ground the mask had rejected outright, which put an even pepper over the
+    // entire pan no matter what the density field said. The floor is now small
+    // enough to read as strays rather than as a texture.
+    accept: (s, r) => r() < 0.012 + Math.pow(s.woody, 0.85) * 0.95,
+    variants: scrubGeos, tilt: 0.5, scaleRange: [0.42, 1.60], sink: 0.05,
   });
   scrubGeos.forEach((g, i) => add(buildTiles(g, near[i], scrubMat, scrubDepth, `scrub-n${i}`, 500, 62)));
   counts.scrubNear = near.reduce((a, b) => a + b.length, 0);
@@ -257,19 +299,19 @@ export function createScrub(field, uniforms, seed = 20260731) {
   // What has to survive at range is *projected area*, so the distant tiers are
   // domes of wide arching ribbons instead: a metre and a half of silhouette for
   // ten triangles.
-  const bushMat = branchMaterial(uniforms, [0.300, 0.244, 0.152], 0.05, 0.94);
+  const bushMat = branchMaterial(uniforms, BRANCH_COLORS.bush, 0.05, 0.94);
   bushMat.side = THREE.DoubleSide;
   const bushDepth = matchingDepthMaterial(uniforms, 0.05);
   bushDepth.side = THREE.DoubleSide;
 
   const bushGeoNear = [0, 1].map((i) => buildTuft({
-    blades: 9, segments: 3, seed: 8810 + i * 57,
-    minH: 0.34, maxH: 0.66, width: 0.075, spread: 0.16, curve: 1.15, dome: 0.7,
+    blades: 9, segments: 2, seed: 8810 + i * 57,
+    minH: 0.34, maxH: 0.66, width: 0.085, spread: 0.16, curve: 1.15, dome: 0.7,
   }));
   const bushNear = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 145, candidates: 13000,
-    accept: (s, r) => s.slope < 0.60 && r() < 0.02 + s.woody * 0.50,
-    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.75, 1.90], sink: 0.05,
+    field, rng, rInner: 0, rOuter: 145, candidates: 22000,
+    accept: (s, r) => r() < 0.003 + Math.pow(s.woody, 0.85) * 0.50,
+    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.58, 2.05], sink: 0.05,
   });
   bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMat, bushDepth, `bush-n${i}`, 500, 48)));
   counts.bushNear = bushNear.reduce((a, b) => a + b.length, 0);
@@ -282,9 +324,9 @@ export function createScrub(field, uniforms, seed = 20260731) {
     minH: 0.42, maxH: 0.86, width: 0.185, spread: 0.26, curve: 1.25, dome: 0.85,
   });
   const bushMid = scatterAnnulus({
-    field, rng, rInner: 130, rOuter: 340, candidates: 26000,
-    accept: (s, r) => s.slope < 0.70 && r() < 0.03 + s.woody * 0.50,
-    variants: [bushGeoMid], tilt: 0.5, scaleRange: [0.95, 2.30], sink: 0.06,
+    field, rng, rInner: 130, rOuter: 340, candidates: 44000,
+    accept: (s, r) => r() < 0.004 + Math.pow(s.woody, 0.85) * 0.74,
+    variants: [bushGeoMid], tilt: 0.5, scaleRange: [0.72, 2.55], sink: 0.06,
   });
   add(buildTiles(bushGeoMid, bushMid[0], bushMat, null, 'bush-m', 400));
   counts.bushMid = bushMid[0].length;
@@ -294,46 +336,51 @@ export function createScrub(field, uniforms, seed = 20260731) {
     minH: 0.65, maxH: 1.15, width: 0.40, spread: 0.52, curve: 1.30, dome: 0.95,
   });
   const bushFar = scatterAnnulus({
-    field, rng, rInner: 320, rOuter: 1050, candidates: 95000,
-    accept: (s, r) => s.slope < 0.78 && r() < 0.02 + s.woody * 0.42,
-    variants: [bushGeoFar], tilt: 0.45, scaleRange: [1.25, 3.00], sink: 0.10,
+    field, rng, rInner: 320, rOuter: 1050, candidates: 150000,
+    accept: (s, r) => r() < 0.0015 + Math.pow(s.woody, 0.85) * 0.50,
+    variants: [bushGeoFar], tilt: 0.45, scaleRange: [0.95, 3.20], sink: 0.10,
   });
   add(buildTiles(bushGeoFar, bushFar[0], bushMat, null, 'bush-f', 560));
   counts.bushFar = bushFar[0].length;
 
   // ---- dry brush balls ----------------------------------------------------
   const brushGeos = [0, 1, 2].map((i) => growPlant(brushParams(7700 + i * 91)));
-  const brushMat = branchMaterial(uniforms, [0.430, 0.352, 0.210], 0.03, 0.95);
+  const brushMat = branchMaterial(uniforms, BRANCH_COLORS.brush, 0.03, 0.95);
   const brushDepth = matchingDepthMaterial(uniforms, 0.03);
   const brush = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 190, candidates: 3000,
+    field, rng, rInner: 0, rOuter: 190, candidates: 3600,
     // Brush blows about and snags on open ground and against anything that
-    // breaks the wind, rather than sitting in the wet lines.
-    accept: (s, r) => s.slope < 0.30 && r() < 0.04 + (1 - s.density) * 0.16 + s.shelter * 0.55,
-    variants: brushGeos, tilt: 0.85, scaleRange: [0.60, 1.35],
+    // breaks the wind, rather than sitting in the wet lines. It is the one
+    // scatter that legitimately covers open ground, so it keeps a real floor —
+    // but it now needs the stand field's permission like everything else, or
+    // it re-creates the uniform pepper on its own.
+    accept: (s, r) => s.slope < 0.30 && r() < (0.05 + (1 - s.density) * 0.30) * s.stand + s.shelter * 0.55,
+    variants: brushGeos, tilt: 0.85, scaleRange: [0.45, 1.45],
   });
   brushGeos.forEach((g, i) => add(buildTiles(g, brush[i], brushMat, brushDepth, `brush-${i}`, 600)));
   counts.brush = brush.reduce((a, b) => a + b.length, 0);
 
   // ---- dead trees ---------------------------------------------------------
   const treeGeos = [0, 1].map((i) => growPlant(deadTreeParams(3300 + i * 211)));
-  const treeMat = branchMaterial(uniforms, [0.352, 0.296, 0.222], 0.045, 0.84);
+  const treeMat = branchMaterial(uniforms, BRANCH_COLORS.tree, 0.045, 0.84);
   const treeDepth = matchingDepthMaterial(uniforms, 0.045);
   const treeNear = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 175, candidates: 2600,
-    // Rare, and only where there is enough water to have grown one.
-    accept: (s, r) => s.slope < 0.34 && s.density > 0.26 && r() < 0.010 + s.density * 0.050,
-    variants: treeGeos, tilt: 0.35, scaleRange: [1.05, 2.40], sink: 0.08,
+    field, rng, rInner: 0, rOuter: 175, candidates: 3600,
+    // Rare, and only where there is enough water to have grown one — which now
+    // means the drainage lines specifically, since that is where the density
+    // field puts its water.
+    accept: (s, r) => s.slope < 0.34 && s.density > 0.20 && r() < 0.004 + s.density * 0.075,
+    variants: treeGeos, tilt: 0.35, scaleRange: [0.85, 2.55], sink: 0.08,
   });
   treeGeos.forEach((g, i) => add(buildTiles(g, treeNear[i], treeMat, treeDepth, `tree-n${i}`, 500, 130)));
 
   const treeL1 = [growPlant(deadTreeParamsL1(3901))];
   const treeFar = scatterAnnulus({
-    field, rng, rInner: 165, rOuter: 760, candidates: 9000,
+    field, rng, rInner: 165, rOuter: 760, candidates: 13000,
     // Bias hard onto breaks of slope out here: a bare tree only pays for itself
     // when it is standing against the sky.
-    accept: (s, r) => s.slope > 0.05 && s.slope < 0.40 && s.density > 0.20 && r() < 0.006 + s.density * 0.035,
-    variants: treeL1, tilt: 0.3, scaleRange: [1.30, 2.90], sink: 0.10,
+    accept: (s, r) => s.slope > 0.04 && s.slope < 0.32 && s.density > 0.14 && r() < 0.004 + s.density * 0.11,
+    variants: treeL1, tilt: 0.3, scaleRange: [1.05, 3.15], sink: 0.10,
   });
   add(buildTiles(treeL1[0], treeFar[0], treeMat, null, 'tree-f', 560));
   counts.trees = treeNear.reduce((a, b) => a + b.length, 0) + treeFar[0].length;

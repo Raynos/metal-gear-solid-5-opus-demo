@@ -109,8 +109,12 @@ function weaponPose(pos, dir) {
 }
 
 const WEAPON_POSES = {
-  // Patrol carry: both hands on, muzzle forward and down.
-  ready: weaponPose([0.14, 1.19, -0.21], [-0.36, -0.36, -0.86]),
+  // Low ready. The weapon lies across the chest rather than hanging off the
+  // firing hand: butt tucked into the shoulder pocket, muzzle 20 degrees below
+  // horizontal and swung across to the support side. Round 3 carried it 8 cm
+  // lower and 4 cm further out, which put the whole rifle behind the hip in the
+  // gameplay framing and left both arms reading as hanging.
+  ready: weaponPose([0.105, 1.305, -0.225], [-0.40, -0.345, -0.85]),
   // Shouldered.
   aim: weaponPose([0.115, 1.4, -0.3], [-0.03, -0.02, -1.0]),
   // Crouched carry sits lower and tighter to the body.
@@ -485,10 +489,19 @@ export class Animator {
     // when the support hand crosses the body (sprint carry, weapon transitions)
     // — the pole ends up nearly parallel to the limb axis and the bend plane is
     // undefined.
+    //
+    // Elbows OUT, not tucked: a low-ready carry drives both elbows away from
+    // the ribs, and the triangle that makes between the forearms and the
+    // weapon is the single clearest silhouette cue that a figure is holding
+    // something. Round 3 dropped the pole 0.55 m below the limb midpoint with
+    // only a small lateral bias, which folded both arms flat against the torso
+    // and read as hanging. The support arm gets the wider bias — it is the one
+    // that has to reach across the body to the handguard.
+    const out = side === 'L' ? 0.40 : 0.30;
     this._t3.set(
-      (this._t2.x + wrist.x) * 0.5 + cosY * sgn * 0.2 + sinY * 0.16,
-      (this._t2.y + wrist.y) * 0.5 - 0.55,
-      (this._t2.z + wrist.z) * 0.5 - sinY * sgn * 0.2 + cosY * 0.16,
+      (this._t2.x + wrist.x) * 0.5 + cosY * sgn * out + sinY * 0.12,
+      (this._t2.y + wrist.y) * 0.5 - 0.26,
+      (this._t2.z + wrist.z) * 0.5 - sinY * sgn * out + cosY * 0.12,
     );
     twoBoneIK(shoulder, elbow, wrist, this._t3, this.armLen.upper, this.armLen.lower);
     setWorldQuaternion(hand, q);

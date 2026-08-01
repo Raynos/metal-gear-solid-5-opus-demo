@@ -34,7 +34,8 @@ export const TIME_OF_DAY = {
   dawn: {
     sunElevation: 4.0,
     sunAzimuth: 96,
-    sunColor: [1.0, 0.62, 0.36],
+    // Round 4 integration: 0.62/0.36 -> 0.68/0.46, for the same reason as dusk.
+    sunColor: [1.0, 0.68, 0.46],
     sunIntensity: 6.1,
     skyTurbidity: 4.2,
     rayleigh: 2.6,
@@ -52,7 +53,12 @@ export const TIME_OF_DAY = {
     // Nudged warm in round 3 to hold red above blue at noon once the cloud
     // deck and the dust in-scatter were both pulled back: the shot's margin
     // had fallen to under three counts.
-    sunColor: [1.0, 0.938, 0.852],
+    // Round 4 integration: 0.938/0.852 -> 0.925/0.812. Noon is the one daylight
+    // frame with a third of its area on clear blue sky, so it carries the least
+    // warmth of the set; once the print's white balance came down to fix the
+    // hazy frames, the noon frame fell to R-B +6.5, under the +8 floor. This
+    // puts the warmth back on the beam, where it belongs, and only at noon.
+    sunColor: [1.0, 0.915, 0.782],
     sunIntensity: 9.5,
     // Afghan noon is DUSTY, not alpine. Round 1's clean low-turbidity blue was
     // the last daylight frame still measuring blue above red; raising the
@@ -70,7 +76,12 @@ export const TIME_OF_DAY = {
   afternoon: {
     sunElevation: 27.0,
     sunAzimuth: 244,
-    sunColor: [1.0, 0.87, 0.70],
+    // Round 4 integration: was [1.0, 0.87, 0.70], R/B 1.43 — a ~3300 K beam at
+    // 27 degrees of elevation, which is roughly two air masses too much
+    // reddening. Multiplied into sand at R/B 1.46 it made sunlit ground
+    // R/B 2.08, and every afternoon frame inherited it: vista measured mean
+    // R-B +27.3 and outpost +26.4 against a +8..+18 target. 4800 K instead.
+    sunColor: [1.0, 0.915, 0.795],
     sunIntensity: 8.5,
     skyTurbidity: 3.8,
     rayleigh: 1.9,
@@ -88,7 +99,10 @@ export const TIME_OF_DAY = {
     // Round 3: was [1.0, 0.45, 0.20]. A sun that saturated turned the whole
     // dusk frame into a sunset postcard — the ridge shot measured R151/B94,
     // which is the orange blockbuster grade this file rules out on line 10.
-    sunColor: [1.0, 0.56, 0.34],
+    // Round 4 integration: 0.56/0.34 -> 0.63/0.44. The ridge frame still came
+    // back at mean R-B +47 with a bottom third crushed to black; a 2 degree sun
+    // is genuinely red but this is a beam, not a filter over the whole image.
+    sunColor: [1.0, 0.63, 0.44],
     sunIntensity: 5.4,
     skyTurbidity: 5.0,
     rayleigh: 3.1,
@@ -104,16 +118,23 @@ export const TIME_OF_DAY = {
     sunElevation: -14.0,
     sunAzimuth: 300,
     sunColor: [0.46, 0.56, 0.82],
-    sunIntensity: 0.95,
+    // Round 4: 0.95 -> 2.9 with the exposure cut from 1.40 to 0.72. The night
+    // frame spanned 0.66 stops end to end — sky 0.0410, a moonlit wall 0.0397,
+    // that wall's own shadow face 0.0505 (brighter than its lit face) and open
+    // ground 0.0549. Everything was the same value because a big exposure was
+    // being used to lift a weak key, which lifts the fill by exactly as much.
+    // Raising the moon and stopping down instead buys real moonlight: the same
+    // wall now reads, and the sky sits under it instead of level with it.
+    sunIntensity: 2.9,
     skyTurbidity: 2.2,
     rayleigh: 0.9,
     mieCoefficient: 0.003,
     mieDirectionalG: 0.78,
     ambientColor: [0.18, 0.24, 0.40],
-    ambientIntensity: 1.0,
+    ambientIntensity: 0.28,
     fogColor: [0.13, 0.16, 0.24],
     fogDensity: 0.00013,
-    exposure: 1.40,
+    exposure: 0.72,
   },
 };
 
@@ -135,8 +156,17 @@ export const GRADE = {
   // display space it was written for, that compensation arrived at full
   // strength and vista measured R-B +40 — the orange-blockbuster look the top
   // of this file rules out. These are the values that land it back at +14.
-  shadowTint: [0.940, 0.980, 1.060],
-  midTint: [1.028, 1.000, 0.975],
+  // Round 4: 0.940/0.980/1.060 -> 0.926/0.978/1.078, alongside widening the
+  // band this tint is applied over (see buildGradeLUT). The scene-side fix
+  // (a sky-coloured ambient) does the heavy lifting; this is the print.
+  shadowTint: [0.926, 0.978, 1.078],
+  // Round 4 integration: 1.028/0.975 -> 1.022/0.982. Ablated on the shipped
+  // frames (grade off / white balance off / split tone off, same scene), the
+  // vista's own pixels measure R-B +4.8 and the outpost's +7.9 — the LANDSCAPE
+  // is already sitting inside the +8..+18 target. The print was adding +14 on
+  // top of it. Trimming the two warm terms is therefore the only honest fix;
+  // cooling the ground further would have made the scene itself wrong.
+  midTint: [1.022, 1.000, 0.982],
   highlightTint: [1.015, 1.0, 0.975],
   // Round 3: saturation 0.90 -> 0.86 and lift 0.034 -> 0.050. The warmth fix
   // landed (every daylight frame now measures red above blue) but it landed
@@ -177,16 +207,35 @@ export const GRADE = {
   // pixels while the outpost piled its highlights on hard white.
   whitePoint: 5.2,
   shoulder: 0.30,
+  /**
+   * How much chroma is pulled out of the highlights before the tonemap, as a
+   * multiplier on smoothstep(0.75, 1.6, maxComponent) of the linear signal.
+   * Film bleaches toward white at the shoulder; a tonemapper without this
+   * drives hot pixels toward their dominant primary, which is why every
+   * round-3 frame clipped in red (R 255) while blue never passed 243.
+   */
+  highlightDesat: 0.85,
   // Global white balance applied before the split tone. MGSV Afghanistan
   // daylight has red above blue in every frame; round 1 had blue above red in
   // every frame, and no per-band tint was ever going to fix that.
-  warmth: [1.058, 1.0, 0.905],
+  // Round 4 integration: 1.058/0.905 (a 16.9% R-over-B tilt) -> 1.042/0.938
+  // (11.1%). The scene-side white balance was fixed this round — the sky is
+  // genuinely blue and the sun is no longer a 3300 K filter — so the print no
+  // longer has to carry the warmth on its own, and at the old value it was
+  // adding ~9 counts of R-B to a mid-grey before the split tone had run.
+  warmth: [1.034, 1.0, 0.950],
 };
 
 /** Terrain / material palette (linear-space albedo). */
 export const PALETTE = {
-  sandLight: [0.62, 0.545, 0.425],
-  sandDark: [0.44, 0.375, 0.28],
+  // Round 4 integration: sand was R/B 1.46 (light) and 1.57 (dark). Multiplied
+  // by an afternoon beam it put sunlit ground at R/B 1.84, and since mean R-B
+  // in 8-bit scales with LEVEL as well as with chroma, the brightest surface in
+  // the game was also the one contributing most of the frame's warmth — vista
+  // and outpost measured +27 against a +8..+18 target. Afghan sand is a pale
+  // grey-khaki; these are R/B 1.28 / 1.37, which is still unambiguously warm.
+  sandLight: [0.60, 0.545, 0.470],
+  sandDark: [0.43, 0.375, 0.315],
   rockLight: [0.42, 0.40, 0.365],
   rockDark: [0.24, 0.225, 0.205],
   rockRed: [0.40, 0.30, 0.225],
@@ -218,15 +267,27 @@ export const LIGHT_TRANSPORT = {
    * Effective diffuse albedo of the landscape, linear. Sand plus gravel plus
    * rock, warm-tilted. Drives the ground-bounce radiance that fills undersides.
    */
-  groundAlbedo: [0.54, 0.44, 0.295],
+  // Round 4 integration: 0.295 -> 0.345 in blue, tracking PALETTE.sandLight.
+  // This is the radiance the ground bounce fills every shaded surface with, so
+  // leaving it at R/B 1.83 while the ground it models moved to 1.28 would put
+  // the warm pedestal back into exactly the shade faces this round just fixed.
+  groundAlbedo: [0.54, 0.44, 0.345],
   /**
    * How high the surrounding ridgelines sit above the local horizon, degrees.
    * In an Afghan valley this much of the "sky" hemisphere is actually sunlit
    * rock, and it is the single biggest reason a desert shadow reads dusty
    * rather than blue. sin^2 of this angle is the fraction of a horizontal
    * surface's ambient that comes from warm terrain instead of cold sky.
+   *
+   * Round 4: 33 -> 11. A horizontal surface only lost 30% of its fill to this,
+   * but a VERTICAL one loses far more — a vertical cosine lobe is concentrated
+   * at low elevations, so a 33 degree skyline is most of what an escarpment
+   * flank can see. Measured on a grey sphere under the afternoon preset, the
+   * flank turned away from the sun came back at hue 19 deg (warmer than the
+   * sunlit flank at 32.7) with only 12.9 degrees between them. This is the
+   * single biggest cause.
    */
-  ridgeElevation: 33,
+  ridgeElevation: 11,
   /**
    * Rough-ground interreflection. A flat Lambertian plane cannot see itself,
    * but sand and gravel have micro-relief and every point sees lit neighbours.
@@ -240,14 +301,60 @@ export const LIGHT_TRANSPORT = {
   // was landing at B/R 1.00 — neutral grey, not the cool sky-filled shadow the
   // target calls for. Less warm interreflection pedestal puts more of the fill
   // back on the sky, which is where the 1.10-1.20 band comes from.
-  groundCoupling: 0.40,
+  //
+  // Round 4: 0.40 -> 0.11. This term is added ISOTROPICALLY, i.e. it lands on
+  // the sky directions too, so at 0.40 it was a warm pedestal sitting on top of
+  // the blue dome: the noon zenith fill measured B/R 1.018 — dead neutral under
+  // a clear blue sky. Interreflection is real but it is a few per cent of the
+  // budget, not forty.
+  groundCoupling: 0.11,
   /**
-   * Target key:fill contrast in linear radiance. A hazy desert midday is about
-   * 5:1 (two stops); near the horizon the sky takes over and it flattens out.
+   * Reflectivity of the ground bounce as a whole. Sand does not return the
+   * albedo of a lab swatch: it is rough, it self-shadows at the grain scale,
+   * and half of what a wall sees below its horizon is the wall's own footing.
    */
-  keyFillHigh: 5.2,
-  keyFillLow: 2.6,
-  keyFillNight: 3.2,
+  bounceStrength: 0.82,
+  /**
+   * Fraction of the landscape a shaded surface can see that is actually taking
+   * the key, as `base + slope * sin(solarElevation)`. A rough landscape
+   * shadows itself; at a 27 degree sun most of the terrain is turned away from
+   * the sun too, so what bounces back is sky arriving twice, not sun arriving
+   * once. Round 3 lit the whole ground hemisphere with the full key, which is
+   * the second reason a shade face measured warmer than the sunlit one.
+   */
+  terrainLitBase: 0.24,
+  terrainLitSlope: 0.62,
+  /**
+   * How far the ground has washed toward the sky's own colour by the time it
+   * reaches the horizon. A vertical surface's ambient is roughly half sky and
+   * half ground, and nearly all of that ground is far away — seen through
+   * kilometres of the same dust that turns a distant ridge pale blue-grey. This
+   * is what lets a wall in shade go cool while the sand under it stays khaki.
+   */
+  groundHaze: 0.62,
+  /**
+   * Target key:fill contrast in linear radiance, as (key + fill) / fill on a
+   * horizontal surface.
+   *
+   * Round 4 re-derived these from the illuminance split rather than by eye. A
+   * clear midday puts ~89% of the horizontal illuminance in the direct beam and
+   * ~11% in the sky, which is 9:1; a dusty one is a little flatter. Near the
+   * horizon the beam is attenuated by five air masses and the sky takes over,
+   * which is ~3:1. Round 3's 5.2/2.6 was under a stop and a half of separation
+   * at noon and delivered a frame with no dynamic range at all.
+   */
+  keyFillHigh: 8.6,
+  keyFillLow: 2.8,
+  keyFillNight: 3.6,
+  /**
+   * Width, in N.L, of the shading-normal terminator roll-in on the key light.
+   * max(0, N.L) is a kink, and on a coarse mesh the entire lit-to-shade
+   * transition collapses into the two pixels where it crosses zero — measured
+   * on ridge.png at y=330: 114 luminance codes across 4 pixels. A sun with a
+   * real angular diameter, seen against an interpolated normal, rolls in over
+   * a band; this is that band.
+   */
+  terminatorWidth: 0.12,
   /**
    * Angular diameter of the effective light source, radians. Much larger than
    * the true 0.53 deg sun because the circumsolar aureole in a dusty sky is
@@ -255,15 +362,30 @@ export const LIGHT_TRANSPORT = {
    */
   sunAngularSize: 0.036,
   moonAngularSize: 0.014,
-  /** Cloud shadows: a scrolling deck projected onto the landscape along the sun. */
-  cloudDeck: 1600,
-  cloudCoverage: 0.46,
-  cloudShadowStrength: 0.55,
-  // 1/scale is the size of one noise cell in metres: 0.0026 puts the base
-  // octave at ~385 m, which lands three or four distinct patches across a
-  // valley at this framing. The round-1-sized 1300 m cells simply put the whole
-  // foreground in one shadow and read as a grading error.
-  cloudScale: 0.0026,
+  /**
+   * Cloud shadows: the volumetric pass's own weather field projected onto the
+   * landscape along the sun. These are fallbacks — when the volumetrics module
+   * is installed, the deck altitude and the coverage are read from ITS
+   * per-time-of-day numbers so the shadow and the cloud cannot disagree.
+   */
+  cloudDeck: 1800,
+  cloudCoverage: 0.30,
+  // Round 4: 0.55 -> 0.92. At half strength the patches read as a soft grade
+  // rather than as cloud, and MGSV's valleys are dramatic precisely because a
+  // passing deck takes the key off the ground almost completely.
+  cloudShadowStrength: 0.92,
+  /**
+   * Optical depth of the deck at which the ground starts to lose the sun. Lower
+   * puts more of the valley floor under shade; this is the one knob that sets
+   * what fraction of the landscape is in cloud shadow at a given coverage.
+   * Swept against the vista framing: 0.30 leaves 2% of the valley floor in
+   * shade, 0.14 leaves 32%, 0.06 leaves 63%.
+   */
+  cloudShadowBias: 0.14,
+  // The volumetric weather map wraps over 46 km; this is its uv scale in 1/m.
+  // Round 3 sampled a private value-noise field at ~385 m cells, so the shade
+  // on the ground belonged to no cloud in the sky.
+  cloudScale: 1 / 46000,
   cloudSpeed: [9.0, 3.5],
   /** Specular-only IBL weight once the diffuse comes from the light probe. */
   specularIBL: 1.0,

@@ -45,13 +45,20 @@ export async function install(world) {
     uSunDir: { value: new THREE.Vector3(0.4, 0.5, -0.75) },
     uSunColor: { value: new THREE.Vector3(1, 1, 1) },
     uSkyColor: { value: new THREE.Vector3(0.10, 0.13, 0.18) },
-    // (through-scatter gain, wrapped-sky gain). Both are deliberately modest.
-    // The sun is 5.0 in physical units here, so a through-scatter gain near 1
-    // adds more light than the direct term ever could and every blade turns
-    // into a glowing white spike — which is exactly what the first pass did.
-    // The sky term is a bounce between neighbouring blades, not a second
-    // ambient light: push it and the field goes milky and double-counts the IBL.
-    uTranslucency: { value: new THREE.Vector2(0.52, 0.18) },
+    // (through-scatter gain, wrapped-sky gain).
+    //
+    // Round 2 called 0.52/0.18 "deliberately modest" and it was not. With the
+    // forward lobe on top, the through-scatter peaked at 0.83 of a full frontal
+    // sun hit — added on top of the standard BRDF, so a back-lit blade received
+    // nearly twice what a front-lit one did. Under the dawn camera, which looks
+    // straight into a 6.1-unit sun across the valley, that is the white
+    // confetti. And the sky half is a constant that never reaches zero: it is
+    // the reason a dead branch measured luminance 80 in a NIGHT frame.
+    //
+    // 0.26 is roughly the transmittance of a dry straw blade. 0.06 is what is
+    // left of the wrapped-sky term once the IBL (envMapIntensity, also pulled
+    // down) is allowed to do the ambient work it is there to do.
+    uTranslucency: { value: new THREE.Vector2(0.26, 0.06) },
     uHeightMap: { value: field.heightTex },
     uSurfMap: { value: field.surfTex },
     uPadMap: { value: field.padTex },

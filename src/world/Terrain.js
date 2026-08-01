@@ -210,14 +210,28 @@ const MICRO_FIELD = new Float32Array(MICRO_N * MICRO_N * 4);
     const v = j * inv;
     for (let i = 0; i < N; i++) {
       const u = i * inv;
-      // Broad drift + braid, then a shallow directional ripple set. Integer
-      // wave numbers so the ripple tiles with the noise.
+      // Broad drift plus braid. Both are NOISE. Round 3 mixed in a directional
+      // plane wave here — sin((u*27 + v*10)*2pi), a 2.2 m ripple — and that one
+      // term was the source of the swirling wood-grain arcs the critics kept
+      // reading off the open pan: a strictly periodic world-space signal beats
+      // against the pixel grid under perspective, and a perspective beat is not
+      // straight bands, it is exactly those curved fans. Measured by rendering
+      // the same viewpoint with and without it. Directional relief now comes
+      // from the ripple tile, which is quasi-periodic and phase-wandered and
+      // therefore has nothing to beat against.
+      //
+      // NOTHING here may go below ~1.6 m. This field is real geometry: the
+      // vertex shader displaces by it and level 0 of the clipmap is a 0.5 m
+      // lattice, so a 0.8 m octave is 1.6 vertices per period and aliases into
+      // metre-wide curved bands across the whole pan — measured, by adding
+      // exactly such an octave and rendering the open pan with every shading
+      // layer ablated in turn: the bands survived all of them, because they
+      // were in the mesh. Sub-metre directional relief belongs to the ripple
+      // tile, which is a normal map at 512 texels per 1.6 m and cannot alias.
       const broad = tileFbm(u, v, 6, 3);
       const braid = tileFbm(u * 1.0 + 0.31, v * 1.0 + 0.77, 20, 2);
-      const rip = Math.sin((u * 27 + v * 10) * Math.PI * 2);
-      // Drifts come and go; a uniform ripple field over 6 km reads as corduroy.
       const env = clamp(tileFbm(u + 0.13, v - 0.41, 3, 2) * 1.7 + 0.5, 0, 1);
-      h[j * N + i] = (broad * 0.55 + braid * 0.30 + rip * 0.15) * (0.22 + 0.78 * env) * 0.062;
+      h[j * N + i] = (broad * 0.60 + braid * 0.40) * (0.22 + 0.78 * env) * 0.062;
     }
   }
   const cell = MICRO_PERIOD / N;
@@ -262,6 +276,27 @@ const MICRO_GLSL = /* glsl */ `
 `;
 
 // ---------------------------------------------------------------------------
+// Wind frame
+// ---------------------------------------------------------------------------
+//
+// The prevailing wind. Ripple crests run PERPENDICULAR to it, so the whole pan
+// carries one consistent grain the eye can read as a direction. That direction
+// is the single strongest "this is desert sand and not a concrete slab" tell
+// there is, and no isotropic clast field can produce it: a clast normal has the
+// same statistics along every axis by construction, which is exactly why the
+// ground measured flatter than the sandbags standing on it.
+const WIND = 0.38; // rad, ~22 deg
+const WIND_C = Math.cos(WIND);
+const WIND_S = Math.sin(WIND);
+
+// One ripple tile is RIPPLE_TILE metres square and holds RIPPLE_TILE/0.10 m
+// transverse ripples plus a megaripple set at 5x the spacing. 512 texels over
+// 1.6 m is 3.1 mm per texel — 32 texels per ripple, which mips and filters
+// cleanly instead of beating against the pixel grid the way a 0.36 m tile did.
+const RIPPLE_N = 512;
+const RIPPLE_TILE = 1.6;
+
+// ---------------------------------------------------------------------------
 // Heightfield simulation
 // ---------------------------------------------------------------------------
 
@@ -271,8 +306,17 @@ const MICRO_GLSL = /* glsl */ `
  * and it is dirt cheap compared to a droplet sim.
  *
  * `deposit` accumulates where material lands — that is the scree mask.
+ *
+ * `talus` may be a number or a per-cell Float32Array. Per-cell is the important
+ * case: the angle of repose is a MATERIAL property, and running the whole map at
+ * 0.62 (32 degrees, loose scree) is what turned every summit into a smooth pale
+ * dome. Bedrock stands at 55-70 degrees; only weak beds and fines run. Feeding
+ * the stratigraphic hardness in here is what produces cliff, bench and talus
+ * apron from one field instead of three decorations.
  */
 function thermalErode(h, N, cell, passes, talus, rate, deposit) {
+  const talArr = typeof talus === 'number' ? null : talus;
+  const talNum = talArr ? 0 : talus;
   const dh = new Float32Array(h.length);
   for (let p = 0; p < passes; p++) {
     dh.fill(0);
@@ -287,7 +331,7 @@ function thermalErode(h, N, cell, passes, talus, rate, deposit) {
         const d1 = hc - h[c + 1];
         const d2 = hc - h[c - N];
         const d3 = hc - h[c + N];
-        const t = talus * cell;
+        const t = (talArr ? talArr[c] : talNum) * cell;
         if (d0 > t) { total += d0 - t; if (d0 > maxDiff) maxDiff = d0; }
         if (d1 > t) { total += d1 - t; if (d1 > maxDiff) maxDiff = d1; }
         if (d2 > t) { total += d2 - t; if (d2 > maxDiff) maxDiff = d2; }
@@ -580,6 +624,9 @@ class Grid {
     this.rock = new Float32Array(n * n);
     this.scree = new Float32Array(n * n);
     this.flow = new Float32Array(n * n);
+    // Published drainage/deposition fields — see `surfaceAt`.
+    this.accum = new Float32Array(n * n);
+    this.deposit = new Float32Array(n * n);
     this.ao = new Float32Array(n * n);
     this.curv = new Float32Array(n * n);
     this.nx = new Float32Array(n * n);
@@ -637,6 +684,7 @@ export class Terrain {
     this._buildMicroTexture();
     this._buildDetailTextures();
     this._buildGritTextures();
+    this._buildRippleTexture();
     this._buildMaterial();
     this._buildClipmap();
   }
@@ -664,7 +712,13 @@ export class Terrain {
     return Math.hypot(ex, ez) + w0 * 560 + w1 * 210 + w2 * 70;
   }
 
-  _base(x, z) {
+  /**
+   * @param {object} [out] receives `hard` — the stratigraphic resistance of the
+   *   bed outcropping here, 0 (fines / weak marl) to 1 (cliff-forming rock).
+   *   `_buildFar` hands it straight to the thermal pass as a per-cell talus
+   *   angle, which is what turns a smooth dome into cliff + bench + apron.
+   */
+  _base(x, z, out) {
     const S = 1 / 2600;
 
     // Strike frame. s runs along the range, t across it.
@@ -698,8 +752,12 @@ export class Terrain {
 
     // Massif field: which stretches of the belt actually stand up. Squared, so
     // a few dominant massifs tower and the rest are subordinate foothills.
+    // Round 4 widened the spread (was 0.16 + m^2.1 * 2.05, capped 1.45). A
+    // skyline of similarly-sized cones is one of the two things every critic
+    // read off the ridge shot; the fix is not more noise, it is a bigger ratio
+    // between the dominant massifs and the subordinate ground between them.
     const massifN = clamp(fbm2(qs * S * 0.46 + 61.0, qt * S * 0.80 - 43.0, 4) * 0.5 + 0.5, 0, 1);
-    mask = Math.min(mask * (0.16 + Math.pow(massifN, 2.1) * 2.05), 1.45);
+    mask = Math.min(mask * (0.13 + Math.pow(massifN, 2.4) * 2.45), 1.7);
 
     // Broad basins and swells the ranges sit on.
     let h = fbm2(qs * S * 0.70, qt * S * 1.05, 4) * 135 - 30;
@@ -719,8 +777,14 @@ export class Terrain {
     // Foothills: a second, lower ridge line at 0.6-1.5 km. Three depth planes
     // (buttes / foothills / range) is what turns a wall of rock into a landscape
     // with aerial perspective.
+    // Their amplitude varies on a field of its OWN. Tying it to massifN, as
+    // round 3 did, made the foothills a scaled copy of the range behind them,
+    // which is the "near-regular sawtooth of similarly-sized cones" reading.
     const foot = ridged2(rs * S * 2.5 - 4.0, rt * S * 6.4 + 9.0, 4);
-    const footMask = smoothstep(480, 1450, d) * (1 - smoothstep(1750, 3050, d)) * (0.42 + massifN * 0.9);
+    const footVar = clamp(fbm2(qs * S * 1.15 - 29.0, qt * S * 1.9 + 51.0, 3) * 0.5 + 0.5, 0, 1);
+    const footMask =
+      smoothstep(480, 1450, d) * (1 - smoothstep(1750, 3050, d)) *
+      (0.16 + Math.pow(footVar, 1.9) * 1.60);
     h += Math.pow(foot, 1.25) * 195 * footMask;
 
     // Isolated buttes standing out of the valley floor — the flat-topped rock
@@ -734,24 +798,21 @@ export class Terrain {
       smoothstep(330, 620, Math.hypot(x, z));
     h += butteMask * 125;
 
-    // Bedding. Cut the benches in (h - bedDip), against a *tilted* datum, with
-    // bed thickness varying regionally and only about half the range bedded at
-    // all: sedimentary sections next to massive ones. Round 1 stepped raw
-    // altitude at a fixed 28 m and drew eight dead-flat lines across the whole
-    // mid-ground, which is what read as an 8-bit heightfield.
-    const bedDip = x * DIP_X + z * DIP_Z;
+    // Where a bedded section outcrops, and how thick its beds are. The
+    // stratigraphy itself is NOT cut here — see `_addStrata`, which runs after
+    // the erosion. Round 3 cut terraces at this point in the chain and then ran
+    // twenty thermal passes over them, which is why the ranges came out as
+    // smooth domes wearing contour lines.
     const bedReg = clamp(fbm2(qs * S * 0.95 + 5.0, qt * S * 1.5 - 19.0, 3) * 0.5 + 0.5, 0, 1);
-    const bedding =
-      smoothstep(0.52, 0.88, bedReg) *
-      Math.min(1, smoothstep(30, 175, h) * (mask + footMask * 0.8) + butteMask * 1.4);
-    if (bedding > 0.02) {
-      const stepH = 15 + bedReg * 27;
-      const v = (h - bedDip) / stepH;
-      const fl = Math.floor(v);
-      let f = v - fl;
-      // Flat tread, abrupt riser.
-      f = f < 0.58 ? f * 0.30 : 0.174 + (f - 0.58) * 1.967;
-      h += ((fl + f) * stepH + bedDip - h) * bedding * 0.32;
+    if (out) {
+      out.section = Math.min(
+        1,
+        smoothstep(25, 160, h) * (mask + footMask * 0.8) + butteMask * 1.4,
+      ) * (0.45 + smoothstep(0.30, 0.80, bedReg) * 0.75);
+      // 18-45 m beds. Thinner and the cliff step is 4 px at 2 km, which is a
+      // texture and not a landform — measured on the first attempt at this,
+      // where 9-20 m beds left the range as smooth as it started.
+      out.bandH = 18 + bedReg * 27;
     }
 
     // Mid-scale spurs and gullies so erosion has something to bite into.
@@ -766,15 +827,24 @@ export class Terrain {
     const g = this.far;
     const n = g.n;
     const h = g.h;
+    const out = { section: 0, bandH: 20 };
+    const section = new Float32Array(n * n);
+    const bandH = new Float32Array(n * n);
+    const talus = new Float32Array(n * n).fill(0.62);
     for (let j = 0; j < n; j++) {
       const wz = g.origin + j * g.cell;
       for (let i = 0; i < n; i++) {
-        h[j * n + i] = this._base(g.origin + i * g.cell, wz);
+        const c = j * n + i;
+        h[c] = this._base(g.origin + i * g.cell, wz, out);
+        section[c] = out.section;
+        bandH[c] = out.bandH;
       }
     }
 
-    // Simulate: talus first (build the faces), water second (cut the wadis),
-    // talus again (dress the fresh cuts with scree).
+    // Simulate: talus (build the faces), water (cut the wadis), drainage
+    // incision (organise them into a hierarchy), stratigraphy (put the cliffs
+    // and benches back), talus again on the per-bed repose angle (dress the
+    // fresh cuts and build the aprons at their feet).
     //
     // The droplet count is the whole ball game. 150 k over a 1536^2 grid is
     // ~0.06 visits per cell — enough to roughen a slope, nowhere near enough to
@@ -790,10 +860,16 @@ export class Terrain {
       depositRate: 0.28,
       evaporation: 0.014,
     });
-    thermalErode(h, n, g.cell, 6, 0.70, 0.45, g.scree);
+    this._inciseDrainage(g, { scale: 1.0 });
+    this._addStrata(g, section, bandH, talus);
+    thermalErode(h, n, g.cell, 3, talus, 0.45, g.scree);
+    // Half the amplitude round 3 used: the crags are now a surface texture on
+    // faces the stratigraphy and the drainage have already shaped, not the only
+    // thing standing between a dome and a mountain.
     this._addCrags(g, 1 / 130, 34, null, 2.4);
 
     this._relaxBasin(g, 500, 1250, 0.75, 150);
+    this._smoothFlats(g, null);
     this._bakeChannels(g, dropFlow);
   }
 
@@ -852,13 +928,20 @@ export class Terrain {
       depositRate: 0.32,
       evaporation: 0.020,
     });
+    this._inciseDrainage(g, { scale: 0.6, edge });
     thermalErode(h, n, g.cell, 5, 0.72, 0.45, g.scree);
-    this._addCrags(g, 1 / 34, 9.5, edge, 2.1);
-    this._addCrags(g, 1 / 9.5, 2.4, edge, 1.6);
+    this._addCrags(g, 1 / 34, 7.0, edge, 2.1);
+    this._addCrags(g, 1 / 9.5, 1.8, edge, 1.6);
 
     // Camp pad: relax toward the local mean so vehicles and buildings have
     // something to sit on. The target is the terrain's own blurred self and the
     // weight is gated on altitude, so it reads as an alluvial flat.
+    // Take the simulation's cell-scale hatching and its droplet grooves back
+    // out of the low-relief ground BEFORE any intentional relief is written, so
+    // the pass can run wide (24 iterations ~ a 7 m kernel) without eating the
+    // floor relief that follows it. Order matters: run it last and it either
+    // leaves the grooves or flattens the washes.
+    this._smoothFlats(g, edge, 0.45, 24);
     this._relaxBasin(g, 330, 820, 0.9, 92);
     this._addFloorRelief(g, edge);
 
@@ -866,6 +949,183 @@ export class Terrain {
     for (let k = 0; k < n * n; k++) h[k] = before[k] + (h[k] - before[k]) * edge[k];
 
     this._bakeChannels(g, dropFlow, edge);
+  }
+
+  /**
+   * Stratigraphy, cut into the ERODED field.
+   *
+   * Altitude is quantised into beds against the tilted bedding datum, and each
+   * bed is given its own horizontal offset into the noise it is displaced by.
+   * Neighbouring beds are then reading decorrelated noise, so the surface STEPS
+   * between them instead of running smoothly through — and that step is a
+   * sub-vertical cliff with the bed below it as its bench. It is the one
+   * operator a smooth dome cannot survive, and smooth pale domes with no
+   * bedrock, no strata and no cliffs is exactly what all three critics read off
+   * the distant ranges.
+   *
+   * Each bed also gets a RESISTANCE, returned as a per-cell talus angle. Weak
+   * beds are handed the angle of repose and relax into scree; resistant ones are
+   * handed a bedrock angle and stand. Running the thermal pass afterwards on
+   * that field is what deposits the talus apron at the foot of each cliff, so
+   * cliff, bench, bare rock and apron all come out of one construction rather
+   * than three decorations that happen to sit near each other.
+   *
+   * This has to run AFTER the hydraulic pass. Cut before it, the twenty thermal
+   * passes that shape the range flatten every step back to the angle of repose.
+   */
+  _addStrata(g, section, bandHF, talusOut) {
+    const n = g.n;
+    const h = g.h;
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        const c = j * n + i;
+        const sec = section[c];
+        if (sec < 0.02) continue;
+        const wx = g.origin + i * g.cell;
+        const bandH = bandHF[c];
+        const dip = wx * DIP_X + wz * DIP_Z;
+        const v = (h[c] - dip) / bandH;
+        const k = Math.floor(v);
+        // Two decorrelated hashes: the per-bed offset must be a real 2D shift,
+        // or every bed slides along one axis and all the cliffs face one way.
+        const ox = ((Math.imul(k | 0, 0x9e3779b1) >>> 9) / 4194304) - 1;
+        const oz = ((Math.imul((k ^ 0x51ed) | 0, 0x85ebca6b) >>> 9) / 4194304) - 1;
+        const hr = (Math.imul((k * 2654435761) ^ 0x2f1b, 0x27d4eb2f) >>> 8) / 16777216;
+        const hard = sec * (0.15 + 0.85 * smoothstep(0.30, 0.70, hr));
+        // A resistant bed weathers to a bench with an abrupt riser at its top;
+        // a weak one just slopes. On its own this is the round-3 terrace and it
+        // draws contour lines — but here it is applied to alternating beds ONLY,
+        // and the lateral offset below then breaks each contour into segments
+        // that step past one another. That is the difference between a ledge and
+        // a contour line.
+        let fr = v - k;
+        fr = fr < 0.70 ? fr * 0.34 : 0.238 + (fr - 0.70) * 2.54;
+        h[c] += ((k + fr) * bandH + dip - h[c]) * hard * 0.42;
+        const broad = fbm2(wx / 760 + ox * 47.0, wz / 760 + oz * 47.0, 3);
+        // A finer term so the cliff LINE is ragged rather than a clean contour.
+        const fine = fbm2(wx / 165 + ox * 23.0, wz / 165 + oz * 23.0, 2);
+        h[c] += (broad * 0.85 + fine * 0.34) * bandH * sec;
+        // 29 deg on fines and weak beds, up to 64 on the cliff-formers. Round 3
+        // ran the whole map at 32 deg — the angle of repose of loose scree — and
+        // a map relaxed everywhere to that angle is by definition a field of
+        // smooth cones, which is what the ranges measured as.
+        talusOut[c] = 0.55 + hard * 1.75;
+      }
+    }
+  }
+
+  /**
+   * Cut the drainage network in, with channel WIDTH and DEPTH set by upstream
+   * contributing area.
+   *
+   * The corrugation every critic read off the flanks came from adding
+   * fixed-amplitude ridged noise: every rill the same width from crest to base,
+   * equally spaced, mutually parallel, and no two of them ever joining. Real
+   * drainage is dendritic — tributaries converge and the channel carrying the
+   * combined discharge is wider and deeper than either of its parents.
+   *
+   * So the incision is driven by the D8 flow accumulation A instead. Three bands
+   * of A, each dilated to the width that discharge supports (W ~ sqrt(A): 12 ->
+   * 34 -> 96 m across a factor of ~8 in area per step) and cut to the matching
+   * depth. Because all three read ONE accumulation field they merge exactly
+   * where the drainage merges, and the hierarchy is a consequence of the field
+   * rather than something painted on top of it.
+   */
+  _inciseDrainage(g, { scale = 1, edge = null } = {}) {
+    const n = g.n;
+    const h = g.h;
+    const cell = g.cell;
+    const acc = flowAccumulate(h, n);
+    let maxAcc = 1;
+    for (let k = 0; k < acc.length; k++) if (acc[k] > maxAcc) maxAcc = acc[k];
+    const invLog = 1 / Math.log(1 + maxAcc);
+
+    // A channel needs a gradient to cut on: no incision on the pan.
+    const slope = new Float32Array(n * n);
+    for (let j = 1; j < n - 1; j++) {
+      for (let i = 1; i < n - 1; i++) {
+        const c = j * n + i;
+        slope[c] = Math.hypot(h[c + 1] - h[c - 1], h[c + n] - h[c - n]) / (2 * cell);
+      }
+    }
+
+    const BANDS = [
+      { lo: 0.20, hi: 0.42, widthM: 12, depthM: 1.8 },
+      { lo: 0.40, hi: 0.62, widthM: 34, depthM: 4.6 },
+      { lo: 0.58, hi: 0.82, widthM: 96, depthM: 9.5 },
+    ];
+    const mask = new Float32Array(n * n);
+    for (const b of BANDS) {
+      const r = Math.max(1, Math.round(b.widthM / (2 * cell)));
+      for (let c = 0; c < n * n; c++) {
+        mask[c] = smoothstep(b.lo, b.hi, Math.log(1 + acc[c]) * invLog);
+      }
+      const wide = blurField(mask, n, r, 2);
+      // Two box passes of half-width r turn a one-cell line into a triangle of
+      // peak 1/(2r+1). Rescaling by that puts the channel floor back at full
+      // depth and leaves the blur's own falloff as the banks — a flat-floored
+      // wadi with sloping sides, which is what one actually looks like.
+      const norm = (2 * r + 1) * 0.8;
+      for (let c = 0; c < n * n; c++) {
+        const w = clamp(wide[c] * norm, 0, 1);
+        if (w < 0.006) continue;
+        // Slope gate, and it has to be this high. D8 on near-flat ground combs
+        // into long parallel ties — `flowAccumulate` says so in its own comment
+        // — and once that field is used to cut GEOMETRY rather than to paint a
+        // mask, those ties become metre-deep parallel furrows. Measured: at
+        // 0.03-0.20 the open pan came out as a ploughed field with chevrons
+        // where the flow directions switched. A channel needs a real gradient to
+        // incise on, so nothing below about 8 degrees gets cut at all.
+        const gate = smoothstep(0.14, 0.45, slope[c]) * scale * (edge ? edge[c] : 1);
+        h[c] -= b.depthM * w * w * gate;
+      }
+    }
+  }
+
+  /**
+   * Cell-scale de-hatching on low-relief ground.
+   *
+   * The thermal pass is Jacobi and the droplet brush is a cone, and both leave a
+   * herringbone at the grid cell. On an almost-flat pan that herringbone is the
+   * only thing in the heightfield at that scale, so the baked normals are pure
+   * cell-scale noise — and at grazing incidence that noise aliases into the
+   * swirling wood-grain arcs the pan has been read for since round 1. Measured:
+   * hillshading the raw array over a 160 m window at (1000, 1000) showed a 2 m
+   * herringbone with no landform under it at all, and ablating every shading
+   * layer in the fragment shader left the arcs untouched — they are geometry.
+   *
+   * Real alluvium is smooth at 2 m. Everything finer belongs to the ripple and
+   * micro layers, which are band-limited by construction and cannot alias.
+   */
+  _smoothFlats(g, edge, strength = 0.45, passes = 4) {
+    const n = g.n;
+    const h = g.h;
+    const cell = g.cell;
+    const w = new Float32Array(n * n);
+    for (let j = 1; j < n - 1; j++) {
+      for (let i = 1; i < n - 1; i++) {
+        const c = j * n + i;
+        const slope = Math.hypot(h[c + 1] - h[c - 1], h[c + n] - h[c - n]) / (2 * cell);
+        // Gentle ground, not just dead-flat ground: the hatching survives on
+        // anything up to a 25 deg slope, and at eye level a 10 deg apron a
+        // hundred metres long fills a third of the frame.
+        w[c] = (1 - smoothstep(0.11, 0.52, slope)) * strength * (edge ? edge[c] : 1);
+      }
+    }
+    // 5-point Laplacian: the smallest kernel that kills a checkerboard. The
+    // weight stays under 0.5 because the checkerboard eigenvalue is -2 and
+    // anything above that inverts it instead of removing it.
+    const lap = new Float32Array(n * n);
+    for (let p = 0; p < passes; p++) {
+      for (let j = 1; j < n - 1; j++) {
+        for (let i = 1; i < n - 1; i++) {
+          const c = j * n + i;
+          lap[c] = (h[c - 1] + h[c + 1] + h[c - n] + h[c + n]) * 0.25 - h[c];
+        }
+      }
+      for (let k = 0; k < n * n; k++) h[k] += lap[k] * w[k];
+    }
   }
 
   /**
@@ -892,8 +1152,14 @@ export class Terrain {
         const cs = (wx * SK_C + wz * SK_S) * freq;
         const ct = (-wx * SK_S + wz * SK_C) * freq * aniso;
         const a = (ridged2(cs, ct, 3) - 0.40) * amp;
-        const b = (ridged2(cs * 3.3 + 41.0, ct * 3.3 - 23.0, 2) - 0.40) * amp * 0.34;
-        h[c] += (a + b) * rocky * (edge ? edge[c] : 1);
+        const b = (ridged2(cs * 3.3 + 41.0, ct * 3.3 - 23.0, 2) - 0.34) * amp * 0.34;
+        // Amplitude varies over ~6 crag wavelengths. Round 3 added the same
+        // amplitude to every slope on the map, which is the other half of why
+        // the flanks read as corrugated iron: same relief, same spacing, on
+        // every face in the frame.
+        const va = 0.45 + 1.25 * clamp(
+          fbm2(wx * freq * 0.17 + 77.0, wz * freq * 0.17 - 55.0, 3) * 0.5 + 0.5, 0, 1);
+        h[c] += (a + b) * rocky * va * (edge ? edge[c] : 1);
       }
     }
   }
@@ -1041,6 +1307,13 @@ export class Terrain {
       // Drainage. On steep ground any incised line counts; out on the pan only
       // the trunk washes survive, or the solver paints parallel ties across it.
       const a = Math.log(1 + acc[c]) * invLogMax;
+      // Published for other modules: normalised log upstream contributing area,
+      // and normalised depositional thickness. Rocks want the first to keep
+      // boulders out of live channels and the second to find the talus aprons;
+      // vegetation wants both, because in a desert the only thing that grows is
+      // what sits on a wash.
+      g.accum[c] = a;
+      g.deposit[c] = Math.min(1, talus[c] / (screeMax * 0.28));
       let fl = smoothstep(0.30, 0.70, a);
       fl = Math.max(fl, smoothstep(0.6, 5.0, dropFlow[c]) * 0.5);
       fl *= 1 - smoothstep(0.5, 1.0, slope);
@@ -1068,6 +1341,8 @@ export class Terrain {
           g.rock[c] += (f.sample(f.rock, wx, wz) - g.rock[c]) * (1 - w);
           g.scree[c] += (f.sample(f.scree, wx, wz) - g.scree[c]) * (1 - w);
           g.flow[c] += (f.sample(f.flow, wx, wz) - g.flow[c]) * (1 - w);
+          g.accum[c] += (f.sample(f.accum, wx, wz) - g.accum[c]) * (1 - w);
+          g.deposit[c] += (f.sample(f.deposit, wx, wz) - g.deposit[c]) * (1 - w);
           g.ao[c] += (f.sample(f.ao, wx, wz) - g.ao[c]) * (1 - w);
           g.curv[c] += (f.sample(f.curv, wx, wz) - g.curv[c]) * (1 - w);
           // Normals too: a 2 m central difference of an upsampled 8 m field is
@@ -1337,6 +1612,114 @@ export class Terrain {
   }
 
   /**
+   * Wind-ripple set — sand's OWN detail layer.
+   *
+   * Blown sand organises into transverse ripples: crests perpendicular to the
+   * wind, 7-14 cm apart, 4-10 mm high, and each crest is sinuous and roughly
+   * eight times longer than the crest spacing. That aspect ratio is the whole
+   * point. It is what makes a sand surface directional, and directionality is
+   * what the previous ground was missing — it had a clast normal shared with
+   * the gravel and then attenuated to 36% on sand, which left the pan measuring
+   * a third of the high-pass energy of the sandbags sitting on it.
+   *
+   * Three superposed sets: ripples (10 cm), megaripples (53 cm, same
+   * direction), and a 2.5 cm grain. Patchy — a uniform ripple field over a
+   * kilometre reads as corduroy — so an envelope noise turns them on and off.
+   *
+   * RG: normal xy in the WIND frame (the shader rotates it back). B: height,
+   * for the crest/trough albedo split. A: the ripple envelope.
+   */
+  _buildRippleTexture() {
+    const N = RIPPLE_N;
+    const inv = 1 / N;
+    const h = new Float32Array(N * N);
+    const envF = new Float32Array(N * N);
+    const TAU = Math.PI * 2;
+
+    // Anisotropic tileable fbm: independent lattice periods per axis. Both must
+    // stay powers of two so they divide perlin's 256-cell period and the tile
+    // still wraps.
+    const aniso = (u, v, pu, pv, oct) => {
+      let amp = 0.5;
+      let sum = 0;
+      let norm = 0;
+      let a = pu;
+      let b = pv;
+      for (let o = 0; o < oct; o++) {
+        sum += amp * perlin2(u * a + 0.5, v * b + 0.5);
+        norm += amp;
+        amp *= 0.5;
+        a *= 2;
+        b *= 2;
+      }
+      return sum / norm;
+    };
+    // Skewed sine: gentle stoss face, abrupt lee face. A pure sine reads as
+    // corrugated iron; the asymmetry is what says "granular".
+    const skew = (p, k) => Math.sin(p * TAU + k * Math.sin(p * TAU));
+
+    const NC = Math.round(RIPPLE_TILE / 0.10); // crests across the tile
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let j = 0; j < N; j++) {
+      const v = j * inv;
+      for (let i = 0; i < N; i++) {
+        const u = i * inv;
+        const c = j * N + i;
+        // Crest wander: 8:1 stretched along the crest, so crests are long,
+        // sinuous and occasionally bifurcate rather than being ruled lines.
+        // Round 4, second pass: the phase wander was 1.35 and the crests came
+        // out as continuous ruled lines running the whole tile — rendered, that
+        // is a ploughed field, not sand. At 2.6 the crests break, bifurcate and
+        // die out over a few wavelengths, which is what a real ripple train does.
+        const wob = aniso(u + 0.11, v + 0.37, 2, 16, 3) * 2.6;
+        const wob2 = aniso(u - 0.23, v + 0.71, 1, 4, 2) * 0.75;
+        // Patchier envelope for the same reason: bare drifts between the
+        // rippled patches are most of what stops it reading as corduroy.
+        const e = clamp(aniso(u + 0.5, v + 0.5, 4, 4, 2) * 2.7 + 0.42, 0, 1);
+        const s = skew(v * NC + wob + wob2, 0.55);
+        const s2 = skew(v * (NC / 5) + aniso(u + 0.6, v - 0.2, 1, 2, 2) * 0.9, 0.4);
+        const grain = aniso(u, v, 64, 64, 2);
+        const y = s * 0.0038 * e + s2 * 0.0040 * (0.45 + 0.55 * e) + grain * 0.00045;
+        h[c] = y;
+        envF[c] = e;
+        if (y < lo) lo = y;
+        if (y > hi) hi = y;
+      }
+    }
+
+    const cell = RIPPLE_TILE / N;
+    const data = new Uint8Array(N * N * 4);
+    const invR = 1 / Math.max(1e-6, hi - lo);
+    for (let j = 0; j < N; j++) {
+      for (let i = 0; i < N; i++) {
+        const c = j * N + i;
+        const l = h[j * N + ((i - 1 + N) % N)];
+        const r = h[j * N + ((i + 1) % N)];
+        const d = h[((j - 1 + N) % N) * N + i];
+        const uu = h[((j + 1) % N) * N + i];
+        const nx = (l - r) / (2 * cell);
+        const ny = (d - uu) / (2 * cell);
+        const invL = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+        data[c * 4] = Math.round((nx * invL * 0.5 + 0.5) * 255);
+        data[c * 4 + 1] = Math.round((ny * invL * 0.5 + 0.5) * 255);
+        data[c * 4 + 2] = Math.round(clamp((h[c] - lo) * invR, 0, 1) * 255);
+        data[c * 4 + 3] = Math.round(clamp(envF[c], 0, 1) * 255);
+      }
+    }
+
+    const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.LinearFilter;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.generateMipmaps = true;
+    t.anisotropy = 16;
+    t.colorSpace = THREE.NoColorSpace;
+    t.needsUpdate = true;
+    this.texRipple = t;
+  }
+
+  /**
    * Near-field grit set, one tile = GRIT_TILE metres. This is the texture the
    * player is actually looking at from 1.5 m, so it is authored for that
    * distance and nothing else: two Worley clast layers (~4 cm cobbles over
@@ -1370,8 +1753,13 @@ export class Terrain {
       }
       return { G, px, py, pr, pt };
     };
-    const coarse = layer(6, 0.22, 0.74, 2.4);
-    const fine = layer(22, 0.18, 0.56, 2.0);
+    // Cell counts are set against GRIT_TILE (0.9 m), not against the tile's
+    // texel count: 14 cells is 6.4 cm, giving clasts 2.8-9.5 cm across, and 46
+    // cells is 2.0 cm, giving 0.7-2.9 cm gravel. The round-3 tile was 0.36 m,
+    // so its 512 texels were 0.7 mm apart — finer than a pixel anywhere past
+    // one metre, which is why the whole grit layer measured as absent.
+    const coarse = layer(14, 0.22, 0.74, 2.4);
+    const fine = layer(46, 0.18, 0.56, 2.0);
 
     // Tileable Worley: returns normalised distance, plus the winning clast's
     // radius and random id so each stone can carry its own albedo.
@@ -1549,27 +1937,71 @@ export class Terrain {
    * does — while floating never is, so the asymmetry is deliberate. Two lattice
    * phases are probed because the rings snap to the camera, not to the world.
    *
-   * The level range is chosen from the body's own size rather than from a
-   * camera distance, because placement runs once at install and a 25 m butte is
-   * on screen from kilometres away while a 30 cm chip is only ever seen from
-   * inside L0, where the lattice error is zero to 2 cm.
+   * Round 4: the level range used to be derived from the body's SIZE, and that
+   * was the bug. Size is not what decides which ring rasterises the ground under
+   * a body — position is. A 1.5 m stone at 500 m is drawn on the 8 m ring
+   * exactly like the 25 m butte next to it, but the size rule only ever probed
+   * the 2 m lattice for it and then capped its sink at 0.5 m, so it hung metres
+   * above the mesh. That is the floating-rock band at 200-800 m. The level now
+   * comes from `clipSpacingAt`, which is the renderer's own selection rule, and
+   * size only survives as a floor (a tall body is still read through coarser
+   * rings once the camera backs off past its own footprint).
    */
   seatHeightAt(wx, wz, size = 0) {
     const h = this.heightAt(wx, wz);
-    // Below ~2.5 m the body is only ever read at close range, where the drawn
-    // surface and the heightfield agree to a centimetre. Skip the work.
-    if (!(size > 2.5)) return h;
-    const coarsest = Math.min(16, size * 0.9);
+    const drawn = this.clipSpacingAt(wx, wz);
+    const coarsest = Math.max(drawn, size > 2.5 ? Math.min(16, size * 0.9) : 0);
+    // Level 0 (0.5 m) reproduces the heightfield to a couple of centimetres.
+    if (coarsest < 1) return h;
     let lo = h;
-    for (let sp = 2; sp <= coarsest; sp *= 2) {
+    for (let sp = 1; sp <= coarsest + 1e-6; sp *= 2) {
       lo = Math.min(lo, this._latticeHeight(wx, wz, sp, 0), this._latticeHeight(wx, wz, sp, sp * 0.5));
     }
-    // Never bury more than a third of the body chasing a coarse ring: a 3 m
-    // stone dropped 3 m is gone, and gone is its own kind of defect.
-    return Math.max(lo, h - size * 0.34);
+    // Sink budget: a third of the body PLUS whatever the ring under it demands.
+    // The old body-only budget is what made the fix impossible even when the
+    // probe found the right surface — the ring at 500 m sits up to 5.5 m below
+    // the heightfield and a 3 m rock was only allowed to drop 1 m of that.
+    return Math.max(lo, h - (size * 0.34 + drawn * 0.85));
   }
 
-  /** Drainage / rock / scree at a point — useful for placement rules. */
+  /**
+   * Ring spacing, in metres, that the clipmap will actually draw this point at.
+   *
+   * This is the renderer's own level selection, not an approximation of it:
+   * `_ringGeometry` gives level l a hollow square ring covering Chebyshev
+   * distance 48*sp to 96*sp from the clipmap centre, with sp = 0.5 * 2^l, and
+   * level 0 is the solid patch inside 48*0.5 m. Anything that needs to know how
+   * coarsely the ground under it is tessellated — seating, decals, footprint
+   * blending — should ask here rather than guess from an object's size.
+   */
+  clipSpacingAt(wx, wz) {
+    const cx = Number.isFinite(this._cx) ? this._cx : 0;
+    const cz = Number.isFinite(this._cz) ? this._cz : 0;
+    const d = Math.max(Math.abs(wx - cx), Math.abs(wz - cz));
+    let sp = 0.5;
+    while (sp < 64 && d >= 96 * sp) sp *= 2;
+    return sp;
+  }
+
+  /**
+   * Drainage / rock / scree at a point — the placement contract for every module
+   * that scatters something on the ground.
+   *
+   *   rock    0-1  bedrock exposure; steep, scoured, convex ground
+   *   scree   0-1  talus and alluvial-apron cover (the painted material weight)
+   *   flow    0-1  the drainage MASK the shader paints wadis with
+   *   ao      0-1  sky occlusion
+   *   accum   0-1  NEW in round 4. Normalised log of the D8 upstream
+   *                contributing area — the raw dendritic drainage network,
+   *                before any mask or blur. 0 is a divide, ~0.4 a headwater
+   *                rill, ~0.6 a tributary, >0.75 a trunk wash. This is the
+   *                field the channel geometry is now cut from, so scattering
+   *                against it agrees with the shape of the ground exactly.
+   *   deposit 0-1  NEW in round 4. Normalised thermal deposition thickness —
+   *                where material has come to rest. This is the talus apron at
+   *                the foot of a cliff, as opposed to `scree`, which also
+   *                includes slope- and supply-derived guesses.
+   */
   surfaceAt(wx, wz) {
     const g = this.near.contains(wx, wz, this.near.cell * 1.5) ? this.near : this.far;
     return {
@@ -1577,6 +2009,8 @@ export class Terrain {
       scree: g.sample(g.scree, wx, wz),
       flow: g.sample(g.flow, wx, wz),
       ao: g.sample(g.ao, wx, wz),
+      accum: g.sample(g.accum, wx, wz),
+      deposit: g.sample(g.deposit, wx, wz),
     };
   }
 
@@ -1728,14 +2162,18 @@ export class Terrain {
   }
 
   _buildMaterial() {
-    // Terrain-local palette. Warmer than PALETTE all through: round 1 measured
-    // out at blue > red in every daylight frame — a cold quarry, not sunbaked
-    // Afghanistan — because a neutral albedo under a blue sky IBL integrates
-    // blue. Dry desert mineral is iron-stained and absorbs blue hard, so R/B
-    // here sits near 1.5 on sand and 1.3 on rock, and the frame comes out warm
-    // before the grade touches it. Deliberately short of the 1.7 the mineral
-    // would justify: the composite pass now applies its own warm balance, and
-    // stacking both takes the landscape past khaki into sepia.
+    // Terrain-local palette.
+    //
+    // This used to sit ~10% warmer in R/B than PALETTE all through, and the
+    // reason given was a round-1 measurement: blue exceeded red in every
+    // daylight frame, so the ground was pushed warm to compensate. That bug is
+    // gone — round 4 fixed the sky projection, the grade colour space and the
+    // afternoon beam — and the compensation outlived it. Measured on
+    // shots/r4/vista.png the mid-frame bands, which are almost entirely this
+    // material, ran to R-B +43 while the whole frame had to land at +8..+18.
+    // So the ramp is back on PALETTE's ratios: R/B 1.28 on sand, 1.18 on rock,
+    // with the iron-stained variants still allowed to run hot. Warm, khaki,
+    // sunbaked — but no longer carrying a correction for something else.
     const C = (r, g, b) => new THREE.Color(r, g, b);
 
     const u = {
@@ -1750,21 +2188,22 @@ export class Terrain {
       uDetailN: { value: this.texDetailN },
       uGrit: { value: this.texGrit },
       uGritN: { value: this.texGritN },
+      uRipple: { value: this.texRipple },
       uFarInfo: { value: this._gridUniform(this.far) },
       uNearInfo: { value: this._gridUniform(this.near) },
       uNearHalf: { value: this.near.size / 2 - this.near.cell * 2 },
       uClipCentre: { value: new THREE.Vector2(0, 0) },
       uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.5) },
       uDip: { value: new THREE.Vector2(DIP_X, DIP_Z) },
-      uSandLight: { value: C(0.618, 0.548, 0.432) },
-      uSandMid: { value: C(0.478, 0.416, 0.318) },
-      uSandDark: { value: C(0.330, 0.282, 0.216) },
-      uSilt: { value: C(0.648, 0.586, 0.478) },
-      uGravel: { value: C(0.376, 0.328, 0.270) },
-      uRockLight: { value: C(0.460, 0.424, 0.372) },
-      uRockDark: { value: C(0.238, 0.212, 0.184) },
-      uRockRed: { value: C(0.415, 0.306, 0.246) },
-      uVarnish: { value: C(0.190, 0.156, 0.134) },
+      uSandLight: { value: C(0.605, 0.548, 0.472) },  // R/B 1.28
+      uSandMid: { value: C(0.470, 0.416, 0.352) },    // 1.34
+      uSandDark: { value: C(0.325, 0.282, 0.240) },   // 1.35
+      uSilt: { value: C(0.640, 0.586, 0.510) },       // 1.25
+      uGravel: { value: C(0.372, 0.328, 0.290) },     // 1.28
+      uRockLight: { value: C(0.456, 0.424, 0.386) },  // 1.18
+      uRockDark: { value: C(0.236, 0.212, 0.192) },   // 1.23
+      uRockRed: { value: C(0.410, 0.306, 0.262) },    // 1.56 iron stain
+      uVarnish: { value: C(0.188, 0.156, 0.142) },    // 1.32
     };
     this.uniforms = u;
 
@@ -1816,6 +2255,10 @@ export class Terrain {
     // contour lines following the ripple, which is exactly the wood grain that
     // showed up across the pan. The cascade casts the smooth landform instead;
     // 4 cm of peter-panning at a 6 cm texel is not observable.
+    //
+    // Round 4 tried casting `fullH` here, on the theory that caster/receiver
+    // agreement matters more than texel size. It made no measurable difference
+    // to the banding it was aimed at, so the round-3 form stands.
     const DISPLACE = (micro) => /* glsl */ `
       #include <begin_vertex>
       vec2 wxz = (modelMatrix * vec4(transformed, 1.0)).xz;
@@ -1860,6 +2303,7 @@ export class Terrain {
           uniform sampler2D uDetailN;
           uniform sampler2D uGrit;
           uniform sampler2D uGritN;
+          uniform sampler2D uRipple;
           uniform vec4 uFarInfo;
           uniform vec4 uNearInfo;
           uniform float uNearHalf;
@@ -1875,9 +2319,12 @@ export class Terrain {
           uniform vec3 uRockRed;
           uniform vec3 uVarnish;
 
-          // One grit tile is 0.36 m of ground; clast relief spans GRIT_H metres.
-          #define GRIT_TILE 0.36
-          #define GRIT_H 0.055
+          // One grit tile is GRIT_TILE metres of ground; clast relief spans
+          // GRIT_H metres.
+          #define GRIT_TILE 0.90
+          #define GRIT_H 0.045
+          #define RIPPLE_TILE ${RIPPLE_TILE.toFixed(3)}
+          #define WIND_SC vec2(${WIND_C.toFixed(6)}, ${WIND_S.toFixed(6)})
 
           // Values shared between the chunks we hook into.
           vec3  gN;
@@ -1907,10 +2354,44 @@ export class Terrain {
           // Fade every octave out on its OWN screen-space footprint rather than
           // on distance. Footprint, not range, is what decides whether a tap is
           // still resolvable, and it stays correct at any FOV or resolution.
-          float sharpness(vec2 uv) {
-            vec2 fw = fwidth(uv) * 512.0;   // texels crossed per pixel
-            return 1.0 - smoothstep(0.35, 1.5, max(fw.x, fw.y));
+          //
+          // The footprint is an ELLIPSE, not a disc, and these textures are
+          // sampled with 16x anisotropy — so the axis that decides whether the
+          // tap still carries detail is the SHORT one, not the long one. Round 3
+          // faded on max(fw), which is the isotropic-mip rule: on a ground plane
+          // at eye height the footprint is routinely 20:1, so every near-field
+          // octave measured zero and the sand was left carrying nothing but the
+          // 26 m tile at 40% weight. That is the whole of FATAL 1. Dividing the
+          // long axis by 10 (short of the hardware's 16, for margin) restores
+          // the near field without letting an unfilterable tap through: past
+          // 10:1 the hardware clamps its own LOD and the tap goes smooth on its
+          // own, so being generous here cannot alias.
+          //
+          // The two axes also have to be measured as VECTORS. fwidth() is
+          // per-component, so on a ground plane whose view direction is not axis
+          // aligned it smears the long axis into both components and reports a
+          // circular footprint that is nowhere near the truth.
+          //
+          // Finally, lim is how many texels a pixel may cover before the layer
+          // starts to go, and it is NOT one: it depends on how many texels the
+          // layer's own features span. The ripple tile's crests are 32 texels
+          // apart, so a 3-texel footprint still resolves them ten times over,
+          // while the clast tiles carry content down to ~6 texels and have to go
+          // sooner. One global limit is what made every near-field layer vanish.
+          float sharpnessK(vec2 uv, float lim) {
+            vec2 dxu = dFdx(uv) * 512.0;    // texels crossed per pixel, screen x
+            vec2 dyu = dFdy(uv) * 512.0;    // ... and screen y
+            float mx = max(length(dxu), length(dyu));
+            float mn = min(length(dxu), length(dyu));
+            return 1.0 - smoothstep(lim, lim * 4.2, max(mn, mx * 0.10));
           }
+          // The default limit stays tight. The clast tiles and the 64 m micro
+          // field both carry content within a couple of texels of Nyquist, and
+          // letting those through at grazing incidence is what produces the
+          // swirling wood grain across the pan that round 2 spent a pass
+          // removing. Only the ripple layer, whose features are 32 texels
+          // across, is allowed to run long.
+          float sharpness(vec2 uv) { return sharpnessK(uv, 0.50); }
           ${MICRO_GLSL}
           `,
         )
@@ -2019,9 +2500,17 @@ export class Terrain {
             // modelled ledges are the same beds — and they are never horizontal
             // lines drawn across the whole map.
             float bedH = vWPos.y - dot(vWPos.xz, uDip);
-            float band = fract(bedH * (0.36 - macro * 0.13) + (D.a - 0.5) * 0.9);
-            float strata = smoothstep(0.0, 0.20, band) * (1.0 - smoothstep(0.40, 0.62, band));
-            rockBase *= 1.0 + (strata - 0.45) * 0.34 * wallW * (1.0 - smoothstep(160.0, 700.0, dist));
+            // Round 4: the painted band period was 2.8 m, which is finer than a
+            // pixel past a couple of hundred metres — hence the 160-700 m fade,
+            // and hence a distant range with no strata on it at all, which is
+            // half of "the ranges read as meringue". The beds the GEOMETRY is
+            // now cut into are 9-20 m, so painting at the same period both
+            // agrees with the modelled ledges and survives to the horizon: a
+            // 15 m bed at 2 km is still 13 px of frame.
+            float band = fract(bedH * (0.078 - macro * 0.028) + (D.a - 0.5) * 0.35);
+            float strata = smoothstep(0.0, 0.22, band) * (1.0 - smoothstep(0.42, 0.66, band));
+            rockBase *= 1.0 + (strata - 0.45) * 0.22 * mix(0.30, 1.0, wallW)
+                      * (1.0 - smoothstep(1600.0, 3400.0, dist));
             // Mineral zoning: whole massifs shift warm, which is what stops a
             // range from reading as one grey material at 2 km.
             float iron = smoothstep(0.44, 0.86, macro);
@@ -2055,7 +2544,7 @@ export class Terrain {
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
-            float gritW = (1.0 - smoothstep(3.0, 26.0, dist)) * sharpness(baseUV * (1.0 / GRIT_TILE));
+            float gritW = (1.0 - smoothstep(4.0, 34.0, dist)) * sharpness(baseUV * (1.0 / GRIT_TILE));
             gMicroShadow = 1.0;
             vec2 gpert = vec2(0.0);
             if (gritW > 0.004) {
@@ -2111,6 +2600,39 @@ export class Terrain {
               gpert = (GN.rg * 2.0 - 1.0) * (0.70 * gritW);
             }
 
+            // --- wind ripples --------------------------------------------------
+            // Sand's own relief, and the only layer in this shader that is
+            // anisotropic. Crests run across the wind; the tile is read in the
+            // wind frame and the normal is rotated back, so the direction is a
+            // world direction and not a texture-space one. A second, 5x tap of
+            // the same tile at a different rotation breaks the 1.6 m repeat and
+            // carries a coarse drift the near tap is too fine to hold.
+            vec2 rpert = vec2(0.0);
+            {
+              vec2 rw = rot(vWPos.xz, WIND_SC);
+              vec2 ruv = rw * (1.0 / RIPPLE_TILE);
+              vec2 cuv = rot(rw, vec2(0.83, 0.5578)) * (1.0 / (RIPPLE_TILE * 3.7)) + vec2(0.31, 0.67);
+              float sR = sharpnessK(ruv, 1.6);
+              float sRC = sharpnessK(cuv, 1.6);
+              // Ripples only form on loose fines: bedrock has none, the coarse
+              // lag patches interrupt them, and a wall never carries them.
+              float sandW = (1.0 - rockW) * (1.0 - screeW * 0.55) * (1.0 - wallW);
+              float rippleW = sandW * (1.0 - smoothstep(26.0, 80.0, dist));
+              if (rippleW > 0.004 && max(sR, sRC) > 0.004) {
+                vec4 RP = texture2D(uRipple, ruv);
+                vec4 RC = texture2D(uRipple, cuv);
+                rpert = (unrot(RP.rg * 2.0 - 1.0, WIND_SC) * (0.80 * sR * mix(0.30, 1.0, RP.a))
+                       + unrot(RC.rg * 2.0 - 1.0, WIND_SC) * (0.22 * sRC)) * rippleW;
+                // Crests are winnowed to coarse grains and read a touch darker
+                // and warmer; the troughs bank pale fines. Small, but it is what
+                // keeps the ripples legible once the sun is high enough that the
+                // normal alone stops shading them.
+                float crest = (RP.b - 0.5) * mix(0.30, 1.0, RP.a) * sR + (RC.b - 0.5) * 0.55 * sRC;
+                albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.35, 0.35, crest)),
+                             rippleW * 0.11);
+              }
+            }
+
             diffuseColor.rgb *= albedo * 0.80;
 
             // --- normal --------------------------------------------------------
@@ -2124,7 +2646,7 @@ export class Terrain {
             // visible honeycomb across the pan. The grit layer is exempt: that
             // one IS the stones.
             pert *= mix(0.36, 1.0, clamp(screeW * 0.55 + rockW, 0.0, 1.0));
-            pert += gpert;
+            pert += gpert + rpert;
 
             // The 7 cm geometric ripple in the vertex shader needs a matching
             // shading normal, or the ground wobbles in silhouette and stays flat

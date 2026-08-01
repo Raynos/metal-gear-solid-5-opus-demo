@@ -73,16 +73,151 @@ export function containerGeo() {
 
 // ------------------------------------------------------------------ drums ---
 
-/** 200 litre steel drum with rolling hoops. */
-export function drumGeo() {
+// -------------------------------------------------------------- sand drift ---
+
+/** How many distinct drift meshes exist. */
+export const DRIFT_VARIANTS = 3;
+
+/**
+ * A bank of wind-deposited fines against the upwind face of an obstruction.
+ *
+ * Every critic round has said the props sit ON the ground rather than IN it.
+ * A contact shadow only ever half-solves that, because the thing the eye is
+ * actually missing is the sand's own response to the object being there: in a
+ * desert, anything that stands in the wind for a season grows a wedge of fines
+ * on its windward side and a long tail of scour on its lee. Modelling the wedge
+ * is worth more than any amount of AO because it is ASYMMETRIC and it points —
+ * one glance tells you which way the wind blows here, and every drift in frame
+ * agrees, which is a thing procedural scenes essentially never do.
+ *
+ * Authored with the obstruction at z = 0 and the wind arriving from +z, so the
+ * caller only has to rotate the instance to face the wind.
+ */
+export function driftGeo(variant = 0) {
+  const b = newBag();
+  let s = (variant * 374761393 + 7) >>> 0;
+  const rnd = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
+  // 12x6 = 144 triangles. A drift is a smooth surface with no silhouette
+  // detail finer than its own ripples, and the ripples are in the shader.
+  const NX = 12;
+  const NZ = 6;
+  const halfW = 1.0;
+  const runOut = 1.0;   // how far upwind the toe of the drift reaches
+  const crest = 1.0;    // height at the face, scaled by the instance
+  const lee = 0.34;     // short tail on the sheltered side
+  const lobe = 0.55 + rnd() * 0.5;
+  const skew = (rnd() - 0.5) * 0.5;
+
+  const pos = [];
+  const idx = [];
+  const height = (fx, fz) => {
+    // fx in [-1,1] across the face, fz in [-lee/runOut, 1] upwind.
+    const across = Math.max(0, 1 - Math.pow(Math.abs(fx + skew * fz * 0.5), 1.6 + lobe));
+    const along = fz >= 0
+      ? Math.pow(Math.max(0, 1 - fz), 1.9)          // upwind ramp, concave
+      : Math.pow(Math.max(0, 1 + fz / (lee / runOut)), 1.2) * 0.55; // lee tail
+    const wob = 0.86 + 0.28 * Math.sin(fx * 5.1 + variant * 2.3) * Math.cos(fz * 3.7 + lobe * 4.0);
+    return crest * across * along * wob;
+  };
+  for (let j = 0; j <= NZ; j++) {
+    const fz = -lee / runOut + (j / NZ) * (1 + lee / runOut);
+    for (let i = 0; i <= NX; i++) {
+      const fx = -1 + (2 * i) / NX;
+      pos.push(fx * halfW, height(fx, fz), fz * runOut);
+    }
+  }
+  for (let j = 0; j < NZ; j++) {
+    for (let i = 0; i < NX; i++) {
+      const a = j * (NX + 1) + i;
+      idx.push(a, a + NX + 1, a + 1, a + 1, a + NX + 1, a + NX + 2);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  b.drift.push(g);
+  return bake(b, crest, 0.2, 0);
+}
+
+/** How many distinct drum meshes exist; placement buckets instances by this. */
+export const DRUM_VARIANTS = 4;
+
+/**
+ * 200 litre steel drum with rolling hoops.
+ *
+ * Round 3: these were one mesh instanced eighty times, and eighty identical
+ * cylinders is a texture, not a scrapyard. The per-instance `aVar` was already
+ * varying the rust and the paint pick, but a drum's identity is in its
+ * SILHOUETTE — a drum that has been dropped off a truck has a dished top, a
+ * kicked-in side and a bowed hoop, and no amount of albedo variation stands in
+ * for that. Four bodies now, each with its own dent field and its own fittings:
+ *
+ *   0 — sound: a drum that is still in service
+ *   1 — knocked about: two shallow side dents, one bowed hoop
+ *   2 — labelled: a painted band round the belly and a stencil panel
+ *   3 — wrecked: dished top, deep side crease, missing bung
+ */
+export function drumGeo(variant = 0) {
   const b = newBag();
   const r = 0.293;
   const h = 0.88;
-  b.metal.push(cyl(r, h, 16, { y: h / 2 }));
-  for (const sy of [h * 0.3, h * 0.7]) b.metal.push(cyl(r + 0.022, 0.055, 16, { y: sy }));
-  b.metal.push(cyl(r + 0.012, 0.045, 16, { y: h - 0.02 }));
-  b.metal.push(cyl(r + 0.012, 0.045, 16, { y: 0.02 }));
-  b.metal.push(cyl(0.05, 0.03, 8, { x: r * 0.55, y: h + 0.005 }));
+  let s = (variant * 2654435761 + 101) >>> 0;
+  const rnd = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
+
+  // Dent field: a handful of localised radial pushes. Each is a direction, a
+  // height, a depth and an angular width — which is exactly how a real dent is
+  // described, and why a noise displacement does not look like one.
+  const dents = [];
+  const nD = [0, 2, 1, 3][variant];
+  for (let i = 0; i < nD; i++) {
+    dents.push({
+      a: rnd() * Math.PI * 2,
+      y: 0.16 + rnd() * 0.60,
+      depth: (0.020 + rnd() * 0.045) * (variant === 3 ? 1.9 : 1.0),
+      wa: 0.45 + rnd() * 0.55,
+      wy: 0.10 + rnd() * 0.16,
+    });
+  }
+  const body = cyl(r, h, 18, { y: h / 2 });
+  const p = body.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i);
+    const y = p.getY(i);
+    const z = p.getZ(i);
+    const rad = Math.hypot(x, z);
+    if (rad < 1e-4) continue;
+    let push = 0;
+    for (const d of dents) {
+      let da = Math.atan2(z, x) - d.a;
+      da = Math.atan2(Math.sin(da), Math.cos(da));
+      const fa = Math.max(0, 1 - Math.abs(da) / d.wa);
+      const fy = Math.max(0, 1 - Math.abs(y - d.y) / d.wy);
+      push += d.depth * fa * fa * fy * fy;
+    }
+    const k = (rad - push) / rad;
+    p.setXYZ(i, x * k, y, z * k);
+  }
+  body.computeVertexNormals();
+  b.metal.push(body);
+
+  for (const sy of [h * 0.3, h * 0.7]) b.metal.push(cyl(r + 0.022, 0.055, 18, { y: sy }));
+  // Chime rings top and bottom. On the wrecked drum the top is dished in.
+  b.metal.push(cyl(r + 0.012, 0.045, 18, { y: h - 0.02 }));
+  b.metal.push(cyl(r + 0.012, 0.045, 18, { y: 0.02 }));
+  if (variant === 3) {
+    b.metal.push(cyl(r * 0.72, 0.05, 14, { y: h - 0.075 }));
+  } else {
+    b.metal.push(cyl(0.05, 0.03, 8, { x: r * 0.55, y: h + 0.005 }));
+    if (variant !== 1) b.metal.push(cyl(0.032, 0.022, 8, { x: -r * 0.5, y: h + 0.004 }));
+  }
+  if (variant === 2) {
+    // Painted contents band and a stencil panel. One drum in four carrying a
+    // hazard band is what turns a row of cylinders into stock with a history.
+    b.paintWarn.push(cyl(r + 0.004, 0.185, 18, { y: h * 0.50 }));
+    b.paint.push(cyl(r + 0.006, 0.032, 18, { y: h * 0.50 + 0.115 }));
+    b.paint.push(cyl(r + 0.006, 0.032, 18, { y: h * 0.50 - 0.115 }));
+  }
   return bake(b, h, 0.65);
 }
 
@@ -98,8 +233,19 @@ export function crateGeo(s = 1.0) {
   for (const sy of [t / 2 + 0.01, h - t / 2 - 0.01]) {
     b.wood.push(box(w, t * 1.6, d, { y: sy }));
   }
-  for (const sx of [-1, 1]) b.wood.push(box(t * 1.6, h, d, { x: sx * (w / 2 - t * 0.6), y: h / 2 }));
-  for (const sz of [-1, 1]) b.wood.push(box(w, h, t * 1.6, { z: sz * (d / 2 - t * 0.6), y: h / 2 }));
+  // Corner battens, PROUD of the boarding rather than flush with it. A packing
+  // case is a frame with boards nailed to the outside of it, so every vertical
+  // arris of the case is a 90mm timber standing 25mm off the face — which at
+  // 4 m from the gameplay camera is the difference between a crate and a
+  // smooth plywood block with lines drawn on it.
+  const bt = 0.085;
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      b.wood.push(box(bt, h + 0.02, bt, { x: sx * (w / 2 + bt * 0.18), y: h / 2, z: sz * (d / 2 + bt * 0.18) }));
+    }
+  }
+  for (const sx of [-1, 1]) b.wood.push(box(bt, h, d - bt, { x: sx * (w / 2 + bt * 0.18), y: h / 2 }));
+  for (const sz of [-1, 1]) b.wood.push(box(w - bt, h, bt, { z: sz * (d / 2 + bt * 0.18), y: h / 2 }));
   // Diagonal brace on the long faces.
   for (const sz of [-1, 1]) {
     b.wood.push(xform(box(Math.hypot(w, h) - 0.1, 0.1 * s, t * 1.5), {
@@ -168,15 +314,42 @@ export function rubbleGeo(seed = 1) {
   const b = newBag();
   let s = seed >>> 0;
   const r = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
-  const g = new THREE.IcosahedronGeometry(0.30, 0);
+  // Round 3 tried to fix this by narrowing the aspect ratio, and it could not
+  // work, because the shape was not a shard — it was TORN. `IcosahedronGeometry`
+  // is a PolyhedronGeometry, i.e. non-indexed: every face carries its own copy
+  // of each corner. Drawing a fresh random number per vertex therefore moved
+  // each copy of a shared corner somewhere different and pulled the solid apart
+  // into twenty disconnected triangles, which is exactly the "folded paper" the
+  // gameplay camera kept finding at 4 m (shots/r4/gameplay.png, x=905 y=880).
+  //
+  // The displacement is now a function of the vertex's own DIRECTION, so every
+  // copy of a corner gets the same answer and the hull stays closed. Detail 1
+  // as well: at 0.5 m across and 2 m from the lens, 20 facets are individually
+  // readable and 80 are not.
+  const g = new THREE.IcosahedronGeometry(0.30, 1);
   const p = g.attributes.position;
+  // Three fixed lobes with a per-seed phase: coherent, cheap, and repeatable
+  // for any two vertices that share a position.
+  const ph = [r() * 6.283, r() * 6.283, r() * 6.283];
+  const inv = 1 / 0.30;
   for (let i = 0; i < p.count; i++) {
-    p.setXYZ(i, p.getX(i) * (0.7 + r() * 0.8), p.getY(i) * (0.34 + r() * 0.34), p.getZ(i) * (0.7 + r() * 0.8));
+    const x = p.getX(i) * inv, y = p.getY(i) * inv, z = p.getZ(i) * inv;
+    const k = 1
+      + 0.16 * Math.sin(2.7 * x + ph[0]) * Math.cos(3.1 * z + ph[1])
+      + 0.11 * Math.sin(3.9 * z + ph[2] + 1.7 * y);
+    // A broken piece of slab is a SLAB: 2:1 at worst, with a flat bed face it
+    // settles onto. Flattening the underside is what removes the last of the
+    // artefact, because it is the up-tilted thin edge that catches nothing.
+    p.setXYZ(i, p.getX(i) * k * 1.06, Math.max(p.getY(i) * k, -0.30 * 0.42) * 0.72, p.getZ(i) * k * 1.06);
   }
   g.computeVertexNormals();
-  g.translate(0, 0.09, 0);
+  // Sunk far enough that the waist of the chunk is at grade: a piece of broken
+  // slab in a compound yard is half in the dirt, not resting on top of it.
+  g.translate(0, 0.045, 0);
   b.concrete.push(g);
-  return bake(b, 1.6, 0.9, -1.4);
+  // y0 at the bed face rather than 1.4 m below it, so the shader's splash band
+  // actually lands on the bottom of the chunk and beds it into the dirt.
+  return bake(b, 0.30, 0.9, -0.03);
 }
 
 /**

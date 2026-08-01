@@ -27,9 +27,22 @@ export const SHOTS = {
     // Round 3 raised the target 10 m: the old aim spent the bottom 40% of the
     // frame on one unbroken hillside in shadow at 0.048 display luminance —
     // correctly lit, and nothing to look at.
-    position: [120, 22, 60],
-    target: [-60, 18, -90],
-    fov: 38,
+    //
+    // Round 4 swung the camera round to the sun's side of the compound and
+    // dropped the aim 8 m. The round-3 framing spent the bottom fifth on bare
+    // unbroken hillside — rows 1000-1080 measured mean 48.5, sd 1.92, a flat
+    // wash carrying no information at all. Two candidate rigs were rendered and
+    // measured before this one was picked (rows 1000-1080, dusk):
+    //   round 3            mean 22.6  sd  7.8  grad 0.51   3% over L=40
+    //   low + close (7 m)  mean 12.5  sd  1.4  grad 0.13   0% over L=40
+    //   this one           mean 30.6  sd 21.0  grad 0.67  18% over L=40
+    // Dropping the camera turned the wash black instead of filling it; what
+    // actually works is putting the SUNLIT approach ground, the compound's lit
+    // west flank and its water tower into the lower band, so the band carries a
+    // real luminance range and a real silhouette instead of one value.
+    position: [140, 20, 30],
+    target: [-30, 10, -80],
+    fov: 40,
     tod: 'dusk',
     note: 'Low sun raking across the ridge; long shadows.',
   },
@@ -66,14 +79,27 @@ export const SHOTS = {
   //   subject (1.48, 4.56) - forward*2.4 + right*0.72, eye 1.60, pitch -5 deg
   // which lands him with his spine on the 30% line and his head at 27% of frame
   // height, aim space open across the remaining two thirds.
+  //
+  // Round 4 rebuilt it as a hard local offset instead. The round-3 rig read as a
+  // drone shot: the horizon sat at y=382 while the top of the player's head was
+  // at y=612, i.e. the horizon floated half a body height ABOVE the character,
+  // which only happens when the camera is well over head height and pitched
+  // down. The rig is now (right 0.45, up 1.62, back 2.1) from the player ROOT,
+  // aimed along its own heading at the height of his sternum (root + 1.45) —
+  // 4.6 degrees of pitch, all of it geometric, none of it added to "keep the
+  // ground in frame". Solved over the outpost yard (graded flat at y = -0.05)
+  // for the same subject position, so nothing else about the shot moved:
+  //   cam (2.723, 1.57, 6.312), subject (1.476, -0.05, 4.563)
+  // Horizon lands at y=434 and the crown of the head at y=392 — the horizon
+  // crosses BELOW the head, which is what an eye-height camera does.
   gameplay: {
-    position: [3.09, 1.6, 6.48],
-    target: [-1.65, 0.55, -4.49],
+    position: [2.723, 1.57, 6.312],
+    target: [-1.247, 0.76, -2.868],
     fov: 45,
     tod: 'afternoon',
-    subject: { dist: 2.4, lateral: 0.72, eye: 1.6 },
+    subject: { dist: 2.1, lateral: 0.45, eye: 1.62 },
     // Autofocus point, UV with 0,0 at bottom-left: the soldier's chest.
-    focus: [0.3, 0.52],
+    focus: [0.32, 0.42],
     note: 'Third-person over-the-shoulder gameplay camera.',
   },
   // Outpost approach — tests structures, props, set dressing.

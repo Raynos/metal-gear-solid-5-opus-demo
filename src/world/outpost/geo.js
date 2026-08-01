@@ -34,10 +34,21 @@ export function merge(list) {
 
 /**
  * Bake the per-vertex weathering signal: x = height within the *object* (0 at its
- * base, 1 at its top), y = extra wear, z = spare (oil / footpath on the ground).
+ * base, 1 at its top), y = extra wear, z = the ARRIS mask on architecture (1 on a
+ * chamfer facet, 0 on a flat face) or the oil/footpath signal on the ground.
+ *
+ * The arris channel is what turns the chamfer from geometry into a material
+ * event. A 32mm bevel on its own only ever contributes a one-or-two-pixel
+ * specular sliver; a real thirty-year-old concrete arris is also *chipped* —
+ * the cement skin is gone, the aggregate is showing, it is paler and rougher
+ * than the face behind it and it has rust weeping out of it where the cover
+ * failed. That cannot be derived in the shader from the normal alone, because a
+ * 45-degree normal on a box edge and a 45-degree normal on a cylinder are
+ * indistinguishable, so it is marked at authoring time and carried here.
  */
 export function bakeWeather(g, { y0 = null, y1 = null, wear = 0, extra = 0 } = {}) {
   const pos = g.attributes.position;
+  const arris = g.userData.opArris;
   let lo = y0;
   let hi = y1;
   if (lo === null || hi === null) {
@@ -50,7 +61,7 @@ export function bakeWeather(g, { y0 = null, y1 = null, wear = 0, extra = 0 } = {
   for (let i = 0; i < pos.count; i++) {
     arr[i * 3] = THREE.MathUtils.clamp((pos.getY(i) - lo) / span, 0, 1);
     arr[i * 3 + 1] = wear;
-    arr[i * 3 + 2] = extra;
+    arr[i * 3 + 2] = arris && arris.length === pos.count ? arris[i] : extra;
   }
   g.setAttribute('aWeather', new THREE.BufferAttribute(arr, 3));
   return g;
@@ -98,6 +109,9 @@ function chamferBox(w, h, d, c) {
   const H = [w / 2, h / 2, d / 2];
   const I = [H[0] - c, H[1] - c, H[2] - c];
   const verts = [];
+  // 1 for every vertex belonging to a chamfer facet; see bakeWeather.
+  const arris = [];
+  let markArris = 0;
   const tri = (p, q, r, nx, ny, nz) => {
     // Auto-orient: the caller supplies the intended outward normal and we flip
     // the winding if the cross product disagrees. Cheaper than getting 26
@@ -112,7 +126,10 @@ function chamferBox(w, h, d, c) {
     const cy = uz * vx - ux * vz;
     const cz = ux * vy - uy * vx;
     const a = cx * nx + cy * ny + cz * nz < 0 ? [p, r, q] : [p, q, r];
-    for (const t of a) verts.push(t[0], t[1], t[2]);
+    for (const t of a) {
+      verts.push(t[0], t[1], t[2]);
+      arris.push(markArris);
+    }
   };
   const quad = (p, q, r, s, n) => {
     tri(p, q, r, n[0], n[1], n[2]);
@@ -138,6 +155,7 @@ function chamferBox(w, h, d, c) {
     }
   }
   // Twelve edge chamfers.
+  markArris = 1;
   for (let a = 0; a < 3; a++) {
     const b = (a + 1) % 3;
     const e = (a + 2) % 3;
@@ -174,6 +192,7 @@ function chamferBox(w, h, d, c) {
 
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  g.userData.opArris = Float32Array.from(arris);
   g.computeVertexNormals();
   // Planar UV off the two largest axes; nothing here samples a map, but merges
   // need the attribute to exist and to be finite.
@@ -204,10 +223,23 @@ export function box(w, h, d, o = {}) {
   // real silhouette the player can walk up to. On a 40mm cable clip or a 60mm
   // conduit bracket it is sub-pixel at every distance and would only be paid for
   // four times over in the shadow cascades, so those stay sharp.
-  if (o.sharp || m < 0.10 || Math.max(aw, ah, ad) < 0.40) {
+  // The gate is on the SECTION, not just on the overall size: a 45mm pallet
+  // board is a metre long but it is 45mm thick, so its arris is sub-pixel at
+  // every distance it is ever seen from and chamfering it cost 34k triangles
+  // across the site for nothing measurable. 75mm of section and 450mm of length
+  // is roughly "a member you could sit on", which is the set of edges that
+  // actually carry the building's silhouette.
+  if (o.sharp || m < 0.075 || Math.max(aw, ah, ad) < 0.45) {
     return xform(new THREE.BoxGeometry(w, h, d), o);
   }
-  const c = Math.min(0.022, Math.max(0.008, m * 0.10));
+  // Round 3: the cap was 22mm and the entry gate 100mm, which meant every
+  // building silhouette — walls, piers, copings, cills — carried a 22mm arris
+  // that is under a third of a pixel at 30m and therefore not there at all. A
+  // real precast arris is 20-25mm but a poured-and-struck concrete corner that
+  // has been knocked about for thirty years is 30-45mm, and it is the only
+  // thing standing between a facade and a perfect mathematical edge. 32mm at
+  // 30m is ~2px of specular rim, which is the point.
+  const c = Math.min(0.032, Math.max(0.009, m * 0.12));
   return xform(chamferBox(aw, ah, ad, c), o);
 }
 

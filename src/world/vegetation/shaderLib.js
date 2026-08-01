@@ -102,6 +102,25 @@ vec3 vegNormalAt(vec2 p, float e) {
   float hU = vegHeightAt(p + vec2(0.0, e));
   return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
 }
+/**
+ * Normal *and* mean curvature from one five-tap stencil. Curvature is positive
+ * in a hollow and negative on a nose, normalised by the stencil radius so it is
+ * a slope difference per metre rather than a height.
+ *
+ * The extra tap is the cheapest placement signal there is. Concave ground
+ * collects water, seed and wind-blown fines; convex ground sheds all three, so
+ * this is what puts the scrub in the swales and leaves the spurs bare instead
+ * of dusting both evenly.
+ */
+vec3 vegGroundAt(vec2 p, float e, out float curv) {
+  float h0 = vegHeightAt(p);
+  float hL = vegHeightAt(p - vec2(e, 0.0));
+  float hR = vegHeightAt(p + vec2(e, 0.0));
+  float hD = vegHeightAt(p - vec2(0.0, e));
+  float hU = vegHeightAt(p + vec2(0.0, e));
+  curv = ((hL + hR + hD + hU) * 0.25 - h0) / e;
+  return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
+}
 
 /**
  * The engineered platform, as vegetation sees it. Mirror of applyDevelopment()
@@ -113,7 +132,9 @@ vec3 vegNormalAt(vec2 p, float e) {
  */
 float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
   float yard = smoothstep(0.40, 0.92, dev);
-  float shoulder = max(0.0, 1.0 - abs(dev - 0.42) * 2.2);
+  // 2.8, not 2.2: at 2.2 this was 0.076 on wild ground (dev = 0), and the
+  // shoulder term below then put a 0.047 density floor under the entire map.
+  float shoulder = max(0.0, 1.0 - abs(dev - 0.42) * 2.8);
   float ok = 1.0 - smoothstep(0.28, 0.62, slope);
   float out_ = d * (1.0 - yard * 0.985);
   // Shelter adds rather than scales: the strip against a wall is fertile
@@ -134,9 +155,31 @@ float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
  * Where vegetation is allowed to grow. Grass follows water: it thickens along
  * the drainage lines the terrain's erosion pass carved, breaks into patches on
  * the open flats, and is simply absent from bedrock, talus and steep faces.
+ *
+ * Round 3 rebuilt this around three signals that were missing, all of which the
+ * critics read straight off the frame as "a uniform field of near-identical
+ * specks at uniform density":
+ *
+ *   slope     hard zero past 30 degrees (1 - cos 30 = 0.134). Tussock does not
+ *             hold a scree face; the old mask only reached zero at 62 degrees,
+ *             so every hillside carried the same dusting as the pan.
+ *   curvature concave collects, convex sheds — see vegGroundAt.
+ *   cluster   a 40 m stand field, thresholded hard enough to leave over half
+ *             the open plain genuinely bare. Bare ground between stands is not
+ *             an absence of work, it IS the read: it is what gives the
+ *             remaining stands a shape.
+ *
+ * and it triples the weight on the drainage channel, so a wadi carries several
+ * times what the pan does rather than 1.3x.
+ *
+ * vegCover is the same field with the per-tussock clump term left out — the
+ * smooth, 40 m-scale *coverage* of the ground, which is what the distant tonal
+ * layer paints with. Both come out of one call so the extra texture work is a
+ * couple of noise octaves rather than a second ground query.
  */
-float vegDensity(vec2 p, out float slope, out float dev) {
-  vec3 n = vegNormalAt(p, 2.0);
+float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
+  float curv;
+  vec3 n = vegGroundAt(p, 7.0, curv);
   slope = 1.0 - n.y;
   vec4 s = vegSurfAt(p);
   vec3 pad = vegPadAt(p);
@@ -149,16 +192,20 @@ float vegDensity(vec2 p, out float slope, out float dev) {
   float macro = vegFbm(p * 0.0085 + 41.0, 3);
   float meso = vegFbm(p * 0.052 - 12.0, 2);
   float clump = vegFbm(p * 0.42 + 7.0, 2);
+  float stand = vegFbm(p * 0.025 + 17.0, 2);
 
-  // Weighted so the field genuinely *swings*: real stands of grass tens of
-  // metres across with real bare ground between them. Round 1's balance left
-  // it saturated almost everywhere, so the only variation left was the 2.4 m
-  // clump term and the whole map read as one even stubble.
-  float raw = 0.30 + s.r * 1.00 + (macro - 0.5) * 1.7 + (meso - 0.5) * 1.9;
-  float d = smoothstep(0.0, 0.62, raw) * smoothstep(0.24, 0.58, clump);
-  d *= 1.0 - smoothstep(0.16, 0.52, slope);
+  float raw = 0.24 + s.r * 1.85 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
+  float d = smoothstep(0.0, 0.62, raw);
+  d *= smoothstep(0.455, 0.630, stand);
+  d *= clamp(0.72 + curv * 5.5, 0.16, 1.85);
+  d *= 1.0 - smoothstep(0.075, 0.140, slope);
   d *= 1.0 - smoothstep(0.18, 0.68, max(s.g, s.b * 0.6));
-  return clamp(vegDevelopment(p, d, pad.g, pad.b, slope), 0.0, 1.0);
+  cover = clamp(vegDevelopment(p, d, pad.g, pad.b, slope), 0.0, 1.0);
+  return clamp(cover * smoothstep(0.24, 0.58, clump), 0.0, 1.0);
+}
+float vegDensity(vec2 p, out float slope, out float dev) {
+  float cover;
+  return vegDensity(p, slope, dev, cover);
 }
 `;
 
@@ -208,6 +255,25 @@ float vegGust(vec2 wxz) {
  * shadow, and an ungated glow lights up every blade on it — a field of warm
  * specks in a dark slope, which is the most obvious tell in the whole module.
  * The sky term is deliberately not gated; sky light reaches a shadowed blade.
+ *
+ * ROUND 3 — the gains here were the single biggest reason every critic measured
+ * vegetation as *brighter* than the ground it grows out of.
+ *
+ *   - the sun lobe peaked at through*(0.55 + 1.05) * 0.52 = 0.83, i.e. a
+ *     back-lit blade received 83% of a full frontal sun hit *in addition to*
+ *     whatever the standard BRDF gave it. Under the dawn camera, which looks
+ *     straight into a 6.1-unit sun, that turned the whole valley floor into
+ *     glowing white confetti. Dead straw transmits perhaps a quarter of what
+ *     lands on it, so the peak is now 0.26.
+ *   - the sky term was a *constant ambient bolted onto the material*. It never
+ *     went to zero, which is exactly why the critics measured branches at
+ *     luminance 80 in a night frame: a plant that stays bright at night has a
+ *     light baked into it. It is now a third of its old weight and exists only
+ *     to keep the dark side of a blade off the floor, with the IBL (whose
+ *     intensity came down to match) doing the real ambient work.
+ *   - and both fall off with range. A through-scatter glow is a near-field
+ *     effect on a resolved blade; at 400 m the blade is a third of a pixel and
+ *     all the glow can do is lift that pixel off the terrain it is standing on.
  */
 export const GLSL_DRY_SHADING = /* glsl */ `
 uniform vec3 uSunDir;
@@ -215,15 +281,18 @@ uniform vec3 uSunColor;
 uniform vec3 uSkyColor;
 uniform vec2 uTranslucency; // (through-scatter, sky wrap gain)
 
-vec3 vegDryShading(vec3 N, vec3 V, vec3 albedo, float exposure, float sunVis) {
+vec3 vegDryShading(vec3 N, vec3 V, vec3 albedo, float exposure, float sunVis, float dist) {
   float ndl = dot(N, uSunDir);
   float through = clamp(-ndl * 0.62 + 0.48, 0.0, 1.0);
   float lobe = pow(clamp(dot(-uSunDir, V), 0.0, 1.0), 2.5);
-  vec3 sun = uSunColor * (through * (0.55 + 1.05 * lobe)) * uTranslucency.x * sunVis;
+  // Sub-pixel geometry cannot be back-lit: there is no thickness left to see
+  // through. Beyond 90 m the effect tapers, and past 300 m it is gone.
+  float near = 1.0 - smoothstep(90.0, 300.0, dist);
+  vec3 sun = uSunColor * (through * (0.48 + 0.52 * lobe)) * uTranslucency.x * sunVis * near;
   // Wrapped sky: (N.up + w) / (1 + w) with w = 1 gives a floor of 0.5 even for
   // a blade edge-on to the sky, which is what stops the dark side crushing.
   float sky = (N.y + 1.0) * 0.5;
-  sky = mix(sky, 1.0, 0.35) * uTranslucency.y;
+  sky = mix(sky, 1.0, 0.35) * uTranslucency.y * mix(0.35, 1.0, near);
   return (sun + uSkyColor * sky) * exposure * albedo * RECIPROCAL_PI;
 }
 `;

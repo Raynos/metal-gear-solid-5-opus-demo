@@ -31,7 +31,20 @@ export const MODE = {
   CLOTH: 4,
   GROUND: 5,
   MASONRY: 6,
+  SAND: 7,
 };
+
+/**
+ * Prevailing wind, world space, as the direction the wind BLOWS TOWARD.
+ *
+ * This has to agree with `WIND` in src/world/Terrain.js (0.38 rad), which is
+ * what the terrain's ripple crests are set out perpendicular to. A drift banked
+ * against an object at one angle while the sand around it ripples at another is
+ * worse than having no drifts at all — two contradictory wind directions in one
+ * frame is a thing no photograph has ever contained.
+ */
+export const WIND_RAD = 0.38;
+export const WIND_DIR = [Math.cos(WIND_RAD), Math.sin(WIND_RAD)];
 
 export const NOISE_GLSL = /* glsl */ `
 float ophash(vec2 p){ p = floor(p); return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
@@ -120,6 +133,11 @@ const PROLOGUE = /* glsl */ `
   // South elevations take twice the UV dose. Bleaching one side of every
   // building is what stops a compound reading as a single flat-lit maquette.
   float southFace = clamp(-wn.z * 0.72 + wn.x * 0.38, 0.0, 1.0);
+  // Arris mask, baked per vertex on every chamfered box (see geo.js). 1 on the
+  // 32mm bevel facets, 0 on the flat faces. Interpolation across the facet is
+  // exactly what is wanted: the wear feathers a centimetre or two onto the face
+  // either side of the edge, which is what a knocked corner actually looks like.
+  float arris = clamp(vOPW.z, 0.0, 1.0);
   vec3 nrm = wn;
 `;
 
@@ -192,6 +210,16 @@ const BODY = {
     c *= 0.93 + 0.14 * fine;
     gRough = clamp(0.90 + (m2 - 0.5) * 0.18, 0.5, 1.0);
     gMetal = 0.0;
+    // Chipped arris. This is the payoff for baking the bevel mask: the cement
+    // skin has gone off every edge in the compound, so the edge is a PALE,
+    // ROUGH, aggregate-showing line that is a different material from the face
+    // — not merely a slightly differently-lit sliver of the same one. It is
+    // broken along its length (the m3 term) because a continuous chip is a
+    // moulding, and it bleeds rust wherever the cover was thin.
+    float chipE = arris * (0.35 + 0.65 * smoothstep(0.30, 0.78, m3 * 0.7 + m2 * 0.5));
+    c = mix(c, uBase3 * 1.34 + vec3(0.030, 0.027, 0.021), clamp(chipE * 0.62, 0.0, 0.7));
+    c = mix(c, uRust * 0.85, clamp(chipE * (streak * 1.1 + 0.18 * wear), 0.0, 0.32));
+    gRough = mix(gRough, 0.99, chipE * 0.55);
     ${DADO}
     // Relief so a shaded facade still catches a gradient from the sky.
     nrm = normalize(wn + vec3(m3 - 0.5, m2 - 0.5, m2 - 0.5) * 0.22 * (0.4 + chip)
@@ -227,7 +255,14 @@ const BODY = {
     c = mix(c, uRust * 0.9, clamp(run * (0.3 + 0.8 * wear), 0.0, 0.7));
     c = mix(c, uBase * 0.45 * (0.7 + 0.6 * m3), splash * 0.85);
     c = mix(c, c * 1.24 + vec3(0.03, 0.026, 0.014), southFace * 0.48);
+    // Knocked corners: the lime and the render are both off the arris and the
+    // block below is showing, which on a whitewashed building is the DARKER
+    // material — the opposite sign to bare concrete, and the reason the two
+    // shells stop looking like the same wall in two tints.
+    float chipE = arris * (0.30 + 0.70 * smoothstep(0.28, 0.75, m3 * 0.7 + m2 * 0.5));
+    c = mix(c, uBase2 * 0.86, clamp(chipE * 0.70, 0.0, 0.78));
     gRough = clamp(0.88 + (m2 - 0.5) * 0.16 + joint * 0.08, 0.5, 1.0);
+    gRough = mix(gRough, 0.99, chipE * 0.5);
     gMetal = 0.0;
     ${DADO}
     nrm = normalize(wn
@@ -247,8 +282,14 @@ const BODY = {
     c = mix(c, uRust * 1.05 * (0.55 + 0.6 * m2), clamp(run * (0.4 + wear), 0.0, 0.85));
     c *= 1.0 - 0.22 * topWash;
     c = mix(c, c * 1.16 + vec3(0.02, 0.017, 0.01), southFace * 0.34);
+    // Paint never survives on an edge: every folded arris in the compound is
+    // bare steel going to rust, which is a bright specular line on a matt body.
+    float chipE = arris * (0.40 + 0.60 * smoothstep(0.25, 0.80, m3));
+    c = mix(c, mix(uRust * 1.15, vec3(0.20, 0.19, 0.18), 0.35) * (0.7 + 0.5 * m2), clamp(chipE * 0.65, 0.0, 0.75));
     gRough = clamp(mix(0.46, 0.94, rustM) + (m3 - 0.5) * 0.08 + run * 0.35, 0.08, 1.0);
+    gRough = mix(gRough, 0.42, chipE * 0.45);
     gMetal = mix(uMetal, 0.04, max(rustM, run * 0.8));
+    gMetal = mix(gMetal, 0.55, chipE * 0.35);
     nrm = normalize(wn + vec3(m3 - 0.5, 0.0, m2 - 0.5) * 0.14 * rustM);
     ${DADO}
   `,
@@ -351,6 +392,36 @@ const BODY = {
     gRough = 0.98;
     gMetal = 0.0;
     nrm = normalize(nrm + vec3(fold - 0.5, 0.0, m2 - 0.5) * 0.50);
+  `,
+  [MODE.SAND]: /* glsl */ `
+    // Wind-deposited fines: the wedge of sand that banks up against the upwind
+    // face of anything that obstructs the wind. It is NOT the same material as
+    // the graded ground it sits on — it is the finest fraction, sorted out of
+    // the load, so it is paler, smoother, and it carries the ripple set at the
+    // same heading as the terrain's own.
+    vec2 wd = vec2(${Math.cos(0.38).toFixed(5)}, ${Math.sin(0.38).toFixed(5)});
+    vec2 wp = vec2(dot(vOPP.xz, wd), dot(vOPP.xz, vec2(-wd.y, wd.x)));
+    // Crests every ~18cm, made sinuous by warping the phase along the crest
+    // line. A straight-crested ripple at constant amplitude is a corrugated
+    // sheet, which is exactly what the first attempt looked like.
+    float rip = sin(wp.x * 34.0 + opn2(vec2(wp.y * 1.9, wp.x * 0.6)) * 7.0) * 0.5 + 0.5;
+    rip *= 0.40 + 0.60 * opn2(vec2(wp.y * 2.4, wp.x * 0.5));
+    float n1s = opfbm(vOPP.xz * 0.55, 3);
+    float n2s = opfbm(vOPP.xz * 4.5, 2);
+    vec3 c = mix(uBase, uBase3, clamp(n1s * 0.8 + n2s * 0.35, 0.0, 1.0));
+    // The crest of the drift is scoured and pale; the toe is shaded and coarse.
+    // The toe of the drift has to BE the ground it lies on, or the join reads
+    // as the edge of a decal. Only the crest, where the fines are actively
+    // being sorted and scoured, is paler than the surround.
+    c = mix(c, uBase2, smoothstep(0.62, 0.02, y01) * 0.90);
+    c = mix(c, uBase3 * 1.06, up * 0.30 * smoothstep(0.15, 0.65, y01));
+    c *= 0.95 + 0.10 * rip;
+    // Ripple relief only — a drift has no other structure, and giving it any
+    // reads as rubble.
+    float ampR = 0.030 * (0.4 + 0.6 * up) * (0.35 + 0.65 * smoothstep(0.05, 0.5, y01));
+    nrm = normalize(wn + vec3(wd.x, 0.0, wd.y) * cos(wp.x * 46.0) * ampR);
+    gRough = clamp(0.93 + (n2s - 0.5) * 0.08, 0.6, 1.0);
+    gMetal = 0.0;
   `,
   [MODE.GROUND]: /* glsl */ `
     float road = clamp(vOPT.x, 0.0, 1.0);

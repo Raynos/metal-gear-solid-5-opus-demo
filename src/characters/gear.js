@@ -193,20 +193,73 @@ export function buildChestRig(o = {}) {
 
   // --- the BACK of the carrier -------------------------------------------
   // The third-person camera spends the entire game looking at this panel, and
-  // in round 1 it was blank. MOLLE ladders, a utility pouch, a drag handle and
-  // the shoulder-strap adjusters are all silhouette-adjacent detail that reads
-  // from directly behind.
-  parts.push(...molle(1.305, 3, 0.05, 0.115, 0.13, Z.WEBBING, 0.008));
+  // in round 1 it was blank. Round 3 gave it three widely spaced tapes and a
+  // pouch, and a row-scan across the shipped frame still returned the same
+  // 8-bit value 150 times in a row. Nothing below is decoration: every piece is
+  // a value STEP across that span — a raised plate pocket, a recessed spine
+  // channel between two padded panels, six MOLLE rungs at 32 mm with vertical
+  // stitch stiles, a shoulder yoke, and the hard horizontal of the drag handle.
+
+  // Raised rear plate pocket standing 14 mm off the carrier, with its own
+  // stitched border: a lit top edge and a shadowed bottom edge straight across
+  // the middle of the panel.
   parts.push({
-    surface: roundedBox(0.14, 0.1, 0.052, 0.014, { zone: Z.POUCH, radial: 12 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.17, 0.155),
+    surface: loftKeys(
+      [
+        { p: V(0, 1.14, 0.128), rx: 0.128 * bulk, rz: 0.030, n: 5.0, zone: Z.VEST },
+        { p: V(0, 1.19, 0.136), rx: 0.140 * bulk, rz: 0.034, n: 5.4, zone: Z.VEST },
+        { p: V(0, 1.30, 0.138), rx: 0.146 * bulk, rz: 0.035, n: 5.4, zone: Z.VEST },
+        { p: V(0, 1.37, 0.130), rx: 0.132 * bulk, rz: 0.030, n: 5.0, zone: Z.VEST },
+      ],
+      10,
+      { radial: 18, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // Spine channel: two padded panels either side of a 26 mm gap. A real carrier
+  // is built this way so the wearer's spine is not loaded, and the gap reads as
+  // a dark vertical stripe down the middle of the back — the one axis the
+  // horizontal MOLLE rungs cannot break.
+  for (const sgn of [-1, 1]) {
+    parts.push({
+      surface: loftKeys(
+        [
+          { p: V(sgn * 0.058, 1.13, 0.146), rx: 0.036, rz: 0.013, n: 4.6, zone: Z.POUCH },
+          { p: V(sgn * 0.062, 1.20, 0.152), rx: 0.042, rz: 0.016, n: 4.8, zone: Z.POUCH },
+          { p: V(sgn * 0.062, 1.31, 0.153), rx: 0.042, rz: 0.016, n: 4.8, zone: Z.POUCH },
+          { p: V(sgn * 0.058, 1.375, 0.145), rx: 0.034, rz: 0.012, n: 4.6, zone: Z.POUCH },
+        ],
+        10,
+        { radial: 12, capStart: true, capEnd: true },
+      ),
+      mat: 'cloth',
+    });
+  }
+  parts.push(...molle(1.352, 6, 0.032, 0.106, 0.146, Z.WEBBING, 0.007));
+  // The tapes are stitched down every 52 mm; the stitch columns are what make a
+  // ladder read as a grid rather than as stripes.
+  for (const sx of [-0.078, -0.026, 0.026, 0.078]) {
+    parts.push({
+      surface: strap(
+        [V(sx, 1.365, 0.148), V(sx, 1.28, 0.157), V(sx, 1.20, 0.157), V(sx, 1.155, 0.148)],
+        0.010,
+        0.004,
+        Z.WEBBING,
+        { stations: 10 },
+      ),
+      mat: 'cloth',
+    });
+  }
+  parts.push({
+    surface: roundedBox(0.128, 0.086, 0.048, 0.014, { zone: Z.POUCH, radial: 12 }).transform(
+      new THREE.Matrix4().setPosition(0, 1.104, 0.162),
     ),
     mat: 'cloth',
   });
   parts.push({
     surface: strap(
-      [V(-0.062, 1.222, 0.148), V(-0.03, 1.228, 0.176), V(0.03, 1.228, 0.176), V(0.062, 1.222, 0.148)],
-      0.022,
+      [V(-0.056, 1.146, 0.156), V(-0.028, 1.152, 0.184), V(0.028, 1.152, 0.184), V(0.056, 1.146, 0.156)],
+      0.02,
       0.007,
       Z.WEBBING,
       { stations: 9 },
@@ -224,7 +277,20 @@ export function buildChestRig(o = {}) {
     ),
     mat: 'cloth',
   });
+  // Shoulder yoke: the seam where the strap assembly is sewn into the back
+  // panel, running out over each trapezius. It closes the outline at the top of
+  // the carrier, which otherwise ends in a bare curve against the collar.
   for (const sgn of [-1, 1]) {
+    parts.push({
+      surface: strap(
+        [V(sgn * 0.03, 1.418, 0.114), V(sgn * 0.078, 1.428, 0.102), V(sgn * 0.112, 1.4, 0.056), V(sgn * 0.122, 1.352, 0.01)],
+        0.04,
+        0.010,
+        Z.WEBBING,
+        { stations: 12 },
+      ),
+      mat: 'cloth',
+    });
     parts.push(...buckle(V(sgn * 0.088, 1.325, 0.128), { w: 0.028, h: 0.022, rotY: sgn * 0.15 }));
   }
   return parts;
@@ -326,15 +392,23 @@ export function buildHolster(side = 1) {
  */
 export function buildBackpack(o = {}) {
   const parts = [];
-  const back = 0.185;
+  // Round 4: this was a 31 cm wide, 40 cm tall expedition rucksack standing
+  // 27 cm proud of the spine. From the gameplay camera it WAS the character —
+  // a row-scan across the shipped frame returned 150 consecutive pixels of one
+  // value, because the only thing in that scanline was the pack's blank flank.
+  // Everything worth looking at (the carrier's back panel, the MOLLE, the drag
+  // handle, the shoulders, the collar, the neck) was behind it. This is now a
+  // low-profile assault pack: 25 cm wide, 26 cm tall, riding high and tight so
+  // the bottom third of the carrier and both shoulders stay in the outline.
+  const back = 0.148;
   parts.push({
     surface: loftKeys(
       [
-        { p: V(0, 1.02, back - 0.01), rx: 0.13, rz: 0.062, n: 3.6, zone: Z.PACK },
-        { p: V(0, 1.09, back + 0.006), rx: 0.145, rz: 0.078, n: 3.8, zone: Z.PACK },
-        { p: V(0, 1.22, back + 0.012), rx: 0.155, rz: 0.084, n: 4.0, zone: Z.PACK },
-        { p: V(0, 1.34, back + 0.006), rx: 0.152, rz: 0.078, n: 4.0, zone: Z.PACK },
-        { p: V(0, 1.42, back - 0.012), rx: 0.13, rz: 0.06, n: 3.6, zone: Z.PACK },
+        { p: V(0, 1.135, back - 0.006), rx: 0.101, rz: 0.040, n: 3.6, zone: Z.PACK },
+        { p: V(0, 1.19, back + 0.004), rx: 0.116, rz: 0.052, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.27, back + 0.008), rx: 0.124, rz: 0.058, n: 4.0, zone: Z.PACK },
+        { p: V(0, 1.34, back + 0.004), rx: 0.121, rz: 0.053, n: 4.0, zone: Z.PACK },
+        { p: V(0, 1.39, back - 0.008), rx: 0.102, rz: 0.040, n: 3.6, zone: Z.PACK },
       ],
       12,
       { radial: 20, capStart: true, capEnd: true },
@@ -345,10 +419,10 @@ export function buildBackpack(o = {}) {
   parts.push({
     surface: loftKeys(
       [
-        { p: V(0, 1.462, back - 0.006), rx: 0.118, rz: 0.056, n: 3.4, zone: Z.PACK },
-        { p: V(0, 1.44, back + 0.004), rx: 0.142, rz: 0.075, n: 3.8, zone: Z.PACK },
-        { p: V(0, 1.415, back + 0.006), rx: 0.146, rz: 0.079, n: 3.8, zone: Z.PACK },
-        { p: V(0, 1.392, back + 0.002), rx: 0.138, rz: 0.073, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.418, back - 0.004), rx: 0.092, rz: 0.036, n: 3.4, zone: Z.PACK },
+        { p: V(0, 1.402, back + 0.003), rx: 0.113, rz: 0.050, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.383, back + 0.004), rx: 0.116, rz: 0.053, n: 3.8, zone: Z.PACK },
+        { p: V(0, 1.366, back + 0.001), rx: 0.110, rz: 0.049, n: 3.8, zone: Z.PACK },
       ],
       9,
       { radial: 18, capStart: true, capEnd: true },
@@ -356,18 +430,18 @@ export function buildBackpack(o = {}) {
     mat: 'cloth',
   });
   // Lid closure straps running down onto the back panel, each ending in a buckle.
-  for (const sx of [-0.062, 0.062]) {
+  for (const sx of [-0.05, 0.05]) {
     parts.push({
       surface: strap(
-        [V(sx, 1.455, back + 0.03), V(sx, 1.418, back + 0.082), V(sx, 1.36, back + 0.096), V(sx, 1.318, back + 0.09)],
-        0.024,
+        [V(sx, 1.412, back + 0.02), V(sx, 1.385, back + 0.056), V(sx, 1.345, back + 0.066), V(sx, 1.312, back + 0.062)],
+        0.022,
         0.007,
         Z.WEBBING,
         { stations: 10 },
       ),
       mat: 'cloth',
     });
-    parts.push(...buckle(V(sx, 1.322, back + 0.098), { w: 0.028, h: 0.022 }));
+    parts.push(...buckle(V(sx, 1.316, back + 0.07), { w: 0.026, h: 0.02 }));
   }
 
   // Side pockets: the flanks are where a pack's silhouette is judged.
@@ -375,10 +449,10 @@ export function buildBackpack(o = {}) {
     parts.push({
       surface: loftKeys(
         [
-          { p: V(sgn * 0.148, 1.09, back + 0.03), rx: 0.032, rz: 0.052, n: 3.6, zone: Z.PACK },
-          { p: V(sgn * 0.158, 1.14, back + 0.036), rx: 0.038, rz: 0.062, n: 3.8, zone: Z.PACK },
-          { p: V(sgn * 0.158, 1.21, back + 0.036), rx: 0.038, rz: 0.062, n: 3.8, zone: Z.PACK },
-          { p: V(sgn * 0.148, 1.26, back + 0.03), rx: 0.03, rz: 0.05, n: 3.6, zone: Z.PACK },
+          { p: V(sgn * 0.114, 1.185, back + 0.018), rx: 0.026, rz: 0.036, n: 3.6, zone: Z.PACK },
+          { p: V(sgn * 0.124, 1.222, back + 0.024), rx: 0.031, rz: 0.043, n: 3.8, zone: Z.PACK },
+          { p: V(sgn * 0.124, 1.278, back + 0.024), rx: 0.031, rz: 0.043, n: 3.8, zone: Z.PACK },
+          { p: V(sgn * 0.114, 1.315, back + 0.018), rx: 0.024, rz: 0.034, n: 3.6, zone: Z.PACK },
         ],
         9,
         { radial: 14, capStart: true, capEnd: true },
@@ -387,8 +461,8 @@ export function buildBackpack(o = {}) {
     });
     parts.push({
       surface: strap(
-        [V(sgn * 0.132, 1.245, back + 0.03), V(sgn * 0.172, 1.25, back + 0.036), V(sgn * 0.17, 1.2, back + 0.078)],
-        0.02,
+        [V(sgn * 0.102, 1.302, back + 0.018), V(sgn * 0.136, 1.306, back + 0.024), V(sgn * 0.134, 1.264, back + 0.05)],
+        0.018,
         0.006,
         Z.WEBBING,
         { stations: 9 },
@@ -397,42 +471,46 @@ export function buildBackpack(o = {}) {
     });
   }
 
-  // MOLLE ladders across the back panel.
-  parts.push(...molle(1.3, 4, 0.048, 0.108, back + 0.086, Z.WEBBING, 0.012));
+  // MOLLE ladders across the back panel. Five rows at 34 mm rather than four at
+  // 48: at the distance the gameplay camera sits, 48 mm spacing puts one dark
+  // line every 19 px and leaves everything between them flat.
+  parts.push(...molle(1.335, 5, 0.034, 0.084, back + 0.06, Z.WEBBING, 0.009));
 
   // Horizontal compression straps, cinched with buckles on the character's left.
-  for (const y of [1.135, 1.285]) {
+  for (const y of [1.168, 1.302]) {
     parts.push({
       surface: strap(
-        [V(-0.157, y, back + 0.02), V(-0.12, y, back + 0.09), V(0, y, back + 0.1), V(0.12, y, back + 0.09), V(0.157, y, back + 0.02)],
-        0.028,
+        [V(-0.124, y, back + 0.012), V(-0.095, y, back + 0.06), V(0, y, back + 0.068), V(0.095, y, back + 0.06), V(0.124, y, back + 0.012)],
+        0.026,
         0.008,
         Z.WEBBING,
         { stations: 14 },
       ),
       mat: 'cloth',
     });
-    parts.push(...buckle(V(-0.086, y, back + 0.104), { w: 0.03, h: 0.022 }));
+    parts.push(...buckle(V(-0.07, y, back + 0.072), { w: 0.028, h: 0.02 }));
   }
 
-  // Bedroll lashed under the pack.
+  // Bedroll lashed under the pack — the one horizontal mass on a body made of
+  // verticals, and it sits exactly on the waistline where the eye reads the
+  // break between torso and hips.
   parts.push({
     surface: loftKeys(
       [
-        { p: V(-0.15, 1.0, back + 0.03), rx: 0.045, rz: 0.045, n: 2.2, zone: Z.PACK },
-        { p: V(0, 0.985, back + 0.04), rx: 0.05, rz: 0.05, n: 2.2, zone: Z.PACK },
-        { p: V(0.15, 1.0, back + 0.03), rx: 0.045, rz: 0.045, n: 2.2, zone: Z.PACK },
+        { p: V(-0.115, 1.118, back + 0.014), rx: 0.033, rz: 0.033, n: 2.2, zone: Z.PACK },
+        { p: V(0, 1.106, back + 0.022), rx: 0.038, rz: 0.038, n: 2.2, zone: Z.PACK },
+        { p: V(0.115, 1.118, back + 0.014), rx: 0.033, rz: 0.033, n: 2.2, zone: Z.PACK },
       ],
       9,
       { radial: 12, capStart: true, capEnd: true, forward: V(0, 1, 0) },
     ),
     mat: 'cloth',
   });
-  for (const sx of [-0.075, 0.075]) {
+  for (const sx of [-0.058, 0.058]) {
     parts.push({
       surface: strap(
-        [V(sx, 1.03, back + 0.055), V(sx, 0.995, back + 0.09), V(sx, 0.958, back + 0.055)],
-        0.018,
+        [V(sx, 1.146, back + 0.03), V(sx, 1.112, back + 0.056), V(sx, 1.078, back + 0.03)],
+        0.016,
         0.006,
         Z.WEBBING,
         { stations: 8 },
@@ -441,19 +519,36 @@ export function buildBackpack(o = {}) {
     });
   }
 
+  // Whip antenna off the pack's left shoulder. A 45 cm line breaking the
+  // headroom above the silhouette is the cheapest possible read of "this is
+  // equipment, not a costume", and it survives to any distance.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(-0.088, 1.36, back + 0.03), rx: 0.0055, rz: 0.0055, n: 2.2, zone: MZ.DARKPOLY },
+        { p: V(-0.104, 1.52, back + 0.028), rx: 0.0035, rz: 0.0035, n: 2.2, zone: MZ.DARKPOLY },
+        { p: V(-0.128, 1.68, back + 0.016), rx: 0.0026, rz: 0.0026, n: 2.2, zone: MZ.DARKPOLY },
+        { p: V(-0.162, 1.80, back - 0.008), rx: 0.0018, rz: 0.0018, n: 2.2, zone: MZ.DARKPOLY },
+      ],
+      12,
+      { radial: 6, capStart: true, capEnd: true },
+    ),
+    mat: 'metal',
+  });
+
   // Shoulder straps over the front, each with a sternum-height adjuster.
   for (const sgn of [-1, 1]) {
     parts.push({
       surface: strap(
         [
-          V(sgn * 0.09, 1.4, back - 0.03),
-          V(sgn * 0.105, 1.462, 0.03),
-          V(sgn * 0.105, 1.44, -0.06),
-          V(sgn * 0.095, 1.33, -0.12),
+          V(sgn * 0.085, 1.38, back - 0.03),
+          V(sgn * 0.1, 1.452, 0.03),
+          V(sgn * 0.102, 1.432, -0.06),
+          V(sgn * 0.093, 1.33, -0.12),
           V(sgn * 0.07, 1.19, -0.13),
         ],
-        0.048,
-        0.014,
+        0.046,
+        0.013,
         Z.WEBBING,
         { stations: 18 },
       ),
@@ -595,7 +690,7 @@ export function buildBandana() {
   // horns.
   const band = new Surface();
   const R = 26;
-  const rows = [0.30, 0.42, 0.54];
+  const rows = [0.24, 0.38, 0.52];
   const dir = new THREE.Vector3();
   const p3 = new THREE.Vector3();
   for (let j = 0; j < rows.length; j++) {
@@ -607,7 +702,12 @@ export function buildBandana() {
       headSurface(dir, p3, {});
       p3.sub(HEAD_CENTRE);
       const len = p3.length() || 1;
-      p3.multiplyScalar(1 + (0.0055 + 0.0015 * Math.sin(th * 7)) / len).add(HEAD_CENTRE);
+      // 17 mm of stand-off, not 5.5. The bandana goes OVER the hair, and the
+      // hair shell is 13 mm proud of the skull — at 5.5 mm the band was buried
+      // inside it everywhere except the bare forehead, which is why the head
+      // came back from the gameplay camera as one undifferentiated dark bowl.
+      // The 1.5 mm ripple is the fold the cloth takes over the ear.
+      p3.multiplyScalar(1 + (0.0168 + 0.0012 * Math.sin(th * 7)) / len).add(HEAD_CENTRE);
       band.vert(p3.x, p3.y, p3.z, (i / R) * 0.5, j * 0.03, Z.BANDANA);
     }
   }
@@ -618,21 +718,25 @@ export function buildBandana() {
     }
   }
   parts.push({ surface: band, mat: 'cloth' });
-  // Knot + tails trailing down the back of the head.
+  // Knot + tails trailing down the back of the head. Round 4 halved both: at
+  // 26 mm wide and 15 cm long the tails were the widest thing on the head and
+  // the only saturated colour in the frame, so from the gameplay camera the
+  // read was "red ribbon", not "soldier". A tied bandana tail is a 14 mm
+  // pennant.
   parts.push({
-    surface: roundedBox(0.04, 0.032, 0.032, 0.008, { zone: Z.BANDANA, radial: 8 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.716, 0.092),
+    surface: roundedBox(0.034, 0.028, 0.028, 0.007, { zone: Z.BANDANA, radial: 8 }).transform(
+      new THREE.Matrix4().setPosition(0, 1.712, 0.108),
     ),
     mat: 'cloth',
   });
   for (const sgn of [-1, 1]) {
     parts.push({
       surface: strap(
-        [V(sgn * 0.012, 1.712, 0.094), V(sgn * 0.03, 1.662, 0.106), V(sgn * 0.045, 1.608, 0.104), V(sgn * 0.052, 1.562, 0.088)],
-        0.026,
-        0.005,
+        [V(sgn * 0.012, 1.706, 0.112), V(sgn * 0.026, 1.672, 0.118), V(sgn * 0.038, 1.638, 0.114), V(sgn * 0.044, 1.608, 0.1)],
+        0.015,
+        0.004,
         Z.BANDANA,
-        { stations: 10, taper: 0.35 },
+        { stations: 10, taper: 0.45 },
       ),
       mat: 'cloth',
     });

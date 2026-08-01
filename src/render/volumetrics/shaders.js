@@ -127,6 +127,7 @@ uniform sampler2D tPrevColor;    // last frame's HDR colour (heat-haze refractio
 uniform sampler2D tSunHeight;    // terrain shadow-height field
 uniform sampler2D tShadowMap;    // engine sun shadow map (RGBA packed)
 uniform sampler2D tWeather;      // 2D cloud weather map
+uniform sampler2D tSkyLut;       // sky radiance by view direction (see SkyLut.js)
 uniform sampler3D tCloud;
 
 uniform mat4 uInvViewProj;
@@ -150,22 +151,23 @@ uniform float uShaftHeight;      // scale height of the shaft medium
 uniform float uSunScatter;       // gain on the crepuscular lobe
 uniform float uPhaseG;
 uniform float uHazeOwned;        // 1 when this pass owns the distance haze
-uniform vec3 uSkyAmbient;        // hemisphere-average sky radiance
 uniform vec3 uBetaR;             // Rayleigh extinction at the datum, per metre
 uniform vec3 uBetaD;             // desert dust extinction at ground level, per metre
 uniform vec3 uDustAlbedo;        // warm scattering albedo of the dust
 uniform vec3 uGroundLight;       // radiance of the sunlit ground under the haze
 uniform float uBetaM;
 uniform float uDustHeight;       // scale height of the dust layer
-uniform float uApSun;
-uniform float uApAmb;
+uniform float uApGain;           // overall strength of the distance haze
+uniform float uApDesat;          // multiple-scattering flattening of the haze chroma
+uniform float uSkyLutValid;      // 1 when tSkyLut holds a real table
 uniform float uApG;
 
 uniform float uCloudCoverage;
 uniform float uCloudBase;
 uniform float uCloudTop;
 uniform float uCloudDensity;
-uniform float uCloudAbsorb;
+uniform float uCloudAbsorb;      // view-ray extinction of the cloud medium
+uniform float uCloudLightExt;    // extinction along the light march (self-shadow)
 uniform float uCloudGain;
 uniform float uCloudAmbGain;
 uniform float uCirrus;
@@ -175,6 +177,27 @@ uniform float uCloudShadow;
 uniform float uWindT;
 
 ${COMMON}
+
+// ------------------------------------------------------------------ sky lookup
+
+/**
+ * Radiance of the sky looking along d. This is the convergence target for
+ * every distance effect in this shader — the distance haze, the far end of the
+ * cloud deck, the cirrus. Round 3 converged them all onto authored constants
+ * instead, which is why the haze got warmer with distance while the sky it sat
+ * under got cooler.
+ *
+ * Storage and warp are documented in SkyLut.js; the fallback is the old
+ * horizon/zenith pair, used only if Sky exposes no query API at all.
+ */
+vec3 skyRadiance(vec3 d) {
+  if (uSkyLutValid < 0.5) {
+    return mix(uSkyHorizon, uSkyZenith, smoothstep(0.0, 0.55, d.y));
+  }
+  float u = atan(d.z, d.x) * 0.15915494 + 0.5;
+  float v = sqrt(clamp((d.y + 0.05) * (1.0 / 1.05), 0.0, 1.0));
+  return texture2D(tSkyLut, vec2(u, v)).rgb;
+}
 
 // ---------------------------------------------------------------- shaft volume
 
@@ -273,9 +296,26 @@ float heightProfile(float h, float cov, float typ, float peak) {
 }
 
 /**
- * Density at a world point. lod fades the erosion octaves out with distance:
- * detail finer than the step length only aliases, and aliased cloud edges are
- * exactly the "shimmering popcorn" tell.
+ * Density at a world point. lod fades the finest erosion octave out with
+ * distance: detail finer than the step length only aliases, and aliased cloud
+ * edges are exactly the "shimmering popcorn" tell.
+ *
+ * ## Round 4: the silhouette
+ *
+ * Round 3 built the shape from two octaves at 2600 m and 900 m. The 48^3 volume
+ * carries its coarsest Worley at three cells per period, so 2600 m meant ~870 m
+ * blobs, and a hard density threshold applied to a trilinearly interpolated
+ * field of ~870 m blobs is a faceted polyhedron. Measured on
+ * shots/r3-fix2/ground.png, a horizontal scan across a cloud at y=252 ran
+ * 171 172 176 ... 230 239 243 [247 x 20] 246 ... 183 175 173: a plateau with two
+ * hard shoulders and nothing in between, which is the outline of the noise cell,
+ * not the outline of a cloud.
+ *
+ * Four octaves now, top one 130 m, so the silhouette breaks up at a fifth of the
+ * scale a single puff subtends. The erosion keeps a floor at distance instead of
+ * switching off entirely — a far cloud with NO high-frequency boundary is
+ * exactly the flat-edged plate above, and a soft-but-present fringe aliases far
+ * less than the hard threshold edge it replaces.
  */
 float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
   float h = clamp((alt - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
@@ -285,20 +325,28 @@ float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
   // Wind shear: a cumulus top lags downwind of its base, which is the cue that
   // says "this is a volume in a moving airmass" rather than an extruded decal.
   vec3 q = p + vec3(uWindT * 3.1 + 260.0 * h, 0.0, uWindT * 1.1 + 90.0 * h);
-  float shape = texture(tCloud, q * (1.0 / 2600.0)).r;
-  shape = shape * 0.70 + texture(tCloud, q * (1.0 / 900.0) + 0.31).r * 0.30;
+  float shape = texture(tCloud, q * (1.0 / 1700.0)).r * 0.50
+              + texture(tCloud, q * (1.0 / 620.0) + 0.31).r * 0.31
+              + texture(tCloud, q * (1.0 / 230.0) + 0.67).r * 0.19;
 
   float base = shape * prof;
-  float d = remap(base, 1.0 - wx.x, 1.0, 0.0, 1.0);
+  // Fixed-width transition band rather than "threshold to 1.0". Averaging four
+  // octaves narrows the field's spread around 0.5, so a band that stretched from
+  // the threshold all the way to 1.0 would never be crossed; and a constant band
+  // width means the density ramp at a cloud's edge has a constant softness
+  // instead of collapsing to a step wherever coverage happens to be high, which
+  // is the other half of why round 3's silhouettes had hard shoulders.
+  float thr = mix(0.80, 0.20, wx.x);
+  float d = remap(base, thr, thr + 0.28, 0.0, 1.0);
   if (d <= 0.0) return 0.0;
 
-  if (lod > 0.01) {
-    vec4 hi = texture(tCloud, (p + vec3(uWindT * 5.0, 0.0, uWindT * 1.8)) * (1.0 / 260.0));
-    float fbm = hi.g * 0.58 + hi.b * 0.29 + hi.a * 0.13;
-    // Erode hard at the base, softly at the top: wispy bottoms, firm anvils.
-    float e = mix(fbm, 1.0 - fbm, clamp(h * 2.4, 0.0, 1.0)) * lod;
-    d = remap(d, e * 0.62, 1.0, 0.0, 1.0);
-  }
+  float er = mix(0.34, 1.0, lod);
+  vec4 hi = texture(tCloud, (p + vec3(uWindT * 5.0, 0.0, uWindT * 1.8)) * (1.0 / 420.0));
+  float fbm = hi.g * 0.50 + hi.b * 0.32 + hi.a * 0.18;
+  // Erode hard at the base, softly at the top: wispy bottoms, firm anvils.
+  float e = mix(fbm, 1.0 - fbm, clamp(h * 2.4, 0.0, 1.0)) * er;
+  d = remap(d, e * 0.70, 1.0, 0.0, 1.0);
+
   return clamp(d, 0.0, 1.0) * uCloudDensity;
 }
 
@@ -318,7 +366,7 @@ float cloudShadowAt(vec3 p) {
   vec3 wx = weatherAt(q.xz);
   if (wx.x < 0.001) return 0.0;
   float d = cloudDensity(q, mid, wx, 0.0);
-  return (1.0 - exp(-d * uCloudAbsorb * 700.0)) * uCloudShadow;
+  return (1.0 - exp(-d * uCloudLightExt * 700.0)) * uCloudShadow;
 }
 
 /**
@@ -329,14 +377,14 @@ float cloudShadowAt(vec3 p) {
 float cloudLightMarch(vec3 p, float alt0, float jit) {
   float t = 0.0;
   float dsum = 0.0;
-  float stepLen = 46.0 * (0.7 + 0.6 * jit);
-  for (int i = 0; i < 5; i++) {
+  float stepLen = 38.0 * (0.7 + 0.6 * jit);
+  for (int i = 0; i < 6; i++) {
     t += stepLen;
     vec3 q = p + uKeyDir * t;
     float alt = alt0 + uKeyDir.y * t;
     if (alt > uCloudTop || alt < uCloudBase) break;
     dsum += cloudDensity(q, alt, weatherAt(q.xz), i < 2 ? 1.0 : 0.0) * stepLen;
-    stepLen *= 2.0;
+    stepLen *= 1.9;
   }
   return dsum;
 }
@@ -354,15 +402,18 @@ vec3 cloudScatter(float dsum, float cosT, float density) {
     // Dual-lobe: a tight forward lobe (the silver lining) plus a mild backward
     // one (the glow you get looking away from the sun through a thin deck).
     float ph = mix(hgRel(cosT, -0.28 * c), hgRel(cosT, 0.88 * c), 0.74);
-    energy += b * exp(-dsum * uCloudAbsorb * a) * ph;
-    a *= 0.42;
-    b *= 0.50;
+    energy += b * exp(-dsum * uCloudLightExt * a) * ph;
+    a *= 0.38;
+    b *= 0.44;
     c *= 0.60;
   }
   // Powder: darkens the optically thin fringes seen against the light, which is
-  // the cue that tells the eye a cloud is a volume and not a decal.
-  float powder = 1.0 - exp(-density * 16.0);
-  return uKeyColor * energy * (0.18 + 0.82 * powder) * uCloudGain;
+  // the cue that tells the eye a cloud is a volume and not a decal. Round 4
+  // deepened the floor from 0.18 to 0.07 — measured, the fringes and the cores
+  // were landing within one display code value of each other (a flat 247 plateau
+  // in ground.png), and a cumulus with no internal range is a paper cut-out.
+  float powder = 1.0 - exp(-density * 11.0);
+  return uKeyColor * energy * (0.07 + 0.93 * powder) * uCloudGain;
 }
 
 void main() {
@@ -425,19 +476,30 @@ void main() {
   }
 
   // ---- aerial perspective -------------------------------------------------
-  // Real in-scattering, not a lerp to a fixed grey. Three media, each with its
-  // own scale height and its own phase function:
   //
-  //   Rayleigh  8 km  blue, near-isotropic  -> the cool cast on shaded ridges
-  //   Mie       1.4 km neutral, forward     -> the glow around the sun
-  //   dust      ~0.5 km WARM, forward       -> the khaki body of the effect
+  // Round 4 rewrite. There is exactly one physically correct convergence target
+  // for this effect and it is not an authored colour: as the view ray gets long,
+  // the in-scattered light saturates at the radiance the SKY has in that same
+  // direction, because it is the same air integrated the same way from the same
+  // point. Round 3 converged instead onto a constant warm dust colour, which
+  // measured (vista.png) as haze whose R/B *rose* with distance — 1.381 near,
+  // 1.584 mid, 1.587 far — under a sky sitting at 0.916. That divergence was the
+  // largest single colour defect in the build.
   //
-  // Because the colour is (phase x sun) + (sky), a ridge facing into the sun
-  // picks up the warm forward lobe and glows, while a ridge on the anti-sun
-  // side is lit only by the sky term and goes cool — the directional variation
-  // round 1 had none of. And because every term is an integral of exp(-y/H)
-  // along the ray, a barrel 4 m away accumulates ~0.0004 optical depths and is
-  // untouched, instead of being veiled by a fog that started at the lens.
+  // So: source function = skyRadiance(rd), per pixel, out of the same integrator
+  // the dome is painted with. Every directional behaviour MGSV has falls out of
+  // that for free — ridges toward the sun pick up the solar aureole and glow,
+  // ridges away from it are lit by the cool part of the dome, and a ridge at
+  // infinity dissolves into the sky exactly rather than sitting in front of it
+  // as a coloured plate.
+  //
+  // Three media still set HOW FAST it converges, each with its own scale height:
+  //   Rayleigh  8 km    -> the long-range blue
+  //   Mie       1.4 km  -> the near-sun glow
+  //   dust     ~0.5 km  -> the body of the effect in a desert
+  // Only the dust is missing from the sky model, so only the dust gets a chroma
+  // of its own, and only as a unit-luminance tilt (uDustAlbedo) so it can shade
+  // the haze warm without ever moving it off the sky's own brightness.
   float Thaze = 1.0;
   if (uHazeOwned > 0.5 && !isSky) {
     float dist = min(sceneDist, 40000.0);
@@ -452,25 +514,29 @@ void main() {
     vec3 tauR = uBetaR * IR;
     vec3 tauM = vec3(uBetaM * IM);
     vec3 tauD = uBetaD * ID;
-    vec3 T = exp(-(tauR + tauM + tauD));
+    vec3 tau = tauR + tauM + tauD;
+    vec3 T = exp(-tau);
 
-    float pR = (3.0 / (16.0 * PI)) * (1.0 + cosT * cosT);
-    // Multiple scattering flattens the effective phase; without this the
-    // anti-sun half of the valley goes implausibly dark and the sunward half
-    // blows out.
-    float pM = mix(0.0796, hgPhase(cosT, uApG), 0.55);
-    float pD = mix(0.0796, hgPhase(cosT, uApG * 0.78), 0.40);
-
-    // Suspended dust sits in the bottom few hundred metres, where nearly half
-    // the light arriving at it has already bounced off sunlit sand. Lighting it
-    // with the sky alone is what made round 1's distance haze a cold blue-grey;
-    // folding in the warm ground radiance is what makes it read as khaki dust.
-    vec3 dustLight = mix(uSkyAmbient, uGroundLight, 0.45);
-    vec3 sunIn = (tauR * pR + tauM * pM) * uKeyColor
-               + tauD * pD * uKeyColor * uDustAlbedo;
-    vec3 ambIn = (tauR + tauM) * uSkyAmbient
-               + tauD * dustLight * uDustAlbedo * 0.78;
-    inscatter += sunIn * uApSun + ambIn * uApAmb;
+    vec3 skyD = skyRadiance(rd);
+    // Optical-depth-weighted source: the air scatters the sky's own colour, the
+    // dust scatters it tilted warm. Dividing by the total optical depth is what
+    // makes the saturated limit independent of how thick the medium is, i.e.
+    // what makes an 8 km ridge and a 3 km ridge converge to the SAME colour
+    // rather than the thicker path drifting further off the sky.
+    vec3 src = (tauR + tauM + tauD * uDustAlbedo) / max(tau, vec3(1e-9)) * skyD;
+    // Multiple scattering. Sky's radiance is a single-scattering integral with a
+    // multi-scatter table behind it, but the haze in front of a ridge is a dense
+    // low layer whose photons have bounced several times before they reach the
+    // lens, and every bounce redistributes them across directions and flattens
+    // the chroma toward the sky's mean. Without this the dusk frame inherits the
+    // solar aureole at full saturation: measured on the ridge shot, converging
+    // straight onto the raw sky took the whole frame from R/B 1.41 to 1.83, i.e.
+    // exactly the orange-blockbuster grade ArtDirection.js rules out on line 10.
+    // The value is largest at dawn and dusk because that is when the aureole is
+    // most saturated and the path through it is longest.
+    float sl = dot(src, vec3(0.2126, 0.7152, 0.0722));
+    src = mix(src, vec3(sl), uApDesat);
+    inscatter += src * (1.0 - T) * uApGain;
 
     // The composite blend carries one scalar alpha, so extinction is applied
     // achromatically; the chromatic part of aerial perspective lives in the
@@ -516,7 +582,11 @@ void main() {
           // the shoulders, so the base falls into its own shadow. That vertical
           // ramp, together with the sun-facing side, is the internal luminance
           // range that makes a cumulus read as a solid lit object.
-          vec3 amb = mix(uSkyZenith * 0.16, uSkyZenith * 1.30, h * h * 0.72 + h * 0.28);
+          // Round 4 pushed the base of this ramp from 0.16 to 0.05. A cumulus
+          // base is genuinely dark — it sees almost none of the sky and none of
+          // the sun — and the flat, uniformly bright decks the critics measured
+          // were as much this pedestal as they were the gain.
+          vec3 amb = mix(uSkyZenith * 0.05, uSkyZenith * 1.30, h * h * 0.72 + h * 0.28);
           // The desert kicks a lot of warm light back up into cloud bases.
           amb += uGroundBounce * (1.0 - h) * (1.0 - h);
           vec3 L = cloudScatter(dsum, cosT, d) + amb * uCloudAmbGain;
@@ -536,7 +606,7 @@ void main() {
         // white lattice along the horizon instead of dissolving into the band
         // of pale haze that tells you how far away it is.
         float hz = 1.0 - exp(-t0 * 0.000030);
-        cloudCol = mix(cloudCol, uSkyHorizon * energy, hz * 0.85);
+        cloudCol = mix(cloudCol, skyRadiance(rd) * energy, hz * 0.85);
         // ...and let the sky show back through, so the horizon reads as a soft
         // edge rather than a lid.
         Tcloud = mix(Tcloud, 1.0, hz * 0.35);
@@ -561,7 +631,7 @@ void main() {
       // Ice crystals forward-scatter hard: cirrus near the sun is far brighter
       // than cirrus away from it, and that gradient is most of what sells it.
       vec3 ccol = uKeyColor * (0.030 + 0.075 * max(0.0, hgRel(cosT, 0.72) - 1.0))
-                + uSkyZenith * 0.9;
+                + skyRadiance(rd) * 0.9;
       cloudCol += ccol * a;
       Tcloud *= (1.0 - a * 0.72);
     }

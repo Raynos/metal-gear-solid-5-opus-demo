@@ -36,6 +36,14 @@ const VIEWS = [
   // backlit — so the set below walks the whole lighting range the game has to
   // survive, not just the flattering end of it.
   { name: 'ots', who: 'player', dist: 2.9, h: 1.66, look: 1.25, fov: 48, sunOff: 1.15, faceOff: 0.0 },
+  // The canonical `gameplay` rig, reproduced here so character iteration does
+  // not depend on the whole world bundling. Same distance, eye height and fov
+  // as SHOTS.gameplay, and the same -1.10 rad turn off the view axis that
+  // index.js gives the player. `gp-back` is the same subject with the key
+  // behind him: the frame that decides whether the silhouette separates.
+  { name: 'gp', who: 'player', dist: 2.4, h: 1.6, look: 1.16, fov: 45, aim: 0.12, yaw: -1.10, sunOff: 1.15 },
+  { name: 'gp-back', who: 'player', dist: 2.4, h: 1.6, look: 1.16, fov: 45, aim: 0.12, yaw: -1.10, sunOff: 2.7 },
+  { name: 'gp-key', who: 'player', dist: 2.4, h: 1.6, look: 1.16, fov: 45, aim: 0.12, yaw: -1.10, sunOff: 0.35 },
   // Every visible surface in shadow — the "flat black cutout" test. This frame
   // has to hold form with no key light on it at all.
   { name: 'shade', who: 'player', dist: 2.9, h: 1.66, look: 1.25, fov: 48, sunOff: 0.3, shadeSide: true },

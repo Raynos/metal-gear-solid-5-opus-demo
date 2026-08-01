@@ -186,37 +186,61 @@ const CHAR_BOUNCE = /* glsl */ `
   iblIrradiance = mix(iblIrradiance, dot(iblIrradiance, CH_LUMA) * chTint, chW);
 
   // Ground bounce on top: undersides see the floor almost fully, vertical
-  // panels about half, the tops of shoulders almost none.
+  // panels about half, the tops of shoulders almost none. The bounce carries
+  // only as much of the warm tint as the rest of the indirect does — a term
+  // that is always fully orange is a private light rig by another name, and it
+  // was the reason the character's shade measured nine counts warmer than every
+  // shadow in the scene around it.
+  vec3 chBTint = mix(vec3(1.0), chTint, clamp(uWarmMix * 1.6, 0.0, 1.0));
   vec3 chInd = irradiance + iblIrradiance;
   float chUp = geometryNormal.y * 0.5 + 0.5;
-  irradiance += dot(chInd, CH_LUMA) * chTint * uBounceAmt * mix(1.15, 0.28, chUp) * mix(0.55, 1.0, gAO) * mix(0.5, 1.0, chDay);
+  irradiance += dot(chInd, CH_LUMA) * chBTint * uBounceAmt * mix(1.15, 0.28, chUp) * mix(0.55, 1.0, gAO) * mix(0.5, 1.0, chDay);
 }
 `;
 
 const CHAR_RIM = /* glsl */ `
 {
+  // Round 4 tightened both lobes by two powers and cut the sun term by more
+  // than half. The direct-sun rim runs at the key's own intensity (8.5 in
+  // physical units at afternoon), so even a fresnel of 0.05 was landing at
+  // twice the diffuse of a 0.13-albedo garment — measured on the round-4
+  // frames it drew a uniform cream ring around the ENTIRE head, 15% of the
+  // head's radius wide, which swallowed the hairline, the bandana and the ear.
+  // A rim is meant to describe an edge, not to replace the form behind it.
   float chF = 1.0 - saturate(dot(geometryNormal, geometryViewDir));
-  float chRim = chF * chF * chF;
+  float chF2 = chF * chF;
+  float chRim = chF2 * chF2;
   reflectedLight.indirectSpecular +=
     chRim * uRimAmt * uRimColor * (irradiance * 0.35 + iblIrradiance * 0.65) * gAO;
   #if NUM_DIR_LIGHTS > 0
     // Backlit edge: only where the key is genuinely behind the subject.
     float chBack = saturate(-dot(directionalLights[0].direction, geometryViewDir));
     reflectedLight.indirectSpecular +=
-      chF * chF * chF * chF * chBack * chBack * uSunRim * directionalLights[0].color * gAO;
+      chRim * chF2 * chBack * chBack * chBack * uSunRim * directionalLights[0].color * gAO;
   #endif
 }
 `;
 
-/** Defaults shared by every character material; per-material overrides merge in. */
+/**
+ * Defaults shared by every character material; per-material overrides merge in.
+ *
+ * Round 4 cut `warmMix` from 0.80 to 0.30 and `bounce` from 0.50 to 0.32.
+ * Measured on the round-3 gameplay frame, the player's shaded back returned
+ * sRGB R51 G40 B30 — R-B +21 — while the world's own cast shadow four metres
+ * away returned R62 G55 B50, R-B +12. A character whose shade is nine counts
+ * warmer than every shadow around it is not being lit by the scene; it is being
+ * lit by a private orange rig, and that is precisely what makes it read as a
+ * pasted cutout no matter how good the sculpt is. At 0.30 the character's
+ * indirect is the scene's sky-and-bounce with a nudge, not a repaint of it.
+ */
 function lightUniforms(o = {}) {
   return {
-    uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.70, 0.40])) },
-    uBounceAmt: { value: o.bounce ?? 0.50 },
-    uWarmMix: { value: o.warmMix ?? 0.80 },
+    uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.83, 0.63])) },
+    uBounceAmt: { value: o.bounce ?? 0.40 },
+    uWarmMix: { value: o.warmMix ?? 0.10 },
     uRimColor: { value: new THREE.Vector3(...(o.rimColor ?? [1.0, 0.94, 0.86])) },
-    uRimAmt: { value: o.rim ?? 0.30 },
-    uSunRim: { value: o.sunRim ?? 0.11 },
+    uRimAmt: { value: o.rim ?? 0.40 },
+    uSunRim: { value: o.sunRim ?? 0.075 },
   };
 }
 
@@ -242,26 +266,46 @@ function injectLighting(shader) {
  * without that value step the whole chest rig merges into one slab.
  */
 function defaultClothPalette() {
-  const c = new Array(18).fill(null).map(() => new THREE.Vector3(0.2, 0.176, 0.12));
-  c[Z.JACKET] = new THREE.Vector3(0.202, 0.171, 0.110);
-  c[Z.SLEEVE] = new THREE.Vector3(0.209, 0.177, 0.114);
-  c[Z.TROUSER] = new THREE.Vector3(0.185, 0.156, 0.099);
-  c[Z.COLLAR] = new THREE.Vector3(0.176, 0.149, 0.096);
-  c[Z.SHIRT] = new THREE.Vector3(0.134, 0.115, 0.082);
-  c[Z.VEST] = new THREE.Vector3(0.090, 0.079, 0.053);
-  c[Z.WEBBING] = new THREE.Vector3(0.074, 0.063, 0.043);
-  c[Z.POUCH] = new THREE.Vector3(0.128, 0.109, 0.071);
-  c[Z.BELT] = new THREE.Vector3(0.063, 0.053, 0.037);
-  c[Z.LEATHER] = new THREE.Vector3(0.083, 0.059, 0.038);
-  c[Z.GLOVE] = new THREE.Vector3(0.060, 0.050, 0.037);
-  c[Z.KNEEPAD] = new THREE.Vector3(0.049, 0.044, 0.037);
-  c[Z.PACK] = new THREE.Vector3(0.154, 0.131, 0.084);
-  c[Z.HELMCOVER] = new THREE.Vector3(0.150, 0.129, 0.084);
-  c[Z.CAP] = new THREE.Vector3(0.139, 0.118, 0.077);
-  // Snake's bandana is the one saturated accent on an otherwise khaki character.
-  c[Z.BANDANA] = new THREE.Vector3(0.168, 0.030, 0.021);
-  c[Z.HAIR] = new THREE.Vector3(0.058, 0.042, 0.029);
-  c[Z.BOOT] = new THREE.Vector3(0.121, 0.086, 0.053);
+  const c = new Array(18).fill(null).map(() => new THREE.Vector3(0.25, 0.22, 0.15));
+  // Round 4 raised the whole ladder ~24%. Measured against the sand it stands
+  // on: sunlit sand renders at 0.224 display luminance and the soldier's shaded
+  // side at 0.013, a 17:1 step. The lighting is not at fault — the key:fill in
+  // LIGHT_TRANSPORT is 5.2 and the albedo ratio accounts for the other 3.2 —
+  // but the result is a figure that is functionally black in every frame where
+  // the sun is not on his face. Sun-bleached cotton twill measures 0.30-0.35
+  // reflectance; 0.20 was closer to wet slate.
+  c[Z.JACKET] = new THREE.Vector3(0.252, 0.214, 0.140);
+  c[Z.SLEEVE] = new THREE.Vector3(0.250, 0.212, 0.138);
+  c[Z.TROUSER] = new THREE.Vector3(0.234, 0.198, 0.127);
+  c[Z.COLLAR] = new THREE.Vector3(0.220, 0.187, 0.121);
+  c[Z.SHIRT] = new THREE.Vector3(0.168, 0.144, 0.103);
+  // Round 4 lifted the load-bearing kit by ~40%. Measured on the round-3
+  // gameplay frame the entire character sat at sRGB G≈28 while the ground's own
+  // cast shadow four metres away sat at G≈55 — i.e. the soldier was rendering
+  // half as bright as the shadow he stands in, which no khaki nylon does. The
+  // value STEPS between these zones are what break the panel up, so they are
+  // held (vest:webbing 1.28, pouch:vest 1.20, pack:pouch 1.12) while the whole
+  // ladder moves up.
+  c[Z.VEST] = new THREE.Vector3(0.152, 0.131, 0.087);
+  c[Z.WEBBING] = new THREE.Vector3(0.119, 0.101, 0.068);
+  c[Z.POUCH] = new THREE.Vector3(0.182, 0.155, 0.101);
+  c[Z.BELT] = new THREE.Vector3(0.103, 0.086, 0.059);
+  c[Z.LEATHER] = new THREE.Vector3(0.119, 0.085, 0.055);
+  c[Z.GLOVE] = new THREE.Vector3(0.091, 0.075, 0.055);
+  c[Z.KNEEPAD] = new THREE.Vector3(0.075, 0.067, 0.056);
+  c[Z.PACK] = new THREE.Vector3(0.204, 0.174, 0.112);
+  c[Z.HELMCOVER] = new THREE.Vector3(0.182, 0.157, 0.102);
+  c[Z.CAP] = new THREE.Vector3(0.169, 0.143, 0.093);
+  // Snake's bandana is the one saturated accent on an otherwise khaki
+  // character. Round 4 pulled it toward oxide: at R/G 5.6 it was the single
+  // most saturated thing in a frame whose whole grade is built on being
+  // desaturated, and the tails read as a ribbon rather than as dyed cotton.
+  c[Z.BANDANA] = new THREE.Vector3(0.132, 0.038, 0.029);
+  // Dark brown, not black. A crop in Afghan sun carries a strong sheen off the
+  // crown; at 0.048 the whole back of the head rendered as one silhouette and
+  // took the bandana and the ear down with it.
+  c[Z.HAIR] = new THREE.Vector3(0.104, 0.079, 0.056);
+  c[Z.BOOT] = new THREE.Vector3(0.147, 0.105, 0.065);
   return c;
 }
 
@@ -418,7 +462,30 @@ export function makeClothMaterial(opts = {}) {
          float gGather = 0.0;
          float gStitch = 0.0;
          float gPix = 0.001;
-         vec3 gSheenCol = vec3(0.5);`,
+         float gQuilt = 0.0;
+         vec3 gSheenCol = vec3(0.5);
+         // Load-bearing kit: carrier, pouches, webbing, belt, pack. Everything
+         // in this set is a padded, stitched, laminated panel rather than a
+         // draping fabric, and round 3 shaded it with the *fallback* branch of
+         // every term below — which is why a 150 px span of a plate carrier
+         // came back as one 8-bit value.
+         // Webbing tape is 25 mm wide, so the 42 mm quilt lattice below is
+         // nonsense on it — it lands as one arbitrary stripe per tape and the
+         // whole rig reads as plaid. Tapes get the sag and the stitching only.
+         bool ch_isKit(int zi) {
+           return zi == 3 || zi == 5 || zi == 9 || zi == 12 || zi == 10 || zi == 15;
+         }
+         // Quilted padding: a stitch lattice at 42 mm with the pad puffing
+         // between the lines. UVs are authored in metres, so this is a real
+         // 42 mm cell wherever it lands. It is the single term that puts a
+         // value break every ~16 px across the back panel at gameplay range.
+         float ch_quilt(vec2 uvv, float pix) {
+           float fade = 1.0 - smoothstep(0.0035, 0.011, pix);
+           vec2 q = abs(fract(uvv / 0.042) - 0.5);
+           float line = max(1.0 - smoothstep(0.02, 0.10, q.x), 1.0 - smoothstep(0.02, 0.10, q.y));
+           float puff = (0.5 - q.x) * (0.5 - q.y) * 4.0;
+           return (puff - 0.5 - line * 0.85) * fade;
+         }`,
       )
       .replace(
         '#include <map_fragment>',
@@ -438,6 +505,7 @@ export function makeClothMaterial(opts = {}) {
 
            vec3 bp = vBind * 1.0 + uSeed;
            bool garment = (zi == 0 || zi == 1 || zi == 2 || zi == 13 || zi == 14);
+           bool kit = ch_isKit(zi);
 
            // Dye lot / sun-bleach variation: large soft patches, then a finer
            // fibre-level mottle. Kept SUBTLE — round 1 ran this so hard the
@@ -473,6 +541,24 @@ export function makeClothMaterial(opts = {}) {
            float creaseAmt = clamp(0.20 + gGather * 0.45 + (1.0 - ao) * 0.30, 0.0, 1.0);
            base *= 1.0 + (fold - 0.55) * 0.13 * creaseAmt;
 
+           // Mid-scale sag: 6 cycles per metre, so roughly one lobe every 60 px
+           // at gameplay range. Everything above runs at thread or crease
+           // frequency, which the mip chain averages back to flat by the time
+           // the character is 2.4 m from the lens; this is the octave that
+           // actually survives. Kit gets it hardest because a loaded panel sags
+           // between its stitch rows more than a sleeve does.
+           float sag = ch_fbm(vBind * 6.0 + uSeed * 0.5, 2);
+           base *= 1.0 + (sag - 0.5) * (kit ? 0.30 : 0.17);
+
+           // Quilting on the load-bearing panels. The albedo share is small on
+           // purpose: padding is a SHAPE, so almost all of this should arrive
+           // through the normal, and a strong colour lattice reads as printed
+           // plaid rather than as a stitched pad.
+           if (kit) {
+             gQuilt = ch_quilt(vUvC, gPix);
+             base *= 1.0 + gQuilt * 0.030;
+           }
+
            // Tailoring. Seams are a hair darker with a thread highlight beside
            // them; stitched borders run a few mm in from every cut edge.
            float seam = ch_seams(vBind, vEdge.x, zi);
@@ -480,7 +566,11 @@ export function makeClothMaterial(opts = {}) {
            float border = 1.0 - smoothstep(0.0030, 0.0055, abs(vEdge.y - 0.0042));
            float dash = step(0.42, fract(vUvC.x / 0.0026));
            gStitch = border * dash * (garment ? 0.25 : 1.0);
-           base = mix(base, base * 1.5 + vec3(0.010, 0.009, 0.006), gStitch * 0.55);
+           // Round 4 pulled this back from *1.5 at 0.55 weight. Every lofted
+           // pouch caps at both ends, so the border term fires 4.2 mm in from
+           // each cap; at 50% lift that drew a bright cream outline around
+           // every single piece of kit and the rig read as a line drawing.
+           base = mix(base, base * 1.30 + vec3(0.008, 0.007, 0.005), gStitch * 0.38);
 
            // Ground-in dust: settles low on the body, in the creases, and on
            // anything that touches the ground. It LIGHTENS and warms — round 1
@@ -496,8 +586,11 @@ export function makeClothMaterial(opts = {}) {
 
            // Baked contact occlusion. Kept well off zero: an AO term that can
            // reach 0.35 is doing the job of a shadow map and turns armpits,
-           // strap undersides and boot tops into holes.
-           base *= mix(0.58, 1.0, pow(ao, 1.1));
+           // strap undersides and boot tops into holes. Round 4 raised the
+           // floor again — stacked on the gAO term below it, 0.58 was taking
+           // most of the character down to half the value of the shadow it
+           // stands in.
+           base *= mix(0.72, 1.0, pow(ao, 1.1));
 
            diffuseColor.rgb *= base;
            gRough = clamp(rough + (meso - 0.5) * 0.09 - seam * 0.06, 0.25, 1.0);
@@ -518,6 +611,7 @@ export function makeClothMaterial(opts = {}) {
            mat3 tbn = ch_frame(normal, -vViewPosition, vUvC);
            int zi = int(vZone + 0.5);
            bool garment = (zi == 0 || zi == 1 || zi == 2 || zi == 13 || zi == 14);
+           bool kit = ch_isKit(zi);
            float ao = clamp(vAO, 0.0, 1.0);
 
            // Ripstop lattice — a real, visible 7.5 mm grid of doubled threads.
@@ -546,14 +640,33 @@ export function makeClothMaterial(opts = {}) {
            vec3 gp = vec3(vBind.x * 7.0, vBind.y * 16.0, vBind.z * 7.0) + uSeed;
            float g0 = ch_fbm(gp, 2);
            vec2 nDrape = vec2(g0 - ch_fbm(gp + vec3(0.25, 0.0, 0.0), 2),
-                              g0 - ch_fbm(gp + vec3(0.0, 0.25, 0.0), 2)) * 2.2 * (garment ? 1.0 : 0.3);
+                              g0 - ch_fbm(gp + vec3(0.0, 0.25, 0.0), 2)) * 2.6 * (garment ? 1.0 : 0.85);
+
+           // Quilt relief on the load-bearing panels: real 42 mm padding lobes
+           // with a stitch trench between them. Sampled analytically off the
+           // same lattice the albedo uses so the shading and the value step
+           // agree, which is what stops it reading as a printed pattern.
+           vec2 nQuilt = vec2(0.0);
+           if (kit) {
+             vec2 q = fract(vUvC / 0.042) - 0.5;
+             float fade = 1.0 - smoothstep(0.0035, 0.011, max(fwidth(vUvC.x), fwidth(vUvC.y)));
+             nQuilt = -q * 2.0 * fade * 0.95
+                      - vec2(sign(q.x) * (1.0 - smoothstep(0.02, 0.10, abs(q.x))),
+                             sign(q.y) * (1.0 - smoothstep(0.02, 0.10, abs(q.y)))) * 0.55 * fade;
+           }
+
+           // The one octave that survives the mip at gameplay range.
+           vec3 sp = vBind * 6.0 + uSeed * 0.5;
+           float s0 = ch_fbm(sp, 2);
+           vec2 nSag = vec2(s0 - ch_fbm(sp + vec3(0.22, 0.0, 0.0), 2),
+                            s0 - ch_fbm(sp + vec3(0.0, 0.22, 0.0), 2)) * (kit ? 5.5 : 3.2);
 
            // Seams and stitching are geometry too: a shallow trench with the
            // thread standing proud of it.
            float seam = ch_seams(vBind, vEdge.x, zi);
            float stitchN = gStitch * 0.55 - seam * 0.35;
 
-           vec3 tn = normalize(vec3(nRip + nWeave + nFold + nDrape + vec2(stitchN), 1.0));
+           vec3 tn = normalize(vec3(nRip + nWeave + nFold + nDrape + nQuilt + nSag + vec2(stitchN), 1.0));
            normal = normalize(tbn * tn);
          }`,
       )
@@ -595,7 +708,7 @@ export function makeSkinMaterial(opts = {}) {
     uBrow: { value: opts.brow ?? 1.0 },
     // Skin wants a warmer, weaker rim than cloth: a cold sky rim on a face
     // reads as a chrome edge.
-    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.26, sunRim: 0.14, bounce: 0.4, warmMix: 0.45, ...opts }),
+    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.34, sunRim: 0.085, bounce: 0.30, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -707,10 +820,14 @@ export function makeSkinMaterial(opts = {}) {
            }
 
            if (vZone > 0.5 && vZone < 1.5) {
-             // Neck: shaded by the collar and the jaw, but never crushed.
-             c *= mix(0.66, 1.0, smoothstep(1.49, 1.585, vBind.y));
+             // Neck: shaded by the collar and the jaw, but never crushed. The
+             // 22 mm AO voxel already buries the neck against the collar and
+             // the jaw from two sides, so this term stacks on top of a bake
+             // that is doing most of the work; at 0.66 the throat read as a
+             // black slot between the head and the shoulders.
+             c *= mix(0.80, 1.0, smoothstep(1.49, 1.585, vBind.y));
            }
-           c *= mix(0.76, 1.0, pow(ao, 0.85));
+           c *= mix(0.84, 1.0, pow(ao, 0.85));
            diffuseColor.rgb *= c;
 
            // Oilier on the forehead and nose, drier on the cheeks and hands.
@@ -796,7 +913,7 @@ export function makeMetalMaterial(opts = {}) {
   const uniforms = {
     uMetalColor: { value: colors },
     uSeed: { value: opts.seed ?? 0 },
-    ...lightUniforms({ rim: 0.32, sunRim: 0.10, bounce: 0.32, warmMix: 0.62, ...opts }),
+    ...lightUniforms({ rim: 0.40, sunRim: 0.07, bounce: 0.24, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -890,7 +1007,7 @@ export function makeRubberMaterial(opts = {}) {
     envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
-  const uniforms = lightUniforms({ rim: 0.32, sunRim: 0.08, bounce: 0.55, warmMix: 0.5, ...opts });
+  const uniforms = lightUniforms({ rim: 0.38, sunRim: 0.05, bounce: 0.34, warmMix: 0.14, ...opts });
   mat.userData.uniforms = uniforms;
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);

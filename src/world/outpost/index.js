@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { makeRng } from './rng.js';
-import { MODE, createSurface } from './mat.js';
+import { MODE, createSurface, WIND_RAD } from './mat.js';
 import { merge, instanced, makeVars, xform, bakeWeather, catenary, box, inPoly } from './geo.js';
 import {
   newBag, placeBag, blockhouse, barracks, vehicleShed, bunker, watchtower, gateway, helipad,
@@ -162,6 +162,28 @@ export async function install(world) {
       rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.42, scale: 1.0, roughness: 0.92, envMapIntensity: 1.15,
       dado: 0.195, dadoStrength: 0.95, dadoColor: [0.212, 0.132, 0.046],
     }),
+    // The later pour. Round 3: the critics measured that every wall on the site
+    // was the same grey at the same tiling scale, and no amount of noise inside
+    // one material fixes that — the giveaway IS the scale, because two walls
+    // built twenty years apart out of different aggregate cannot have the same
+    // spatial frequency. So this is a genuinely different concrete: browner,
+    // coarser shutter marks (scale 0.55 puts the pour-patch octave at nearly
+    // twice the size), less rust bleed, and markedly more sun-bleached.
+    concrete2: createSurface({
+      mode: MODE.CONCRETE, name: 'op-concrete2', dust: DUST,
+      color: [0.452, 0.402, 0.306], color2: [0.300, 0.262, 0.196], color3: [0.612, 0.556, 0.442],
+      rust: [0.30, 0.140, 0.058], wear: 0.30, dustAmt: 0.46, scale: 0.55, roughness: 0.95, envMapIntensity: 1.15,
+    }),
+    // Painted joinery. Institutional sage-green oil paint on every reveal,
+    // architrave and door surround. It is deliberately the only cool hue on the
+    // buildings: one desaturated green line around every opening is what makes
+    // a window read as a window from 30m, where the reveal shadow alone does not.
+    trim: createSurface({
+      mode: MODE.METAL, name: 'op-trim', dust: DUST,
+      color: [0.108, 0.142, 0.108], color2: [0.146, 0.176, 0.140], color3: [0.222, 0.248, 0.208],
+      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.30, metalness: 0.02, roughness: 0.60, scale: 2.4,
+      envMapIntensity: 1.0,
+    }),
     // Broken slab and rubble. It lies in the dirt, so it must read *darker* than
     // the hardstanding it sits on. On the shared concrete material a tumbling
     // chunk presents almost nothing but up-faces, which collect both the
@@ -169,8 +191,12 @@ export async function install(world) {
     // a scatter of white paper across the yard.
     debris: createSurface({
       mode: MODE.CONCRETE, name: 'op-debris', dust: DUST,
-      color: [0.222, 0.198, 0.158], color2: [0.145, 0.128, 0.102], color3: [0.278, 0.250, 0.202],
-      rust: [0.30, 0.145, 0.062], wear: 0.85, dustAmt: 0.24, scale: 3.2, roughness: 0.96, envMapIntensity: 0.95,
+      // Round 3: these were 30% darker than this and, seen from the gameplay
+      // camera at 4 m, measured under 0.03 display luminance in full sun — a
+      // hole in the frame rather than a piece of concrete. Broken slab is
+      // DIRTIER than the road it lies on, not black.
+      color: [0.315, 0.282, 0.222], color2: [0.208, 0.184, 0.146], color3: [0.392, 0.354, 0.286],
+      rust: [0.30, 0.145, 0.062], wear: 0.85, dustAmt: 0.34, scale: 3.2, roughness: 0.96, envMapIntensity: 1.05,
     }),
     wall: createSurface({
       mode: MODE.CONCRETE, name: 'op-wall', dust: DUST,
@@ -247,6 +273,14 @@ export async function install(world) {
       color: [1.180, 1.130, 1.010], color2: [0.840, 0.800, 0.720], color3: [1.360, 1.310, 1.190],
       rust: [0.34, 0.163, 0.072], wear: 0.30, dustAmt: 0.26, scale: 2.6, roughness: 0.92, envMapIntensity: 1.0,
     }),
+    // Wind-deposited fines. Paler and finer than the graded ground it banks up
+    // against — that value break is what makes a drift read as *deposited*
+    // rather than as a lump modelled into the terrain.
+    drift: createSurface({
+      mode: MODE.SAND, name: 'op-drift', dust: DUST,
+      color: [0.436, 0.366, 0.260], color2: [0.398, 0.326, 0.230], color3: [0.548, 0.478, 0.360],
+      wear: 0.1, dustAmt: 0.0, roughness: 0.95, scale: 1.0, envMapIntensity: 1.15,
+    }),
     ground: createSurface({
       mode: MODE.GROUND, name: 'op-ground', dust: DUST,
       color: [0.412, 0.338, 0.238], color2: [0.268, 0.216, 0.150], color3: [0.208, 0.190, 0.166],
@@ -258,8 +292,14 @@ export async function install(world) {
     dark: new THREE.MeshStandardMaterial({
       color: 0x14120f, roughness: 0.94, metalness: 0.0, envMapIntensity: 0.22, name: 'op-dark',
     }),
+    // Glazing. Round 3 had this at roughness 0.07 / env 3.2, which is a mirror:
+    // every pane returned the hazy white sky at very nearly the luminance of
+    // the wall around it, so the openings measured within 20% of the masonry
+    // and disappeared. Dirty thirty-year-old glass is roughness ~0.14 and it
+    // reflects the sky at its real Fresnel weight — dark, with a faint gradient
+    // down the pane. That is what makes a window a hole with something in it.
     glass: new THREE.MeshStandardMaterial({
-      color: 0x141a20, roughness: 0.07, metalness: 0.04, envMapIntensity: 3.2, name: 'op-glass',
+      color: 0x0d1116, roughness: 0.14, metalness: 0.02, envMapIntensity: 1.15, name: 'op-glass',
     }),
   };
   // Glazing that lights up; emissive is driven from the time of day below.
@@ -360,6 +400,9 @@ export async function install(world) {
         ry: rng.range(0, 6.28),
         rz: side ? Math.PI / 2 : 0,
         rx: side ? 0 : rng.jitter(0.02),
+        // A drum lying on its side has been rolled and dropped; it is never the
+        // sound one. Standing drums skew toward serviceable.
+        variant: side ? rng.int(1, 3) : (rng.chance(0.42) ? 0 : rng.int(1, 3)),
         wear: rng.range(0.2, 1.0),
       });
     }
@@ -375,14 +418,21 @@ export async function install(world) {
       const u = cu + rng.jitter(2.6);
       const v = cv + rng.jitter(2.2);
       pallets.push(at(u, v, rng.range(0, 6.28)));
+      // Stacks are built out of whatever sizes came off the truck, so the
+      // running height has to be accumulated rather than assumed — a big case
+      // under a small one is the whole point of having three sizes.
       const stackN = rng.int(1, 2);
+      let hy = 0.21;
       for (let s = 0; s < stackN; s++) {
+        const variant = rng.int(0, 2);
+        const scale = rng.range(0.88, 1.06);
         crates.push({
-          pos: pos(u + rng.jitter(0.12), v + rng.jitter(0.12), 0.21 + s * 0.78),
+          pos: pos(u + rng.jitter(0.12), v + rng.jitter(0.12), hy),
           ry: rng.range(0, 6.28) * (s ? 0.02 : 1) + rng.jitter(0.08),
-          scale: rng.range(0.88, 1.06),
+          scale, variant,
           wear: rng.range(0.1, 0.9),
         });
+        hy += 0.78 * [1.0, 0.78, 1.22][variant] * scale;
       }
     }
     for (let i = 0; i < 9; i++) {
@@ -402,21 +452,30 @@ export async function install(world) {
   }
 
   // Rubble and broken slab where the plant has chewed the edges up.
+  // Round 4 integration: 420 -> 300 and 260 -> 180 below. The chunk mesh went
+  // from 20 facets to 80 to stop it reading as folded paper at 4 m (see
+  // props.js rubbleGeo), which cost ~81k triangles once the shadow pass is
+  // counted. Thinning the scatter by 29% pays for the detail and is invisible:
+  // measured on shots/r4g, no canonical framing shows more than 40 chunks.
   const rubble = [];
-  for (let i = 0; i < 420; i++) {
+  for (let i = 0; i < 300; i++) {
     const u = rng.range(RECT.u0 - 34, RECT.u1 + 34);
     const v = rng.range(RECT.v0 - 30, RECT.v1 + 46);
     const k = ground.padK(u, v);
     if (k < 0.08) continue;
     if (k < 0.9 && rng.chance(0.45)) continue;
     rubble.push({
-      pos: pos(u, v, -0.04), ry: rng.range(0, 6.28), rx: rng.jitter(0.25), rz: rng.jitter(0.25),
-      scale: rng.range(0.35, 1.25),
+      pos: pos(u, v, -0.05), ry: rng.range(0, 6.28), rx: rng.jitter(0.12), rz: rng.jitter(0.12),
+      // Capped at 0.8: at 1.25 a chunk was 700mm across, and a 20-facet
+      // icosahedron 700mm across at 4 m from the gameplay camera reads as
+      // folded paper. Rubble has to stay small enough that its faceting is
+      // under the eye's threshold at the closest range it is ever seen.
+      scale: rng.range(0.32, 0.80),
     });
   }
 
   // Debris thrown clear of the ramp by thirty years of traffic.
-  for (let i = 0; i < 260; i++) {
+  for (let i = 0; i < 180; i++) {
     const t = rng.range(0, 1);
     const road = roads[0].pts;
     const seg = Math.min(road.length - 2, Math.floor(3 + t * (road.length - 5)));
@@ -428,8 +487,8 @@ export async function install(world) {
     const v = v0 - off * 0.3;
     if (ground.padK(u, v) < 0.05) continue;
     rubble.push({
-      pos: pos(u, v, -0.04), ry: rng.range(0, 6.28), rx: rng.jitter(0.3), rz: rng.jitter(0.3),
-      scale: rng.range(0.3, 1.5),
+      pos: pos(u, v, -0.05), ry: rng.range(0, 6.28), rx: rng.jitter(0.14), rz: rng.jitter(0.14),
+      scale: rng.range(0.30, 0.92),
     });
   }
 
@@ -547,7 +606,9 @@ export async function install(world) {
   for (const nb of netBags) for (const k of Object.keys(nb)) (bag[k] ??= []).push(...nb[k]);
 
   addMerged(bag.concrete, M.concrete, 'op-arch-concrete');
+  addMerged(bag.concrete2, M.concrete2, 'op-arch-concrete2');
   addMerged(bag.masonry, M.masonry, 'op-arch-masonry');
+  addMerged(bag.trim, M.trim, 'op-arch-trim');
   addMerged(bag.sign, M.sign, 'op-arch-sign', { cast: false });
   addMerged(bag.dark, M.dark, 'op-arch-dark', { cast: false });
   addMerged(bag.metal, M.metal, 'op-arch-metal');
@@ -594,13 +655,23 @@ export async function install(world) {
 
   // Props.
   const matMap = {
-    concrete: M.concrete, masonry: M.masonry, metal: M.metal, corr: M.corr, wood: M.wood, cloth: M.cloth,
-    net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp, paint: M.paint, paintWarn: M.paintWarn,
-    sign: M.sign, dark: M.dark, mil: M.mil, dado: M.dado,
+    concrete: M.concrete, concrete2: M.concrete2, masonry: M.masonry, metal: M.metal, corr: M.corr,
+    wood: M.wood, cloth: M.cloth, net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp,
+    paint: M.paint, trim: M.trim, paintWarn: M.paintWarn, sign: M.sign, dark: M.dark, mil: M.mil,
+    dado: M.dado, drift: M.drift,
   };
   addInst(P.bagToGeos(P.containerGeo()), containers, matMap, { wearAmp: 0.8 });
-  addInst(P.bagToGeos(P.drumGeo()), drums, matMap, { wearAmp: 0.9 });
-  addInst(P.bagToGeos(P.crateGeo()), crates, matMap, { wearAmp: 0.7 });
+  for (let v = 0; v < P.DRUM_VARIANTS; v++) {
+    addInst(P.bagToGeos(P.drumGeo(v)), drums.filter((d) => d.variant === v), matMap, { wearAmp: 0.9 });
+  }
+  // Three crate sizes rather than one. A dump of stores is never one SKU, and
+  // three widths in a stack is the difference between "cargo" and "wallpaper".
+  for (let v = 0; v < 3; v++) {
+    addInst(
+      P.bagToGeos(P.crateGeo([1.0, 0.78, 1.22][v])), crates.filter((c) => c.variant === v),
+      matMap, { wearAmp: 0.7 },
+    );
+  }
   addInst(P.bagToGeos(P.palletGeo()), pallets, matMap, { wearAmp: 0.8 });
   addInst(P.bagToGeos(P.jerryCanGeo()), jerry, matMap, { wearAmp: 0.9 });
   // Repeated props get real mesh variants, not just a scale jitter: three tyre
@@ -620,6 +691,80 @@ export async function install(world) {
   addInst(P.bagToGeos(P.pipeGeo()), pipes, matMap, { wearAmp: 0.8 });
   for (let v = 0; v < P.SANDBAG_VARIANTS; v++) {
     addInst(P.bagToGeos(P.sandbagGeo(v)), sandbags.filter((s) => s.variant === v), matMap, { wearAmp: 0.5 });
+  }
+
+  // ------------------------------------------------------------ sand drifts --
+  //
+  // Fines banked against the upwind face of everything that stands in the wind.
+  // The terrain engineer's prevailing wind is 0.38 rad in WORLD space; the
+  // compound is authored at yaw THETA, so the drift heading in compound-local
+  // space is (WIND_RAD - THETA) and every drift on the site therefore agrees
+  // with every sand ripple on the terrain outside it.
+  //
+  // driftGeo is authored with the obstruction at z = 0 and the wind arriving
+  // from +z, so an instance rotated to `driftRy` puts its ramp on the windward
+  // side by construction.
+  const driftRy = Math.PI - (WIND_RAD - THETA);
+  const drifts = [];
+  /** Bank a drift against a face `halfW` wide, `reach` metres upwind, `h` tall. */
+  const drift = (u, v, halfW, h, reach, jitter = 0.25) => {
+    drifts.push({
+      pos: pos(u + rng.jitter(jitter), v + rng.jitter(jitter), -0.05),
+      ry: driftRy + rng.jitter(0.22),
+      sx: halfW * rng.range(0.85, 1.15),
+      sy: h * rng.range(0.75, 1.25),
+      sz: reach * rng.range(0.85, 1.2),
+      variant: rng.int(0, P.DRIFT_VARIANTS - 1),
+      wear: rng.range(0, 1),
+    });
+  };
+  // The upwind offset, in compound-local axes: where the toe of a drift sits
+  // relative to the thing it is banked against.
+  const wu = -Math.cos(WIND_RAD - THETA);
+  const wv = Math.sin(WIND_RAD - THETA);
+  for (const c of containers) drift(c.pos.x - wu * 1.1, c.pos.z - wv * 1.1, 2.6, 0.52, 2.4);
+  for (const b2 of barriers) drift(b2.pos.x - wu * 0.5, b2.pos.z - wv * 0.5, 1.5, 0.34, 1.5);
+  for (const e of emplacements) {
+    const mu = (e.pts[0][0] + e.pts[1][0]) / 2;
+    const mv = (e.pts[0][1] + e.pts[1][1]) / 2;
+    drift(mu - wu * 0.8, mv - wv * 0.8, 2.4, 0.44, 2.0);
+  }
+  for (const [cu, cv] of dumps) drift(cu - wu * 2.0, cv - wv * 2.0, 2.2, 0.30, 2.2, 0.8);
+  // Along the windward wall of every building and along the perimeter run: a
+  // continuous ribbon rather than a single lump, because a 26 m barrack banks
+  // sand along its whole length.
+  for (const [bu, bv, bw, bd, bry] of [
+    [-26, -13, 26, 10, 0.085], [-27.5, 6, 22, 9.5, Math.PI - 0.155], [-8, 26, 16, 9.5, 0.72],
+    [BLOCK.u, BLOCK.v, BLOCK.w, BLOCK.d, BLOCK.ry], [29, -5, 16, 12, 0.10], [-39, -31, 12, 8, 0.36],
+  ]) {
+    // Support function of the building's footprint: how far its outline
+    // reaches upwind, and how wide it is across the wind. Doing it properly
+    // rather than assuming the short face is the windward one matters, because
+    // three of these six are turned nearly side-on to the wind.
+    const ax = [Math.cos(bry), -Math.sin(bry)];   // along the building's width
+    const az = [Math.sin(bry), Math.cos(bry)];    // along its depth
+    const sup = (dx, dz) => (bw / 2) * Math.abs(dx * ax[0] + dz * ax[1]) + (bd / 2) * Math.abs(dx * az[0] + dz * az[1]);
+    const reachUp = sup(-wu, -wv);
+    const across = sup(-wv, wu);
+    const n = Math.max(2, Math.round((across * 2) / 3.6));
+    for (let i = 0; i < n; i++) {
+      const t = ((i + 0.5) / n - 0.5) * 2 * across * 0.86;
+      drift(
+        bu - wu * (reachUp + 1.0) - wv * t,
+        bv - wv * (reachUp + 1.0) + wu * t,
+        2.1, 0.44, 2.2, 0.30,
+      );
+    }
+  }
+  for (let i = 1; i < peri.pilasters.length; i += 5) {
+    const pl = peri.pilasters[i];
+    drift(pl.pos.x - wu * 0.9, pl.pos.z - wv * 0.9, 2.4, 0.42, 2.3, 0.4);
+  }
+  for (let v = 0; v < P.DRIFT_VARIANTS; v++) {
+    addInst(
+      P.bagToGeos(P.driftGeo(v)), drifts.filter((d) => d.variant === v), matMap,
+      { wearAmp: 0.4, cast: false },
+    );
   }
 
   const floodGeos = P.bagToGeos(P.floodlightGeo({ h: 6.4 }));
@@ -651,18 +796,76 @@ export async function install(world) {
 
   // Telegraph line beside the access track. Poles are the cheapest possible way
   // to make an approach read as a road to somewhere.
-  const poleAt = [[10.5, 33], [12.5, 45], [17.5, 62], [23, 80], [29, 100], [36, 122], [46, 158]];
-  addInst(P.bagToGeos(P.telegraphPoleGeo({ h: 8.2 })), poleAt.map(([u, v]) => at(u, v, 0.1 + u * 0.01)), matMap, { wearAmp: 0.7 });
+  //
+  // Round 3: three critics all read these four wires as lying flat on the sand.
+  // Measured, they were never on the sand — the projected clearance in the
+  // lower-left of the outpost frame was 5.6-7.3 m — but the READ was correct and
+  // that is what matters, and it had three real causes.
+  //
+  //   1. The endpoints were the pole's root transform plus a hard-coded lateral
+  //      offset in compound axes, so they ignored each pole's own yaw and sat
+  //      850mm below the insulator caps. The wires did not visibly touch the
+  //      poles, which is the one cue that says "suspended".
+  //   2. The spans ran to 38 m and the run started 33 m OUTSIDE the wire, so in
+  //      any given frame you saw a great deal of wire and almost no pole. A wire
+  //      with no visible support is a line on the ground; that is simply what
+  //      the eye decides.
+  //   3. At r=22mm the wire is under a pixel at 60 m and the shadow it casts is
+  //      far under one shadow-map texel, so there was no cast shadow to separate
+  //      it from the sand it was crossing.
+  //
+  // So: endpoints are now solved from the pole's actual insulator geometry
+  // through its own yaw, spans are capped near 22 m with the run starting at the
+  // gate so a pole is always in frame with its wire, the wire is thicker, and
+  // every span is checked against the ground it crosses (see CABLE_CLEAR below).
+  const POLE_H = 8.2;
+  // Insulator caps, from telegraphPoleGeo: crossarms at h-0.5 and h-1.35, pin
+  // tops 300mm above each, at +-820mm and +-580mm along the arm.
+  const INSULATORS = [
+    [-0.82, POLE_H - 0.20], [0.82, POLE_H - 0.20],
+    [-0.58, POLE_H - 1.05], [0.58, POLE_H - 1.05],
+  ];
+  // Five metres to the left of the access-track centreline, following its
+  // curve, at 17 m centres — which is short for a real line but is what it
+  // takes for a pole to be in frame wherever a wire is.
+  const poleAt = [
+    [11.3, 40], [14.9, 55], [20.0, 71], [25.5, 88], [30.6, 104],
+    [35.6, 120], [40.9, 136], [46.3, 152], [51.7, 168],
+  ];
+  const poles = poleAt.map(([u, v]) => at(u, v, 0.1 + u * 0.008));
+  addInst(P.bagToGeos(P.telegraphPoleGeo({ h: POLE_H })), poles, matMap, { wearAmp: 0.7 });
+  /** Insulator k of pole i, in compound-local space, through that pole's yaw. */
+  const insulator = (i, k) => {
+    const p = poles[i];
+    const [ox, oy] = INSULATORS[k];
+    return new THREE.Vector3(p.pos.x + Math.cos(p.ry) * ox, p.pos.y + oy, p.pos.z - Math.sin(p.ry) * ox);
+  };
+  // Minimum clearance a wire is allowed anywhere over the ground it crosses.
+  // Reported by the probe; if a span breaks it the whole span lifts.
+  const CABLE_CLEAR = 5.2;
   const lineGeo = [];
   for (let i = 0; i < poleAt.length - 1; i++) {
-    const [au, av] = poleAt[i];
-    const [bu, bv] = poleAt[i + 1];
-    for (const [ox, oy] of [[-0.82, 7.7], [0.82, 7.7], [-0.58, 6.85], [0.58, 6.85]]) {
-      lineGeo.push(catenary(
-        new THREE.Vector3(au + ox, gy(au, av) + oy, av),
-        new THREE.Vector3(bu + ox, gy(bu, bv) + oy, bv),
-        Math.hypot(bu - au, bv - av) * 0.055, 0.022, 10,
-      ));
+    const span = Math.hypot(poleAt[i + 1][0] - poleAt[i][0], poleAt[i + 1][1] - poleAt[i][1]);
+    // A real conductor hangs at about span/25 of sag at this tension and span.
+    const sag = span / 25;
+    for (let k = 0; k < INSULATORS.length; k++) {
+      const A = insulator(i, k);
+      const B = insulator(i + 1, k);
+      // Walk the span against the finished ground. A pole line is set out to
+      // clear the ground it crosses, not to follow the pole feet — if the
+      // track dips between two poles the wire stays where it is and the
+      // clearance grows, but if a bank rises into it the whole span lifts.
+      let lift = 0;
+      for (let t = 0; t <= 12; t++) {
+        const f = t / 12;
+        const u = A.x + (B.x - A.x) * f;
+        const v = A.z + (B.z - A.z) * f;
+        const yw = A.y + (B.y - A.y) * f - Math.sin(f * Math.PI) * sag;
+        lift = Math.max(lift, CABLE_CLEAR - (yw - gy(u, v)));
+      }
+      A.y += lift;
+      B.y += lift;
+      lineGeo.push(catenary(A, B, sag, 0.030, 10));
     }
   }
   addMerged(lineGeo.map((g) => bakeWeather(g, { wear: 0.9 })), M.metal, 'op-telegraph', { receive: false });

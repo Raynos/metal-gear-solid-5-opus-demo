@@ -22,11 +22,17 @@ export async function install(world) {
   const t0 = performance.now();
   const lib = buildShapeLibrary();
   const material = createRockMaterial();
-  const { group, meshes, records } = buildRockField(world, lib, material);
+  const { group, meshes, collars, records } = buildRockField(world, lib, material);
   world.scene.add(group);
 
   let instances = 0;
   let triangles = 0;
+  let collarTris = 0;
+  let collarInst = 0;
+  for (const m of collars) {
+    collarInst += m.count;
+    collarTris += (m.geometry.attributes.position.count / 3) * m.count;
+  }
   // Per-LOD breakdown: the hero mesh is 4x the triangles of the mid one, so a
   // band-0 population that quietly grows is the fastest way to blow the budget.
   const perLod = [0, 0, 0];
@@ -40,11 +46,12 @@ export async function install(world) {
     instLod[lod] += m.count;
   }
   console.log(
-    `[rocks] ${meshes.length} draws, ${instances} instances, ` +
-      `${(triangles / 1e6).toFixed(2)}M tris, ${Math.round(performance.now() - t0)}ms` +
+    `[rocks] ${meshes.length + collars.length} draws, ${instances} instances, ` +
+      `${((triangles + collarTris) / 1e6).toFixed(2)}M tris, ${Math.round(performance.now() - t0)}ms` +
       ` | lod0 ${instLod[0]}i/${(perLod[0] / 1e6).toFixed(2)}M` +
       ` lod1 ${instLod[1]}i/${(perLod[1] / 1e6).toFixed(2)}M` +
-      ` lod2 ${instLod[2]}i/${(perLod[2] / 1e6).toFixed(2)}M`,
+      ` lod2 ${instLod[2]}i/${(perLod[2] / 1e6).toFixed(2)}M` +
+      ` collar ${collars.length}d/${collarInst}i/${(collarTris / 1e6).toFixed(2)}M`,
   );
 
   const tmp = new THREE.Matrix4();
@@ -53,6 +60,8 @@ export async function install(world) {
   return {
     group,
     meshes,
+    /** Fines aprons. Separate bodies, placed in world space — see Scatter.addCollar. */
+    collars,
     material,
     /** Keep-clear radii used for the outpost footprint, metres. */
     clearRadii: CLEAR,

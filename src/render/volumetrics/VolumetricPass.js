@@ -7,6 +7,7 @@ import {
   COMPOSITE_FRAG,
 } from './shaders.js';
 import { buildCloudVolume, buildWeatherMap } from './noise.js';
+import { SkyLut } from './SkyLut.js';
 import { PALETTE } from '../../config/ArtDirection.js';
 
 /**
@@ -41,42 +42,66 @@ import { PALETTE } from '../../config/ArtDirection.js';
  * `sunScatter` is now a gain on the *excess over isotropic* phase energy, i.e.
  * purely the crepuscular lobe, so the values are much larger than round 1's
  * whole-sky fog gains and still cover far less of the frame.
+ *
+ * ## Round 4
+ *
+ * `apSun`/`apAmb` are gone. They were the two gains on a haze whose colour was
+ * authored; the haze now takes its colour from the sky per pixel (see SkyLut.js
+ * and the aerial-perspective block in shaders.js), so there is one gain left —
+ * `apGain`, how completely a ray at infinity converges onto the sky. 1.0 is
+ * physically exact and makes a far ridge vanish outright; the shipped values sit
+ * just under it so the silhouette survives as a whisper.
+ *
+ * `dustWarm` is how far the dust's in-scatter chroma is pulled off the sky's own
+ * toward the colour of the sunlit ground beneath it, 0 = no tilt at all. It is
+ * the ONLY authored colour left in the distance haze and it is a unit-luminance
+ * tilt, so it can never move the haze off the sky's brightness — only its hue.
+ * Round 3's equivalent (a dust albedo of 1.25/1.02/0.70, R/B 1.79, applied to a
+ * warm ground-lit source) is what measured as sepia.
+ *
+ * `apDesat` is the multiple-scattering flattening of that chroma, and it is
+ * large at dawn and dusk for a physical reason: those are the frames whose sky
+ * carries a hard, saturated solar aureole, and a dense low haze re-scatters its
+ * photons several times before they arrive, mixing the aureole back toward the
+ * rest of the dome. Converging the dusk ridge onto the raw aureole measured the
+ * whole frame at R/B 1.83, which is the sunset postcard the art direction
+ * forbids; at 0.40 it lands at 1.64 with the distance gradient intact.
  */
 export const ATMOS = {
   dawn: {
     shaftDensity: 0.00120, shaftHeight: 170, sunScatter: 0.055, phaseG: 0.80, dustBand: 2.0,
-    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.86, cloudAmb: 0.85, cirrus: 0.50,
+    cloudCoverage: 0.46, cloudDensity: 1.05, cloudGain: 0.56, cloudAmb: 0.50, cirrus: 0.50,
     cloudBase: 1500, cloudTop: 3000, cirrusAlt: 7600, heatHaze: 0.0, cloudShadow: 0.22,
-    bounce: 0.40,
-    dustBeta: 4.0e-4, dustHeight: 430, apSun: 0.26, apAmb: 0.62,
+    bounce: 0.40, cloudExt: 0.034, cloudLightExt: 0.052,
+    dustBeta: 4.2e-4, dustHeight: 330, apGain: 0.94, dustWarm: 0.04, apDesat: 0.48,
   },
   noon: {
     shaftDensity: 0.00042, shaftHeight: 260, sunScatter: 0.020, phaseG: 0.74, dustBand: 0.7,
-    cloudCoverage: 0.28, cloudDensity: 1.0, cloudGain: 0.70, cloudAmb: 0.68, cirrus: 0.24,
+    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.42, cloudAmb: 0.42, cirrus: 0.24,
     cloudBase: 1900, cloudTop: 3800, cirrusAlt: 8200, heatHaze: 1.0, cloudShadow: 0.30,
-    bounce: 0.28,
-    dustBeta: 4.0e-4, dustHeight: 620, apSun: 0.34, apAmb: 0.66,
+    bounce: 0.28, cloudExt: 0.040, cloudLightExt: 0.078,
+    dustBeta: 4.4e-4, dustHeight: 420, apGain: 0.97, dustWarm: 0.05, apDesat: 0.12,
   },
   afternoon: {
     shaftDensity: 0.00058, shaftHeight: 250, sunScatter: 0.026, phaseG: 0.76, dustBand: 1.0,
-    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.68, cloudAmb: 0.70, cirrus: 0.28,
+    cloudCoverage: 0.32, cloudDensity: 1.0, cloudGain: 0.44, cloudAmb: 0.44, cirrus: 0.28,
     cloudBase: 1800, cloudTop: 3600, cirrusAlt: 8000, heatHaze: 0.85, cloudShadow: 0.28,
-    bounce: 0.34,
-    dustBeta: 4.2e-4, dustHeight: 520, apSun: 0.36, apAmb: 0.62,
+    bounce: 0.34, cloudExt: 0.038, cloudLightExt: 0.075,
+    dustBeta: 4.4e-4, dustHeight: 360, apGain: 0.97, dustWarm: 0.05, apDesat: 0.14,
   },
   dusk: {
     shaftDensity: 0.00135, shaftHeight: 165, sunScatter: 0.060, phaseG: 0.81, dustBand: 2.2,
-    cloudCoverage: 0.42, cloudDensity: 1.05, cloudGain: 0.88, cloudAmb: 0.80, cirrus: 0.52,
+    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.58, cloudAmb: 0.48, cirrus: 0.52,
     cloudBase: 1500, cloudTop: 3100, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.20,
-    bounce: 0.44,
-    dustBeta: 4.0e-4, dustHeight: 420, apSun: 0.26, apAmb: 0.60,
+    bounce: 0.44, cloudExt: 0.034, cloudLightExt: 0.052,
+    dustBeta: 4.2e-4, dustHeight: 320, apGain: 0.94, dustWarm: 0.03, apDesat: 0.52,
   },
   night: {
     shaftDensity: 0.00060, shaftHeight: 200, sunScatter: 0.0, phaseG: 0.72, dustBand: 0.9,
-    cloudCoverage: 0.34, cloudDensity: 0.95, cloudGain: 1.8, cloudAmb: 0.55, cirrus: 0.22,
+    cloudCoverage: 0.36, cloudDensity: 0.95, cloudGain: 1.1, cloudAmb: 0.48, cirrus: 0.22,
     cloudBase: 1700, cloudTop: 3300, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.0,
-    bounce: 0.02,
-    dustBeta: 5.0e-4, dustHeight: 480, apSun: 0.50, apAmb: 1.00,
+    bounce: 0.02, cloudExt: 0.034, cloudLightExt: 0.050,
+    dustBeta: 5.0e-4, dustHeight: 480, apGain: 0.95, dustWarm: 0.0, apDesat: 0.10,
   },
 };
 
@@ -102,6 +127,7 @@ export class VolumetricPass {
 
     this.cloudTex = buildCloudVolume(48);
     this.weatherTex = buildWeatherMap(256);
+    this.skyLut = new SkyLut(world.sky);
 
     this.quadScene = new THREE.Scene();
     this.quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -148,6 +174,7 @@ export class VolumetricPass {
         tSunHeight: { value: this.fields.sunHeightTex },
         tShadowMap: { value: null },
         tWeather: { value: this.weatherTex },
+        tSkyLut: { value: this.skyLut.texture },
         tCloud: { value: this.cloudTex },
         uInvViewProj: { value: new THREE.Matrix4() },
         uShadowMatrix: { value: new THREE.Matrix4() },
@@ -170,21 +197,23 @@ export class VolumetricPass {
         uSunScatter: { value: 0.026 },
         uPhaseG: { value: 0.76 },
         uHazeOwned: { value: 0 },
-        uSkyAmbient: { value: new THREE.Vector3(0.42, 0.63, 0.75) },
         uBetaR: { value: new THREE.Vector3(5.802e-6, 13.558e-6, 33.1e-6) },
         uBetaD: { value: new THREE.Vector3(2.6e-4, 2.6e-4, 2.6e-4) },
-        uDustAlbedo: { value: new THREE.Vector3(1.25, 1.02, 0.70) },
+        // Unit-luminance chroma tilt of the dust in-scatter; see _dustTint.
+        uDustAlbedo: { value: new THREE.Vector3(1, 1, 1) },
         uGroundLight: { value: new THREE.Vector3(0.45, 0.34, 0.21) },
         uBetaM: { value: 8.0e-6 },
         uDustHeight: { value: 900 },
-        uApSun: { value: 0.55 },
-        uApAmb: { value: 0.85 },
+        uApGain: { value: 0.93 },
+        uApDesat: { value: 0.14 },
+        uSkyLutValid: { value: 0 },
         uApG: { value: 0.66 },
         uCloudCoverage: { value: 0.38 },
         uCloudBase: { value: 1800 },
         uCloudTop: { value: 3600 },
         uCloudDensity: { value: 1.0 },
-        uCloudAbsorb: { value: 0.030 },
+        uCloudAbsorb: { value: 0.038 },
+        uCloudLightExt: { value: 0.058 },
         uCloudGain: { value: 1.0 },
         uCloudAmbGain: { value: 0.8 },
         uCirrus: { value: 0.32 },
@@ -362,6 +391,10 @@ export class VolumetricPass {
     const hz = this._skyQuery('radianceInDirection', { x: (sd.x / h) * 0.9987, y: 0.05, z: (sd.z / h) * 0.9987 });
     const zn = this._skyQuery('radianceInDirection', { x: 0, y: 1, z: 0 });
     this._skyRad = hz && zn ? { zenith: zn, horizon: hz } : null;
+
+    // The per-direction table the haze converges onto. ~670 CPU raymarches; it
+    // runs when the sun moves to a new preset, not per frame.
+    this.volMat.uniforms.uSkyLutValid.value = this.skyLut.build(sd) ? 1 : 0;
   }
 
   /** Pull colours out of the active time-of-day preset. */
@@ -426,6 +459,8 @@ export class VolumetricPass {
     u.uPhaseG.value = p.phaseG;
     u.uCloudCoverage.value = p.cloudCoverage;
     u.uCloudDensity.value = p.cloudDensity;
+    u.uCloudAbsorb.value = p.cloudExt ?? 0.038;
+    u.uCloudLightExt.value = p.cloudLightExt ?? 0.058;
     u.uCloudGain.value = p.cloudGain;
     u.uCloudAmbGain.value = p.cloudAmb;
     u.uCirrus.value = p.cirrus;
@@ -435,21 +470,48 @@ export class VolumetricPass {
     u.uHeatHaze.value = p.heatHaze;
     u.uCloudShadow.value = p.cloudShadow;
     u.uHazeOwned.value = this.ownsHaze ? 1 : 0;
-    u.uSkyAmbient.value.set(sky[0], sky[1], sky[2]);
 
     // Dust load rides the art-directed fog density so the look stays tunable
     // from ArtDirection.js without touching a shader.
     const dust = (preset.fogDensity ?? 0.000095) / 0.000095;
     u.uBetaD.value.setScalar(p.dustBeta * dust);
     u.uDustHeight.value = p.dustHeight;
-    u.uApSun.value = p.apSun;
-    u.uApAmb.value = p.apAmb;
+    u.uApGain.value = p.apGain ?? 0.93;
+    u.uApDesat.value = p.apDesat ?? 0.14;
+    // Chroma of the dust in-scatter, as a UNIT-LUMINANCE tilt away from the
+    // sky's own colour and toward the sunlit ground under it. Unit luminance is
+    // the whole point: it means the dust can only ever change the haze's hue,
+    // never its level, so the far field still lands on the sky's brightness and
+    // a distant ridge cannot end up brighter or darker than the sky it fades
+    // into. Round 3's uDustAlbedo was an unnormalised (1.25, 1.02, 0.70) applied
+    // on top of an already-warm ground-lit source; that product is what the
+    // critics measured as a constant sepia in every frame.
+    this._dustTint(u.uDustAlbedo.value, p.dustWarm ?? 0.18, u.uGroundLight.value);
     // Rayleigh and Mie follow the same numbers the sky dome is drawn with, so a
     // ridge that fades into the sky fades into the colour the sky actually is.
     const ray = (preset.rayleigh ?? 1.9) / 1.9;
     u.uBetaR.value.set(5.802e-6 * ray, 13.558e-6 * ray, 33.1e-6 * ray);
     u.uBetaM.value = 8.0e-6 * ((preset.mieCoefficient ?? 0.0058) / 0.0058);
     u.uApG.value = Math.min(preset.mieDirectionalG ?? 0.8, 0.82);
+  }
+
+  /**
+   * Write the dust chroma tilt into `out`: white nudged `warm` of the way toward
+   * the chroma of `ground`, then renormalised to luminance 1. Falls back to
+   * neutral when the ground is unlit (night), where a "warm dust" tilt would be
+   * describing light that does not exist.
+   */
+  _dustTint(out, warm, ground) {
+    const gl = 0.2126 * ground.x + 0.7152 * ground.y + 0.0722 * ground.z;
+    if (!(gl > 1e-6) || warm <= 0) return out.set(1, 1, 1);
+    const w = Math.min(warm, 1);
+    out.set(
+      1 + w * (ground.x / gl - 1),
+      1 + w * (ground.y / gl - 1),
+      1 + w * (ground.z / gl - 1),
+    );
+    const l = 0.2126 * out.x + 0.7152 * out.y + 0.0722 * out.z;
+    return l > 1e-6 ? out.multiplyScalar(1 / l) : out.set(1, 1, 1);
   }
 
   update(dt, engine) {
@@ -589,5 +651,6 @@ export class VolumetricPass {
     for (const rt of [this.depthRT, this.volRT, this.histRT0, this.histRT1]) rt?.dispose();
     this.cloudTex.dispose();
     this.weatherTex.dispose();
+    this.skyLut.dispose();
   }
 }

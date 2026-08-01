@@ -72,6 +72,66 @@ const BETA_R = [0.005802, 0.013558, 0.033100];
 // albedo (0.94, 0.88, 0.77) — coarse silicate with a hematite fraction.
 const BETA_M_S = [0.0580, 0.0548, 0.0505];
 const BETA_M_A = [0.0045, 0.0090, 0.0180];
+
+// ---------------------------------------------------------------------------
+// Delta-M truncation of the aerosol forward peak (round 4).
+//
+// Round 3 drew the aerosol with one Cornette-Shanks lobe at g=0.82 against the
+// full scattering coefficient. Measured on the shipped frames, the resulting
+// aureole was the single worst defect in the game: the outpost frame's top band
+// sits 13-20 degrees off the sun and the dome put 2.8-3.1 units of radiance
+// there against 0.57 for the sunlit sand it is meant to be lighting. Five times
+// the ground, achromatic (B/R 0.80-0.87), and it filled the whole upper half of
+// three of the seven canonical frames with a blown cream card. Two independent
+// errors compound into that:
+//
+//  1. A coarse-mode dust aerosol puts more than half its scattered energy into a
+//     diffraction peak a couple of degrees wide. Light scattered through one
+//     degree is indistinguishable from light that was never scattered, so every
+//     serious transfer solver removes it from BOTH the phase function and the
+//     scattering coefficient before integrating — Wiscombe's delta-M scaling,
+//     `beta' = beta(1-f)`, `p' = (p - f*delta)/(1-f)`. Round 3 did not, so that
+//     energy was scattered a second time into the 10-40 degree band where a
+//     single HG lobe still has plenty of amplitude, and the aureole inherited
+//     all of it.
+//  2. SKY_GAIN doubles sky radiance for art reasons. Doubling a term that is
+//     already five times the subject is how a lift becomes a blowout.
+//
+// So the peak is truncated properly, and a deliberately *small* narrow lobe is
+// added back on top: at these framings a few degrees of glare around the disc is
+// resolved on screen and reads as a brutal sun, which is the look. The retained
+// phase is `w*HG(gSpike) + (1-w)*HG(gBroad)`, gBroad following delta-M from the
+// preset's asymmetry. Adding the spike back leaves the whole aerosol at an
+// effective g of 0.85 against the 0.82 asked for — 4% too forward, deliberately,
+// and the only place that shows is the first few degrees around the disc.
+//
+// Measured on the outpost frame's top-left ray, 15 degrees off the sun, in
+// scene-linear radiance against a sunlit sand reference of 0.55:
+//
+//   f      radiance   B/R    x sand      (0.0 is the round-3 single lobe)
+//   0.00     2.66     0.86     4.7
+//   0.62     1.06     1.72     1.9
+//   0.74     0.84     2.32     1.6      <- shipped
+//   0.85     0.75     2.78     1.4
+//
+// The knee is real: below 0.74 the aureole still dominates, above it the return
+// falls off because what is left is Rayleigh, which is the part that is supposed
+// to be there. 0.74 is at the top of the range a 1-2 um silicate actually has
+// (Mie theory puts the diffraction fraction at 0.6-0.75 for these sizes), and it
+// is chosen at the top of that range on purpose. The same numbers cost the noon
+// zenith 17% of its radiance and gain it 0.8 of B/R, and the horizon band gets
+// *warmer and brighter* (0.86 -> 1.07 at B/R 0.79) because the energy the peak
+// was hoarding comes back as multiple scattering along the long path.
+const DUST_TRUNC = 0.74;
+// The glare lobe is narrow on purpose — g=0.96 is 3 degrees to half amplitude,
+// about where a 2 um silicate's diffraction peak has its first minimum, and it
+// is 0.4% of its own peak by 15 degrees. Widening it to 0.93 at matched weight
+// adds nothing on the disc and puts 4% back into the aureole.
+const DUST_SPIKE_W = 0.16;
+const DUST_SPIKE_G = 0.96;
+/** Scattering and extinction after truncation. Everything downstream uses these. */
+const BETA_M_S_EFF = BETA_M_S.map((v) => v * (1 - DUST_TRUNC));
+const BETA_M_E_EFF = BETA_M_S_EFF.map((v, i) => v + BETA_M_A[i]);
 // Ozone (Chappuis), 1/km at the layer peak. Tent profile, 10 km -> 25 km -> 40 km.
 const BETA_O = [0.000650, 0.001881, 0.000085];
 // Desert sand, linear albedo. Feeds the multi-scatter integral and the
@@ -88,9 +148,16 @@ const E_TOA = 8.2;
 /**
  * Artistic lift of sky radiance over the physical value. Real clear-sky zenith
  * sits about a stop under sunlit sand; every shipped game opens that up because
- * the sky is the frame's negative space and a dark one reads as overcast. 2.0 is
- * the number that puts the vista zenith at the 0.45-0.60 display luminance the
- * art direction asks for without ACES desaturating it back to white.
+ * the sky is the frame's negative space and a dark one reads as overcast.
+ *
+ * Round 2 set this to hold the vista zenith at 0.45-0.60 display luminance.
+ * That target is dead: 0.5 display luminance on a zenith IS the blown cream card
+ * three critics rejected, and it was only ever reachable because ACES then
+ * desaturated the blue out of it on the way. The zenith is now aimed at
+ * 0.14-0.22 display, and the dome measures 0.11-0.21 across the daylight frames
+ * without touching this number — the level was never the problem, the aerosol
+ * phase was (see DUST_TRUNC). Left at 2.05 because it is also the sky's weight
+ * in the IBL, and halving it here would silently cut the ambient fill in half.
  */
 const SKY_GAIN = 2.05;
 /**
@@ -123,8 +190,12 @@ const float RA = ${RA.toFixed(1)};
 const float H_RAY = ${H_RAY.toFixed(3)};
 const float H_MIE = ${H_MIE.toFixed(3)};
 const vec3  BETA_R = vec3(${BETA_R.join(', ')});
-const vec3  BETA_M_S = vec3(${BETA_M_S.join(', ')});
+// Delta-M truncated: the diffraction peak is out of both of these (see the
+// DUST_TRUNC block). BETA_M_S is the untruncated coefficient, kept only so a
+// an including shader that wants the raw aerosol optical depth can have it.
+const vec3  BETA_M_S = vec3(${BETA_M_S_EFF.join(', ')});
 const vec3  BETA_M_A = vec3(${BETA_M_A.join(', ')});
+const vec3  BETA_M_S_RAW = vec3(${BETA_M_S.join(', ')});
 const vec3  BETA_O = vec3(${BETA_O.join(', ')});
 const vec3  GROUND_ALBEDO = vec3(${GROUND_ALBEDO.join(', ')});
 const float PI_ = 3.141592653589793;
@@ -138,12 +209,22 @@ void densities(float h, out float dR, out float dM, out float dO) {
 
 float phaseRayleigh(float mu) { return (3.0 / (16.0 * PI_)) * (1.0 + mu * mu); }
 
-/** Cornette-Shanks: the Mie phase Henyey-Greenstein approximates badly at 90 deg. */
-float phaseMie(float mu, float g) {
+float hg(float mu, float g) {
   float g2 = g * g;
-  float d = 1.0 + g2 - 2.0 * g * mu;
-  return (3.0 / (8.0 * PI_)) * ((1.0 - g2) * (1.0 + mu * mu)) /
-         ((2.0 + g2) * pow(max(d, 1e-4), 1.5));
+  return (1.0 - g2) / (4.0 * PI_ * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+}
+
+/**
+ * Retained aerosol phase after delta-M truncation: a narrow resolved glare lobe
+ * plus the broad remainder. g is the preset's asymmetry for the *whole*
+ * aerosol; the broad lobe's is what is left of it once the delta has been taken
+ * out, which is the standard (g - f) / (1 - f). Normalised by construction, so
+ * pairing it with BETA_M_S (already scaled by 1-f) conserves energy.
+ */
+float phaseDust(float mu, float g) {
+  float gb = clamp((g - ${DUST_TRUNC.toFixed(3)}) / ${(1 - DUST_TRUNC).toFixed(3)}, 0.05, 0.80);
+  return ${DUST_SPIKE_W.toFixed(3)} * hg(mu, ${DUST_SPIKE_G.toFixed(3)}) +
+         ${(1 - DUST_SPIKE_W).toFixed(3)} * hg(mu, gb);
 }
 
 /** Nearest positive intersection with a sphere centred at the origin; -1 if none. */
@@ -305,10 +386,10 @@ March marchSky(vec3 ro, vec3 rd, vec3 sunDir, vec3 sunE, vec3 moonDir, vec3 moon
 
   float muSun = dot(rd, sunDir);
   float pRs = phaseRayleigh(muSun);
-  float pMs = phaseMie(muSun, mieG);
+  float pMs = phaseDust(muSun, mieG);
   float muMoon = dot(rd, moonDir);
   float pRm = phaseRayleigh(muMoon);
-  float pMm = phaseMie(muMoon, mieG);
+  float pMm = phaseDust(muMoon, mieG);
   bool doMoon = uNight > 0.001;
 
   const int STEPS = 20;
@@ -552,8 +633,8 @@ class AtmosphereTables {
     this.rayleighScale = rayleighScale;
     this.aerosolScale = aerosolScale;
     this.bR = BETA_R.map((v) => v * rayleighScale);
-    this.bMs = BETA_M_S.map((v) => v * aerosolScale);
-    this.bMe = BETA_M_S.map((v, i) => (v + BETA_M_A[i]) * aerosolScale);
+    this.bMs = BETA_M_S_EFF.map((v) => v * aerosolScale);
+    this.bMe = BETA_M_E_EFF.map((v) => v * aerosolScale);
     this.bO = BETA_O.map((v) => v * rayleighScale);
 
     this.trans = new Float32Array(TRANS_W * TRANS_H * 3);
@@ -859,6 +940,7 @@ export class Sky {
     this._camAltitudeKm = 0.4;
     this._scratch = [0, 0, 0];
     this._scratch2 = [0, 0, 0];
+    this._scratch3 = [0, 0, 0];
 
     this._refresh();
   }
@@ -1048,8 +1130,50 @@ export class Sky {
     return out.setRGB(t[0], t[1], t[2], THREE.LinearSRGBColorSpace);
   }
 
-  /** CPU mirror of `marchSky`. Same tables, same steps, same numbers. */
-  _march(dx, dy, dz, out) {
+  /**
+   * Aerial perspective along a *finite* view ray — the query the volumetrics
+   * pass needs so distance haze converges to the sky instead of to an authored
+   * `TIME_OF_DAY.fogColor` constant.
+   *
+   *   const { inscatter, transmittance } = sky.inscatterAlongRay(dir, metres);
+   *   shaded = surfaceRadiance * transmittance + inscatter;
+   *
+   * `dir` is any object with x/y/z (need not be normalised); `distance` is in
+   * SCENE METRES and is clamped to wherever the ray leaves the atmosphere or
+   * hits the planet. Both results are scene-linear radiance/ratio in exactly the
+   * units the dome is drawn in, computed by the same march against the same
+   * transmittance and multi-scatter tables — so a ridge fading out and the sky
+   * it fades into are the same numbers by construction, at any distance, in any
+   * direction, at any time of day.
+   *
+   * As `distance` grows past the atmosphere this converges to
+   * `radianceInDirection(dir)` with a transmittance of zero, which is the
+   * property that makes the horizon join up. Cost is one 20-step CPU march with
+   * two table taps per step: fine for a few hundred calls when the time of day
+   * changes, not something to call per pixel per frame.
+   *
+   * Pass `out` (an object with `inscatter`/`transmittance` THREE.Color fields)
+   * to avoid allocating; the same object is returned.
+   */
+  inscatterAlongRay(dir, distance, out) {
+    const res = out ?? { inscatter: new THREE.Color(), transmittance: new THREE.Color() };
+    const L = this._scratch2;
+    const T = this._scratch3;
+    this._march(dir.x, dir.y, dir.z, L, Math.max(0, (distance ?? 0) * 0.001), T);
+    res.inscatter.setRGB(L[0], L[1], L[2], THREE.LinearSRGBColorSpace);
+    res.transmittance.setRGB(T[0], T[1], T[2], THREE.LinearSRGBColorSpace);
+    return res;
+  }
+
+  /**
+   * CPU mirror of `marchSky`. Same tables, same steps, same numbers.
+   *
+   * `maxKm > 0` truncates the ray at that distance (aerial perspective); the lit
+   * ground term is then skipped, because the ray stopped in mid-air rather than
+   * on the planet. `outT`, if given, receives the view-ray transmittance over
+   * the marched span.
+   */
+  _march(dx, dy, dz, out, maxKm, outT) {
     const n = normalize3([dx, dy, dz]);
     const T = this._tables;
     const u = this.material.uniforms;
@@ -1065,15 +1189,21 @@ export class Sky {
     let tMax = raySphereFarCPU(0, r0, 0, n[0], n[1], n[2], RA);
     const tG = raySphereNearCPU(0, r0, 0, n[0], n[1], n[2], RG);
     if (tG > 0) tMax = tG;
+    // A finite ray stops in mid-air: no ground term, and the step distribution
+    // has to be renormalised onto the shorter span or the whole march collapses
+    // into the first few metres.
+    const truncated = maxKm > 0 && maxKm < tMax;
+    if (truncated) tMax = maxKm;
     out[0] = out[1] = out[2] = 0;
+    if (outT) outT[0] = outT[1] = outT[2] = 1;
     if (!(tMax > 0)) return out;
 
     const muSun = n[0] * sun.x + n[1] * sun.y + n[2] * sun.z;
     const pRs = (3 / (16 * Math.PI)) * (1 + muSun * muSun);
-    const pMs = miePhase(muSun, mieG);
+    const pMs = dustPhase(muSun, mieG);
     const muMoon = n[0] * moon.x + n[1] * moon.y + n[2] * moon.z;
     const pRm = (3 / (16 * Math.PI)) * (1 + muMoon * muMoon);
-    const pMm = miePhase(muMoon, mieG);
+    const pMm = dustPhase(muMoon, mieG);
 
     const Tv = [1, 1, 1];
     const tl = [0, 0, 0];
@@ -1126,7 +1256,9 @@ export class Sky {
       }
     }
 
-    if (tG > 0) {
+    if (outT) { outT[0] = Tv[0]; outT[1] = Tv[1]; outT[2] = Tv[2]; }
+
+    if (tG > 0 && !truncated) {
       const px = n[0] * tG;
       const py = r0 + n[1] * tG;
       const pz = n[2] * tG;
@@ -1168,10 +1300,15 @@ export class Sky {
   }
 }
 
-function miePhase(mu, g) {
+function hgPhase(mu, g) {
   const g2 = g * g;
-  const d = 1 + g2 - 2 * g * mu;
-  return (3 / (8 * Math.PI)) * ((1 - g2) * (1 + mu * mu)) / ((2 + g2) * Math.pow(Math.max(d, 1e-4), 1.5));
+  return (1 - g2) / (4 * Math.PI * Math.pow(Math.max(1 + g2 - 2 * g * mu, 1e-4), 1.5));
+}
+
+/** CPU mirror of the shader's `phaseDust`. */
+function dustPhase(mu, g) {
+  const gb = Math.min(0.80, Math.max(0.05, (g - DUST_TRUNC) / (1 - DUST_TRUNC)));
+  return DUST_SPIKE_W * hgPhase(mu, DUST_SPIKE_G) + (1 - DUST_SPIKE_W) * hgPhase(mu, gb);
 }
 
 function normalize3(v) {

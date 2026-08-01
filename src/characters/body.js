@@ -60,6 +60,31 @@ export function buildHips(o = {}) {
   return loftKeys(keys, 14, { radial: 22, capStart: true, capEnd: true });
 }
 
+/**
+ * A standing jacket collar.
+ *
+ * Without one the neck rises straight out of the torso loft and the AO bake
+ * buries the join, so the head reads as a ball balanced on a shaft — which was
+ * exactly the round-3 note. A collar is a separate piece of cloth standing 12 mm
+ * off the neck with a cut edge at the top, so it gets its own rim highlight, its
+ * own stitched border and its own shadow onto the shoulders: three value steps
+ * in the 60 px where the head meets the body.
+ */
+export function buildCollar(o = {}) {
+  const bulk = o.bulk ?? 1;
+  return loftKeys(
+    [
+      { p: V(0, 1.452, -0.006), rx: 0.128 * bulk, rz: 0.098 * bulk, n: 2.9, back: 1.04, zone: Z.COLLAR },
+      { p: V(0, 1.478, -0.004), rx: 0.106, rz: 0.088, n: 2.7, back: 1.06, zone: Z.COLLAR },
+      { p: V(0, 1.508, -0.002), rx: 0.086, rz: 0.079, n: 2.5, back: 1.1, zone: Z.COLLAR },
+      // The stand flares back out at the top the way a turned-up collar does.
+      { p: V(0, 1.542, 0.002), rx: 0.081, rz: 0.077, n: 2.5, back: 1.14, zone: Z.COLLAR },
+    ],
+    10,
+    { radial: 20, capStart: true },
+  );
+}
+
 export function buildNeck() {
   const keys = [
     { p: V(0, 1.4, -0.004), rx: 0.072, rz: 0.076, n: 2.4, zone: SZ.NECK },
@@ -199,16 +224,28 @@ export function buildHair(o = {}) {
   return displacedSphere(
     (dir, out) => {
       headSurface(dir, tmp, o);
-      // Hairline: high on the forehead, receding at the temples.
-      let cover = THREE.MathUtils.smoothstep(dir.y * 1.0 + dir.z * 0.72, 0.28, 0.66);
+      // The hairline is TWO boundaries, not one, and collapsing them into a
+      // single band on (y + 0.72z) is what produced both failures this round:
+      // at 0.28..0.66 the hair ran down over the jaw and the head was one dark
+      // bowl; at 0.40..0.72 it retreated to a skullcap and left a bald ring
+      // around the temples and the ear.
+      //   `front` — the frontal hairline, crossing the forehead high and
+      //     dropping behind the temple. Weighted 0.62/1.0 on y/z so it is
+      //     mostly a *depth* test: the face is the front of the head, not the
+      //     bottom of it.
+      //   `above` — hair stops above the jawline. Separate, because the ear sits
+      //     at y = -0.2 and the jaw at y = -0.6, and no single plane splits them.
+      const front = THREE.MathUtils.smoothstep(dir.y * 0.62 + dir.z * 1.0, -0.42, 0.04);
+      let cover = front * THREE.MathUtils.smoothstep(dir.y, -0.46, -0.16);
       if (back) cover *= THREE.MathUtils.smoothstep(dir.y * 0.4 + dir.z, -0.1, 0.45);
-      const clump = 1 + 0.55 * Math.sin(dir.x * 34) * Math.sin(dir.z * 29) * cover;
+      const clump = 1 + 0.26 * Math.sin(dir.x * 34) * Math.sin(dir.z * 29) * cover;
       // Offset ALONG the skull's own radius: negative where there is no hair, so
       // the shell is buried inside the head and the crossover is the hairline.
       // 30 mm of burial, not 9: the skull has a 36 mm nose and a 14 mm brow
       // displaced onto it, and a shell that only clears the *average* radius
-      // still surfaces across the cheeks and the jaw.
-      const t = -0.030 + cover * (0.040 + 0.004 * clump);
+      // still surfaces across the cheeks and the jaw. The 24 mm crown is a
+      // regulation 13 mm crop, not the 20 mm helmet round 3 grew.
+      const t = -0.030 + cover * (0.0128 + 0.0022 * clump);
       out.copy(tmp).sub(c);
       const len = out.length() || 1;
       out.multiplyScalar(1 + t / len).add(c);
@@ -292,6 +329,69 @@ export function buildArm(o = {}) {
     });
   } else {
     parts.push({ surface: loftKeys(keys, 24, { radial: 16, capStart: true }), mat: 'cloth' });
+  }
+
+  // --- sleeve furniture ---------------------------------------------------
+  // The upper arm is the biggest unbroken surface on a soldier and it points
+  // straight at the third-person camera. Round 3 shipped it as a bare tapered
+  // tube: measured on the gameplay frame it was the brightest thing on the
+  // character and carried no value break at all over 100 px, which is the
+  // definition of a mannequin limb. A combat shirt has three things on it and
+  // all three are horizontal, i.e. across the taper where they read hardest.
+
+  // Bicep bellows pocket with its own flap — the pen/velcro pocket every set of
+  // fatigues has, standing 12 mm proud on the outboard face.
+  const pocketAt = (t, h, r, zone) => {
+    const a = armPoint(t - h);
+    const b = armPoint(t + h);
+    return loftKeys(
+      [
+        { p: a, rx: r * 0.92, rz: r * 0.96, n: 4.6, zone },
+        { p: a.clone().lerp(b, 0.35), rx: r, rz: r * 1.04, n: 4.8, zone },
+        { p: a.clone().lerp(b, 0.65), rx: r, rz: r * 1.04, n: 4.8, zone },
+        { p: b, rx: r * 0.9, rz: r * 0.94, n: 4.6, zone },
+      ],
+      9,
+      { radial: 14, capStart: true, capEnd: true },
+    );
+  };
+  parts.push({ surface: pocketAt(0.235, 0.075, 0.070 * bulk, Z.POUCH), mat: 'cloth' });
+  parts.push({ surface: pocketAt(0.163, 0.018, 0.072 * bulk, Z.WEBBING), mat: 'cloth' });
+
+  // Elbow reinforcement patch: a second layer of cloth over the joint, which is
+  // where the eye looks to decide whether an arm has a joint in it at all.
+  parts.push({ surface: pocketAt(0.50, 0.055, 0.058 * bulk, Z.POUCH), mat: 'cloth' });
+
+  // Shoulder seam where the sleeve head is set into the body, and the cuff.
+  parts.push({
+    surface: strap(
+      [
+        armPoint(0.055).add(V(0, 0.062, 0.0)),
+        armPoint(0.05).add(V(0, 0.0, -0.064)),
+        armPoint(0.048).add(V(0, -0.062, 0.0)),
+        armPoint(0.05).add(V(0, 0.0, 0.064)),
+        armPoint(0.055).add(V(0, 0.062, 0.0)),
+      ],
+      0.014,
+      0.005,
+      Z.WEBBING,
+      { stations: 16 },
+    ),
+    mat: 'cloth',
+  });
+  if (!rolled) {
+    parts.push({
+      surface: loftKeys(
+        [
+          { p: armPoint(0.905), rx: 0.040, rz: 0.043, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.945), rx: 0.037, rz: 0.041, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.985), rx: 0.031, rz: 0.036, n: 3.0, zone: Z.WEBBING },
+        ],
+        7,
+        { radial: 14, capStart: true, capEnd: true },
+      ),
+      mat: 'cloth',
+    });
   }
   return parts;
 }

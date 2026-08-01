@@ -18,9 +18,14 @@ export const STOREY = 3.2;
 export const DOOR_H = 2.1;
 export const DOOR_W = 1.1;
 
+// `concrete2` is a second, later, coarser pour and `trim` is the painted
+// joinery colour. Both exist purely so that not every surface in the compound
+// is drawn by the same material at the same tiling scale — which is the
+// complaint round 2 got, and which no amount of extra noise inside a single
+// material can answer, because the tiling scale is what gives it away.
 const GEO_KEYS = [
-  'concrete', 'masonry', 'metal', 'corr', 'wood', 'glass', 'glow', 'cloth', 'net',
-  'rubber', 'paint', 'paintWarn', 'sign', 'dark', 'mil', 'dado',
+  'concrete', 'concrete2', 'masonry', 'metal', 'corr', 'wood', 'glass', 'glow', 'cloth', 'net',
+  'rubber', 'paint', 'trim', 'paintWarn', 'sign', 'dark', 'mil', 'dado', 'drift',
 ];
 
 /**
@@ -38,6 +43,45 @@ export function dadoSkin(b, { w, d, h = 1.35, out = 0.03, y = 0 }) {
   // A cast bullnose at the head of the band — where the painter stopped.
   for (const sz of [-1, 1]) b.concrete.push(box(w + out * 2 + 0.10, 0.07, 0.12, { y: y + h + 0.03, z: sz * (d / 2 + out + 0.02) }));
   for (const sx of [-1, 1]) b.concrete.push(box(0.12, 0.07, d + out * 2 + 0.10, { x: sx * (w / 2 + out + 0.02), y: y + h + 0.03 }));
+}
+
+/**
+ * Plinth course: the projecting base a building actually stands on.
+ *
+ * Round 3 asked for this by name and it is worth more than it looks. Where a
+ * wall meets the ground is the one place on a building the eye ALWAYS checks
+ * for a shadow, because in reality nothing is ever flush: there is a splayed
+ * or stepped course, it throws a 40-80mm shadow onto the dirt, and the dirt
+ * banks up against it. A wall that runs straight into the ground plane is the
+ * single most reliable "this geometry was extruded" tell in the frame — worse
+ * than a missing bevel, because it also destroys the contact.
+ *
+ * Three courses: a buried footing that takes the splash zone, a projecting
+ * course, and a splayed weathering above it so water runs off rather than
+ * sitting on the top of the plinth.
+ */
+export function plinth(b, { w, d, h = 0.62, out = 0.13, y = 0, key = 'concrete' }) {
+  b[key].push(box(w + out * 2, h, d + out * 2, { y: y + h / 2 }));
+  // Splayed weathering: a shallow chamfered cap so the plinth sheds water and
+  // presents a lit top edge above its own shadow.
+  b[key].push(box(w + out * 2 + 0.06, 0.075, d + out * 2 + 0.06, { y: y + h + 0.03 }));
+  b[key].push(box(w + out * 0.9, 0.11, d + out * 0.9, { y: y + h + 0.12 }));
+  // The footing itself, mostly buried; what shows is a hard dark line at grade.
+  b[key].push(box(w + out * 2 + 0.14, 0.26, d + out * 2 + 0.14, { y: y - 0.10 }));
+}
+
+/**
+ * Proud panels between the piers of one storey, in a DIFFERENT material key.
+ *
+ * A Soviet frame building is a concrete skeleton with a rendered or blockwork
+ * infill, and expressing that is the cheapest way to break the "every wall is
+ * the same grey" read the round-2 critics all landed on: the frame stays bare
+ * concrete, the infill goes whitewashed masonry, and the elevation gains a
+ * horizontal albedo break with real relief on it instead of a shader gradient.
+ */
+export function renderBand(b, { w, d, y, h, out = 0.05, key = 'masonry' }) {
+  for (const sz of [-1, 1]) b[key].push(box(w, h, out, { y: y + h / 2, z: sz * (d / 2 + out / 2) }));
+  for (const sx of [-1, 1]) b[key].push(box(out, h, d, { x: sx * (w / 2 + out / 2), y: y + h / 2 }));
 }
 
 /**
@@ -111,12 +155,28 @@ export function placeBag(dst, src, { u = 0, v = 0, y = 0, ry = 0 } = {}) {
  * Returns the opening spec so the wall run can punch a hole for it.
  */
 function windowUnit(b, { x, y, z, w, h, faceZ = 1, lit = false, barred = true, boarded = false, wallT, shell = 'concrete' }) {
-  const inset = 0.17;
+  // Round 3: the reveal was 170mm and the cill projected 110mm, and at 30m on a
+  // shaded elevation neither threw a shadow you could measure — the openings
+  // vanished into the wall and the facade read as one flat rectangle with
+  // pilasters. A reveal has to be deep enough that the sun cannot reach the
+  // pane at any hour: 280mm at this window width puts the whole opening in
+  // shadow from about 35 degrees of azimuth off-normal, which is most of the
+  // day, so the opening reads as a HOLE rather than as a darker patch.
+  const inset = 0.28;
+  const face = z + faceZ * (wallT / 2); // outer plane of the wall
   const zp = z + faceZ * (wallT / 2 - inset);
-  // A painted timber frame in the reveal, with a transom and a mullion. Round 1
-  // shipped an unframed black rectangle, which reads as a hole cut in cardboard:
-  // a real window is four bright edges around a dark centre, and it is the BRIGHT
-  // EDGE the eye uses to decide the wall has thickness.
+  // Painted reveal lining: the jambs, head and cill soffit inside the opening.
+  // This is the bright edge the eye uses to decide the wall has thickness, and
+  // it only works if it is a DIFFERENT material from the wall — a reveal in the
+  // same grey concrete is just more grey concrete.
+  const rl = 0.035;
+  for (const sx of [-1, 1]) {
+    b.trim.push(box(rl, h + 0.02, inset - 0.02, { x: x + sx * (w / 2 - rl / 2), y: y + h / 2, z: zp + faceZ * (inset / 2) }));
+  }
+  b.trim.push(box(w - 0.02, rl, inset - 0.02, { x, y: y + h - rl / 2, z: zp + faceZ * (inset / 2) }));
+  b.trim.push(box(w - 0.02, rl, inset - 0.02, { x, y: y + rl / 2, z: zp + faceZ * (inset / 2) }));
+  // A painted timber frame set in the back of the reveal, with a transom and a
+  // mullion.
   const fr = 0.055;
   for (const sx of [-1, 1]) {
     b.paint.push(box(fr, h - 0.02, 0.075, { x: x + sx * (w / 2 - fr / 2 - 0.02), y: y + h / 2, z: zp + faceZ * 0.03 }));
@@ -130,9 +190,22 @@ function windowUnit(b, { x, y, z, w, h, faceZ = 1, lit = false, barred = true, b
   // decal; a dark card 200mm back gives it parallax and a believable interior.
   b.dark.push(box(w - 0.06, h - 0.06, 0.04, { x, y: y + h / 2, z: zp - faceZ * 0.20 }));
   (lit ? b.glow : b.glass).push(box(w - 0.10, h - 0.10, 0.02, { x, y: y + h / 2, z: zp }));
-  // Cill throws water clear of the wall — and seeds the dirt streak below it.
-  b[shell].push(box(w + 0.30, 0.075, wallT + 0.22, { x, y: y - 0.038, z: z + faceZ * 0.02, rx: faceZ * 0.035 }));
-  b[shell].push(box(w + 0.24, 0.115, wallT + 0.12, { x, y: y + h + 0.058, z }));
+  // Cast cill: throws water clear of the wall, seeds the dirt streak below it,
+  // and — the reason it is 170mm proud rather than 110 — puts a hard horizontal
+  // shadow under every opening on the elevation at any sun above 30 degrees.
+  b[shell].push(box(w + 0.34, 0.085, wallT + 0.34, { x, y: y - 0.043, z: z + faceZ * 0.06, rx: faceZ * 0.05 }));
+  // Drip lip on the underside of the cill nose. 40mm of shadow that always
+  // reads, and the thing that stops the cill looking like a pasted-on slab.
+  b[shell].push(box(w + 0.30, 0.045, 0.05, { x, y: y - 0.105, z: face + faceZ * 0.145 }));
+  // Lintel, proud of the wall, with its own soffit shadow.
+  b[shell].push(box(w + 0.30, 0.135, wallT + 0.20, { x, y: y + h + 0.068, z: z + faceZ * 0.03 }));
+  // Painted architrave: a 55mm band around the opening. The trim colour is what
+  // makes a window read as joinery rather than as a hole in a slab, and it is
+  // the cheapest per-building identity there is.
+  for (const sx of [-1, 1]) {
+    b.trim.push(box(0.085, h + 0.16, 0.055, { x: x + sx * (w / 2 + 0.042), y: y + h / 2 + 0.02, z: face + faceZ * 0.026 }));
+  }
+  b.trim.push(box(w + 0.17, 0.075, 0.055, { x, y: y + h + 0.075, z: face + faceZ * 0.026 }));
   if (boarded) {
     for (let i = 0; i < 3; i++) {
       b.wood.push(box(w + 0.06, (h - 0.06) / 3 - 0.03, 0.035, {
@@ -179,22 +252,52 @@ function doorUnit(b, { x, z, faceZ = 1, wallT, w = DOOR_W, h = DOOR_H, doubleLea
   b[shell].push(box(w + 0.26, 0.11, 0.07, { x, y: h + 0.055, z: zf }));
   b[shell].push(box(0.11, h + 0.11, 0.07, { x: x - w / 2 - 0.075, y: (h + 0.11) / 2, z: zf }));
   b[shell].push(box(0.11, h + 0.11, 0.07, { x: x + w / 2 + 0.075, y: (h + 0.11) / 2, z: zf }));
+  // Painted architrave round the opening, and a projecting hood over it: the
+  // entrance is the one place a soldier's eye goes first, so it gets the trim
+  // colour and a hard cast shadow of its own.
+  for (const sx of [-1, 1]) {
+    b.trim.push(box(0.10, h + 0.24, 0.05, { x: x + sx * (w / 2 + 0.145), y: (h + 0.24) / 2, z: zf + faceZ * 0.055 }));
+  }
+  b.trim.push(box(w + 0.39, 0.10, 0.05, { x, y: h + 0.19, z: zf + faceZ * 0.055 }));
+  b[shell].push(box(w + 0.86, 0.115, 0.42, { x, y: h + 0.36, z: z + faceZ * (wallT / 2 + 0.16) }));
+  // Threshold slab and a single step down to the dirt — the contact detail that
+  // stops a door looking like a decal on a wall that meets the ground flush.
   b.concrete.push(box(w + 0.75, 0.15, 0.9, { x, y: 0.075, z: z + faceZ * (wallT / 2 + 0.45) }));
+  b.concrete.push(box(w + 1.05, 0.11, 0.34, { x, y: 0.02, z: z + faceZ * (wallT / 2 + 0.96) }));
   b.interest.push({ pos: new THREE.Vector3(x, 0, z + faceZ * (wallT / 2 + 1.5)), kind: 'door' });
   return { x, w, y0: 0, h };
 }
 
-/** Parapet + coping + scuppers + downpipes on a flat roof. */
-function parapet(b, { w, d, y, t = 0.17, h = 0.55 }) {
+/**
+ * Parapet + coping + scuppers + downpipes on a flat roof.
+ *
+ * Round 3: the upstand was 550mm but the coping was a 75mm slip that overhung
+ * by 70mm, and from any distance the whole thing collapsed into the roof line —
+ * the buildings ended at a single hard edge against the sky, which is the most
+ * reliable "untextured box" tell there is. A real parapet is read from three
+ * things and it needs all three: an upstand tall enough to hide the roof deck,
+ * a coping whose TOP FACE catches the sun as a bright line, and a drip lip
+ * under the coping nose that puts a dark line immediately below it. Bright line
+ * over dark line over wall is the signature; one of them alone is nothing.
+ */
+function parapet(b, { w, d, y, t = 0.17, h = 0.55, key = 'concrete' }) {
   const runs = [
-    { len: w, ry: 0, x: 0, z: d / 2 - t / 2, cap: w + t * 2 },
-    { len: w, ry: 0, x: 0, z: -d / 2 + t / 2, cap: w + t * 2 },
-    { len: d - t * 2, ry: Math.PI / 2, x: w / 2 - t / 2, z: 0, cap: d - t * 2 },
-    { len: d - t * 2, ry: Math.PI / 2, x: -w / 2 + t / 2, z: 0, cap: d - t * 2 },
+    { len: w, ry: 0, x: 0, z: d / 2 - t / 2, cap: w + t * 2, ox: 0, oz: 1 },
+    { len: w, ry: 0, x: 0, z: -d / 2 + t / 2, cap: w + t * 2, ox: 0, oz: -1 },
+    { len: d - t * 2, ry: Math.PI / 2, x: w / 2 - t / 2, z: 0, cap: d - t * 2, ox: 1, oz: 0 },
+    { len: d - t * 2, ry: Math.PI / 2, x: -w / 2 + t / 2, z: 0, cap: d - t * 2, ox: -1, oz: 0 },
   ];
+  const lip = t / 2 + 0.145; // outer face of the coping nose, from the run centre
   for (const s of runs) {
-    for (const g of wallRun(s.len, h, t, [])) b.concrete.push(xform(g, { ry: s.ry, x: s.x, y, z: s.z }));
-    b.concrete.push(xform(box(s.cap, 0.075, t + 0.14), { ry: s.ry, x: s.x, y: y + h + 0.037, z: s.z }));
+    for (const g of wallRun(s.len, h, t, [])) b[key].push(xform(g, { ry: s.ry, x: s.x, y, z: s.z }));
+    // Coping: 110mm slab overhanging 120mm each side, so its top face is a
+    // distinct sunlit plane and its soffit is a distinct shadowed one.
+    b.concrete.push(xform(box(s.cap + 0.10, 0.11, t + 0.24), { ry: s.ry, x: s.x, y: y + h + 0.055, z: s.z }));
+    // 50mm drip lip hung under the outer nose: a permanent dark line directly
+    // below the bright one, at every sun angle.
+    b.concrete.push(xform(box(s.cap + 0.06, 0.055, 0.055), {
+      ry: s.ry, x: s.x + s.ox * lip, y: y + h - 0.005, z: s.z + s.oz * lip,
+    }));
   }
   // Two scuppers and their downpipes — the origin of the vertical staining.
   for (const sx of [-w * 0.31, w * 0.33]) {
@@ -211,8 +314,7 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
   const b = newBag();
   const H = storeys * STOREY;
 
-  b.concrete.push(box(w + 0.5, 0.44, d + 0.5, { y: 0.22 }));
-  b.concrete.push(box(w - 0.2, 0.3, d - 0.2, { y: 0.5 }));
+  plinth(b, { w, d, h: 0.52, out: 0.16 });
 
   const frontOpen = [];
   const backOpen = [];
@@ -264,10 +366,16 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) b.concrete.push(post(0.74, H, 0.74, sx * (w / 2 - 0.02), 0.4, sz * (d / 2 - 0.02)));
   }
-  const bayN = nWin + 1;
+  // Bay pilasters go BETWEEN the windows. Round 3 found them landing exactly on
+  // top of them: the old expression put pilaster 3 of 5 at x = 1.50 and window 3
+  // of 5 at x = 1.50, so a 560mm pier stood across a 1350mm opening on both
+  // elevations of the command block — which is a large part of why the hero
+  // shot's facade measured as vertical strips and nothing else. The windows are
+  // laid out on `bayStep` centres from x0, so the piers are simply the midpoints.
   const bayStep = (w - 6.6) / Math.max(1, nWin - 1);
-  for (let i = 1; i < bayN; i++) {
-    const x = -w / 2 + 4.8 - bayStep / 2 + (i * (w - 6.6 + bayStep)) / bayN;
+  const winX0 = -w / 2 + 4.8;
+  for (let i = 1; i < nWin; i++) {
+    const x = winX0 + (i - 0.5) * bayStep;
     for (const sz of [-1, 1]) {
       b.concrete.push(post(0.56, H - 0.15, 0.44, x, 0.4, sz * (d / 2 + 0.20)));
       b.concrete.push(box(0.70, 0.14, 0.52, { x, y: H - 0.2, z: sz * (d / 2 + 0.22) }));
@@ -288,6 +396,11 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
     for (let k = 0; k < 4; k++) b.metal.push(box(0.14, 0.05, 0.05, { x: cx2, y: 1.2 + k * 1.5, z: d / 2 + 0.14 }));
   }
   signPlane(b, { x: door.x, y: DOOR_H + 0.78, z: d / 2 + 0.17, w: 2.4, h: 0.8, cell: 2 });
+  // Building number, stencilled big on the front elevation. On a compound of
+  // near-identical grey blocks the number is how a real garrison tells them
+  // apart, and it is the only thing on this facade that is unambiguously
+  // *writing* — which is what makes the wall read as a wall and not a texture.
+  signPlane(b, { x: w / 2 - 2.1, y: H - 1.35, z: d / 2 + 0.17, w: 1.6, h: 1.6, cell: 5 });
   signPlane(b, { x: -(w / 2 + 0.42), y: 4.15, z: 0, ry: -Math.PI / 2, w: 1.9, h: 1.9, cell: 12 });
   signPlane(b, { x: w / 2 + 0.42, y: 4.15, z: d * 0.24, ry: Math.PI / 2, w: 1.7, h: 1.7, cell: 10 });
   // Storey string courses, thrown well clear of the wall so they cast a hard
@@ -296,12 +409,23 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
   for (let s = 1; s < storeys; s++) b.concrete.push(box(w + 0.62, 0.26, d + 0.62, { y: s * STOREY - 0.10 }));
   b.concrete.push(box(w + 0.34, 0.15, d + 0.34, { y: 0.95 }));
   dadoSkin(b, { w: w + 0.06, d: d + 0.06, h: 0.78, y: 0.52 });
+  // Whitewashed blockwork infill in the upper storeys, held back from the
+  // concrete frame. The building becomes two materials with a hard horizontal
+  // line between them instead of one continuous grey, which is what the round-2
+  // critics were describing when they said every wall was the same wall.
+  for (let s = 1; s < storeys; s++) {
+    // Below the cill line and above the heads: the two bands of wall that carry
+    // no openings, so the infill can be a continuous ribbon rather than panels
+    // that would have to be cut round every window.
+    renderBand(b, { w, d, y: s * STOREY + 0.16, h: 0.80, out: 0.055 });
+    renderBand(b, { w, d, y: s * STOREY + 2.72, h: 0.34, out: 0.055 });
+  }
 
   const roofY = H;
   // Deep cornice: the biggest single shadow on the building.
   b.concrete.push(box(w + 0.92, 0.30, d + 0.92, { y: roofY + 0.15 }));
   b.concrete.push(box(w + 0.52, 0.22, d + 0.52, { y: roofY + 0.41 }));
-  parapet(b, { w: w + 0.36, d: d + 0.36, y: roofY + 0.52 });
+  parapet(b, { w: w + 0.36, d: d + 0.36, y: roofY + 0.52, h: 0.72 });
 
   // Roof furniture: vent cowls and a water tank on a stand.
   for (let i = 0; i < 3; i++) {
@@ -335,7 +459,14 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
 
   b.lights.push({ pos: new THREE.Vector3(door.x + 1.4, DOOR_H + 0.7, d / 2 + 0.2), kind: 'wall' });
   b.interest.push({ pos: new THREE.Vector3(0, roofY + 0.4, 0), kind: 'roof' });
-  return bakeBag(b, roofY + 2.4, 0.15);
+  // Round 3: the weathering bake ran to the top of the ROOF FURNITURE, so a
+  // wall head sat at y01 = 0.65-0.73 and never reached the 0.80 where the
+  // under-eave water stain starts. Every building on the site was missing the
+  // single dirtiest band on a real concrete elevation. The bake now ends at
+  // the head of the WALL; anything above it clamps to 1.0, which is harmless
+  // because the stain is multiplied by the face's verticality and a roof has
+  // almost none.
+  return bakeBag(b, roofY + 0.55, 0.15);
 }
 
 // ---------------------------------------------------------------- barracks --
@@ -371,8 +502,7 @@ export function barracks({
   const eaveY = ridgeY - eaveZ * pitch;
   const ang = Math.atan(pitch);
 
-  b.concrete.push(box(w + 0.46, 0.4, d + 0.46, { y: 0.2 }));
-  b.concrete.push(box(w - 0.2, 0.28, d - 0.2, { y: 0.48 }));
+  plinth(b, { w, d, h: 0.44, out: 0.14 });
 
   const frontOpen = [];
   const backOpen = [];
@@ -383,9 +513,11 @@ export function barracks({
   // cladding is identical.
   const nWin = Math.max(4, Math.round((w - 6) / 3.0));
   const paired = rng.chance(0.5);
+  const winX = [];
   for (let i = 0; i < nWin; i++) {
     const t = i / Math.max(1, nWin - 1);
     const x = -w / 2 + 4.8 + (paired ? (t + (i % 2 ? 0.10 : -0.10) / nWin) : t) * (w - 7.4);
+    winX.push(x);
     frontOpen.push(windowUnit(b, {
       x, y: 1.30, z: d / 2 - wallT / 2, w: 1.25, h: 1.30, faceZ: 1, wallT, shell,
       lit: rng.chance(litFrac), boarded: rng.chance(0.12), barred: rng.chance(0.4),
@@ -404,10 +536,14 @@ export function barracks({
     }
   }
   b.concrete.push(box(w + 0.32, 0.18, d + 0.32, { y: H + 0.09 }));
-  // Bay piers between the windows and a plinth band, both of which catch a rim
-  // of light on an otherwise dead facade.
-  for (let i = 0; i <= nWin; i++) {
-    const x = -w / 2 + 3.1 + (i * (w - 6.2)) / nWin;
+  // Bay piers, set out from the ACTUAL window centres rather than from an
+  // independent even division of the wall. With a paired rhythm the two
+  // divisions drift apart and piers end up standing across openings, which is
+  // exactly the defect found on the command block.
+  const pierX = [winX[0] - 1.55];
+  for (let i = 1; i < nWin; i++) pierX.push((winX[i - 1] + winX[i]) / 2);
+  pierX.push(winX[nWin - 1] + 1.55);
+  for (const x of pierX) {
     for (const sz of [-1, 1]) b[shell].push(post(0.32, H - 0.1, 0.14, x, 0, sz * (d / 2 + 0.06)));
   }
   b.concrete.push(box(w + 0.2, 0.12, d + 0.2, { y: 0.72 }));
@@ -490,7 +626,7 @@ export function barracks({
   b.metal.push(cyl(0.16, 0.09, 8, { x: fx, y: ridgeY + 1.62, z: -d * 0.18 }));
 
   b.lights.push({ pos: new THREE.Vector3(cx + 1.6, DOOR_H + 0.55, d / 2 + 0.2), kind: 'wall' });
-  return bakeBag(b, ridgeY + 1.8, 0.3);
+  return bakeBag(b, eaveY + 0.30, 0.3);
 }
 
 /**
@@ -500,9 +636,10 @@ export function barracks({
 function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCell = 9, lean = false } = {}) {
   const b = newBag();
   const H = 3.35;
-  const shell = 'concrete';
+  // The 1970s pour: a different cement, a different gang, a coarser shutter.
+  const shell = 'concrete2';
 
-  b.concrete.push(box(w + 0.5, 0.42, d + 0.5, { y: 0.21 }));
+  plinth(b, { w, d, h: 0.40, out: 0.15, key: shell });
   const frontOpen = [];
   const backOpen = [];
   const door = doorUnit(b, { x: w / 2 - 2.6, z: d / 2 - wallT / 2, wallT, w: 1.15, shell });
@@ -523,11 +660,11 @@ function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCe
       lit: rng.chance(litFrac * 0.4), boarded: rng.chance(0.22), barred: rng.chance(0.5),
     }));
   }
-  for (const g of wallRun(w, H, wallT, frontOpen)) b.concrete.push(xform(g, { z: d / 2 - wallT / 2 }));
-  for (const g of wallRun(w, H, wallT, backOpen)) b.concrete.push(xform(g, { z: -(d / 2 - wallT / 2) }));
+  for (const g of wallRun(w, H, wallT, frontOpen)) b[shell].push(xform(g, { z: d / 2 - wallT / 2 }));
+  for (const g of wallRun(w, H, wallT, backOpen)) b[shell].push(xform(g, { z: -(d / 2 - wallT / 2) }));
   for (const sx of [-1, 1]) {
     for (const g of wallRun(d - wallT * 2, H, wallT, [])) {
-      b.concrete.push(xform(g, { ry: sx * Math.PI * 0.5, x: sx * (w / 2 - wallT / 2) }));
+      b[shell].push(xform(g, { ry: sx * Math.PI * 0.5, x: sx * (w / 2 - wallT / 2) }));
     }
   }
   // The expressed frame: columns proud of the infill by 120mm, with a deep
@@ -535,12 +672,12 @@ function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCe
   for (let i = 0; i <= bays; i++) {
     const x = -w / 2 + bayW * i;
     for (const sz of [-1, 1]) {
-      b.concrete.push(post(0.46, H + 0.30, 0.20, x, 0, sz * (d / 2 + 0.09)));
+      b[shell].push(post(0.46, H + 0.30, 0.20, x, 0, sz * (d / 2 + 0.09)));
     }
   }
-  for (const sz of [-1, 1]) b.concrete.push(box(w + 0.30, 0.40, 0.24, { y: H - 0.20, z: sz * (d / 2 + 0.11) }));
-  b.concrete.push(box(w + 0.34, 0.20, d + 0.34, { y: H + 0.10 }));
-  parapet(b, { w: w + 0.34, d: d + 0.34, y: H + 0.20, h: 0.46, t: 0.15 });
+  for (const sz of [-1, 1]) b[shell].push(box(w + 0.30, 0.40, 0.24, { y: H - 0.20, z: sz * (d / 2 + 0.11) }));
+  b[shell].push(box(w + 0.34, 0.20, d + 0.34, { y: H + 0.10 }));
+  parapet(b, { w: w + 0.34, d: d + 0.34, y: H + 0.20, h: 0.52, t: 0.15, key: shell });
   // Mono-pitch deck falling to the back, seen only as a sliver over the parapet.
   b.corr.push(xform(box(w - 0.2, 0.06, d + 0.1), { rx: 0.07, y: H + 0.42 }));
 
@@ -573,7 +710,7 @@ function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCe
     }
   }
   b.lights.push({ pos: new THREE.Vector3(door.x - 1.3, DOOR_H + 0.75, d / 2 + 0.25), kind: 'wall' });
-  return bakeBag(b, H + 1.6, 0.34);
+  return bakeBag(b, H + 0.30, 0.34);
 }
 
 /**
@@ -588,8 +725,7 @@ function steelShed({ w = 20, d = 11, rng, litFrac = 0.3, signCell = 1 } = {}) {
   const halfD = d / 2;
   const ang = Math.atan2(ridge - eave, halfD);
 
-  b.concrete.push(box(w + 0.9, 0.34, d + 0.9, { y: 0.17 }));
-  b.concrete.push(box(w + 0.5, 0.55, d + 0.5, { y: 0.28 }));
+  plinth(b, { w: w + 0.4, d: d + 0.4, h: 0.55, out: 0.20 });
 
   // Portal frames on 4m centres, expressed inside and out.
   const frames = Math.max(4, Math.round(w / 4.0));
@@ -672,7 +808,7 @@ function steelShed({ w = 20, d = 11, rng, litFrac = 0.3, signCell = 1 } = {}) {
 
   b.lights.push({ pos: new THREE.Vector3(-w / 2 + 4.4, 3.6, halfD + 0.2), kind: 'wall' });
   b.interest.push({ pos: new THREE.Vector3(w / 2 + 3.5, 0, 0), kind: 'bay' });
-  return bakeBag(b, ridge + 1.4, 0.55);
+  return bakeBag(b, eave + 0.55, 0.55);
 }
 
 // ------------------------------------------------------------- vehicle shed --
@@ -686,7 +822,7 @@ export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
   const drop = Hf - Hb;
   const slope = Math.atan2(drop, d + 1.2);
 
-  b.concrete.push(box(w + 0.7, 0.32, d + 0.7, { y: 0.16 }));
+  plinth(b, { w, d, h: 0.36, out: 0.22 });
   for (const g of wallRun(w, Hb, wallT, [])) b.concrete.push(xform(g, { z: -(d / 2 - wallT / 2) }));
   for (const sx of [-1, 1]) {
     const openings = sx > 0 ? [{ x: 0, w: 1.3, y0: 1.5, h: 0.85 }] : [];
@@ -713,7 +849,7 @@ export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
   for (let i = 0; i < bays; i++) {
     b.interest.push({ pos: new THREE.Vector3(-w / 2 + (w / bays) * (i + 0.5), 0, d / 2 + 3.0), kind: 'bay' });
   }
-  return bakeBag(b, Hf + 1.1, 0.4);
+  return bakeBag(b, Hf + 0.20, 0.4);
 }
 
 // ------------------------------------------------------------------ bunker --
@@ -733,7 +869,7 @@ export function bunker({ w = 12, d = 8 } = {}) {
     b.metal.push(cyl(0.2, 0.07, 8, { x, y: H + 1.58, z: -d / 4 }));
   }
   b.interest.push({ pos: new THREE.Vector3(0, 0, d / 2 + 2.8), kind: 'door' });
-  return bakeBag(b, H + 1.6, 0.25);
+  return bakeBag(b, H + 0.35, 0.25);
 }
 
 // ------------------------------------------------------------- watchtower ---

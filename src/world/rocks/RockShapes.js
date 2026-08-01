@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { makeRng } from './Noise.js';
 import {
-  buildRockGeometry, mergeRockGeometries, finaliseGeometry, attachSkirt,
+  buildRockGeometry, mergeRockGeometries, finaliseGeometry,
+  buildCollarGeometry, footprintSupport,
 } from './RockGeometry.js';
 
 /**
@@ -20,14 +21,67 @@ import {
  */
 
 /**
- * Apply one shared normalisation to every LOD of a variant, then bank a collar
- * of fines against the base of the near LODs.
+ * Hard aspect guarantee, enforced on the FINISHED hull.
  *
- * `skirt.sink` must agree with the burial fraction Scatter actually uses for the
- * family, because the collar's rim is authored to sit *below* that ground line
- * so the terrain clips it. Get it wrong and a disc edge floats in the air.
+ * `aspectFloor` inside buildRockGeometry works on the pre-weathering polytope;
+ * bedding ledges, joint grooves and edge relaxation all run after it and all
+ * take material off, so a body can still come out of the pipeline thinner than
+ * it went in. A critic found a 25 m x 2 m plate standing in the vista — a 12:1
+ * plate that no amount of shading can make read as rock. Measuring the shipped
+ * hull and inflating the offending axis is the only version of this rule that
+ * cannot be defeated downstream.
+ *
+ * Applied to every LOD with the SAME factor, or a body changes shape when it
+ * switches mesh.
  */
-function normaliseVariant(geos, seed, skirt) {
+function enforceAspect(geos, minRatio) {
+  geos[0].computeBoundingBox();
+  const e = geos[0].boundingBox.getSize(new THREE.Vector3());
+  const longest = Math.max(e.x, e.y, e.z);
+  const f = { x: 1, y: 1, z: 1 };
+  let any = false;
+  for (const ax of ['x', 'y', 'z']) {
+    const want = longest * minRatio;
+    if (e[ax] >= want || e[ax] < 1e-5) continue;
+    f[ax] = want / e[ax];
+    any = true;
+  }
+  if (!any) return;
+  for (const g of geos) {
+    const b = g.boundingBox ?? g.computeBoundingBox() ?? g.boundingBox;
+    const mid = {
+      x: (b.min.x + b.max.x) * 0.5, y: (b.min.y + b.max.y) * 0.5, z: (b.min.z + b.max.z) * 0.5,
+    };
+    const p = g.attributes.position.array;
+    const n = g.attributes.normal.array;
+    for (let i = 0; i < p.length; i += 3) {
+      p[i] = mid.x + (p[i] - mid.x) * f.x;
+      p[i + 1] = mid.y + (p[i + 1] - mid.y) * f.y;
+      p[i + 2] = mid.z + (p[i + 2] - mid.z) * f.z;
+      // inverse-transpose for a diagonal scale is 1/f per axis
+      let nx = n[i] / f.x;
+      let ny = n[i + 1] / f.y;
+      let nz = n[i + 2] / f.z;
+      const l = Math.hypot(nx, ny, nz) || 1;
+      n[i] = nx / l; n[i + 1] = ny / l; n[i + 2] = nz / l;
+    }
+    g.attributes.position.needsUpdate = true;
+    g.attributes.normal.needsUpdate = true;
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+  }
+}
+
+/**
+ * Apply one shared normalisation to every LOD of a variant.
+ *
+ * Round 4: the fines collar is no longer welded in here. It is a separate body
+ * placed by Scatter in world space — see RockGeometry.buildCollarGeometry. What
+ * this function now publishes instead is `support`, the lower-flank silhouette
+ * samples the collar solve needs.
+ */
+function normaliseVariant(geos, seed, minRatio = 0.30) {
+  enforceAspect(geos, minRatio);
   geos[0].computeBoundingBox();
   const b = geos[0].boundingBox;
   const size = b.getSize(new THREE.Vector3());
@@ -47,23 +101,18 @@ function normaliseVariant(geos, seed, skirt) {
     g.computeBoundingSphere();
   }
   const bodySize = geos[0].boundingBox.getSize(new THREE.Vector3());
-  let lods = geos;
-  if (skirt) {
-    const rng = makeRng(seed ^ 0x9e37);
-    // LOD2 is a >500 m silhouette; a 3 cm sand collar on it is not a pixel.
-    lods = geos.map((g, i) => (i < 2 ? attachSkirt(g, { ...skirt, bins: i === 0 ? 14 : 10, rng }) : g));
-  }
   return {
-    lods,
+    lods: geos,
     size: bodySize,
+    /** Lower-flank silhouette samples, local space. Drives the collar footprint. */
+    support: footprintSupport(geos[Math.min(1, geos.length - 1)]),
     /** 0 = equant block, 1 = a slab. Drives how hard Scatter lies it down. */
     flat: Math.max(0, 1 - bodySize.y / Math.max(1e-4, Math.max(bodySize.x, bodySize.z))),
-    hasSkirt: !!skirt,
   };
 }
 
-function variant(seed, lods, make, skirt) {
-  return normaliseVariant(lods.map((lod) => make(makeRng(seed), lod, seed)), seed, skirt);
+function variant(seed, lods, make, minRatio) {
+  return normaliseVariant(lods.map((lod) => make(makeRng(seed), lod, seed)), seed, minRatio);
 }
 
 /** Flat angular shale/scree chips — the ground litter layer. */
@@ -87,6 +136,9 @@ function chipVariant(seed, lods, a) {
       lod,
       seed,
     }),
+    // Chips are shale flakes. 0.16 still forbids the paper-thin plate that reads
+    // as a shard of broken glass standing in the sand.
+    0.16,
   );
 }
 
@@ -107,21 +159,28 @@ function chipVariant(seed, lods, a) {
  * be a block. `ledges` restores the flat-and-layered read that thin aniso used
  * to fake, but as courses in the silhouette rather than by squashing the body.
  */
+// Round 4 cut the ledge count and depth roughly in half on this family. With
+// the analytic normal detail ablated it was obvious what those courses were
+// doing to a *rounded* body: a regular horizontal saw-tooth wrapped around a
+// boulder does not read as bedding, it reads as folds in a tarpaulin. Bedding
+// belongs to the families that are actually sedimentary stacks — formations and
+// outcrops keep theirs at full strength — and a boulder gets just enough to
+// hint that it calved off one.
 const BOULDERS = [
-  { aniso: [1.0, 0.86, 0.92], planeCount: 12, cleaves: 2, joints: 3, tightness: 0.13, chamfer: 0.035, lump: 0.1, ledges: 5, ledgeDepth: 0.035 },
-  { aniso: [1.0, 0.62, 0.88], planeCount: 14, cleaves: 3, joints: 2, tightness: 0.2, chamfer: 0.03, lump: 0.13, ledges: 7, ledgeDepth: 0.045 },
-  { aniso: [1.0, 1.4, 0.78], planeCount: 14, cleaves: 4, joints: 4, tightness: 0.11, chamfer: 0.028, lump: 0.11, ledges: 4, ledgeDepth: 0.03 },
-  { aniso: [1.0, 0.68, 0.66], planeCount: 12, cleaves: 1, joints: 0, tightness: 0.34, chamfer: 0.075, lump: 0.17, ledges: 0 },
-  { aniso: [1.0, 0.74, 1.0], planeCount: 17, cleaves: 5, joints: 3, tightness: 0.09, chamfer: 0.026, lump: 0.09, ledges: 6, ledgeDepth: 0.04 },
-  { aniso: [1.0, 1.05, 0.72], planeCount: 13, cleaves: 3, joints: 4, tightness: 0.24, chamfer: 0.04, lump: 0.14, ledges: 5, ledgeDepth: 0.05 },
+  { aniso: [1.0, 0.86, 0.92], planeCount: 12, cleaves: 2, joints: 3, tightness: 0.13, chamfer: 0.035, lump: 0.12, ledges: 3, ledgeDepth: 0.018 },
+  { aniso: [1.0, 0.62, 0.88], planeCount: 14, cleaves: 3, joints: 2, tightness: 0.2, chamfer: 0.03, lump: 0.15, ledges: 4, ledgeDepth: 0.022 },
+  { aniso: [1.0, 1.4, 0.78], planeCount: 14, cleaves: 4, joints: 4, tightness: 0.11, chamfer: 0.028, lump: 0.13, ledges: 2, ledgeDepth: 0.016 },
+  { aniso: [1.0, 0.68, 0.66], planeCount: 12, cleaves: 1, joints: 0, tightness: 0.34, chamfer: 0.075, lump: 0.19, ledges: 0 },
+  { aniso: [1.0, 0.74, 1.0], planeCount: 17, cleaves: 5, joints: 3, tightness: 0.09, chamfer: 0.026, lump: 0.11, ledges: 3, ledgeDepth: 0.02 },
+  { aniso: [1.0, 1.05, 0.72], planeCount: 13, cleaves: 3, joints: 4, tightness: 0.24, chamfer: 0.04, lump: 0.16, ledges: 3, ledgeDepth: 0.024 },
 ];
 
 const STONES = [
-  { aniso: [1.0, 0.62, 0.9], planeCount: 10, cleaves: 2, joints: 2, tightness: 0.24, chamfer: 0.045, lump: 0.11, ledges: 0 },
-  { aniso: [1.0, 0.55, 0.82], planeCount: 9, cleaves: 2, joints: 1, tightness: 0.3, chamfer: 0.04, lump: 0.09, ledges: 0 },
-  { aniso: [1.0, 0.82, 0.76], planeCount: 10, cleaves: 3, joints: 3, tightness: 0.16, chamfer: 0.035, lump: 0.12, ledges: 0 },
-  { aniso: [1.0, 0.7, 0.66], planeCount: 8, cleaves: 1, joints: 0, tightness: 0.36, chamfer: 0.08, lump: 0.16, ledges: 0 },
-  { aniso: [1.0, 1.15, 0.72], planeCount: 11, cleaves: 3, joints: 3, tightness: 0.14, chamfer: 0.035, lump: 0.1, ledges: 0 },
+  { aniso: [1.0, 0.62, 0.9], planeCount: 10, cleaves: 2, joints: 2, tightness: 0.24, chamfer: 0.045, lump: 0.14, ledges: 0 },
+  { aniso: [1.0, 0.55, 0.82], planeCount: 9, cleaves: 2, joints: 1, tightness: 0.3, chamfer: 0.04, lump: 0.12, ledges: 0 },
+  { aniso: [1.0, 0.82, 0.76], planeCount: 10, cleaves: 3, joints: 3, tightness: 0.16, chamfer: 0.035, lump: 0.15, ledges: 0 },
+  { aniso: [1.0, 0.7, 0.66], planeCount: 8, cleaves: 1, joints: 0, tightness: 0.36, chamfer: 0.08, lump: 0.19, ledges: 0 },
+  { aniso: [1.0, 1.15, 0.72], planeCount: 11, cleaves: 3, joints: 3, tightness: 0.14, chamfer: 0.035, lump: 0.13, ledges: 0 },
 ];
 
 /** Shattered monoliths that carry the skyline. Tall, sharp, deeply cleaved. */
@@ -129,15 +188,22 @@ const STONES = [
 // tall reads edge-on as a sheet of card standing in the sand — a few deep
 // cleaves through an already-thin block leave a blade, not a butte — so the
 // family floors it. Height (the second component) is what carries the drama.
+// Round 4 roughly doubled `ledgeDepth` across this family and cut `weather`.
+// Bedding has to be in the SILHOUETTE or it is not there: at 0.025 of unit
+// radius a course stepped back by 2 cm on a 12 m butte, which survives to
+// exactly nobody's screen, and what the frame actually showed was a smooth
+// inflated bag with a shader stripe on it. At 0.055 the outline is a staircase,
+// which is the read, and the same relaxation that was rounding the cleave
+// facets off is halved so the steps keep their edge.
 const FORMATIONS = [
-  { aniso: [1.0, 2.1, 0.86], planeCount: 13, cleaves: 4, joints: 5, tightness: 0.1, chamfer: 0.018, lump: 0.11, bedding: 2, ledges: 9, ledgeDepth: 0.03 },
-  { aniso: [1.0, 1.15, 0.95], planeCount: 15, cleaves: 5, joints: 6, tightness: 0.09, chamfer: 0.02, lump: 0.13, bedding: 2, ledges: 7, ledgeDepth: 0.035 },
-  { aniso: [1.0, 1.6, 0.78], planeCount: 12, cleaves: 3, joints: 4, tightness: 0.14, chamfer: 0.022, lump: 0.12, bedding: 3, ledges: 11, ledgeDepth: 0.028 },
-  { aniso: [1.0, 0.86, 1.0], planeCount: 16, cleaves: 6, joints: 6, tightness: 0.08, chamfer: 0.018, lump: 0.14, bedding: 2, ledges: 6, ledgeDepth: 0.04 },
-  { aniso: [1.0, 2.6, 0.84], planeCount: 11, cleaves: 3, joints: 5, tightness: 0.12, chamfer: 0.016, lump: 0.1, bedding: 2, ledges: 13, ledgeDepth: 0.025 },
+  { aniso: [1.0, 2.1, 0.86], planeCount: 13, cleaves: 4, joints: 5, tightness: 0.1, chamfer: 0.018, lump: 0.11, bedding: 2, ledges: 9, ledgeDepth: 0.058 },
+  { aniso: [1.0, 1.15, 0.95], planeCount: 15, cleaves: 5, joints: 6, tightness: 0.09, chamfer: 0.02, lump: 0.13, bedding: 2, ledges: 7, ledgeDepth: 0.066 },
+  { aniso: [1.0, 1.6, 0.78], planeCount: 12, cleaves: 3, joints: 4, tightness: 0.14, chamfer: 0.022, lump: 0.12, bedding: 3, ledges: 11, ledgeDepth: 0.052 },
+  { aniso: [1.0, 0.86, 1.0], planeCount: 16, cleaves: 6, joints: 6, tightness: 0.08, chamfer: 0.018, lump: 0.14, bedding: 2, ledges: 6, ledgeDepth: 0.072 },
+  { aniso: [1.0, 2.6, 0.84], planeCount: 11, cleaves: 3, joints: 5, tightness: 0.12, chamfer: 0.016, lump: 0.1, bedding: 2, ledges: 13, ledgeDepth: 0.046 },
 ];
 
-function bodyVariant(seed, lods, a, extra = {}, skirt) {
+function bodyVariant(seed, lods, a, extra = {}, minRatio = 0.44) {
   return variant(seed, lods, (rng, lod) =>
     buildRockGeometry(rng, {
       planeCount: a.planeCount,
@@ -158,7 +224,7 @@ function bodyVariant(seed, lods, a, extra = {}, skirt) {
       seed,
       ...extra,
     }),
-  skirt);
+  minRatio);
 }
 
 /**
@@ -168,7 +234,7 @@ function bodyVariant(seed, lods, a, extra = {}, skirt) {
  * *emerging*, which is the whole point — a boulder sat on a hill reads as a
  * prop, an outcrop shouldering out of it reads as terrain.
  */
-function outcropVariant(seed, lods, opts = {}, skirt) {
+function outcropVariant(seed, lods, opts = {}, minRatio = 0.44) {
   const { layers: nLayers = 6, taper = 0.45, lean = 0.12, spread = 1.0 } = opts;
   return variant(seed, lods, (rng, lod, s) => {
     const entries = [];
@@ -226,23 +292,47 @@ function outcropVariant(seed, lods, opts = {}, skirt) {
       dz += (rng() - 0.5) * 0.10;
     }
     return finaliseGeometry(mergeRockGeometries(entries));
-  }, skirt);
+  }, minRatio);
 }
 
 /**
- * Fines-apron profiles, in fractions of the body's own height.
+ * Fines-apron profiles.
  *
- * `sink` MUST match the burial fraction Scatter uses for the family — the rim
- * is authored below that line so the ground clips it and no disc edge is ever
- * visible. Small bodies bank a proportionally larger drift than big ones: a
- * 40 cm stone half-vanishes into its own dust shadow, a 20 m butte does not.
+ * `flare` is a multiple of the body's own world footprint radius, and `lip` /
+ * `drop` are fractions of that radius — all measured on the placed, tilted body
+ * by Scatter, so these are now genuinely world-space numbers rather than
+ * fractions of a local bounding box. `sink` is the family's burial fraction and
+ * is still shared with Scatter: the drift's inner lip has to come out of the
+ * ground at the same height the stone does.
+ *
+ * Small bodies bank a proportionally larger drift than big ones: a 40 cm stone
+ * half-vanishes into its own dust shadow, a 20 m butte does not.
  */
-export const SKIRTS = {
-  stones: { flare: 2.15, lip: 0.15, drop: 0.28, sink: 0.32 },
-  boulders: { flare: 1.85, lip: 0.13, drop: 0.24, sink: 0.28 },
-  formations: { flare: 1.44, lip: 0.06, drop: 0.15, sink: 0.26 },
-  outcrops: { flare: 1.42, lip: 0.055, drop: 0.17, sink: 0.36 },
+export const COLLARS = {
+  stones: { flare: 2.10, bank: 0.36, drop: 0.75, sink: 0.30 },
+  boulders: { flare: 1.90, bank: 0.31, drop: 0.72, sink: 0.24 },
+  formations: { flare: 1.56, bank: 0.17, drop: 0.65, sink: 0.16 },
+  outcrops: { flare: 1.50, bank: 0.18, drop: 0.65, sink: 0.24 },
 };
+
+/**
+ * Collar meshes, keyed `${family}:${ring}`.
+ *
+ * Two ring counts: the near band gets a three-ring convex profile, the mid band
+ * a two-ring wedge at half the triangles. Past the mid band there is no collar
+ * at all — a 20 cm drift at 500 m is a third of a pixel.
+ */
+export function buildCollarLibrary() {
+  const out = {};
+  for (const [fam, prof] of Object.entries(COLLARS)) {
+    const rng = makeRng(0xc0117a ^ fam.length * 7919);
+    out[fam] = [
+      buildCollarGeometry(rng, { ...prof, bins: 12, rings: 3 }),
+      buildCollarGeometry(rng, { ...prof, bins: 9, rings: 2 }),
+    ];
+  }
+  return out;
+}
 
 export function buildShapeLibrary() {
   // LOD sets differ per family: gravel never needs a hero mesh, and skyline
@@ -265,17 +355,21 @@ export function buildShapeLibrary() {
   // subdivided mesh buys silhouette detail that is under a pixel wide; the
   // aspect floor, edge weathering and fines apron are what make it read.
   const stones = STONES.map((a, i) =>
-    bodyVariant(2000 + i, [0, 1, 2], a, { grooves: 3, grooveDepth: 0.055 }, SKIRTS.stones));
+    bodyVariant(2000 + i, [0, 1, 2], a, { grooves: 3, grooveDepth: 0.055 }, 0.44));
   const boulders = BOULDERS.map((a, i) =>
-    bodyVariant(3000 + i, [0, 1, 2], a, { hero: 1 }, SKIRTS.boulders));
+    bodyVariant(3000 + i, [0, 1, 2], a, { hero: 1 }, 0.46));
+  // 0.52 on the finished hull for the skyline families. These are the bodies a
+  // critic can see from a kilometre away, and the only defence against the
+  // "placeholder monolith" read at that range is that the thing has three real
+  // dimensions — nothing in the shader survives to the silhouette.
   const formations = FORMATIONS.map((a, i) =>
     bodyVariant(4000 + i, [0, 1, 2], a,
-      { grooves: 6, grooveDepth: 0.085, angle: 38, aspectFloor: 0.58 }, SKIRTS.formations));
+      { grooves: 6, grooveDepth: 0.085, angle: 38, aspectFloor: 0.58, weather: 0.13 }, 0.52));
   const outcrops = [
-    outcropVariant(5000, [0, 1, 2], { layers: 7, taper: 0.5, lean: 0.1, spread: 0.85 }, SKIRTS.outcrops),
-    outcropVariant(5001, [0, 1, 2], { layers: 9, taper: 0.62, lean: 0.16, spread: 0.7 }, SKIRTS.outcrops),
-    outcropVariant(5002, [0, 1, 2], { layers: 6, taper: 0.3, lean: 0.06, spread: 1.1 }, SKIRTS.outcrops),
-    outcropVariant(5003, [0, 1, 2], { layers: 8, taper: 0.72, lean: 0.22, spread: 0.6 }, SKIRTS.outcrops),
+    outcropVariant(5000, [0, 1, 2], { layers: 7, taper: 0.5, lean: 0.1, spread: 0.85 }, 0.52),
+    outcropVariant(5001, [0, 1, 2], { layers: 9, taper: 0.62, lean: 0.16, spread: 0.7 }, 0.52),
+    outcropVariant(5002, [0, 1, 2], { layers: 6, taper: 0.3, lean: 0.06, spread: 1.1 }, 0.52),
+    outcropVariant(5003, [0, 1, 2], { layers: 8, taper: 0.72, lean: 0.22, spread: 0.6 }, 0.52),
   ];
   return { chips, stones, boulders, formations, outcrops };
 }

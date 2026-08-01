@@ -210,6 +210,33 @@ function bakeCurvature(verts, tris, nrm, planes) {
     nb[b].push(c, a);
     nb[c].push(a, b);
   }
+
+  // MEASURE THE CURVATURE OF A SMOOTHED COPY, NOT OF THE SHIPPED MESH.
+  //
+  // Round 4. Discrete mean curvature is a one-ring operator, so on a hero mesh
+  // (two subdivisions, ~5 cm vertex spacing at 1 m) it does not see the body's
+  // shape at all: it sees the per-vertex `grain` displacement, whose amplitude
+  // is ~40% of the edge length. The gain of 2.2 then saturated it to +/-1 over
+  // most of the surface, and the shader multiplied that straight into a 3:1
+  // albedo swing — which is why a boulder at 9 m measured a luminance sigma of
+  // 0.16 against sand's 0.03 and read as splotch camouflage rather than stone.
+  //
+  // Two Laplacian passes on the POSITIONS remove exactly the octave that is
+  // noise and leave the joint grooves (0.10-0.14 units wide, three to four edges
+  // across) and the cleave folds, which are the features this channel is for.
+  let base = verts;
+  for (let it = 0; it < 2; it++) {
+    const next = base.map((v, i) => {
+      const list = nb[i];
+      if (!list.length) return v.clone();
+      const m = new THREE.Vector3();
+      for (const j of list) m.add(base[j]);
+      m.multiplyScalar(1 / list.length);
+      return v.clone().lerp(m, 0.62);
+    });
+    base = next;
+  }
+
   const avg = new THREE.Vector3();
   const d = new THREE.Vector3();
   const cav = new Float32Array(verts.length);
@@ -219,12 +246,12 @@ function bakeCurvature(verts, tris, nrm, planes) {
     avg.set(0, 0, 0);
     let scale = 0;
     for (const j of list) {
-      avg.add(verts[j]);
-      scale += verts[j].distanceTo(verts[i]);
+      avg.add(base[j]);
+      scale += base[j].distanceTo(base[i]);
     }
     avg.multiplyScalar(1 / list.length);
     scale /= list.length;
-    d.subVectors(avg, verts[i]);
+    d.subVectors(avg, base[i]);
     // positive => the neighbourhood sits outside the surface => a crevice
     cav[i] = THREE.MathUtils.clamp((d.dot(nrm[i]) / Math.max(1e-5, scale)) * 2.2, -1, 1);
   }
@@ -416,115 +443,163 @@ function beddingLedges(verts, tris, courses, depth, phase) {
 }
 
 /**
- * A low apron of wind- and rain-accumulated fines banked against the rock's base.
+ * The apron of wind- and rain-accumulated fines banked against a rock's base.
  *
- * This is the cheapest fix in the whole module and the one that does the most
- * work: a hard silhouette meeting a flat plane is the single loudest "dropped in
- * by a script" tell, and 40 triangles of sand collar removes it. The rim is
- * deliberately taken *below* the body's base plane so the terrain clips it —
- * there is never a visible disc edge, only the curve where the drift meets the
- * ground, which is what you actually see in the desert.
+ * ROUND 4 REBUILD — THIS USED TO BE BUILT IN THE WRONG SPACE.
  *
- * Returns the vertex/tri lists to concatenate; `aRock.w` ramps 0 -> 1 outward so
- * the shader can fade the rock surface into sand across the collar.
+ * The previous version welded the collar into the *body* geometry, taking the
+ * ground line from the body's local bounding box. Scatter then multiplied that
+ * body by a tilt quaternion (slope alignment plus a random lean), so the collar
+ * tilted with it: measured over the shipped field, the plane the collar lies in
+ * was 27.7 deg off horizontal at the median for boulders and 52.9 deg for
+ * outcrops, and the rim sat an RMS 30% of the body's own height away from the
+ * ground. A drift of sand standing on edge is worse than no drift at all.
+ *
+ * A collar is now a SEPARATE instanced body with its own transform, built as a
+ * unit ring here and placed by Scatter in world space: seated on the terrain,
+ * lying in the *ground* plane (the terrain normal, not the rock's), and scaled
+ * to the ellipse that the already-tilted hull actually projects onto that
+ * plane. Nothing about the rock's own orientation can tip it any more.
+ *
+ * Three rings, not two. A drift has a convex profile — steep where it laps the
+ * stone, flattening to nothing at its edge — and a single quad from lip to rim
+ * is a cone, which is what made the old collar read as a moulded plastic flange.
+ * The outer rim is taken below y=0 so the terrain always clips it and no disc
+ * edge is ever visible.
+ *
+ * `aRock.w` ramps 0 -> 1 outward; every rock term in the shader keys off it and
+ * switches itself off across the collar.
  */
-function buildSkirt(geo, { bins = 12, flare = 1.62, lip = 0.05, drop = 0.16, sink = 0.3, rng }) {
-  const p = geo.attributes.position.array;
-  const count = geo.attributes.position.count;
-  geo.computeBoundingBox();
-  const sy = Math.max(1e-4, geo.boundingBox.max.y - geo.boundingBox.min.y);
-  // Silhouette radius per azimuth, measured over the lower third of the body —
-  // the collar banks against the base, not against an overhang.
-  const rad = new Float32Array(bins);
-  const yTop = geo.boundingBox.min.y + sy * 0.34;
-  for (let i = 0; i < count; i++) {
-    const x = p[i * 3];
-    const y = p[i * 3 + 1];
-    const z = p[i * 3 + 2];
-    if (y > yTop) continue;
-    const r = Math.hypot(x, z);
-    let b = Math.floor(((Math.atan2(z, x) + Math.PI) / (Math.PI * 2)) * bins) % bins;
-    if (b < 0) b += bins;
-    if (r > rad[b]) rad[b] = r;
-  }
-  // Fill empty bins and smooth, or the collar develops spikes.
-  let fallback = 0;
-  for (let i = 0; i < bins; i++) fallback = Math.max(fallback, rad[i]);
-  for (let i = 0; i < bins; i++) if (rad[i] <= 0) rad[i] = fallback * 0.6;
-  const sm = Float32Array.from(rad);
+export function buildCollarGeometry(rng, { bins = 12, rings = 3, flare = 1.8, drop = 0.70 } = {}) {
+  // Radial profile: (radius, height, skirt weight). Radius 1 is the body's own
+  // world footprint radius and height 1 is the drift's own height at the stone;
+  // Scatter supplies both as the instance scale. Writing the profile in the
+  // drift's own units rather than as a fraction of the rock's bounding box is
+  // what stopped it coming out 7 mm tall on a 1.5 m boulder.
+  //
+  // The inner ring sits INSIDE the body's footprint on purpose: the stone hides
+  // it, so the drift emerges from behind the rock instead of ending in a visible
+  // seam against it.
+  const prof = rings >= 3
+    ? [[0.86, 1.0, 0.02], [1.0 + (flare - 1) * 0.40, 0.34, 0.48], [flare, -drop, 1.0]]
+    : [[0.86, 1.0, 0.02], [flare, -drop, 1.0]];
+
+  // Per-azimuth irregularity, smoothed around the loop. A perfectly circular
+  // drift is a dinner plate; real ones are lobed by whatever the wind does
+  // around the stone.
+  const wob = new Float32Array(bins);
+  for (let i = 0; i < bins; i++) wob[i] = 0.72 + rng() * 0.56;
+  const sm = Float32Array.from(wob);
   for (let i = 0; i < bins; i++) {
-    rad[i] = sm[(i + bins - 1) % bins] * 0.25 + sm[i] * 0.5 + sm[(i + 1) % bins] * 0.25;
+    wob[i] = sm[(i + bins - 1) % bins] * 0.27 + sm[i] * 0.46 + sm[(i + 1) % bins] * 0.27;
   }
 
-  const y0 = geo.boundingBox.min.y + sink * sy;   // where the ground line lands
   const verts = [];
-  const rw = [];                                   // skirt weight per vertex
-  const tris = [];
-  // Drifts are asymmetric — the lee side banks up much further than the windward.
-  const lee = rng() * Math.PI * 2;
+  const rw = [];
   for (let i = 0; i < bins; i++) {
     const a = (i / bins) * Math.PI * 2;
     const ca = Math.cos(a);
     const sa = Math.sin(a);
-    const gust = 0.6 + 0.8 * Math.pow(Math.max(0, Math.cos(a - lee)) , 1.3);
-    const r0 = rad[i] * 0.99;
-    const r1 = rad[i] * (1 + (flare - 1) * gust * (0.7 + rng() * 0.6));
-    verts.push(new THREE.Vector3(ca * r0, y0 + lip * sy * gust, sa * r0));
-    rw.push(0.18);
-    verts.push(new THREE.Vector3(ca * r1, y0 - drop * sy, sa * r1));
-    rw.push(1.0);
+    for (const [r, y, w] of prof) {
+      // Only the flare beyond the body wobbles; the inner lip has to stay glued
+      // to the stone or daylight opens between the drift and the rock.
+      const rr = 1 + (r - 1) * wob[i];
+      verts.push(new THREE.Vector3(ca * rr, y * (0.7 + wob[i] * 0.4), sa * rr));
+      rw.push(w);
+    }
   }
+  const tris = [];
+  const R = prof.length;
   for (let i = 0; i < bins; i++) {
-    const a0 = i * 2;
-    const b0 = ((i + 1) % bins) * 2;
-    tris.push([a0, b0, b0 + 1], [b0 + 1, a0 + 1, a0]);
+    const a0 = i * R;
+    const b0 = ((i + 1) % bins) * R;
+    for (let k = 0; k < R - 1; k++) {
+      tris.push([a0 + k, b0 + k, b0 + k + 1], [b0 + k + 1, a0 + k + 1, a0 + k]);
+    }
   }
-  return { verts, rw, tris };
-}
 
-/**
- * Append a fines apron to an already-normalised variant geometry.
- * Skirt vertices carry the body's base heightFrac and no cavity, so every
- * shader term that keys off the rock surface switches itself off across them.
- */
-export function attachSkirt(geo, opts) {
-  const s = buildSkirt(geo, opts);
-  const nrm = smoothNormals(s.verts, s.tris);
-  const oldCount = geo.attributes.position.count;
-  const add = s.tris.length * 3;
-  const pos = new Float32Array((oldCount + add) * 3);
-  const nor = new Float32Array((oldCount + add) * 3);
-  const rk = new Float32Array((oldCount + add) * 4);
-  pos.set(geo.attributes.position.array);
-  nor.set(geo.attributes.normal.array);
-  rk.set(geo.attributes.aRock.array);
-  let w = oldCount;
-  for (const t of s.tris) {
+  const nrm = smoothNormals(verts, tris);
+  const n = tris.length * 3;
+  const pos = new Float32Array(n * 3);
+  const nor = new Float32Array(n * 3);
+  const rk = new Float32Array(n * 4);
+  let w = 0;
+  for (const t of tris) {
     for (const vi of t) {
-      const v = s.verts[vi];
-      const n = nrm[vi];
+      const v = verts[vi];
+      const nv = nrm[vi];
       pos[w * 3] = v.x; pos[w * 3 + 1] = v.y; pos[w * 3 + 2] = v.z;
       // Bias the collar's normal skyward: it is a sand drift, and shading it off
       // its own steep flank makes it read as a plastic funnel.
-      nor[w * 3] = n.x * 0.4;
-      nor[w * 3 + 1] = Math.abs(n.y) * 0.5 + 0.7;
-      nor[w * 3 + 2] = n.z * 0.4;
+      // Round 4 pulled the skyward bias back from (0.34, +0.78). Fully
+      // sky-facing normals made the drift collect more sky IBL than the ground
+      // it lies on, so in shadow every stone wore a bright white bib. Half the
+      // real normal is enough to stop it shading off its own steep flank.
+      nor[w * 3] = nv.x * 0.5;
+      nor[w * 3 + 1] = Math.abs(nv.y) * 0.5 + 0.58;
+      nor[w * 3 + 2] = nv.z * 0.5;
       const l = Math.hypot(nor[w * 3], nor[w * 3 + 1], nor[w * 3 + 2]) || 1;
       nor[w * 3] /= l; nor[w * 3 + 1] /= l; nor[w * 3 + 2] /= l;
       rk[w * 4] = 0;
-      rk[w * 4 + 1] = 0.25 * s.rw[vi];
+      rk[w * 4 + 1] = 0.22 * (1 - rw[vi]);       // the drift is shaded near the stone
       rk[w * 4 + 2] = 0;
-      rk[w * 4 + 3] = s.rw[vi];
+      rk[w * 4 + 3] = Math.max(0.02, rw[vi]);    // never exactly 0: that means "rock"
       w++;
     }
   }
-  const out = new THREE.BufferGeometry();
-  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-  out.setAttribute('aRock', new THREE.BufferAttribute(rk, 4));
-  out.computeBoundingBox();
-  out.computeBoundingSphere();
-  return out;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geo.setAttribute('aRock', new THREE.BufferAttribute(rk, 4));
+  geo.computeBoundingBox();
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+/**
+ * Sample points on the body's lower flank, for the world-space footprint solve.
+ *
+ * Scatter transforms these by the instance's *finished* rotation and scale and
+ * reads the silhouette off the result, which is the only way to know the
+ * footprint of a body that has already been tilted. Sampling the whole hull
+ * would return its widest cross-section — on a rounded boulder that is the
+ * equator, and a collar built to the equator is a sombrero.
+ */
+export function footprintSupport(geo, count = 44, band = 0.5) {
+  geo.computeBoundingBox();
+  const b = geo.boundingBox;
+  const yTop = b.min.y + (b.max.y - b.min.y) * band;
+  const p = geo.attributes.position.array;
+  const n = geo.attributes.position.count;
+  // Farthest point in each azimuth bin of the lower band: the support function
+  // of the footprint, sampled. 24 bins is finer than the collar's own 12.
+  const BINS = 24;
+  const bestR = new Float32Array(BINS);
+  const best = new Int32Array(BINS).fill(-1);
+  for (let i = 0; i < n; i++) {
+    if (p[i * 3 + 1] > yTop) continue;
+    const x = p[i * 3];
+    const z = p[i * 3 + 2];
+    const r = Math.hypot(x, z);
+    let k = Math.floor(((Math.atan2(z, x) + Math.PI) / (Math.PI * 2)) * BINS) % BINS;
+    if (k < 0) k += BINS;
+    if (r > bestR[k]) { bestR[k] = r; best[k] = i; }
+  }
+  const out = [];
+  for (let k = 0; k < BINS; k++) {
+    if (best[k] < 0) continue;
+    const i = best[k];
+    out.push(p[i * 3], p[i * 3 + 1], p[i * 3 + 2]);
+  }
+  // Guarantee a usable set even for a degenerate hull.
+  if (out.length < 12) {
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2;
+      const r = Math.max(Math.abs(b.max.x), Math.abs(b.min.x), Math.abs(b.max.z), Math.abs(b.min.z));
+      out.push(Math.cos(a) * r, b.min.y, Math.sin(a) * r);
+    }
+  }
+  return Float32Array.from(out.slice(0, count * 3));
 }
 
 /**
@@ -632,7 +707,11 @@ export function buildRockGeometry(rng, opts = {}) {
   for (let i = 0; i < verts.length; i++) {
     const v = verts[i];
     const l = (fbm3(v.x * 1.05 + off, v.y * 1.05, v.z * 1.05 - off, 3) - 0.5) * lump;
-    const m = (fbm3(v.x * 2.7 - off, v.y * 2.7, v.z * 2.7 + off, 2) - 0.5) * lump * 0.5;
+    // Round 4 doubled this octave. Ablating the analytic normal detail showed
+    // what was underneath it: bodies whose faces are mirror-flat, reading as
+    // folded card. A cleaved polytope has ~10 faces and the low octave puts one
+    // bump across the whole body, so nothing was breaking up the face itself.
+    const m = (fbm3(v.x * 2.7 - off, v.y * 2.7, v.z * 2.7 + off, 2) - 0.5) * lump * 0.95;
     const g = lod === 0 ? (noise3(v.x * 5.4 + off, v.y * 5.4, v.z * 5.4) - 0.5) * grain : 0;
     // Only the hero mesh has the vertex density to carry a high octave; on the
     // mid LOD it would just be noise on eight-metre triangles.

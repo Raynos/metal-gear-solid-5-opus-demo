@@ -22,6 +22,20 @@ import { PALETTE } from '../../config/ArtDirection.js';
  *     Afghan limestone is a buff-to-tan carbonate, deeply iron-stained, and it
  *     is never a cool grey outside of a wet cleaved face.
  */
+/**
+ * World-space wind, matched to the terrain's blown-sand relief.
+ *
+ * Terrain.js bakes its ripple set as `sin((u*27 + v*10) * 2pi)` over a 64 m
+ * wrapping field, so the phase gradient — and therefore the wind that built it,
+ * because a ripple's crests lie across the flow — is along (27, 10) in world
+ * XZ. Deriving it from those two integers rather than writing down an azimuth
+ * means the rocks cannot drift out of agreement with the sand if the terrain
+ * author retunes the field: a stone with its drift banked against the wrong
+ * face is a louder error than a stone with no drift at all.
+ */
+const WIND_AZIMUTH = Math.atan2(10, 27);
+export const WIND_DIR = [Math.cos(WIND_AZIMUTH), Math.sin(WIND_AZIMUTH)];
+
 export function createRockMaterial() {
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -31,7 +45,7 @@ export function createRockMaterial() {
     // shaded side, and measured against the terrain the shaded flank was landing
     // at 0.47 of the sand's shadow value — a crushed silhouette, which is the
     // opposite of the reference. MGSV shadows are lifted and full of sky.
-    envMapIntensity: 1.02,
+    envMapIntensity: 1.20,
     dithering: true,
   });
 
@@ -39,17 +53,46 @@ export function createRockMaterial() {
   // it — PALETTE.rock* is tuned for the terrain's *shadowed cliff* case and
   // reads as near-black on a standalone boulder. These are the sunlit values.
   // R/B ratios in the comments; sand is 1.46, so nothing here may sit below it.
+  //
+  // Round 4 raised the whole ramp and, crucially, raised its FLOOR. Measured on
+  // the round-3 field, a shaded rock flank landed at linear luminance 0.024
+  // against sand at 0.19 — eight times darker — and at B/R 0.57-0.70 against
+  // sand's 0.39-0.41, i.e. both far too dark and visibly colder, which is the
+  // "debris composited in" read three critics reported. The albedo could not
+  // survive it: `uRockDeep` at 0.178 is a 3:1 swing away from `uRockLight`, and
+  // the shader was applying it over a 15 cm noise field, so the body was a
+  // black-and-white splotch before a single photon arrived.
+  //
+  // The ramp was then trimmed ~7% back down once the shading was fixed: with
+  // the noise gone the lit face measured brighter than the sand it stands on
+  // (0.61 against 0.34 on a shadowed slope, 0.67 against 0.63 in full sun), and
+  // a rock field brighter than its ground reads as a scatter of sugar cubes.
+  // Limestone is a little darker than quartz sand and a good deal warmer, which
+  // is where these land: 0.508 against PALETTE.sandLight's 0.62, at R/B 1.55
+  // against the sand's 1.46.
+  // Round 4 integration: the whole ramp was rebalanced against the new sand.
+  // "Nothing here may sit below sand's R/B" is still the rule, but sand moved
+  // from 1.46 to 1.28 when the round-1 blue-cast compensation came out of the
+  // palette, and leaving limestone at 1.62-2.57 would have made every boulder
+  // in the valley the reddest object in the frame. Values are the old ones with
+  // the blue channel raised; luminance is unchanged to within half a percent,
+  // so none of the lit/shade calibration above moves.
   mat.userData.uniforms = {
-    uRockLight: { value: new THREE.Vector3(0.512, 0.441, 0.336) },  // 1.52 buff
-    uRockDark: { value: new THREE.Vector3(0.322, 0.265, 0.192) },   // 1.68 tan
-    uRockDeep: { value: new THREE.Vector3(0.178, 0.139, 0.098) },   // 1.82 stain
-    uRockRed: { value: new THREE.Vector3(0.47, 0.302, 0.183) },     // 2.57 iron
+    uRockLight: { value: new THREE.Vector3(0.518, 0.440, 0.362) },  // 1.43 buff
+    uRockDark: { value: new THREE.Vector3(0.356, 0.291, 0.234) },   // 1.52 tan
+    uRockDeep: { value: new THREE.Vector3(0.232, 0.179, 0.142) },   // 1.63 stain
+    uRockRed: { value: new THREE.Vector3(0.47, 0.302, 0.222) },     // 2.12 iron
     uSand: { value: new THREE.Vector3(...PALETTE.sandLight) },
     // Wind dust is *lighter and warmer* than the sand it came from: the fine
     // fraction is what stays airborne, and fines are pale.
-    uDust: { value: new THREE.Vector3(0.566, 0.491, 0.373) },       // 1.52
-    uLichen: { value: new THREE.Vector3(0.245, 0.228, 0.138) },     // 1.78 khaki
+    uDust: { value: new THREE.Vector3(0.571, 0.487, 0.404) },       // 1.41
+    uLichen: { value: new THREE.Vector3(0.245, 0.228, 0.156) },     // 1.57 khaki
     uDetail: { value: 1.0 },
+    // Warm ground-bounce multiplier applied to the indirect term on faces that
+    // look away from the sky. Derived from LIGHT_TRANSPORT.groundAlbedo's hue
+    // (0.54, 0.44, 0.345) normalised so the green channel carries the lift.
+    uBounce: { value: new THREE.Vector3(2.35, 1.80, 1.32) },
+    uWind: { value: new THREE.Vector2(WIND_DIR[0], WIND_DIR[1]) },
   };
 
   mat.onBeforeCompile = (shader) => {
@@ -66,7 +109,9 @@ export function createRockMaterial() {
          varying vec3 vLPos;
          varying vec4 vRock;
          varying vec2 vTint;
-         varying vec3 vBedUp;   // world-space direction of the body's bedding axis`,
+         varying vec3 vBedUp;   // world-space direction of the body's bedding axis
+         varying vec3 vOrg;     // world-space origin of this instance
+         uniform vec2 uWind;`,
       )
       .replace(
         '#include <begin_vertex>',
@@ -75,12 +120,48 @@ export function createRockMaterial() {
          vRock = aRock;
          vTint = aTint;
          {
+           vec3 org = vec3(0.0);
+           #ifdef USE_INSTANCING
+             org = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+             // --- wind-deposited fines on the collar ---------------------
+             // Every stone in a blown-sand desert has a pale crescent banked
+             // against the face the wind hits and a scoured hollow behind it.
+             // The collar is a shared ring mesh, so the crescent cannot be baked
+             // into the geometry — but it can be evaluated here, off the WORLD
+             // azimuth of the vertex, which means one mesh serves every stone
+             // and every one of them agrees with the sand ripples.
+             if (aRock.w > 0.02) {
+               vec3 wv = (instanceMatrix * vec4(position, 1.0)).xyz;
+               vec2 off = wv.xz - org.xz;
+               float l = length(off);
+               if (l > 1e-5) {
+                 float wd = dot(off / l, uWind);       // -1 upwind face, +1 lee
+                 float bank = smoothstep(0.15, -1.0, wd);
+                 float scour = smoothstep(-0.15, 1.0, wd);
+                 float rim = aRock.w;
+                 // Local +Y is the ground normal and local XZ is the ground
+                 // plane, both by construction of the collar's transform, so
+                 // this is a world-space displacement written in local units.
+                 transformed.y += (bank * 0.16 - scour * 0.085) * rim;
+                 transformed.xz *= 1.0 + (bank * 0.26 - scour * 0.17) * rim;
+               }
+             }
+           #endif
+           vOrg = (modelMatrix * vec4(org, 1.0)).xyz;
+
            vec4 wp = vec4(transformed, 1.0);
            vec3 wn = objectNormal;
            vec3 bu = vec3(0.0, 1.0, 0.0);
            #ifdef USE_INSTANCING
              wp = instanceMatrix * wp;
-             wn = mat3(instanceMatrix) * wn;
+             // Instance scale is mildly NON-UNIFORM (Scatter clamps the ratio to
+             // 1.32), so a normal cannot be pushed through the same basis as a
+             // position: it needs the inverse transpose. For R*S with S diagonal
+             // that is R*S^-1, and S is just the column lengths.
+             vec3 isc = vec3(length(instanceMatrix[0].xyz),
+                             length(instanceMatrix[1].xyz),
+                             length(instanceMatrix[2].xyz));
+             wn = mat3(instanceMatrix) * (wn / max(isc * isc, vec3(1e-6)));
              bu = mat3(instanceMatrix) * bu;
            #endif
            vWPos = (modelMatrix * wp).xyz;
@@ -99,6 +180,8 @@ export function createRockMaterial() {
          varying vec4 vRock;
          varying vec2 vTint;
          varying vec3 vBedUp;   // world-space direction of the body's bedding axis
+         varying vec3 vOrg;     // world-space origin of this instance
+         uniform vec2 uWind;
          uniform vec3 uRockLight;
          uniform vec3 uRockDark;
          uniform vec3 uRockDeep;
@@ -107,6 +190,7 @@ export function createRockMaterial() {
          uniform vec3 uDust;
          uniform vec3 uLichen;
          uniform float uDetail;
+         uniform vec3 uBounce;
 
          // set in <map_fragment>, consumed in later chunks
          float gRough = 0.9;
@@ -189,7 +273,7 @@ export function createRockMaterial() {
            // harder beds stand slightly proud and catch more light
            float bandHard = bedTone;
 
-           float tone = clamp(macro * 0.5 + meso * 0.42 + micro * 0.26 + bandHard * 0.38 - 0.28,
+           float tone = clamp(macro * 0.54 + meso * 0.44 + micro * 0.16 + bandHard * 0.30 - 0.24,
                               0.0, 1.0);
            vec3 albedo = mix(uRockDark, uRockLight, tone);
            // deep shading patches: weathering rind, not evenly worn
@@ -202,14 +286,16 @@ export function createRockMaterial() {
 
            // calcite veins — thin, pale, cutting across the bedding. Cheap, and
            // the single detail that most says "limestone" rather than "grey".
+           // Warm: a cool-grey vein on a buff rock is a grey stripe, and grey
+           // stripes are what made the family read cold next to the sand.
            float vein = smoothstep(0.9, 0.99, rfbm(vLPos.xy * 3.4 + vTint.y * 9.0, 3));
-           albedo = mix(albedo, vec3(0.47, 0.455, 0.42), vein * 0.5);
+           albedo = mix(albedo, vec3(0.545, 0.505, 0.435), vein * 0.45);
 
            // mineral grain, close range only (it would alias into fizz further out)
            float gritFade = 1.0 - smoothstep(3.0, 26.0, dist);
            if (gritFade > 0.004) {
              float grit = triF(vWPos, wn, 26.0, 2);
-             albedo *= 1.0 + (grit - 0.5) * 0.38 * gritFade;
+             albedo *= 1.0 + (grit - 0.5) * 0.18 * gritFade;
            }
 
            // per-instance value shift so a cluster is not one flat colour
@@ -219,21 +305,35 @@ export function createRockMaterial() {
            // uRockDeep is a warm iron/organic stain, not a neutral black. Under
            // a blue sky IBL a neutral crevice colour turns *blue*, which is how
            // round 1 ended up with rocks reading colder than the sand.
+           //
+           // Round 4 halved the noise-driven half of this and left the
+           // GEOMETRY-driven half alone. That split is the whole point: crev
+           // comes from the baked curvature of the mesh, so it darkens the
+           // places the body actually folds and makes the form read, whereas
+           // microCrev is a 15 cm noise field that was mixing a 3:1 dark
+           // toward uRockDeep across half the surface — a splotch camouflage
+           // pattern with no relation to the shape under it.
            float crev = clamp(cavity, 0.0, 1.0);
            float edge = clamp(-cavity, 0.0, 1.0);
-           float microCrev = smoothstep(0.62, 0.24, micro);      // noise-scale pits
-           float darkness = clamp(crev * 1.0 + microCrev * 0.45 * fade + seam * 0.12, 0.0, 1.0);
-           albedo = mix(albedo, uRockDeep, darkness * 0.50);
+           float microCrev = smoothstep(0.62, 0.30, micro);      // noise-scale pits
+           float darkness = clamp(crev * 1.15 + microCrev * 0.12 * fade + seam * 0.14, 0.0, 1.0);
+           albedo = mix(albedo, uRockDeep, darkness * 0.44);
            // Worn shoulders are sun-bleached and grit-blasted. Bleaching a rock
            // toward its own luminance makes it grey; carbonate bleaches toward
            // pale *calcite*, which is warm.
-           albedo = mix(albedo, uDust * 0.90, edge * 0.34);
+           albedo = mix(albedo, uDust * 0.94, edge * 0.38);
 
            // --- lichen: only where it survives, i.e. shaded crevices facing up ---
-           float lichenMask = smoothstep(0.52, 0.88, rfbm(vWPos.xz * 0.9 + vWPos.y * 0.6, 3))
+           // Round 4 dropped the frequency and the strength. At 0.9 the mask
+           // cell was 1.1 m with three octaves on top, so on a 1.5 m boulder it
+           // was 20 cm blotches of a colour half the rock's value: the same
+           // splotch-camouflage failure as the cavity channel, from a second
+           // source. Lichen is a low-frequency crust that follows the shelter,
+           // not a spray pattern.
+           float lichenMask = smoothstep(0.56, 0.90, rfbm(vWPos.xz * 0.35 + vWPos.y * 0.22, 2))
                             * smoothstep(-0.05, 0.45, wn.y)
-                            * smoothstep(0.05, 0.5, crev + microCrev * 0.5);
-           albedo = mix(albedo, uLichen, lichenMask * 0.42);
+                            * smoothstep(0.08, 0.5, crev);
+           albedo = mix(albedo, uLichen, lichenMask * 0.26);
 
            // --- wind-blown dust: up-facing surfaces and the base of the rock ---
            // Cranked hard relative to round 1. In a desert the sky-facing half of
@@ -241,32 +341,55 @@ export function createRockMaterial() {
            // is what welds the rock's colour to the ground's. It also solves the
            // hue problem structurally: the dust IS the sand, so a dusty rock can
            // never be colder than the sand.
+           // Round 4 also gives the settled film a WINDWARD bias: fines pile
+           // against the face the wind hits and are stripped off the lee, the
+           // same asymmetry the collar geometry carries, so the two agree.
            float up = clamp(wn.y, 0.0, 1.0);
-           float dust = pow(up, 1.35) * (0.44 + 0.32 * (1.0 - hFrac))
-                      + (1.0 - smoothstep(0.0, 0.30, hFrac)) * 0.42;
-           dust *= 0.55 + 0.65 * smoothstep(0.20, 0.80, rfbm(vWPos.xz * 0.6, 3));
+           float windSide = dot(normalize(vec3(wn.x, 0.0, wn.z) + vec3(1e-5)).xz, uWind);
+           // The 0.11 pedestal is not a fudge: in a blown-sand desert even a
+           // vertical face is grit-blasted and carries a film. Without it the
+           // only surfaces that ever took the sand's colour were the sky-facing
+           // ones, so a rock's flanks stayed a different material from its top.
+           float dust = 0.11
+                      + pow(up, 1.25) * (0.48 + 0.34 * (1.0 - hFrac))
+                      + (1.0 - smoothstep(0.0, 0.32, hFrac)) * 0.44
+                      - windSide * 0.11 * (1.0 - up);
+           dust *= 0.58 + 0.62 * smoothstep(0.20, 0.80, rfbm(vWPos.xz * 0.6, 3));
            // Capped below saturation. Fully dusted the rock takes the dust colour
            // outright and a field of them reads as a scatter of white sugar cubes
            // against the ground rather than as stone with dust on it.
-           dust = clamp(dust, 0.0, 0.56);
+           dust = clamp(dust, 0.0, 0.60);
            albedo = mix(albedo, uDust, dust);
 
            // --- the fines apron banked against the base ---
            // Past the collar's inner lip this is not rock at all: it is drifted
            // sand, so every rock term above has to switch itself off or the
            // apron reads as a plastic flange moulded onto the boulder.
-           float sk = smoothstep(0.12, 0.62, skirt);
+           float sk = smoothstep(0.06, 0.55, skirt);
            if (sk > 0.002) {
-             vec3 fines = uSand * (0.78 + 0.40 * meso);
+             vec3 fines = uSand * (0.82 + 0.38 * meso);
              // A rind of coarse grit and rock-wash right against the stone,
              // washing out to clean windblown sand at the rim. The drift must
              // NOT be the same value as the terrain around it or it vanishes and
              // the rock is back to a hard silhouette on a flat plane — the
              // deposit is coarser, darker and stained by everything that has run
              // off the rock.
-             fines = mix(fines * vec3(0.68, 0.66, 0.62), fines, smoothstep(0.0, 0.85, skirt));
+             fines = mix(fines * vec3(0.70, 0.675, 0.63), fines, smoothstep(0.0, 0.85, skirt));
+             // --- windward crescent / lee scour ---------------------------
+             // Deposition sorts by grain size: the bank on the upwind face is
+             // fresh airborne SILT and reads distinctly paler than the ground,
+             // while the lee has been deflated down to the coarse residue and
+             // reads darker. Getting the two the same value is the difference
+             // between a drift and a ring of sand.
+             vec2 woff = vWPos.xz - vOrg.xz;
+             float wl = length(woff);
+             float wd = wl > 1e-4 ? dot(woff / wl, uWind) : 0.0;
+             float bank = smoothstep(0.15, -1.0, wd);
+             float scour = smoothstep(-0.15, 1.0, wd);
+             fines *= 1.0 + bank * 0.12 - scour * 0.13;
+             fines = mix(fines, uDust * 1.02, bank * 0.34);
              // coarse grains standing proud in the drift, close range only
-             fines *= 1.0 + (triF(vWPos, wn, 9.0, 2) - 0.5) * 0.30 * fade;
+             fines *= 1.0 + (triF(vWPos, wn, 9.0, 2) - 0.5) * 0.22 * fade;
              albedo = mix(albedo, fines, sk);
            }
 
@@ -282,8 +405,14 @@ export function createRockMaterial() {
            // broad occlusion + contact darkening at the base
            // Occlusion scales the *indirect* term only, so it must not be so
            // deep that a shadowed rock crushes to black — MGSV shadows are lifted.
-           gAO = clamp(1.0 - max(bakedAO, 0.0) * 0.42, 0.58, 1.0)
-               * mix(0.84, 1.0, smoothstep(0.0, 0.28, hFrac));
+           // Round 4 pulled both terms back. Measured on a boulder in
+           // afternoon sun, the sky-facing-away flank landed at display 0.104
+           // against sand-in-shadow at 0.215 and at B/R 1.09 against the sand's
+           // 0.87: half the value and visibly bluer, which is the "cool and
+           // flat" read three critics returned. Occlusion this deep on a body
+           // whose only fill IS the indirect term is what crushed it.
+           gAO = clamp(1.0 - max(bakedAO, 0.0) * 0.28, 0.74, 1.0)
+               * mix(0.90, 1.0, smoothstep(0.0, 0.28, hFrac));
            // The drift lies in the rock's own ambient shadow near the contact and
            // opens up to full sky at the rim. That gradient is the whole reason
            // the collar reads as *banked against* the rock rather than painted on.
@@ -309,26 +438,55 @@ export function createRockMaterial() {
            // the coarse rock pitting, or the drift shades like a lumpy shell.
            float skFade = 1.0 - smoothstep(0.1, 0.6, vRock.w);
            fadeCoarse *= skFade;
+           // STRENGTH IS SCALE-NORMALISED. The previous constants (0.40 and
+           // 0.09) were written as if grad were a unit-scale slope, but it is
+           // a derivative of a field whose cell is 1/sc metres, so the coarse
+           // term delivered tan(34 deg) and the fine one tan(35 deg) of normal
+           // perturbation. A near-Lambertian surface under a 5:1 key:fill with
+           // its normal randomised by 35 degrees is not "pitting": it is a
+           // black-and-white splotch, and that is exactly what a rock at 9 m
+           // measured as. Dividing by the noise scale makes the constant read
+           // directly as the tangent of the bump angle it will produce.
+           //
+           // The FREQUENCY matters as much as the amplitude. Measured by
+           // ablation (uDetail = 0), the detail was adding 0.0158 of local
+           // 2-pixel contrast on top of the 0.0098 the geometry produces, on a
+           // ground whose own local contrast is 0.0089 — i.e. two thirds of what
+           // the eye reads as "speckle" came from here. Both octaves are now
+           // roughly two-thirds of an octave lower, so the same surface
+           // roughness lands as relief the eye can resolve rather than as
+           // per-pixel sandpaper.
+           //
+           // The AMPLITUDE then had to come down more than four-fold on top of
+           // that, and the reason is the sun angle, not the noise. At an
+           // afternoon elevation of 27 deg an up-facing rock face sits at
+           // N.L = 0.45, so a +/-15 deg normal perturbation swings its incidence
+           // between sin(12) and sin(42) — a 3.3x luminance swing, which is why
+           // the boulders came out as black-and-white blotch camouflage rather
+           // than as pitted stone. At +/-6.5 deg the same field swings 1.6x and
+           // reads as surface.
            vec3 nWorld = wn;
            if (fadeCoarse > 0.003) {
-             float e = 0.16;
-             float h0 = triF(vWPos, wn, 1.7, 3);
-             float hx = triF(vWPos + vec3(e, 0.0, 0.0), wn, 1.7, 3);
-             float hy = triF(vWPos + vec3(0.0, e, 0.0), wn, 1.7, 3);
-             float hz = triF(vWPos + vec3(0.0, 0.0, e), wn, 1.7, 3);
+             float sc = 1.15;
+             float e = 0.22;
+             float h0 = triF(vWPos, wn, sc, 3);
+             float hx = triF(vWPos + vec3(e, 0.0, 0.0), wn, sc, 3);
+             float hy = triF(vWPos + vec3(0.0, e, 0.0), wn, sc, 3);
+             float hz = triF(vWPos + vec3(0.0, 0.0, e), wn, sc, 3);
              vec3 grad = (vec3(hx, hy, hz) - h0) / e;
              grad -= wn * dot(grad, wn);          // keep it tangential
-             nWorld = normalize(nWorld - grad * 0.40 * uDetail * fadeCoarse);
+             nWorld = normalize(nWorld - grad * (0.13 / sc) * uDetail * fadeCoarse);
            }
            if (fadeFine > 0.003) {
-             float e = 0.035;
-             float h0 = triF(vWPos, wn, 7.5, 3);
-             float hx = triF(vWPos + vec3(e, 0.0, 0.0), wn, 7.5, 3);
-             float hy = triF(vWPos + vec3(0.0, e, 0.0), wn, 7.5, 3);
-             float hz = triF(vWPos + vec3(0.0, 0.0, e), wn, 7.5, 3);
+             float sc = 4.2;
+             float e = 0.062;
+             float h0 = triF(vWPos, wn, sc, 3);
+             float hx = triF(vWPos + vec3(e, 0.0, 0.0), wn, sc, 3);
+             float hy = triF(vWPos + vec3(0.0, e, 0.0), wn, sc, 3);
+             float hz = triF(vWPos + vec3(0.0, 0.0, e), wn, sc, 3);
              vec3 grad = (vec3(hx, hy, hz) - h0) / e;
              grad -= wn * dot(grad, wn);
-             nWorld = normalize(nWorld - grad * 0.09 * uDetail * fadeFine);
+             nWorld = normalize(nWorld - grad * (0.075 / sc) * uDetail * fadeFine);
            }
            // Bedding relief: courses are not flush, so the contacts read as real
            // steps in the surface rather than lines painted on a smooth shell.

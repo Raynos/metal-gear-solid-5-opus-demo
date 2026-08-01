@@ -47,6 +47,13 @@ function freePort() {
 const VIEWS = [
   // name, target character, distance, height, azimuth (rad, 0 = behind), pitch, fov, state
   { name: 'ots', who: 'player', dist: 2.7, h: 1.62, az: 0.34, look: 1.32, fov: 48, state: { speed: 0, stance: 'stand' } },
+  // The gameplay rig, reproduced against a character-anchored camera: same
+  // distance, same eye height, same fov, and the same 63-degree turn off the
+  // view axis that `index.js` gives the player. This is the frame the game is
+  // judged on, so it is the frame the character work is iterated against.
+  { name: 'ots-r4', who: 'player', dist: 2.4, h: 1.6, az: 1.10, look: 1.16, fov: 45, state: { speed: 0, aim: 0.12 } },
+  { name: 'front-r4', who: 'player', dist: 2.6, h: 1.45, az: Math.PI - 0.6, look: 1.2, fov: 45, state: { speed: 0, aim: 0.12 } },
+  { name: 'side-r4', who: 'player', dist: 2.8, h: 1.35, az: Math.PI / 2, look: 1.1, fov: 45, state: { speed: 0, aim: 0.12 } },
   { name: 'ots-walk', who: 'player', dist: 3.0, h: 1.6, az: 0.4, look: 1.25, fov: 48, state: { speed: 1.5 }, warm: 3.1 },
   { name: 'ots-aim', who: 'player', dist: 2.5, h: 1.62, az: 0.3, look: 1.4, fov: 46, state: { speed: 0, aim: 1 }, warm: 1.5 },
   { name: 'front', who: 'player', dist: 3.6, h: 1.05, az: Math.PI - 0.5, look: 0.95, fov: 42, state: { speed: 0 } },

@@ -113,6 +113,10 @@ function buildGradeLUT(grade) {
         let r = ri / (N - 1);
         let g = gi / (N - 1);
         let b = bi / (N - 1);
+        const r0 = r;
+        const g0 = g;
+        const b0 = b;
+        const lumIn = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
         // --- white balance ---
         // Round 1 measured blue over red in every single daylight frame. The
@@ -128,9 +132,15 @@ function buildGradeLUT(grade) {
 
         // --- split tone ---
         // Wider midtone band than round 1: the warmth has to live in the mids,
-        // which in a desert frame is most of the picture. The cool band is
-        // pulled down to the bottom sixth so only genuine shadow goes cyan.
-        const sw = 1 - smoothstep(0.0, 0.30, lum0);
+        // which in a desert frame is most of the picture.
+        //
+        // Round 4 moved the cool band's top edge from 0.30 to 0.42. An MGSV
+        // shadow is LIFTED — a cast shadow on sunlit sand lands around display
+        // luminance 0.25, and with the edge at 0.30 that pixel was receiving
+        // 1 - smoothstep(0, 0.30, 0.25) = 0.08 of the shadow tint. The cool
+        // half of the split tone was, in practice, only reaching pixels the
+        // frame had already crushed. At 0.42 the same pixel gets 0.36.
+        const sw = 1 - smoothstep(0.0, 0.42, lum0);
         const hw = smoothstep(0.62, 1.0, lum0);
         const mw = Math.max(0, 1 - sw - hw);
         r *= sh[0] * sw + mi[0] * mw + hi[0] * hw;
@@ -185,6 +195,21 @@ function buildGradeLUT(grade) {
         r = roll(r, 1.02);
         g = roll(g, 0.995);
         b = roll(b, 0.94);
+
+        // --- the top of the range is identity ---
+        // A grade that tints the highlights can never emit a white pixel. With
+        // a warm balance (R 1.058, B 0.905) the blue channel of display white
+        // maps to 0.905 BEFORE anything else touches it, so no input at all
+        // could produce B = 255. Measured across every round-3 frame: R hit 255
+        // and B never exceeded 243, which is why highlights ran toward
+        // saturated red instead of clipping to white. Fading the whole
+        // transform out to identity across the top of the range costs nothing —
+        // the contrast curve is already near-identity at 1.0 and the toe lift
+        // is irrelevant there — and it guarantees white in, white out.
+        const idW = smoothstep(0.84, 1.0, lumIn);
+        r += (r0 - r) * idW;
+        g += (g0 - g) * idW;
+        b += (b0 - b) * idW;
 
         data[p++] = Math.round(Math.min(1, Math.max(0, r)) * 255);
         data[p++] = Math.round(Math.min(1, Math.max(0, g)) * 255);
@@ -548,8 +573,16 @@ export class RenderPipeline {
         vec3 V = normalize(-P);
 
         // Screen-space radius of the world-space sample sphere.
+        //
+        // Round 3 ran a 2.2 m radius clamped up to 96 pixels. At arm's length
+        // that is a measurement of large-scale openness, not of contact: the
+        // sandbag wall in ground.png measured a bag top at (76.8, 69.7, 65.3)
+        // and the crevice between two stacked bags at essentially the same
+        // value, across two rounds of critique. A crevice is 10 cm wide. The
+        // radius is now sized to the feature, and the pixel clamp with it, so
+        // the horizon search actually resolves the 2-3 pixel contact band.
         float pixRadius = uRadius * uProjScale.y * uResolution.y * 0.5 / max(-P.z, 0.05);
-        pixRadius = clamp(pixRadius, 3.0, 96.0);
+        pixRadius = clamp(pixRadius, 3.0, 52.0);
 
         float rot = ign(gl_FragCoord.xy + uFrame * 7.13);
         float offset = fract(ign(gl_FragCoord.yx * 1.37) + uFrame * 0.618);
@@ -624,8 +657,8 @@ export class RenderPipeline {
         uResolution: { value: new THREE.Vector2() },
         uProjInv: { value: new THREE.Matrix4() },
         uProjScale: { value: new THREE.Vector2(1, 1) },
-        uRadius: { value: 2.2 },
-        uThickness: { value: 0.14 },
+        uRadius: { value: 1.15 },
+        uThickness: { value: 0.10 },
         uFrame: { value: 0 },
       },
     );
@@ -796,9 +829,13 @@ export class RenderPipeline {
         tColor: { value: null },
         tDepth: { value: null },
         tAO: { value: null },
-        uAOPower: { value: 1.20 },
-        uAOFloor: { value: 0.32 },
-        uAODirect: { value: 0.55 },
+        // Round 4: power 1.20 -> 1.55 and the floor 0.32 -> 0.14. A floor of
+        // 0.32 combined with the multi-bounce lift meant the deepest crease the
+        // integrator could find still came back above 0.5 — there was no pool
+        // of contact darkening available to draw, whatever the weight.
+        uAOPower: { value: 1.55 },
+        uAOFloor: { value: 0.14 },
+        uAODirect: { value: 0.52 },
         uAOTint: { value: new THREE.Vector3(1.14, 1.0, 0.78) },
         uInvViewProj: { value: new THREE.Matrix4() },
         uProjInv: { value: new THREE.Matrix4() },
@@ -1285,6 +1322,7 @@ export class RenderPipeline {
       uniform float uWhitePoint;
       uniform float uShoulder;
       uniform float uWhiteScale;
+      uniform float uHiDesat;
 
       const mat3 ACESInput = mat3(
         0.59719, 0.07600, 0.02840,
@@ -1392,6 +1430,24 @@ export class RenderPipeline {
         // strongest where the bloom is strongest.
         color += bloom * dirt * uDirtStrength;
 
+        // --- highlight desaturation ---
+        // Bleach. Film loses chroma as it approaches the shoulder because the
+        // fastest layer saturates first; a digital tonemapper without this
+        // instead drives a hot pixel toward whichever primary is largest, so a
+        // specular on metal under a warm sun clips to saturated RED. Measured
+        // across every round-3 frame: R reached 255, G never passed 254 and B
+        // never passed 243 — the frame had no white in it anywhere. Pulling
+        // chroma out above the knee is what makes a highlight go white.
+        {
+          float mx = max(color.r, max(color.g, color.b));
+          // The band is placed in LINEAR light where the tonemap's knee is
+          // (whitePoint 5.2, knee 1.56): 1.35 lands at display 0.77 and 4.0 at
+          // display 0.94, so only genuine highlights bleach and a golden dusk
+          // sky at display 0.6 keeps every bit of its colour.
+          float t = smoothstep(1.35, 4.0, mx) * uHiDesat;
+          color = mix(color, vec3(dot(color, vec3(0.2126, 0.7152, 0.0722))), t);
+        }
+
         color = acesFitted(color);
 
         // Vignette is a lens light-falloff, so it belongs in linear light,
@@ -1447,6 +1503,7 @@ export class RenderPipeline {
         uWhitePoint: { value: GRADE.whitePoint ?? 5.2 },
         uShoulder: { value: GRADE.shoulder ?? 0.3 },
         uWhiteScale: { value: 1.0 },
+        uHiDesat: { value: GRADE.highlightDesat ?? 0.85 },
       },
     );
     this._refreshWhitePoint();
@@ -1748,6 +1805,7 @@ export class RenderPipeline {
     u.uVignette.value = this.grade.vignette;
     u.uCA.value = this.grade.chromaticAberration;
     u.uDistortion.value = this.grade.barrel ?? 0.035;
+    u.uHiDesat.value = this.grade.highlightDesat ?? 0.85;
     u.uTime.value = this.frame * 0.0163;
 
     this._blit(this.compositeMat, this.compositeRT);

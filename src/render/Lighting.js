@@ -1,5 +1,10 @@
 import * as THREE from 'three';
 import { QUALITY, TIME_OF_DAY, LIGHT_TRANSPORT } from '../config/ArtDirection.js';
+// Read-only: the cloud shadow has to be cast by the SAME weather field the
+// volumetric pass renders, or a patch of shade on the ground belongs to no
+// cloud in the sky. A namespace import so a rename over there degrades to
+// "no cloud shadows" instead of a link error that takes the build down.
+import * as VolNoise from './volumetrics/noise.js';
 
 /**
  * Lighting — sun/moon, cascaded shadow maps, IBL, and the atmosphere numbers
@@ -24,7 +29,7 @@ import { QUALITY, TIME_OF_DAY, LIGHT_TRANSPORT } from '../config/ArtDirection.js
  * coordinate contains it. Weights are carried down the unrolled light loop and
  * cross-faded at the borders, so transitions are invisible instead of popping.
  *
- * The filter is PCSS: a 12-tap blocker search sizes the penumbra, then a 20-tap
+ * The filter is PCSS: a 16-tap blocker search sizes the penumbra, then a 20-tap
  * Vogel disc filters at that size. Contact points stay razor sharp and the
  * shadow softens with distance from the caster, which is the entire read of a
  * low sun raking across a ridge.
@@ -52,48 +57,55 @@ import { QUALITY, TIME_OF_DAY, LIGHT_TRANSPORT } from '../config/ArtDirection.js
 const CSM_SHADOW_FN = /* glsl */ `
 #ifdef USE_SHADOWMAP
 
-  // Cloud shadows. xy = deck pan, z = coverage threshold, w = strength.
-  // x = deck altitude (m), y = horizontal frequency.
-  // Both are shared plain-object uniforms owned by Lighting.js; a shader that
-  // never receives them leaves them at zero, and w = 0 disables the term.
+  // Shared plain-object uniforms owned by Lighting.js; a shader that never
+  // receives them leaves them at zero, and uSkyCloudPan.w = 0 disables clouds.
+  //   uSkyCloudPan  : xy = weather-map uv pan, z = coverage, w = strength
+  //   uSkyCloudDeck : x = deck base altitude (m), y = weather uv scale (1/m),
+  //                   z = terminator softening width (in N.L),
+  //                   w = cloud-shade threshold (the deck's optical depth at
+  //                       which the ground starts to lose the sun)
   uniform vec4 uSkyCloudPan;
   uniform vec4 uSkyCloudDeck;
-
-  float csmHash21( vec2 p ) {
-    vec3 q = fract( vec3( p.xyx ) * vec3( 0.1031, 0.1030, 0.0973 ) );
-    q += dot( q, q.yzx + 33.33 );
-    return fract( ( q.x + q.y ) * q.z );
-  }
-
-  float csmVNoise( vec2 p ) {
-    vec2 i = floor( p );
-    vec2 f = fract( p );
-    f = f * f * ( 3.0 - 2.0 * f );
-    return mix( mix( csmHash21( i ), csmHash21( i + vec2( 1.0, 0.0 ) ), f.x ),
-                mix( csmHash21( i + vec2( 0.0, 1.0 ) ), csmHash21( i + vec2( 1.0, 1.0 ) ), f.x ), f.y );
-  }
+  uniform sampler2D uSkyCloudWeather;
 
   /**
    * Cloud shadow at a world point.
    *
-   * Round 1 drew full cumulus cover overhead and then lit the valley floor with
-   * perfectly uniform unoccluded sun — the loudest "this is a renderer" tell in
-   * the wide shots. The receiver is projected up the sun ray onto the cloud
-   * deck and the deck is sampled there, so the patches skew correctly under a
-   * low sun, stay locked to the world as the camera moves, and keep working far
-   * beyond the last shadow cascade (which is where they matter most).
+   * The receiver is projected up the sun ray onto the cloud deck and the deck
+   * is sampled there, so the patches skew correctly under a low sun, stay
+   * locked to the world as the camera moves, and keep working far beyond the
+   * last shadow cascade (which is where they matter most).
+   *
+   * Round 3 sampled a private value-noise field at a private frequency, so the
+   * shade on the ground was uncorrelated with the cloud you could see — a
+   * grading error with a wind speed. This is now the volumetric pass's own
+   * weather map, read with the volumetric pass's own wrap scale, wind clock,
+   * streak squash and coverage remap, so a shadow belongs to a cloud.
    */
   float csmCloudShadow( vec3 wp, vec3 L ) {
     if ( uSkyCloudPan.w <= 0.001 ) return 1.0;
     float t = ( uSkyCloudDeck.x - wp.y ) / max( L.y, 0.12 );
-    vec2 q = ( wp.xz + L.xz * t ) * uSkyCloudDeck.y + uSkyCloudPan.xy;
-    float n = csmVNoise( q ) * 0.54
-            + csmVNoise( q * 2.13 + 7.7 ) * 0.29
-            + csmVNoise( q * 4.61 - 3.1 ) * 0.17;
-    // A kilometre-wide occluder a kilometre up has an enormous penumbra, so the
-    // threshold is deliberately soft — hard-edged cloud shadow reads as a decal.
-    float c = smoothstep( uSkyCloudPan.z - 0.11, uSkyCloudPan.z + 0.17, n );
-    return 1.0 - uSkyCloudPan.w * ( 1.0 - c );
+    vec2 w = ( wp.xz + L.xz * t ) * uSkyCloudDeck.y + uSkyCloudPan.xy;
+    // The front: which airmass you are under. The volumetric pass's own
+    // coverage lookup, verbatim, wrapping over the same 46 km.
+    float base = texture2D( uSkyCloudWeather, w ).r;
+    float streak = texture2D( uSkyCloudWeather, w * vec2( 0.55, 2.3 ) + 0.27 ).b;
+    float front = clamp( ( base * 0.68 + streak * 0.32 - 0.26 ) / 0.60, 0.0, 1.0 );
+    // Individual clouds. At a 46 km wrap the front alone says which airmass you
+    // are under, not which cloud is over you, and a valley three kilometres
+    // across sits inside a single weather cell. The volumetric pass breaks the
+    // front into cumulus with a 3D shape volume at 2.6 km and 900 m; a
+    // sampler3D is not available to a MeshStandardMaterial in ESSL 1, so this
+    // takes finer octaves of the SAME weather field at the shape volume's own
+    // two periods. The patch scale on the ground is then the patch scale in the
+    // sky, moving on the same wind, thickening under the same front.
+    float cell = texture2D( uSkyCloudWeather, w * 17.7 + 0.13 ).g * 0.62
+               + texture2D( uSkyCloudWeather, w * 51.1 - 0.37 ).a * 0.38;
+    float d = ( 0.45 + 0.55 * front ) * cell * uSkyCloudPan.z * 3.0;
+    // A kilometre-wide occluder two kilometres up has an enormous penumbra, so
+    // the transfer is deliberately soft — hard-edged cloud shade reads as a decal.
+    float shade = smoothstep( uSkyCloudDeck.w, uSkyCloudDeck.w + 0.42, d );
+    return 1.0 - uSkyCloudPan.w * shade;
   }
 
   /**
@@ -145,13 +157,20 @@ const CSM_SHADOW_FN = /* glsl */ `
     // collapsed to a hard edge and a barrel and a warehouse looked identical.
     // 11 texels of search buys ~32 cm of penumbra in the near cascade, which is
     // an 9 m occluder at the sun's effective angular size.
-    const float SEARCH_TEXELS = 11.0;
-    const float MAX_PEN_TEXELS = 13.0;
+    //
+    // Round 4 widened both. The 10-to-90 ramp of a boot's contact shadow and of
+    // a building's cast edge measured the same width, because the ceiling was
+    // 13 texels and every occluder taller than about two metres already hit it.
+    // 16 taps over 16 texels of search, feeding a filter allowed out to 22, is
+    // a 0.5-to-22 texel range — a boot at 2 cm and a warehouse eave at 6 m no
+    // longer land in the same bucket.
+    const float SEARCH_TEXELS = 16.0;
+    const float MAX_PEN_TEXELS = 22.0;
     float blockerSum = 0.0;
     float blockerCount = 0.0;
     float search = SEARCH_TEXELS * texel.x;
-    for ( int i = 0; i < 12; i ++ ) {
-      float r = sqrt( ( float( i ) + 0.5 ) / 12.0 );
+    for ( int i = 0; i < 16; i ++ ) {
+      float r = sqrt( ( float( i ) + 0.5 ) / 16.0 );
       float th = float( i ) * 2.39996323;
       vec2 o = rotM * ( vec2( cos( th ), sin( th ) ) * r * search );
       float d = unpackRGBAToDepth( texture2D( shadowMap, sc.xy + o ) );
@@ -168,7 +187,7 @@ const CSM_SHADOW_FN = /* glsl */ `
 
     float avgBlocker = blockerSum / blockerCount;
     float pen = clamp( ( z0 - avgBlocker ) * penumbraK,
-                       texel.x * 0.75, texel.x * MAX_PEN_TEXELS );
+                       texel.x * 0.5, texel.x * MAX_PEN_TEXELS );
 
     float sum = 0.0;
     for ( int i = 0; i < 20; i ++ ) {
@@ -200,11 +219,11 @@ const CSM_DIR_BLOCK = /* glsl */ `
 				csmRemain -= csmW;
 			#endif
 			float csmS = 1.0;
+			float csmNdL = clamp( dot( geometryNormal, directLight.direction ), 0.0, 1.0 );
 			if ( csmW > 0.0005 && receiveShadow && directLight.visible ) {
 				// Slope-scaled bias: the depth error of a shadow texel grows with
 				// tan(acos(N.L)), so a constant bias either acnes grazing surfaces
 				// or peter-pans everything that faces the light squarely.
-				float csmNdL = clamp( dot( geometryNormal, directLight.direction ), 0.0, 1.0 );
 				float csmSlope = clamp( sqrt( 1.0 - csmNdL * csmNdL ) / max( csmNdL, 0.1 ), 0.0, 8.0 );
 				csmS = getShadowCSM( directionalShadowMap[ i ], directionalLightShadow.shadowMapSize,
 					directionalLightShadow.shadowIntensity,
@@ -216,10 +235,21 @@ const CSM_DIR_BLOCK = /* glsl */ `
 					csmS = mix( 1.0, csmS, csmFade );
 				#endif
 			}
+			// Shading-normal terminator softening. max(0, N.L) is a kink: on a
+			// coarse mesh — a terrain clipmap ring at 1.5 km, a rock LOD — the
+			// whole 3.5 stops between the lit face and the shade face collapse
+			// into the two pixels where N.L crosses zero, and that razor line is
+			// the loudest "polygon" tell in a wide shot. A sun with a real
+			// angular diameter, seen against a normal that is itself an
+			// interpolation, rolls in over a band instead. Rolling the key in
+			// with a smoothstep replaces the kink with a C1 ramp whose width in
+			// N.L is fixed, so the ramp is many pixels wide exactly where the
+			// normal turns slowly — which is where the hard line was.
+			float csmTerm = smoothstep( 0.0, max( uSkyCloudDeck.z, 1e-4 ), csmNdL );
 			// Cloud shade rides on the key light only. Summed over the cascades
 			// the weights are 1, so applying it in every iteration scales the
 			// total exactly once.
-			directLight.color *= csmS * csmW * csmCloud;
+			directLight.color *= csmS * csmW * csmCloud * csmTerm;
 		}
 `;
 
@@ -231,8 +261,35 @@ const CSM_DIR_BLOCK = /* glsl */ `
  */
 export const SHARED_UNIFORMS = {
   uSkyCloudPan: { x: 0, y: 0, z: LIGHT_TRANSPORT.cloudCoverage, w: 0 },
-  uSkyCloudDeck: { x: LIGHT_TRANSPORT.cloudDeck, y: LIGHT_TRANSPORT.cloudScale, z: 0, w: 0 },
+  uSkyCloudDeck: {
+    x: LIGHT_TRANSPORT.cloudDeck,
+    y: LIGHT_TRANSPORT.cloudScale,
+    z: LIGHT_TRANSPORT.terminatorWidth,
+    w: LIGHT_TRANSPORT.cloudShadowBias,
+  },
 };
+
+/**
+ * The volumetric pass's weather map, rebuilt here. It is a pure function of a
+ * seed, so this is the same field byte for byte — the cloud casting the shadow
+ * is the cloud you can see. `cloneUniforms` deep-copies textures, so it has to
+ * be bound into ShaderLib *before* the first material compiles; late-binding a
+ * texture into a shared uniform object does not propagate. Textures cloned
+ * from one Source share a single GPU upload, so the copies are free.
+ */
+let _weatherTex;
+function weatherTexture() {
+  if (_weatherTex !== undefined) return _weatherTex;
+  _weatherTex = null;
+  if (typeof VolNoise.buildWeatherMap === 'function') {
+    try {
+      _weatherTex = VolNoise.buildWeatherMap(256);
+    } catch (err) {
+      console.warn('Lighting: weather map unavailable; cloud shadows off.', err);
+    }
+  }
+  return _weatherTex;
+}
 
 let _chunksPatched = false;
 function installCSMChunks() {
@@ -249,6 +306,7 @@ function installCSMChunks() {
     if (!lib) continue;
     lib.uniforms.uSkyCloudPan = { value: SHARED_UNIFORMS.uSkyCloudPan };
     lib.uniforms.uSkyCloudDeck = { value: SHARED_UNIFORMS.uSkyCloudDeck };
+    lib.uniforms.uSkyCloudWeather = { value: weatherTexture() };
   }
 
   // Diffuse irradiance now comes from the sky SH light probe. Leaving the
@@ -574,6 +632,9 @@ export class Lighting {
   setTimeOfDay(nameOrPreset) {
     const p = typeof nameOrPreset === 'string' ? TIME_OF_DAY[nameOrPreset] : nameOrPreset;
     if (!p) return;
+    // Remembered so the cloud shadow can look up the volumetric pass's own
+    // per-time-of-day cloud coverage and deck altitude by name.
+    if (typeof nameOrPreset === 'string') this.todName = nameOrPreset;
     this.preset = { ...p };
     this.engine.timeOfDay = this.preset;
 
@@ -625,6 +686,10 @@ export class Lighting {
     this._envDirty = true;
     this.invalidateShadows();
     this._pushAtmosphere();
+    // The cloud uniforms are per-time-of-day now, so they cannot wait for the
+    // first update(): a still frame captured before one ran would have the
+    // previous preset's coverage.
+    this._updateCloudShadow(this.engine.elapsed ?? 0);
   }
 
   /**
@@ -664,19 +729,34 @@ export class Lighting {
    * Project the sky dome (plus the ground bounce it causes) into L2 spherical
    * harmonics and hand the result to the scene's LightProbe.
    *
-   * The three things that make this read as MGSV rather than as "IBL from a
-   * skybox":
+   * ROUND 4 — this function was the number-one reason the game did not look
+   * like MGSV. Measured on a neutral grey sphere under the afternoon preset,
+   * the sunlit flank came back at hue 32.7 deg and the flank turned AWAY from
+   * the sun at hue 19.0 deg: the shade was *warmer* than the light, and only
+   * 12 degrees of hue separated them. In Fox Engine's Afghanistan that split is
+   * the entire look — a surface out of the sun is lit by a blue dome and swings
+   * hue dramatically. Three things were producing a warm shade:
    *
-   *  1. The lower hemisphere is not black. It is sunlit ground: albedo times the
-   *     irradiance the ground actually receives. That is the warm kick that
-   *     gives a barrel's shade side any form at all.
-   *  2. The bottom `ridgeElevation` degrees of the *upper* hemisphere are also
-   *     ground. In a valley the local horizon is rock, not sky, and sin^2 of
-   *     that angle is the share of a horizontal surface's fill that arrives warm
-   *     instead of blue. This is most of the difference between a navy shadow
-   *     and a dusty one.
-   *  3. A rough-ground interreflection pedestal. A perfectly flat Lambertian
-   *     plane cannot see itself; gravel can, and does.
+   *  1. `groundCoupling` added 40% of the ground's own (sun-coloured) radiance
+   *     isotropically over the WHOLE sphere, including the sky directions. That
+   *     is a warm pedestal on the blue, and it is why the noon zenith fill
+   *     measured B/R 1.02 — dead neutral under a blue sky.
+   *  2. `ridgeElevation` at 33 degrees turned the bottom third of the sky dome
+   *     into sunlit rock. A horizontal surface loses sin^2(33) = 30% of its
+   *     fill to that, but a VERTICAL one loses far more, because a vertical
+   *     surface's cosine lobe is concentrated at low elevations. That is
+   *     precisely the escarpment flank the critics measured.
+   *  3. The ground hemisphere was lit by the *full* key. A rough landscape
+   *     shadows itself; at a 27 degree sun most of the terrain a shaded wall
+   *     can see is turned away from the sun too, so what comes back is sky
+   *     bounced twice, not sun bounced once.
+   *
+   * What survives, because it is true and because MGSV shows it: the lower
+   * hemisphere is not black, it is warm bounced ground, and that warm kick is
+   * what gives a barrel's shade side any form at all. It is now the minority
+   * term it should be, it fades toward the sky's colour as it recedes toward
+   * the horizon (distant ground is seen through kilometres of dust), and the
+   * skyline band above the horizon is thin.
    *
    * The projection is then scaled by ONE scalar so the key:fill ratio lands on
    * the art-directed value. Scaling cannot change the hue, so the shadow colour
@@ -721,12 +801,27 @@ export class Lighting {
     // is dimmer than a sunlit patch. Using the average here keeps the bounce
     // consistent with what the cloud-shadow term actually does to the sun.
     const cloudMean = 1 - LT.cloudShadowStrength * LT.cloudCoverage;
+    // A rough landscape shadows itself. At a grazing sun only the facets that
+    // face it are lit and everything else is filled by sky, so the *average*
+    // radiance of the terrain a shaded surface can see is nowhere near
+    // albedo * full key. This one number is most of the difference between a
+    // shade face that reads as dim sunlight and one that reads as sky.
+    const litFrac = THREE.MathUtils.clamp(LT.terrainLitBase + LT.terrainLitSlope * cosKey, 0.18, 0.95);
     const alb = LT.groundAlbedo;
-    const groundL = [0, 0, 0];
+    // Ground at your feet: warm, and the source of the underside kick.
+    const groundNear = [0, 0, 0];
+    // Ground toward the horizon: kilometres of dust between here and there, so
+    // it has washed most of the way to the sky's own colour. A vertical surface
+    // sees mostly THIS, which is why a wall in shade goes cool.
+    const groundFar = [0, 0, 0];
     for (let k = 0; k < 3; k++) {
-      groundL[k] = (alb[k] * (eKey[k] * cloudMean + eSky[k])) / Math.PI;
+      const skyMean = eSky[k] / Math.PI;
+      groundNear[k] =
+        ((alb[k] * (eKey[k] * cloudMean * litFrac + eSky[k])) / Math.PI) * LT.bounceStrength;
+      groundFar[k] = groundNear[k] + (skyMean - groundNear[k]) * LT.groundHaze;
     }
-    const pedestal = groundL.map((v) => v * LT.groundCoupling);
+    const groundL = groundNear;
+    const pedestal = groundNear.map((v) => v * LT.groundCoupling);
     const sinRidge = Math.sin(THREE.MathUtils.degToRad(LT.ridgeElevation));
 
     // --- pass 2: full-sphere radiance -> SH, and the up-facing irradiance ----
@@ -738,12 +833,19 @@ export class Lighting {
     for (let i = 0; i < N; i++) {
       const d = SH_DIRS[i];
       if (d.y > 0) {
+        // The skyline: the last few degrees above the horizon are the most
+        // distant terrain there is, so they take the hazed ground colour.
         const t = THREE.MathUtils.smoothstep(d.y, 0, sinRidge);
         const s = skyL[i];
-        for (let k = 0; k < 3; k++) L[k] = groundL[k] + (s[k] - groundL[k]) * t + pedestal[k];
+        for (let k = 0; k < 3; k++) L[k] = groundFar[k] + (s[k] - groundFar[k]) * t + pedestal[k];
         for (let k = 0; k < 3; k++) eUp[k] += L[k] * d.y * dOmega;
       } else {
-        for (let k = 0; k < 3; k++) L[k] = groundL[k] + pedestal[k];
+        // Straight down is the sand under your boots; grazing-down is the plain
+        // two kilometres out. Only the former is fully warm.
+        const nearW = THREE.MathUtils.smoothstep(-d.y, 0.04, 0.62);
+        for (let k = 0; k < 3; k++) {
+          L[k] = groundFar[k] + (groundNear[k] - groundFar[k]) * nearW + pedestal[k];
+        }
       }
       THREE.SphericalHarmonics3.getBasisAt(d, SH_BASIS);
       for (let j = 0; j < 9; j++) {
@@ -760,7 +862,13 @@ export class Lighting {
     let ratio;
     if (this.night > 0.5) ratio = LT.keyFillNight;
     else {
-      const t = THREE.MathUtils.smoothstep(cosKey, 0.06, 0.55);
+      // Round 3 saturated this by a 33 degree sun, so a 27 degree afternoon and
+      // a 68 degree noon were handed nearly the same contrast — which is why
+      // the shots at the same nominal ratio measured a stop apart. The clear-sky
+      // physics is a smooth ride from ~3:1 at the horizon (the sky takes over)
+      // to ~9:1 overhead (direct beam carries ~89% of the illuminance), so the
+      // ramp now spans the whole range of solar elevations.
+      const t = THREE.MathUtils.smoothstep(cosKey, 0.04, 0.90);
       ratio = LT.keyFillLow + (LT.keyFillHigh - LT.keyFillLow) * t;
     }
     const targetUp = lum3(eKey) / Math.max(ratio - 1, 0.25);
@@ -1051,13 +1159,23 @@ export class Lighting {
     const LT = LIGHT_TRANSPORT;
     const u = SHARED_UNIFORMS.uSkyCloudPan;
     const s = SHARED_UNIFORMS.uSkyCloudDeck;
-    s.x = LT.cloudDeck;
+    // Everything here mirrors the volumetric cloud pass exactly: its weather
+    // map (rebuilt above from the same generator), its 46 km wrap, its wind
+    // clock (uWindT = elapsed * 4) and its per-time-of-day coverage and deck
+    // base, read defensively from the registry so this still works if the
+    // module failed to install.
+    const vol = globalThis.__WORLD?.registry?.volumetrics;
+    const atm = vol?.ATMOS?.[this.todName];
+    const windT = elapsed * 4.0;
+    s.x = atm?.cloudBase ?? LT.cloudDeck;
     s.y = LT.cloudScale;
-    u.x = elapsed * LT.cloudSpeed[0] * LT.cloudScale;
-    u.y = elapsed * LT.cloudSpeed[1] * LT.cloudScale;
-    u.z = LT.cloudCoverage;
+    s.z = LT.terminatorWidth;
+    s.w = LT.cloudShadowBias;
+    u.x = windT * 0.000021;
+    u.y = windT * 0.0000071;
+    u.z = atm?.cloudCoverage ?? LT.cloudCoverage;
     // No sun below the horizon means no cloud shadows to cast; the moon's are
     // far too weak to read and would only mottle the night grade.
-    u.w = this.night > 0.5 ? 0.0 : LT.cloudShadowStrength * (1 - this.night);
+    u.w = this.night > 0.5 || !_weatherTex ? 0.0 : LT.cloudShadowStrength * (1 - this.night);
   }
 }
