@@ -567,8 +567,12 @@ const COVER_VERT = /* glsl */ `
   vec2 jitter = vegHash22(cellIdx) - 0.5;
   vec2 wxz = cellIdx * uRing.x + jitter * uRing.x * 0.92;
 
-  float slope, devK, cover;
-  vegDensity(wxz, slope, devK, cover);
+  float slope, devK, cover, woody;
+  vegDensity(wxz, slope, devK, cover, woody);
+  // Union of the two masks, not a sum: on the pan both are high and adding them
+  // saturates, while on a hillside only the woody one is non-zero and it has to
+  // carry the tone on its own now that the distant bush tiers are gone.
+  cover = 1.0 - (1.0 - cover) * (1.0 - woody * 0.66);
 
   float dist = length(wxz - cameraPosition.xz);
   float band = smoothstep(uRing.z, uRingFadeIn.x, dist) * (1.0 - smoothstep(uRingFadeIn.y, uRing.w, dist));

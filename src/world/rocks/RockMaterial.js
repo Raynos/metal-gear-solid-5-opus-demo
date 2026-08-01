@@ -45,6 +45,177 @@ import { PALETTE } from '../../config/ArtDirection.js';
 const TERRAIN_WIND = 0.38;   // rad; Terrain.js `const WIND`
 export const WIND_DIR = [Math.sin(TERRAIN_WIND), Math.cos(TERRAIN_WIND)];
 
+/**
+ * Talus apron surface — the material for the WEDGE, not for the blocks on it.
+ *
+ * A scree slope is not a rock and it is not sand. It is a graded mass of angular
+ * fragments, and the two things that make it read as one are (a) the grain-size
+ * gradient down its length — silt and chips banked at the head, blocks at the
+ * toe, which is the most recognisable property of a talus slope after its angle
+ * — and (b) that it is a shade or two DARKER and warmer than the pediment it
+ * runs out onto. A scree apron the same value as the plain is a smooth fillet
+ * with a texture on it, which is exactly what the round-4 range foot was.
+ *
+ * `aTal` carries (t along the fall line, lobe weight, per-site random), so the
+ * grain scale, the value and the normal amplitude are all driven by position on
+ * the apron rather than by a world noise that knows nothing about the landform.
+ */
+export function createTalusMaterial() {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.96,
+    metalness: 0.0,
+    // Same argument as the rock body: the shaded half of a scree slope is lit by
+    // the sky and nothing else, and MGSV shadows are lifted and full of it.
+    envMapIntensity: 1.22,
+    dithering: true,
+  });
+
+  mat.userData.uniforms = {
+    // Broken limestone: the same buff as the boulders, a little darker because a
+    // scree surface is all shadowed interstice, and warmer than the sand it
+    // meets so the apron never reads cool against the pediment.
+    // Measured against the shipped terrain: the first pass ran these ~25%
+    // brighter and the apron boundary read as a pale scar across the hillside.
+    // A scree slope is a mass of shadowed interstices — it is a little DARKER
+    // than the rock it came off and distinctly warmer than the pediment it runs
+    // out onto, never lighter than either.
+    uTalLight: { value: new THREE.Vector3(0.322, 0.252, 0.152) },   // R/B 2.12
+    uTalDark: { value: new THREE.Vector3(0.186, 0.136, 0.077) },    // R/B 2.42
+    uTalDust: { value: new THREE.Vector3(0.430, 0.348, 0.226) },    // R/B 1.90
+    uDetail: { value: 1.0 },
+  };
+
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, mat.userData.uniforms);
+
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+         attribute vec3 aTal;   // (t head->toe, lobe, site random)
+         varying vec3 vTal;
+         varying vec3 vTWPos;
+         varying vec3 vTWNrm;`,
+      )
+      .replace(
+        '#include <worldpos_vertex>',
+        `#include <worldpos_vertex>
+         vTal = aTal;
+         vTWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+         vTWNrm = normalize(mat3(modelMatrix) * objectNormal);`,
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+         varying vec3 vTal;
+         varying vec3 vTWPos;
+         varying vec3 vTWNrm;
+         uniform vec3 uTalLight;
+         uniform vec3 uTalDark;
+         uniform vec3 uTalDust;
+         uniform float uDetail;
+         float gTalRough = 0.96;
+
+         float thash(vec2 p) {
+           p = floor(p);
+           return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+         }
+         float tnoise(vec2 p) {
+           vec2 i = floor(p);
+           vec2 f = fract(p);
+           vec2 u = f * f * (3.0 - 2.0 * f);
+           return mix(mix(thash(i), thash(i + vec2(1.0, 0.0)), u.x),
+                      mix(thash(i + vec2(0.0, 1.0)), thash(i + vec2(1.0, 1.0)), u.x), u.y);
+         }
+         float tfbm(vec2 p, int oct) {
+           float a = 0.5, s = 0.0, n = 0.0;
+           mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+           for (int i = 0; i < 5; i++) {
+             if (i >= oct) break;
+             s += a * tnoise(p); n += a; a *= 0.5; p = rot * p * 2.09;
+           }
+           return s / n;
+         }`,
+      )
+      .replace(
+        '#include <map_fragment>',
+        `#include <map_fragment>
+         {
+           float dist = length(vTWPos - cameraPosition);
+           float head = vTal.x;    // 1 deep against the rock, 0 at the thin toe
+           float margin = vTal.y;  // 0 at the outer edge of the pile
+           float rnd = vTal.z;
+           // RAGGED MARGIN. The apron mesh ends on a grid diagonal, and since
+           // the pile is a different material from the ground it lands on, that
+           // boundary rendered as a row of sawtooth teeth across the hillside —
+           // the single most obvious artefact in the first render of this pass.
+           // Stippling it out against a world-space noise turns the mesh edge
+           // into a scree margin: a scatter of thinning patches, which is what
+           // the outer metre of a real apron looks like.
+           float edgeN = tfbm(vTWPos.xz * 0.55 + rnd * 19.0, 3) * 0.72
+                       + tnoise(vTWPos.xz * 2.6) * 0.28;
+           if (margin < edgeN * 0.92) discard;
+           // GRAIN SIZE GRADIENT. Fines lodge where the pile is deep — that is
+           // the head, banked against the rock — and a block that survived the
+           // fall kept its momentum to the toe. The clast cell therefore runs
+           // from ~1.3 m at the toe to ~12 cm at the head, and that gradient is
+           // what says "scree" rather than "gravel texture".
+           float cell = mix(0.75, 8.0, head);
+           vec2 q = vTWPos.xz + vec3(vTWPos.y * 1.7).xx * vec2(0.31, -0.19);
+           float clast = tfbm(q * cell, 3);
+           float band = tfbm(q * cell * 0.24 + rnd * 37.0, 3);
+           float tone = clamp(clast * 0.62 + band * 0.52 - 0.12, 0.0, 1.0);
+           vec3 albedo = mix(uTalDark, uTalLight, tone);
+           // Fines wash: the head of an apron is half silt, and silt is pale.
+           albedo = mix(albedo, uTalDust, smoothstep(0.30, 0.95, head) * (0.20 + 0.26 * band));
+           // Blown dust on the up-facing half, exactly as on a rock body.
+           float up = clamp(vTWNrm.y, 0.0, 1.0);
+           albedo = mix(albedo, uTalDust, pow(up, 1.6) * 0.20 * (0.5 + 0.5 * band));
+           // Per-apron value shift; two aprons in one frame must not match.
+           albedo *= 0.90 + rnd * 0.22;
+           diffuseColor.rgb *= albedo;
+           gTalRough = clamp(0.99 - tone * 0.16, 0.60, 1.0);
+         }`,
+      )
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+         roughnessFactor = gTalRough;`,
+      )
+      .replace(
+        '#include <normal_fragment_maps>',
+        `#include <normal_fragment_maps>
+         {
+           float dist = length(vTWPos - cameraPosition);
+           // Two octaves at the local grain size. The amplitude is written as the
+           // tangent of the bump angle it produces, the same convention the rock
+           // body uses, so a 12 degree scree relief stays 12 degrees whatever the
+           // cell size is. Faded out by 420 m, past which it only aliases.
+           float fade = 1.0 - smoothstep(120.0, 420.0, dist);
+           if (fade > 0.004) {
+             float cell = mix(0.75, 8.0, vTal.x);
+             vec3 n = normalize(vTWNrm);
+             float e = 0.35 / cell;
+             vec2 q = vTWPos.xz;
+             float h0 = tfbm(q * cell, 3);
+             float hx = tfbm((q + vec2(e, 0.0)) * cell, 3);
+             float hz = tfbm((q + vec2(0.0, e)) * cell, 3);
+             vec3 grad = vec3((hx - h0) / e, 0.0, (hz - h0) / e);
+             grad -= n * dot(grad, n);
+             n = normalize(n - grad * 0.21 * uDetail * fade);
+             normal = normalize((viewMatrix * vec4(n, 0.0)).xyz);
+           }
+         }`,
+      );
+    mat.userData.shader = shader;
+  };
+
+  return mat;
+}
+
 export function createRockMaterial() {
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -138,7 +309,19 @@ export function createRockMaterial() {
      * and 39% of the clasts came back cooler than their own ground at 1.67.
      * Manganese-iron desert varnish is genuinely a red-brown-black.
      */
-    uVarnish: { value: new THREE.Vector3(0.175, 0.120, 0.076) },    // 2.30
+    // Round 5, second pass: 0.175/0.120/0.076 -> 0.138/0.090/0.050, and the
+    // coat weight below 0.38 -> 0.56. Measured by ablation with the exposure
+    // locked, hiding one family at a time and comparing each family's pixels
+    // with the exact ground pixels behind them, the small clasts came back at
+    //   chips   0.4253 against sand 0.4429  = 0.960 (outpost)
+    //   chips   0.4454 against sand 0.4558  = 0.977 (vista)
+    //   chips   0.4296 against sand 0.4004  = 1.073 (ground, i.e. BRIGHTER)
+    // A field of objects that measures within 2-7% of its own background — and
+    // brighter than it at noon — is not a field of objects, it is a stain, which
+    // is precisely the "flat decals" the critique named. Manganese-iron varnish
+    // is a genuinely dark red-brown-black and it is the one term that separates
+    // a stable clast from the sand that is turned over around it.
+    uVarnish: { value: new THREE.Vector3(0.138, 0.090, 0.050) },    // 2.76
     uDetail: { value: 1.0 },
     /**
      * Warm ground-bounce TINT applied to the indirect term on faces that look
@@ -444,7 +627,7 @@ export function createRockMaterial() {
            // 4% of the sand's, which is why it measured a ratio of 0.98 against
            // the ground it sat on.
            float clast = clamp(vTint.z, 0.0, 1.0);
-           dust = clamp(dust, 0.0, mix(0.60, 0.31, clast));
+           dust = clamp(dust, 0.0, mix(0.60, 0.20, clast));
            albedo = mix(albedo, uDust, dust);
 
            // --- desert varnish on the clast families -------------------------
@@ -462,7 +645,21 @@ export function createRockMaterial() {
                         * (0.42 + 0.58 * pow(up, 0.7))
                         * (0.55 + 0.45 * smoothstep(0.15, 0.75, hFrac))
                         * (0.70 + 0.60 * smoothstep(0.30, 0.85, rfbm(vWPos.xz * 1.7 + 5.1, 3)));
-             albedo = mix(albedo, uVarnish, clamp(coat, 0.0, 1.0) * 0.38);
+             albedo = mix(albedo, uVarnish, clamp(coat, 0.0, 1.0) * 0.56);
+             // And a flat value cut on top of the coat, which the varnish alone
+             // could not deliver because it is gated on up-facing, uncrevassed,
+             // unpale surfaces and a pebble is small enough that half its pixels
+             // fail one of those gates. Measured with the exposure locked and a
+             // stability mask, hiding every chip, stone and talus block in the
+             // outpost frame changed 145 pixels by more than 8 code values, and
+             // on those pixels the clasts read 1.003 of the sand they covered.
+             // A body that alters its own background by three parts in a
+             // thousand is, by definition, a stain and not an object. The cut is
+             // applied in a way that RAISES R/B (the blue channel takes twice
+             // the cut of the red), because the other half of the same finding
+             // is that the family must never read cooler than the sand.
+             float sep = clast * (1.0 - pale * 0.7);
+             albedo *= mix(vec3(1.0), vec3(0.72, 0.65, 0.55), sep);
            }
 
            // --- the fines apron banked against the base ---
@@ -638,8 +835,16 @@ export function createRockMaterial() {
            // about the terrain — a vertical face's cosine lobe is concentrated
            // at low elevations, which in a valley is sunlit rock and sand, not
            // dome. A vertical flank therefore takes the bounce at full weight.
+           // Round 5, second pass: the weight has a floor now. Measured with
+           // the same paired mask, 54-59% of every rock pixel in the outpost
+           // frame was COOLER in R/B than the exact ground pixel behind it,
+           // against a rule in this file that says never cooler than the sand.
+           // A rock's TOP is not lit by the dome alone either — in a valley a
+           // quarter of what an up-facing facet sees is sunlit rock and sand at
+           // low elevation (LIGHT_TRANSPORT.ridgeElevation makes the same point
+           // about the terrain), so the tint cannot be zero at n.y = 1.
            float bDown = 1.0 - clamp(normalize(vWNrm).y, 0.0, 1.0);
-           vec3 bTint = mix(vec3(1.0), uBounce / max(uBounce.g, 1e-4), bDown * 0.90);
+           vec3 bTint = mix(vec3(1.0), uBounce / max(uBounce.g, 1e-4), 0.26 + bDown * 0.68);
            reflectedLight.indirectDiffuse *= gAO * bTint;
            reflectedLight.indirectSpecular *= gAO;
          }`,

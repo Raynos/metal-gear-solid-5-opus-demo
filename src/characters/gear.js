@@ -425,31 +425,182 @@ export function buildBelt(o = {}) {
       mat: 'cloth',
     });
   }
+  if (o.canteen !== false) parts.push(...buildCanteen(o.canteenSide ?? -1));
+  if (o.knife !== false) parts.push(...buildKnife(o.knifeSide ?? -1));
   return parts;
 }
 
-/** Thigh holster with a sidearm in it. */
+/**
+ * 1-quart canteen in a carrier, worn on the belt at the kidney.
+ *
+ * ROUND 6 — MAJOR 5. Silhouette furniture is worth more than surface detail
+ * because it is the only thing that survives to 40 px, and the character had
+ * none below the chest: measured on a flat-mask silhouette of the shipped
+ * frame, the entire figure from the belt down was a single smooth blob with no
+ * outline event at all. A canteen is the cheapest one available — a 96 mm
+ * cylinder standing 62 mm proud of the hip, which is a 36 px bulge at the
+ * gameplay camera and a clearly visible one even at 40 px tall.
+ *
+ * It is deliberately on the LEFT hip, opposite the holster: two lumps on the
+ * same side read as one lump.
+ */
+function buildCanteen(side = -1) {
+  const parts = [];
+  const x = side * 0.163;
+  const z = 0.062;
+  const at = (y) => new THREE.Matrix4().makeRotationY(side * 0.5).setPosition(x, y, z);
+  // Carrier body — a flattened oval pouch, wider than deep like the real thing.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(x, 0.952, z), rx: 0.049, rz: 0.033, n: 3.4, zone: Z.POUCH },
+        { p: V(x, 0.918, z), rx: 0.054, rz: 0.036, n: 3.6, zone: Z.POUCH },
+        { p: V(x, 0.868, z), rx: 0.055, rz: 0.037, n: 3.6, zone: Z.POUCH },
+        { p: V(x, 0.836, z), rx: 0.048, rz: 0.032, n: 3.4, zone: Z.POUCH },
+      ],
+      9,
+      { radial: 14, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // Lid, overhanging the body by 4 mm so it casts its own line across it.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(x, 0.975, z), rx: 0.050, rz: 0.034, n: 3.4, zone: Z.POUCH },
+        { p: V(x, 0.958, z), rx: 0.058, rz: 0.040, n: 3.6, zone: Z.POUCH },
+        { p: V(x, 0.936, z), rx: 0.057, rz: 0.039, n: 3.6, zone: Z.POUCH },
+      ],
+      7,
+      { radial: 14, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // Retaining strap over the lid, and the belt loop behind it.
+  parts.push({
+    surface: strap(
+      [V(x - 0.03, 0.938, z - 0.036), V(x, 0.978, z - 0.030), V(x + 0.03, 0.938, z - 0.036)],
+      0.018,
+      0.005,
+      Z.WEBBING,
+      { stations: 8 },
+    ),
+    mat: 'cloth',
+  });
+  parts.push(...buckle(V(x, 0.949, z - 0.040), { w: 0.019, h: 0.014, rotY: side * 0.5 }));
+  parts.push({
+    surface: roundedBox(0.036, 0.052, 0.016, 0.005, { zone: Z.WEBBING, radial: 8 }).transform(at(0.972)),
+    mat: 'cloth',
+  });
+  return parts;
+}
+
+/**
+ * Sheathed fighting knife, hilt-down on the front-left of the belt.
+ *
+ * The blade is 190 mm and it hangs at 14 degrees off vertical, so it crosses
+ * the hip outline and keeps crossing it as the leg swings. A knife lying flat
+ * against a thigh would be invisible — the point is the diagonal, because every
+ * other line on a standing figure is vertical and the eye finds the odd one out
+ * at any resolution.
+ */
+function buildKnife(side = -1) {
+  const parts = [];
+  const x = side * 0.128;
+  const M = new THREE.Matrix4()
+    .makeRotationZ(side * 0.24)
+    .premultiply(new THREE.Matrix4().makeRotationX(-0.16))
+    .setPosition(x, 0.86, -0.052);
+  // Sheath: a tapered slab with a welt down each edge.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 0.098, 0), rx: 0.023, rz: 0.011, n: 4.0, zone: Z.LEATHER },
+        { p: V(0, 0.056, 0), rx: 0.024, rz: 0.012, n: 4.2, zone: Z.LEATHER },
+        { p: V(0, -0.020, 0), rx: 0.021, rz: 0.011, n: 4.2, zone: Z.LEATHER },
+        { p: V(0, -0.076, 0), rx: 0.014, rz: 0.008, n: 4.0, zone: Z.LEATHER },
+        { p: V(0, -0.098, 0), rx: 0.007, rz: 0.005, n: 3.6, zone: Z.LEATHER },
+      ],
+      11,
+      { radial: 10, capStart: true, capEnd: true },
+    ).transform(M),
+    mat: 'cloth',
+  });
+  // Retention strap across the throat of the sheath.
+  parts.push({
+    surface: strap(
+      [V(-0.028, 0.086, 0.0), V(0, 0.090, -0.016), V(0.028, 0.086, 0.0)],
+      0.016,
+      0.005,
+      Z.WEBBING,
+      { stations: 7 },
+    ).transform(M),
+    mat: 'cloth',
+  });
+  // Grip and pommel standing out of the top — the part that reads.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 0.104, 0), rx: 0.016, rz: 0.013, n: 3.0, zone: MZ.GUNMETAL },
+        { p: V(0, 0.124, 0), rx: 0.011, rz: 0.010, n: 2.8, zone: MZ.GUNMETAL },
+        { p: V(0, 0.166, 0), rx: 0.012, rz: 0.011, n: 2.8, zone: MZ.GUNMETAL },
+        { p: V(0, 0.186, 0), rx: 0.015, rz: 0.013, n: 3.0, zone: MZ.GUNMETAL },
+      ],
+      9,
+      { radial: 10, capStart: true, capEnd: true },
+    ).transform(M),
+    mat: 'metal',
+  });
+  return parts;
+}
+
+/**
+ * Thigh holster.
+ *
+ * ROUND 6 pushed it 33 mm outboard (x 0.155 -> 0.188) and dropped it 25 mm.
+ * At 0.155 it was invisible, and not because it was small: the trouser leg is
+ * centred on x 0.096 with rx 0.090 at that height, so the leg's own outline is
+ * at 0.186, and a 62 mm-wide holster centred on 0.155 spans 0.124..0.186 —
+ * i.e. it terminated exactly ON the leg silhouette and never crossed it. A
+ * piece of kit that does not cross the outline contributes nothing at the
+ * distance that decides whether a figure reads as a soldier; MGSV's Snake is
+ * identifiable at 40 px almost entirely from holster, canteen and antenna
+ * breaking his outline. Now it spans 0.157..0.219 and stands 33 mm proud.
+ */
 export function buildHolster(side = 1) {
   const parts = [];
-  const x = side * 0.155;
-  const m = new THREE.Matrix4().makeRotationZ(side * -0.06).setPosition(x, 0.72, 0.01);
+  const x = side * 0.188;
+  const m = new THREE.Matrix4().makeRotationZ(side * -0.06).setPosition(x, 0.695, 0.01);
   parts.push({ surface: roundedBox(0.062, 0.17, 0.09, 0.016, { zone: Z.LEATHER, radial: 12 }).transform(m), mat: 'cloth' });
   parts.push({
     surface: roundedBox(0.07, 0.05, 0.098, 0.014, { zone: Z.LEATHER, radial: 10 }).transform(
-      new THREE.Matrix4().makeRotationZ(side * -0.06).setPosition(x, 0.805, 0.006),
+      new THREE.Matrix4().makeRotationZ(side * -0.06).setPosition(x, 0.780, 0.006),
     ),
     mat: 'cloth',
   });
   // Pistol grip and slide poking out of the top.
   parts.push({
     surface: roundedBox(0.032, 0.1, 0.052, 0.01, { zone: MZ.GUNMETAL, radial: 10 }).transform(
-      new THREE.Matrix4().makeRotationX(0.18).setPosition(x, 0.845, 0.02),
+      new THREE.Matrix4().makeRotationX(0.18).setPosition(x, 0.820, 0.02),
     ),
     mat: 'metal',
   });
   // Leg strap.
   parts.push({
-    surface: strap([V(x - 0.05, 0.66, -0.06), V(x + 0.01, 0.655, -0.075), V(x + 0.04, 0.66, 0.02), V(x - 0.01, 0.658, 0.085), V(x - 0.06, 0.66, 0.04)], 0.022, 0.007, Z.WEBBING, { stations: 14 }),
+    surface: strap([V(x - 0.07, 0.635, -0.06), V(x + 0.01, 0.630, -0.075), V(x + 0.04, 0.635, 0.02), V(x - 0.01, 0.633, 0.085), V(x - 0.08, 0.635, 0.04)], 0.022, 0.007, Z.WEBBING, { stations: 14 }),
+    mat: 'cloth',
+  });
+  // Suspender from the belt to the holster platform. A drop-leg rig that hangs
+  // off nothing reads as a box glued to a thigh; this is also a second, thinner
+  // silhouette element in the gap between hip and holster.
+  parts.push({
+    surface: strap(
+      [V(x - 0.028, 0.905, -0.012), V(x - 0.012, 0.845, -0.014), V(x - 0.004, 0.790, -0.014)],
+      0.026,
+      0.006,
+      Z.WEBBING,
+      { stations: 8 },
+    ),
     mat: 'cloth',
   });
   return parts;

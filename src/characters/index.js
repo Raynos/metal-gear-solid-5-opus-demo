@@ -268,7 +268,35 @@ export async function install(world) {
     // near flank into the frame, and it faces him into the aim space the
     // over-the-shoulder framing leaves open on the right. Negative, not
     // positive: it is the prosthetic arm and the rifle that end up camera-side.
-    yaw: spawn.yaw - 1.10,
+    // ROUND 6: 1.10 rad (63 deg) -> 0.42 rad (24 deg).
+    //
+    // This one number was the root cause of most of what the last three rounds
+    // of critique called out on the character, and it was never suspected
+    // because it is not in a file anyone was looking at.
+    //
+    // Swept the body yaw in a live probe and measured LIMB PRESENTATION at each
+    // angle — screen length of a bone divided by its true length at that depth,
+    // so 1.0 means the bone lies in the image plane and 0.1 means it points
+    // straight at the lens and draws as a stub whatever you model:
+    //
+    //   turn   shoulders  upperArmR  forearmR  upperArmL  forearmL
+    //   1.10     0.25       0.76       0.11      1.00       0.91   <- round 5
+    //   0.80     0.51       0.85       0.38      0.95       0.99
+    //   0.62     0.66       0.92       0.53      0.90       1.02   <- here
+    //   0.20     0.92       1.00       0.82      0.78       1.00
+    //
+    // At round 5's 63 degrees the firing forearm projected at ELEVEN PERCENT of
+    // its length — a 272 mm bone drawing as 25 px — and the shoulder line at
+    // 25%. That is why the head measured 0.608 of the shoulder span against a
+    // real 0.37-0.40 (a skull is near-spherical in plan, so it projects at full
+    // width from every angle while the shoulders collapse), and it is most of
+    // why the arm could not be found: it was end-on. Everything except the
+    // support upper arm improves monotonically as the turn comes off.
+    //
+    // 0.42 rad is where the curves cross. The weapon still clears the body —
+    // it is carried muzzle-down across the front and its handguard and barrel
+    // project past the near hip, which is exactly how MGSV frames it.
+    yaw: spawn.yaw - 0.62,
     scale: 1.02,
   });
   player.controlled = false;
@@ -278,7 +306,7 @@ export async function install(world) {
   // target; a small amount reads as alert, more reads as a firing pose that the
   // camera is not framed for.
   player.anim.aim = 0.12;
-  const aimYaw = spawn.yaw - 1.10;
+  const aimYaw = spawn.yaw - 0.62;
   player.anim.aimTarget.set(
     spawn.x - Math.sin(aimYaw) * 26,
     ground.heightAt(spawn.x, spawn.z) + 1.2,

@@ -177,6 +177,8 @@ uniform float uCirrusAlt;
 uniform float uHeatHaze;
 uniform float uCloudShadow;
 uniform float uWindT;
+uniform float uCloudFar;         // distance at which the deck has faded out (m)
+uniform float uCloudStreak;      // 0 = isotropic weather, 1 = full cloud streets
 
 ${COMMON}
 
@@ -197,7 +199,15 @@ vec3 skyRadiance(vec3 d) {
     return mix(uSkyHorizon, uSkyZenith, smoothstep(0.0, 0.55, d.y));
   }
   float u = atan(d.z, d.x) * 0.15915494 + 0.5;
-  float v = sqrt(clamp((d.y + 0.05) * (1.0 / 1.05), 0.0, 1.0));
+  // Must match SkyLut.muFromV exactly. Round 6: the below-horizon margin went
+  // 0.05 -> 0.02 and the table got 26 rows instead of 14. At 14 rows the first
+  // THREE all clamped onto the horizon and the fourth landed at 0.9 degrees, so
+  // the whole 0-6 degree band — which is where every distant ridge in the game
+  // sits and where the dome's radiance falls fastest — was two linearly
+  // interpolated samples. That mismatch against the dome is what made the far
+  // cloud deck legible as a pattern of streaks over a sky it was supposed to
+  // have dissolved into.
+  float v = sqrt(clamp((d.y + 0.02) * (1.0 / 1.02), 0.0, 1.0));
   return texture2D(tSkyLut, vec2(u, v)).rgb;
 }
 
@@ -316,14 +326,19 @@ vec3 weatherAt(vec2 xz) {
   vec2 w = xz * (1.0 / 46000.0) + vec2(uWindT * 0.000021, uWindT * 0.0000071);
   vec4 s = texture2D(tWeather, w);
   // Squash across the wind so banks form streets rather than an even sprinkle.
-  // Round 5: 4.2:1 -> 2.3:1, and the weight 0.32 -> 0.24. Cloud streets are a
-  // real formation, but at 4.2:1 on a shell seen in perspective they collapsed
-  // onto the downwind vanishing point as four or five straight-edged radial
-  // wedges — the artefact round 4's critic read as god rays drawn over the sky
-  // with no depth mask (verified: it survives with the shaft pass ablated and
-  // vanishes with the deck ablated).
-  float streak = texture2D(tWeather, w * vec2(0.86, 1.55) + 0.27).b;
-  float cov = s.r * 0.82 + streak * 0.18;
+  //
+  // Round 6: the squash is now a uniform and the presets set it near zero.
+  // Parallel lines in a horizontal plane converge on a vanishing point, and a
+  // cloud street IS a parallel line in a horizontal plane, so any anisotropy at
+  // all draws a starburst centred on the downwind horizon. Ablated on
+  // shots/r5-1080/vista.png: setting cloudCoverage to 0 removed the radial
+  // spokes in the upper-left outright, while ablating the cirrus and the shaft
+  // pass left them untouched — the streets, not the shafts, were drawing them.
+  // Round 5 halved the anisotropy and it survived; this removes it as the
+  // default and keeps the knob for a deliberately streeted sky.
+  vec2 sq = mix(vec2(1.0), vec2(0.86, 1.55), uCloudStreak);
+  float streak = texture2D(tWeather, w * sq + 0.27).b;
+  float cov = mix(s.r, mix(s.r, streak, 0.18), uCloudStreak);
   cov = remap(cov, 0.30, 0.86, 0.0, 1.0);
   cov = clamp(cov * uCloudCoverage * 1.9, 0.0, 1.0);
   return vec3(cov, s.g, s.a);
@@ -440,6 +455,25 @@ float cloudLightMarch(vec3 p, float alt0, float jit) {
  * extinction, contribution and phase eccentricity. One light march feeds all
  * three. The tight first octave carries the brilliant sun-facing side and the
  * silver rim; the loose third keeps deep interiors from going to soot.
+ *
+ * ## Round 6: the level was ~1.7x too low
+ *
+ * uCloudGain was 0.42-0.58. At 88 degrees off the sun the three octaves sum to
+ * a relative phase energy of ~0.80, so a fully lit cumulus flank came out at
+ * 0.80 x uKeyColor x 0.44, which after the powder term landed UNDER the 1.652
+ * scene-linear that sunlit sand is exposed for. That is a midtone, not a
+ * highlight. Measured on shots/r5-1080/vista.png the brightest pixel out of
+ * 2.07 M was rgb(229,213,198) and not one of them reached max-channel 230 — in
+ * a frame containing sunlit cumulus.
+ *
+ * A cumulus face square to the sun is albedo ~0.9 and near-Lambertian:
+ * 0.9/PI x E, against sand's 0.30/PI x E x cos(theta_sun). Four to five times
+ * the sand on the flank, and more on a forward-scattering rim. 0.74-0.82 with
+ * the peak cap below puts the vista frame at a brightest pixel of
+ * rgb(245,237,228) and 1.86% of it over max-channel 230, from 0.000%. Nothing
+ * about the shape of the tonemap changed; this is radiance authoring, which is
+ * where the defect was. Ablated: this value alone back at 0.44 takes the frame
+ * to a brightest pixel of rgb(234,219,203) and 0.017% over 230.
  */
 vec3 cloudScatter(float dsum, float cosT, float density) {
   float energy = 0.0;
@@ -453,6 +487,21 @@ vec3 cloudScatter(float dsum, float cosT, float density) {
     b *= 0.44;
     c *= 0.60;
   }
+  // Cap the summed forward peak. Round 6: raising uCloudGain to get the
+  // highlights back (see above) also multiplied the near-solar lobe, and the
+  // three octaves sum to 10.3x isotropic within a degree of the sun against
+  // 0.80 at 88 degrees off it — a 13:1 spread. At a gain chosen so a cloud in a
+  // side-lit frame reaches white, a cloud NEAR the sun goes twelve times past
+  // it: the outpost frame, which looks along the sun, clipped 2.18% of its
+  // pixels against a 0.6% budget while the vista frame clipped none.
+  //
+  // 2.7 is not arbitrary — it is where singly-scattered HG stops describing a
+  // real cumulus. The diffraction peak that gives HG its 10x is one scattering
+  // event; inside an optically thick cloud the light has scattered dozens of
+  // times before it leaves, which smears that peak out. The three-octave sum is
+  // meant to model exactly that and does it for the BODY of the phase function,
+  // but the first octave still carries the raw peak.
+  energy = min(energy, 2.7);
   // Powder: darkens the optically thin fringes seen against the light, which is
   // the cue that tells the eye a cloud is a volume and not a decal. Round 4
   // deepened the floor from 0.18 to 0.07 — measured, the fringes and the cores
@@ -581,12 +630,27 @@ void main() {
     // rather than the thicker path drifting further off the sky.
     vec3 src = (tauR + tauM + tauD * uDustAlbedo) / max(tau, vec3(1e-9)) * skyD;
     src = msFlatten(src, uApDesat);
-    inscatter += src * (1.0 - T) * uApGain;
 
-    // The composite blend carries one scalar alpha, so extinction is applied
-    // achromatically; the chromatic part of aerial perspective lives in the
-    // in-scatter above, which is where the eye reads it anyway.
-    Thaze = dot(T, vec3(0.30, 0.45, 0.25));
+    // ONE transmittance for both halves of the composite.
+    //
+    // The blend carries a single scalar alpha, so the background can only be
+    // extinguished achromatically. Round 4 nonetheless weighted the in-scatter
+    // by the PER-CHANNEL (1 - T), and the two disagree: wherever T_channel is
+    // below the scalar, that channel gets "surf * Ts + sky * (1 - T_c)", which
+    // is not a convex combination of the surface and the sky and can therefore
+    // land ABOVE both. That is the arithmetic behind "a distant ridge brighter
+    // than the sky above it": the blue channel of a 2 km ridge was being given
+    // 4% more in-scatter than the extinction had removed.
+    //
+    // With one scalar the result is "mix(surface, src, (1 - Ts) * uApGain)"
+    // exactly, so a surface darker than the sky can only ever approach it from
+    // below, at any distance, in any direction. The chromatic part of aerial
+    // perspective is not lost — it lives in "src", which is the sky's own
+    // colour in this direction — only the chromatic EXTINCTION is dropped, and
+    // that was never representable in a one-channel alpha anyway.
+    float Ts = dot(T, vec3(0.2126, 0.7152, 0.0722));
+    inscatter += src * (1.0 - Ts) * uApGain;
+    Thaze = Ts;
   }
 
   // ---- cloud decks --------------------------------------------------------
@@ -594,7 +658,25 @@ void main() {
   float Tcloud = 1.0;
   // Rays that end on geometry never see the sky; sky pixels below the geometric
   // horizon are the far side of the planet, so fade the deck out there.
-  float below = smoothstep(-0.020, -0.004, rd.y);
+  //
+  // Round 6 — the deck stops a few degrees above the horizon, and it stops at a
+  // finite distance.
+  //
+  // A shell at 1.8-3.6 km read at one degree of elevation is entered at 75 km
+  // and left at 110 km, so a SINGLE ray integrates a 35 km horizontal chord
+  // through a weather field whose period is 46 km. Neighbouring rays at the
+  // same azimuth overlap almost all of that chord, so the residual is coherent
+  // ALONG the radial direction and incoherent across it — which is precisely
+  // the "puffs smearing into radial spokes" defect. It cannot be fixed by more
+  // samples; the chord itself is the artefact.
+  //
+  // Physically that band is already gone: at 80 km the air in front of the deck
+  // measures 5-7 optical depths, i.e. the deck IS the sky there. Fading it out
+  // over the last few degrees therefore removes only the numerical difference
+  // between two ways of computing the same colour (the dome's own march, and
+  // this pass's convergence onto the LUT), which is what was reaching the
+  // screen as structure.
+  float below = smoothstep(-0.020, -0.004, rd.y) * smoothstep(0.012, 0.058, rd.y);
   if (isSky && below > 0.0) {
     // Planet-relative origin. Marching a CURVED shell rather than a flat plane
     // is what makes the deck actually reach the horizon: a flat slab at 1.8 km
@@ -605,14 +687,11 @@ void main() {
     float t0 = shellDist(camY, rd.y, uCloudBase);
     float t1 = shellDist(camY, rd.y, uCloudTop);
     if (t0 > 0.0 && t1 > t0) {
-      float tEnd = min(t1, 170000.0);
+      float tEnd = min(t1, uCloudFar);
       float t = t0;
-      // Transmittance-weighted mean distance of the cloud mass this ray hit —
-      // the distance the deck's own aerial perspective is evaluated at. Using t0
-      // instead would put a puff whose body sits 40 km out at the range of the
-      // shell crossing, which near the horizon is a different order of magnitude.
-      float tSum = 0.0;
-      float wSum = 0.0;
+      // The convergence target for every sample along this ray. Constant in the
+      // loop: it depends only on the view direction.
+      vec3 skyD = msFlatten(skyRadiance(rd), uApDesat);
       // Round 5: 64 -> 96 iterations. The step is 1% of the current distance, so
       // 64 of them only carry the march from t0 to 1.9*t0 — for a ray at 8
       // degrees of elevation, from 13 km to 25 km, which is a fraction of the
@@ -638,7 +717,15 @@ void main() {
         if (wx.x < 0.02) { t += dt * 2.5; continue; }
         // Detail is only meaningful while the step is short enough to resolve it.
         float lod = 1.0 - smoothstep(420.0, 1400.0, dt);
-        float d = cloudDensity(p, alt, wx, lod);
+        // Range taper. This is the term that actually removes the radial
+        // spokes; see the block above the shell march. Swept at 1920x1080 on
+        // the vista frame with everything else fixed: 34 km and 26 km are
+        // spoked, 22 km is spoked, 17 km is clean, 11 km has almost no cloud
+        // left in shot. The knee is where the surviving chord stops being long
+        // enough for two rays a degree apart in elevation to cross the same
+        // clouds, and 1800 m of slab over a 1 km puff puts that at ~2 degrees.
+        float d = cloudDensity(p, alt, wx, lod) *
+                  (1.0 - smoothstep(uCloudFar * 0.45, uCloudFar, ts));
         if (d > 0.0015) {
           float dsum = cloudLightMarch(p, alt, jitB);
           float h = clamp((alt - uCloudBase) / (uCloudTop - uCloudBase), 0.0, 1.0);
@@ -662,35 +749,31 @@ void main() {
           // The desert kicks a lot of warm light back up into cloud bases.
           amb += uGroundBounce * (1.0 - h) * (1.0 - h);
           vec3 L = cloudScatter(dsum, cosT, d) + amb * uCloudAmbGain;
+          // Aerial perspective AT THIS SAMPLE'S RANGE. Round 5 evaluated it once
+          // for the whole ray, at the transmittance-weighted mean distance, and
+          // that mean is dominated by the NEAREST puff the ray hits — so every
+          // puff behind it inherited the near puff's (high) transmittance and
+          // arrived at full contrast. Along a ray at 8 degrees of elevation the
+          // shell crossing is 13 km of chord, i.e. six or seven puffs, and the
+          // furthest of them was being drawn as crisply as the first. Neighbouring
+          // elevations share most of that chord, so the error is coherent in the
+          // radial direction and incoherent across it: the radial spokes.
+          //
+          // Per sample it is the correct layered integral — each cloud element is
+          // seen through its own column of air and relaxes onto the sky at its own
+          // rate — and the far half of a grazing chord now converges to the sky
+          // individually instead of riding in on the near half's transmittance.
+          float Tas = dot(exp(-hazeTau(uCamPos.y, alt, ts)), vec3(0.2126, 0.7152, 0.0722));
+          L = L * Tas + skyD * (1.0 - Tas);
           float dT = exp(-d * uCloudAbsorb * dt);
           float wgt = Tcloud * (1.0 - dT);
           cloudCol += wgt * L;
-          tSum += wgt * ts;
-          wSum += wgt;
           Tcloud *= dT;
         }
         t += dt;
       }
 
-      // ---- aerial perspective ON the deck ----------------------------------
-      //
-      // Round 5. This was "mix(cloudCol, sky * energy, (1 - exp(-t0*3e-5)) * 0.85)"
-      // plus a matching 35% re-opening of the transmittance — an authored
-      // extinction with two authored fractions, and the single largest colour
-      // defect left in the build. In a low camera the whole visible sky sits
-      // between 0 and 16 degrees of elevation, where a curved-shell deck at
-      // 32% coverage genuinely saturates to opaque; with only 85% of an
-      // under-strength convergence applied, that band reached the screen as a
-      // near-white lid. Measured on shots/r4/outpost.png, the darkest 5% of the
-      // frame corner farthest from the sun — the pixels that should be the
-      // clearest sky in the frame — came back srgb(174,172,172), linear B/G
-      // 1.001: dead achromatic, and 2.5 stops brighter than the same measurement
-      // on the noon shot. The dome underneath measures B/R 4.09.
-      //
-      // The air in front of the deck is the same air that is in front of a
-      // ridge, so it gets the same optical depth (hazeTau) and the same
-      // convergence target (the sky in this direction). The composite is then
-      // exactly the layered one:
+      // The composite this leaves is exactly the layered one:
       //
       //   pixel = dome * (1 - opacity)          <- gaps: the dome already
       //         + cloudRadiance * Tair             contains all of the air
@@ -698,15 +781,11 @@ void main() {
       //
       // which tends to dome as Tair -> 0. That is the property that makes the
       // horizon join up: an opaque deck 100 km out IS the sky, not a lid in
-      // front of it. Nothing is re-opened in the alpha any more — the deck
-      // occludes what it occludes, and it is its COLOUR that converges.
-      float energy = 1.0 - Tcloud;
-      if (energy > 0.001) {
-        float tBar = wSum > 1e-5 ? tSum / wSum : t0;
-        float altBar = altAt(camY, rd.y, tBar);
-        vec3 Tair = exp(-hazeTau(uCamPos.y, altBar, tBar));
-        cloudCol = cloudCol * Tair + msFlatten(skyRadiance(rd), uApDesat) * energy * (1.0 - Tair);
-      }
+      // front of it. Round 5 established that shape but evaluated Tair once for
+      // the whole ray; round 6 evaluates it per sample inside the loop above, so
+      // the last two lines hold at every depth along the chord rather than only
+      // on average. Nothing is re-opened in the alpha — the deck occludes what
+      // it occludes, and it is its COLOUR that converges.
       Tcloud = mix(1.0, Tcloud, below);
       cloudCol *= below;
     }
@@ -723,7 +802,11 @@ void main() {
       // reads as a lens starburst rather than fibrous cirrus.
       float streak = texture2D(tWeather, cw * vec2(0.8, 3.1) + 0.4).b;
       float a = smoothstep(0.55, 0.93, f * 0.66 + streak * 0.46) * uCirrus;
-      a *= smoothstep(0.012, 0.10, rd.y) * Tcloud;
+      // Round 6: 0.012 -> 0.055 at the bottom of the ramp. This sheet is
+      // PLANE-projected, so at 0.7 degrees of elevation it is being read 650 km
+      // out and one texel of the weather map covers the whole lower sky —
+      // the same radial smear the cumulus deck had, at ten times the range.
+      a *= smoothstep(0.055, 0.17, rd.y) * Tcloud;
       // Ice crystals forward-scatter hard: cirrus near the sun is far brighter
       // than cirrus away from it, and that gradient is most of what sells it.
       // Aerial perspective applies here too: a sheet at 8 km read at 2 degrees

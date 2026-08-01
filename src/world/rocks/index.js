@@ -22,7 +22,8 @@ export async function install(world) {
   const t0 = performance.now();
   const lib = buildShapeLibrary();
   const material = createRockMaterial();
-  const { group, meshes, collars, records, spent, rejected, wind } = buildRockField(world, lib, material);
+  const { group, meshes, collars, records, spent, rejected, wind, apron, apronStats } =
+    buildRockField(world, lib, material);
   world.scene.add(group);
 
   let instances = 0;
@@ -51,7 +52,8 @@ export async function install(world) {
       ` | lod0 ${instLod[0]}i/${(perLod[0] / 1e6).toFixed(2)}M` +
       ` lod1 ${instLod[1]}i/${(perLod[1] / 1e6).toFixed(2)}M` +
       ` lod2 ${instLod[2]}i/${(perLod[2] / 1e6).toFixed(2)}M` +
-      ` collar ${collars.length}d/${collarInst}i/${(collarTris / 1e6).toFixed(2)}M`,
+      ` collar ${collars.length}d/${collarInst}i/${(collarTris / 1e6).toFixed(2)}M` +
+      ` apron ${apronStats.sites} sites/${(apronStats.triangles / 1e3).toFixed(0)}k tris`,
   );
 
   const tmp = new THREE.Matrix4();
@@ -72,6 +74,9 @@ export async function install(world) {
     windDir: wind,
     /** Fines aprons. Separate bodies, placed in world space — see Scatter.addCollar. */
     collars,
+    /** The talus apron LANDFORM — one merged surface mesh. See TalusApron.js. */
+    apron,
+    apronStats,
     material,
     /** Keep-clear radii used for the outpost footprint, metres. */
     clearRadii: CLEAR,

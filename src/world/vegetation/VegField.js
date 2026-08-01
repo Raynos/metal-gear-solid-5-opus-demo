@@ -501,7 +501,14 @@ export class VegField {
     let w = fert * Math.min(1.5, collect) * (1 - smooth01(rocky, 0.52, 0.98)) * 1.95;
     const standCutW = 0.452 - wet * 0.185;
     w *= smooth01(standW, standCutW, standCutW + 0.235);
-    w *= 1 - smooth01(slope, 0.14, 0.34);
+    // ROUND 5, MAJOR 6: "zero above 30 degrees". Round 4 only reached zero at
+    // slope 0.34, i.e. 48.7 degrees, so every hillside in the frame carried the
+    // same dusting the pan did and the mask was doing no sorting at all. Zero at
+    // 0.175 is 34.4 degrees — the angle of repose, above which the surface is
+    // still moving and nothing roots in it. Held marginally above the grass cut
+    // (30.7 degrees) because a thorn bush genuinely does hold ground a tussock
+    // cannot; the two masks must not become the same stencil.
+    w *= 1 - smooth01(slope, 0.090, 0.175);
     w = applyDevelopment(wx, wz, w, p.dev, p.shelter, slope);
     return {
       density: Math.min(1, Math.max(0, d)),

@@ -182,7 +182,7 @@ float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
 float vegWetness(vec4 s) {
   return max(s.r, smoothstep(0.18, 0.62, s.a));
 }
-float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
+float vegDensity(vec2 p, out float slope, out float dev, out float cover, out float woody) {
   float curv;
   vec3 n = vegGroundAt(p, 7.0, curv);
   slope = 1.0 - n.y;
@@ -198,18 +198,34 @@ float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
   float meso = vegFbm(p * 0.052 - 12.0, 2);
   float clump = vegFbm(p * 0.42 + 7.0, 2);
   float stand = vegFbm(p * 0.025 + 17.0, 2);
+  float standW = vegFbm(p * 0.023 - 63.0, 2);
 
   float raw = 0.10 + vegWetness(s) * 2.55 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
-  float d = smoothstep(0.0, 0.62, raw);
-  d *= clamp(0.72 + curv * 5.5, 0.16, 1.85);
-  d *= 1.0 - smoothstep(0.18, 0.68, max(s.g, s.b * 0.6));
+  float fert = smoothstep(0.0, 0.62, raw);
+  float collect = clamp(0.72 + curv * 5.5, 0.16, 1.85);
+  float rocky = max(s.g, s.b * 0.6);
+  float d = fert * collect * (1.0 - smoothstep(0.18, 0.68, rocky));
   // A wadi carries grass whatever the 40 m stand field says about the range
   // condition around it — the water beats the grazing.
   float standCut = 0.448 - vegWetness(s) * 0.200;
   d *= smoothstep(standCut, standCut + 0.185, stand);
   d *= 1.0 - smoothstep(0.075, 0.140, slope);
   cover = clamp(vegDevelopment(p, d, pad.g, pad.b, slope), 0.0, 1.0);
+  // The WOODY mask, mirrored from VegField.density so the distant tonal layer
+  // paints the same coverage the near-field bushes stand in. Round 5 needs it
+  // because the bush tiers past 140 m are gone: without a woody term the cover
+  // layer stops at the grass mask's 30 degree slope cut and every hillside in
+  // the vista goes bare at exactly the range the geometry hands over.
+  float w = fert * min(1.5, collect) * (1.0 - smoothstep(0.52, 0.98, rocky)) * 1.95;
+  float standCutW = 0.452 - vegWetness(s) * 0.185;
+  w *= smoothstep(standCutW, standCutW + 0.235, standW);
+  w *= 1.0 - smoothstep(0.090, 0.175, slope);
+  woody = clamp(vegDevelopment(p, w, pad.g, pad.b, slope), 0.0, 1.0);
   return clamp(cover * smoothstep(0.24, 0.58, clump), 0.0, 1.0);
+}
+float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
+  float woody;
+  return vegDensity(p, slope, dev, cover, woody);
 }
 float vegDensity(vec2 p, out float slope, out float dev) {
   float cover;

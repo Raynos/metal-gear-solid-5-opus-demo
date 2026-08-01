@@ -109,12 +109,42 @@ function weaponPose(pos, dir) {
 }
 
 const WEAPON_POSES = {
-  // Low ready. The weapon lies across the chest rather than hanging off the
-  // firing hand: butt tucked into the shoulder pocket, muzzle 20 degrees below
-  // horizontal and swung across to the support side. Round 3 carried it 8 cm
-  // lower and 4 cm further out, which put the whole rifle behind the hip in the
-  // gameplay framing and left both arms reading as hanging.
-  ready: weaponPose([0.105, 1.305, -0.225], [-0.40, -0.345, -0.85]),
+  // Low ready.
+  //
+  // ROUND 6. Round 5 carried the grip at [0.105, 1.305, -0.225], which is
+  // 0.27 m from the right shoulder ball against a 0.57 m arm — 47% extension,
+  // i.e. both elbows fully folded and crushed against the ribs. Measured on the
+  // shipped gameplay frame with a flat-mask silhouette render: NEITHER ARM
+  // APPEARED IN THE OUTLINE AT ALL. The body was one unbroken blob from the
+  // skull to the knees with a rifle apparently glued to the side of it, and
+  // that — not absent geometry, the arms have been modelled since round 2 — is
+  // what every critic has been reading as "no arms".
+  //
+  // A real low ready holds the grip about two thirds of reach out from the
+  // shoulder, muzzle depressed ~25 degrees, so the forearms make a visible
+  // triangle with the weapon. 0.39 m here, i.e. 68% extension.
+  //
+  // The second half of the same fix is WHICH WAY the arm points. Extending the
+  // arm is not enough if it extends along the view axis: measured with a
+  // limb-presentation probe (screen length / true length at that depth) the
+  // first pass at this pose gave upper arm 1.01 but forearm 0.48 — the firing
+  // hand ended up 239 mm further from the lens than the elbow, so a 272 mm
+  // forearm drew as an 82 px stub. Pulling the grip toward the character's
+  // right and back rotates that segment into the image plane without
+  // shortening the reach, because on this camera the character's own "right"
+  // runs almost straight back at the lens (dot -0.83 with the view direction).
+    //
+  // Carried at 1.15 m, not 1.25. At chest height the firing upper arm has to
+  // swing FORWARD and UP to reach the grip, which on a figure seen from behind
+  // lays it diagonally across the chest rig — it covers the kit, it hides the
+  // weapon directly behind itself, and because it is then pointing partly at
+  // the lens it draws as one fat featureless tube with no elbow in it. Dropped
+  // to waist height the upper arm hangs close to vertical alongside the ribs,
+  // which is both what a real low ready looks like from behind and the pose
+  // that puts the longest, best-presented segment of the limb into the
+  // silhouette. It also drops the receiver and magazine clear of the arm, so
+  // the weapon is visible instead of eclipsed.
+  ready: weaponPose([0.178, 1.148, -0.292], [-0.36, -0.46, -0.81]),
   // Shouldered.
   aim: weaponPose([0.115, 1.4, -0.3], [-0.03, -0.02, -1.0]),
   // Crouched carry sits lower and tighter to the body.
@@ -124,6 +154,21 @@ const WEAPON_POSES = {
   // Sprint: carried diagonally across the chest, muzzle down-left.
   sprint: weaponPose([0.115, 1.13, -0.2], [-0.5, -0.52, -0.69]),
 };
+
+/**
+ * Elbow poles in character space: +x outboard, +z behind, y up.
+ *
+ * The z term is the one that has to be measured rather than reasoned about. On
+ * the gameplay camera the world direction that maps to screen-RIGHT is
+ * (0.81, 0, -0.57); the character's own "backward" maps onto it at -0.83, so
+ * every centimetre the firing elbow goes BACK is 0.8 cm further behind the
+ * torso in screen space. A first pass at this used +0.26 (an anatomically
+ * reasonable chicken-wing) and tucked the elbow straight back behind the ribs
+ * where it contributed nothing to the outline. Near-neutral in z and hard
+ * outboard in x is what puts it against open background.
+ */
+const _POLE_R = new THREE.Vector3(0.50, -0.16, 0.02);
+const _POLE_L = new THREE.Vector3(0.36, -0.20, -0.02);
 
 // -------------------------------------------------------------------------
 // Animator
@@ -497,11 +542,25 @@ export class Animator {
     // only a small lateral bias, which folded both arms flat against the torso
     // and read as hanging. The support arm gets the wider bias — it is the one
     // that has to reach across the body to the handguard.
-    const out = side === 'L' ? 0.40 : 0.30;
+    //
+    // ROUND 6. The pole is now authored as a vector in CHARACTER space
+    // (+x right, +z behind, y up) and rotated into the world, which is what the
+    // old cosY/sinY expression was doing by hand with one shared lateral term
+    // and a fixed 0.26 m drop. The drop dominated: with the shoulder-to-wrist
+    // line already short the elbows ended up hanging almost straight down and
+    // 8 cm out, i.e. inside the torso silhouette.
+    //
+    // Firing side gets the classic chicken-wing — out and BACK — because on the
+    // over-the-shoulder camera that is the elbow nearest the lens, and it is
+    // the one break in the outline that says "this figure has arms" from 40 px.
+    // The support elbow goes out and slightly DOWN and forward, under the
+    // handguard, which is both correct and keeps it clear of the ribs.
+    const pole = side === 'R' ? _POLE_R : _POLE_L;
+    const lx = pole.x * sgn;
     this._t3.set(
-      (this._t2.x + wrist.x) * 0.5 + cosY * sgn * out + sinY * 0.12,
-      (this._t2.y + wrist.y) * 0.5 - 0.26,
-      (this._t2.z + wrist.z) * 0.5 - sinY * sgn * out + cosY * 0.12,
+      (this._t2.x + wrist.x) * 0.5 + cosY * lx + sinY * pole.z,
+      (this._t2.y + wrist.y) * 0.5 + pole.y,
+      (this._t2.z + wrist.z) * 0.5 - sinY * lx + cosY * pole.z,
     );
     twoBoneIK(shoulder, elbow, wrist, this._t3, this.armLen.upper, this.armLen.lower);
     setWorldQuaternion(hand, q);

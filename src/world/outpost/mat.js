@@ -74,6 +74,10 @@ varying vec3 vOPV;
 #if OP_MODE == 5
 varying vec4 vOPT;
 varying vec3 vOPC;
+// Compound-LOCAL xz. The pad mesh is authored in the compound's own frame and
+// the group carries the yaw, so object space is exactly the (u, v) the wear
+// field is rasterised in — no inverse rotation per fragment.
+varying vec2 vOPL;
 #endif
 `;
 
@@ -92,6 +96,18 @@ uniform float uCorrAmp;
 uniform vec3 uDadoCol;
 uniform vec2 uDado;
 uniform vec3 uBounce;
+#if OP_MODE == 5
+uniform sampler2D uWearMap;
+uniform sampler2D uLampMap;
+uniform vec4 uWearOrg;    // (u0, v0, 1/extentU, 1/extentV)
+uniform vec2 uWearTexel;  // (1/width, 1/height) in texture uv
+uniform vec2 uTheta;      // (cos, sin) of the compound yaw, local -> world
+uniform vec3 uLampGain;   // pool radiance scale, driven by time of day
+// (amount, debug). Amount 0 ablates the whole authored-wear layer in place,
+// which is how this feature is measured: render twice, diff. Debug 1 dumps the
+// three masks straight to albedo.
+uniform vec2 uWearCtl;
+#endif
 `;
 
 /** Shared prologue: fetch the cues every mode needs. */
@@ -480,6 +496,45 @@ const BODY = {
     float grade = clamp(vOPW.x, 0.0, 1.0);
     float churn = clamp(vOPC.x, 0.0, 1.0);
 
+    // ---- authored wear: the record of traffic (see wear.js) ---------------
+    //
+    // Footpaths, wheel ruts, spill and scorch arrive as distance fields in a
+    // 0.5 m texture rather than as vertex attributes on a 1.7 m mesh, which is
+    // the whole reason any of them are visible at all. Every boundary is then
+    // broken into fingers by a 0.4 m fbm before it is thresholded: a clean
+    // iso-contour is the loudest possible tell that a mask was authored, and
+    // MGSV's ground has no clean edges anywhere on it.
+    vec2 wuv = (vOPL - uWearOrg.xy) * uWearOrg.zw;
+    vec4 WR = texture2D(uWearMap, wuv);
+    vec4 LPM = texture2D(uLampMap, wuv);
+    WR.r *= uWearCtl.x; WR.b *= uWearCtl.x; WR.a *= uWearCtl.x;
+    LPM.a *= uWearCtl.x;
+    float fbA = opfbm(vOPP.xz * 2.7, 3);
+    float fbB = opfbm(vOPP.xz * 0.62, 3);
+    float edgeN = (fbA - 0.5) * 0.21 + (fbB - 0.5) * 0.15;
+
+    float footRaw = WR.r + edgeN;
+    float foot = smoothstep(0.46, 0.64, footRaw);
+    float footCore = smoothstep(0.60, 0.94, footRaw);
+    float corridor = smoothstep(0.44, 0.63, WR.b + edgeN * 0.85);
+    // Metres across the vehicle line, with that vehicle's own wander already
+    // removed on the CPU — so the pair of ruts moves together, the way one
+    // lorry's line does, instead of breathing independently.
+    float latS = (WR.g - 0.5) * 12.0;
+    float alat = abs(latS);
+    float ra = (alat - 1.06) * 3.5;
+    float rb = (alat - 2.68) * 3.0;
+    float bshape = (alat - 3.55) / 0.78;
+    float rutW = 0.45 + 0.90 * opfbm(vOPP.xz * vec2(0.9, 0.9) + vec2(latS * 2.0, 0.0), 2);
+    float rutE = exp(-ra * ra) + 0.64 * exp(-rb * rb);
+    float rut = clamp(rutE, 0.0, 1.0) * corridor * rutW;
+    float crownE = exp(-latS * latS / 0.44);
+    float bermE = exp(-bshape * bshape);
+    float spillRaw = WR.a + edgeN * 0.55;
+    float spill = smoothstep(0.10, 0.62, spillRaw);
+    float scorchRaw = LPM.a + edgeN * 0.60;
+    float scorch = smoothstep(0.12, 0.64, scorchRaw);
+
     float dcam = length(vOPP - cameraPosition);
     float near = 1.0 - smoothstep(6.0, 78.0, dcam);
     float n0 = opfbm(vOPP.xz * 0.011, 3);
@@ -495,7 +550,7 @@ const BODY = {
     // read as engineered: a graded surface has had its ripple bladed off.
     vec2 wdG = vec2(${Math.cos(0.38).toFixed(5)}, ${Math.sin(0.38).toFixed(5)});
     float ripG = sin(dot(vOPP.xz, wdG) * 24.0 + opfbm(vOPP.xz * 0.9, 2) * 9.0) * 0.5 + 0.5;
-    float wild = (1.0 - grade) * (1.0 - road);
+    float wild = (1.0 - grade) * (1.0 - max(road, corridor));
     sand *= 1.0 + 0.085 * (ripG - 0.5) * wild;
     // Drifted fines catch on the lee of every bump — big, soft, low-contrast.
     sand = mix(sand, uBase * 1.12, smoothstep(0.55, 0.9, n1) * 0.35);
@@ -509,7 +564,21 @@ const BODY = {
     vec3 fill = mix(uBase2 * 0.94, uBase3 * 1.06, 0.45 + 0.45 * n2);
     fill = mix(fill, uBase3 * 1.45, smoothstep(0.70, 0.94, n4) * 0.30);
     fill *= 0.93 + 0.15 * n3;
-    float gradeN = clamp(grade * 1.35 - 0.30 + (n1 - 0.5) * 0.50, 0.0, 1.0);
+    // Round 5 standing finding, third round running: "material junctions are
+    // hard steps with no transitional third material". Both of these masks used
+    // to break up only at n1's 18 m period, which at 5 m from the camera is not
+    // a break at all — it is a smooth ramp, i.e. an airbrushed edge. Adding the
+    // 0.4 m octave (fbA) and a 0.8 m one turns every fill/sand and gravel/fill
+    // boundary into interlocking fingers a boot-width across, which is what the
+    // toe of a bladed surface actually does as it loses itself in the sand.
+    float fineE = (opfbm(vOPP.xz * 1.25, 3) - 0.5);
+    // Only the BOUNDARY is broken up. Applying the fine octaves to the whole
+    // mask sprinkles patches of borrow material across undisturbed desert;
+    // 4k(1-k) is 1 in the transition band and 0 either side of it.
+    float gEdge = 4.0 * grade * (1.0 - grade);
+    float hEdge = 4.0 * hard * (1.0 - hard);
+    float gradeN = clamp(grade * 1.35 - 0.30 + (n1 - 0.5) * 0.50
+                         + (fineE * 0.60 + (fbA - 0.5) * 0.36) * gEdge, 0.0, 1.0);
     vec3 c = mix(sand, fill, gradeN * 0.78);
 
     // Graded gravel hardstanding: cooler, coarser, crushed rock through the fines.
@@ -517,36 +586,35 @@ const BODY = {
     gravel = mix(gravel, uBase3 * 1.9, smoothstep(0.60, 0.95, n4) * 0.45);
     gravel = mix(gravel, uBase * 0.82, smoothstep(0.62, 0.30, n3) * 0.4);
     gravel *= 0.90 + 0.20 * n4;
-    float hardN = clamp(hard * 1.25 - 0.25 + (n1 - 0.5) * 0.55, 0.0, 1.0);
+    float hardN = clamp(hard * 1.25 - 0.25 + (n1 - 0.5) * 0.55
+                        + (fineE * 0.66 + (fbA - 0.5) * 0.40) * hEdge, 0.0, 1.0);
     c = mix(c, gravel, hardN);
     // Big, slow tonal drift across the platform: fill from different borrow pits.
     c *= 0.80 + 0.42 * n0;
 
-    // Vehicle track: compacted fines, two wheel ruts, loose spoil at the shoulder.
-    // Compacted fines are markedly darker and smoother than the surround: that
-    // value break is what makes a track read as a track from 100 m up.
-    vec3 dirt = uBase * (0.46 + 0.26 * n2) * (0.9 + 0.2 * n3);
-    float shoulder = smoothstep(0.35, 1.0, abs(lat) * 0.28);
-    c = mix(c, mix(dirt, sand * 1.10, shoulder), road);
-    gRough = mix(gRough, 0.80, road * (1.0 - shoulder) * 0.6);
-    // Two wheel ruts each side of the crown, wandering the way a truck does.
-    // Round 4: the rut set was symmetric, fixed-width and albedo-only, which is
-    // a stripe rather than a rut. It now wanders (the sway term, a slow
-    // function of arc length, so both ruts move together as one vehicle line),
-    // it is narrower and deeper, and it carries a NORMAL so the groove picks up
-    // a shadow on one flank and a highlight on the other at low sun — which is
-    // the only reason a 60mm depression is visible on sand at all.
-    float sway = (opfbm(vec2(along * 0.045, 3.7), 2) - 0.5) * 1.30;
-    float r1 = (abs(lat) - (1.02 + sway)) * 3.4;
-    float r2 = (abs(lat) - (2.62 + sway)) * 3.0;
-    float rut = exp(-r1 * r1) + exp(-r2 * r2) * 0.62;
-    float rutN = 0.45 + 0.9 * opfbm(vec2(along * 0.55, lat * 4.0), 2);
-    rut = clamp(rut, 0.0, 1.0) * road * rutN;
-    c *= 1.0 - 0.40 * rut;
-    gRough = mix(gRough, 0.72, rut * 0.5);
-    // Loose spoil pushed to the shoulder catches the light and outlines the track.
-    float shoulderBand = smoothstep(0.45, 0.05, abs(abs(lat) * 0.30 - 1.05));
-    c = mix(c, sand * 1.16, shoulderBand * road * 0.45);
+    // VEHICLE CORRIDOR. Compacted fines are markedly darker and smoother than
+    // the surround, and that value break is what makes a track read as a track
+    // from 100 m up. Structure, from the centreline out: a crown of loose
+    // material thrown up between the wheels, a rut, the compacted running
+    // surface, the outer rut, and a spoil ridge on the shoulder that outlines
+    // the whole thing when the sun is low.
+    // Round 5 measured the first pass of this at a mean on/off ratio of 1.00 on
+    // the pixels it touched — i.e. it did NOTHING net. the dirt colour at 0.46x uBase
+    // came out at 0.243 against a graded-fill surround of 0.269: a 7% break,
+    // which is a tenth of a stop and invisible under a desert sun. Compacted
+    // track is soaked in fines, diesel and rubber and it is roughly 0.7x the
+    // loose material either side of it — half a stop, and legible from the air.
+    vec3 dirt = uBase * (0.30 + 0.20 * n2) * (0.88 + 0.24 * n3);
+    c = mix(c, dirt, corridor * 0.78);
+    c *= 1.0 - 0.62 * rut;
+    // Spoil pushed up by the tyre and left standing on the rut's outer lip. It
+    // is the pale line immediately beside the dark one that makes a rut read as
+    // a GROOVE rather than as a painted stripe.
+    float lipE = exp(-(alat - 1.62) * (alat - 1.62) * 5.5) + 0.5 * exp(-(alat - 0.5) * (alat - 0.5) * 8.0);
+    c = mix(c, sand * 1.14, clamp(crownE * corridor * 0.38 + bermE * corridor * 0.46
+                                  + lipE * corridor * rutW * 0.22, 0.0, 0.66));
+    gRough = mix(gRough, 0.80, corridor * 0.60);
+    gRough = mix(gRough, 0.70, rut * 0.55);
 
     // Turning circle: plant pivoting on the spot tears the surface into
     // concentric arcs and throws the fines out to a scuffed lip. The arcs are a
@@ -586,27 +654,38 @@ const BODY = {
       c *= 1.0 - 0.17 * (grit - 0.5) * near;
       c *= 1.0 - 0.11 * (mid - 0.5) * near;
       c *= 1.0 - 0.10 * (fines - 0.5) * near * near;
-      c = mix(c, uBase3 * 2.1, smoothstep(0.72, 0.92, grit) * near * (0.30 + 0.55 * hardN));
-      c = mix(c, uBase2 * 0.58, smoothstep(0.74, 0.94, 1.0 - grit) * near * 0.48);
+      // A beaten surface has had its loose stone kicked, swept and driven off
+      // it — that ABSENCE is half of why a real path reads as polished earth.
+      float loose = 1.0 - 0.85 * max(footCore, corridor * (1.0 - bermE));
+      c = mix(c, uBase3 * 2.1, smoothstep(0.72, 0.92, grit) * near * (0.30 + 0.55 * hardN) * loose);
+      c = mix(c, uBase2 * 0.58, smoothstep(0.74, 0.94, 1.0 - grit) * near * 0.48 * loose);
       // Stones sit ON the surface, so they roughen it and tilt their own normal.
-      gRough = clamp(gRough - 0.10 * smoothstep(0.72, 0.92, grit) * near, 0.14, 1.0);
+      gRough = clamp(gRough - 0.10 * smoothstep(0.72, 0.92, grit) * near * loose, 0.14, 1.0);
     }
 
-    // Worn footpaths: boot traffic polishes the fines and kills the gravel.
-    // Round 4: a beaten path is not just darker, it has a CROWN of scuffed
-    // lighter material either side of a polished core, and boot prints churn the
-    // edges. Without the edge break it reads as a painted line.
-    c = mix(c, dirt * 1.02, path * (0.6 + 0.4 * n3));
-    float pathEdge = smoothstep(0.20, 0.62, path) * smoothstep(0.98, 0.66, path);
-    c = mix(c, sand * 1.14, pathEdge * 0.42);
-    gRough = mix(gRough, 0.78, path * 0.45);
+    // BEATEN FOOTPATHS. A desire line is worn through the loose surface to the
+    // compacted earth beneath: darker, smoother, and — the part that makes it
+    // read as trodden rather than painted — flanked by a scuffed margin of the
+    // material that has been kicked out of it.
+    vec3 beaten = uBase * (0.29 + 0.18 * n2) * (0.88 + 0.24 * n3);
+    c = mix(c, beaten, foot * 0.88);
+    c = mix(c, sand * 1.12, foot * (1.0 - footCore) * 0.34);
+    gRough = mix(gRough, 0.68, footCore * 0.75);
 
-    // Oil and diesel: dark, low-roughness, slightly iridescent at the edge.
-    float oilN = smoothstep(0.25, 0.75, oil * (0.55 + 0.9 * n3));
-    c = mix(c, vec3(0.030, 0.028, 0.026), oilN * 0.85);
+    // SPILL. Oil, diesel and hydraulic fluid under everything that is parked or
+    // decanted here: near-black, and far smoother than the ground it soaks.
+    float oilN = max(spill, smoothstep(0.25, 0.75, oil * (0.55 + 0.9 * n3)));
+    c = mix(c, vec3(0.030, 0.028, 0.026), oilN * 0.86);
+    // SCORCH. The opposite material to spill — a burn scar is bone dry and
+    // matt, with a rim of pale ash where the fire ran out of fuel.
+    c = mix(c, vec3(0.052, 0.047, 0.043) * (0.55 + 0.9 * n3), scorch * 0.82);
+    float ashRim = smoothstep(0.10, 0.26, scorchRaw) * smoothstep(0.52, 0.28, scorchRaw);
+    c = mix(c, uBase3 * 1.55, ashRim * 0.34);
 
-    gRough = clamp(0.94 - hard * 0.03 + (n4 - 0.5) * 0.12 - oilN * 0.55, 0.16, 1.0);
+    gRough = clamp(0.94 - hard * 0.03 + (n4 - 0.5) * 0.12 - oilN * 0.55
+                   - corridor * 0.10 - footCore * 0.14 + scorch * 0.05, 0.16, 1.0);
     gMetal = 0.0;
+    if (uWearCtl.y > 0.5) c = vec3(foot * 0.9 + footCore * 0.1, corridor * 0.6 + rut, max(spill, scorch));
 
     // Gravel micro-relief. The amplitude is millimetres, not metres: a graded
     // surface is *flat*, and overdriving this reads as a lava field.
@@ -639,14 +718,44 @@ const BODY = {
                  + opfbm((vOPP.xz + vec2(0.0, e2)) * 62.0, 2) * gB;
         nrm = normalize(nrm + vec3((k0 - kx) / e2, 0.0, (k0 - kz) / e2) * gN);
       }
-      // The rut groove itself. lat runs across the track, so its gradient in
-      // world space is the track's own normal direction; d(rut)/d(lat) rolls the
-      // shading normal into and out of the groove, which is what puts a 60mm
-      // depression on the screen at all. Analytic rather than sampled, because
-      // the rut is defined by lat and there is nothing to sample.
-      float dr = -2.0 * (r1 * 3.4 * exp(-r1 * r1) + r2 * 3.0 * exp(-r2 * r2) * 0.62);
-      vec3 across = normalize(vec3(vOPC.y, 0.0, vOPC.z) + vec3(1e-5, 0.0, 0.0));
-      nrm = normalize(nrm + across * dr * road * rutN * 0.085 * sign(lat) * fade);
+      // RELIEF FOR THE AUTHORED WEAR.
+      //
+      // Albedo alone cannot make a rut. A 55 mm groove and a 40 mm berm are
+      // visible on desert ground only because they turn toward and away from a
+      // low sun, and that is a normal, not a colour. Both fields are DISTANCE
+      // fields, so their gradient direction is recoverable from four taps of
+      // the same texture — and because a bilinear filter reconstructs a linear
+      // ramp exactly, that gradient is clean at 0.5 m/texel where a sampled
+      // height field would be blocky.
+      if (corridor > 0.02 || foot > 0.02) {
+        vec4 Wpu = texture2D(uWearMap, wuv + vec2(uWearTexel.x, 0.0));
+        vec4 Wmu = texture2D(uWearMap, wuv - vec2(uWearTexel.x, 0.0));
+        vec4 Wpv = texture2D(uWearMap, wuv + vec2(0.0, uWearTexel.y));
+        vec4 Wmv = texture2D(uWearMap, wuv - vec2(0.0, uWearTexel.y));
+        // Compound-local gradient -> world, through the compound's own yaw.
+        // (x, z) = (u*cos + v*sin, -u*sin + v*cos).
+        vec2 gl = vec2(Wpu.g - Wmu.g, Wpv.g - Wmv.g);
+        vec2 gf = vec2(Wpu.r - Wmu.r, Wpv.r - Wmv.r);
+        if (corridor > 0.02 && dot(gl, gl) > 1e-9) {
+          vec2 d = normalize(gl);
+          vec3 across = vec3(d.x * uTheta.x + d.y * uTheta.y, 0.0, -d.x * uTheta.y + d.y * uTheta.x);
+          // d/dlat of: 55 mm rut pair, 38 mm crown between the wheels,
+          // 45 mm spoil ridge on the shoulder. All signed off |lat|.
+          float sgn = latS < 0.0 ? -1.0 : 1.0;
+          float dh = sgn * (0.055 * 2.0 * (ra * 3.5 * exp(-ra * ra) + rb * 3.0 * 0.64 * exp(-rb * rb)) * rutW
+                          - 0.045 * 2.0 * bshape / 0.78 * bermE)
+                   - 0.038 * 2.0 * latS / 0.44 * crownE;
+          nrm = normalize(nrm - across * dh * corridor * fade);
+        }
+        if (foot > 0.02 && dot(gf, gf) > 1e-9) {
+          vec2 d = normalize(gf);
+          vec3 aFoot = vec3(d.x * uTheta.x + d.y * uTheta.y, 0.0, -d.x * uTheta.y + d.y * uTheta.x);
+          // The path itself is dished 35 mm; the relief lives entirely in the
+          // shoulder where it drops off, which is where the eye reads it.
+          float lip = foot * (1.0 - footCore);
+          nrm = normalize(nrm + aFoot * lip * 0.16 * fade);
+        }
+      }
     }
   `,
 };
@@ -663,6 +772,15 @@ vec3 tangentFromGrain(vec3 wn, float grain, float gap) {
 `;
 
 const toV3 = (c) => new THREE.Vector3(c[0], c[1], c[2]);
+
+let EMPTY_WEAR = null;
+function emptyWear() {
+  if (!EMPTY_WEAR) {
+    EMPTY_WEAR = new THREE.DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1, THREE.RGBAFormat);
+    EMPTY_WEAR.needsUpdate = true;
+  }
+  return EMPTY_WEAR;
+}
 
 /**
  * Build one weathered surface material.
@@ -727,6 +845,20 @@ export function createSurface(opts = {}) {
     uDado: { value: new THREE.Vector2(dado, dado > 0 ? dadoStrength : 0) },
     uBounce: { value: new THREE.Vector3(0, 0, 0) },
   };
+  if (mode === MODE.GROUND) {
+    // A 1x1 black default is a valid *empty* wear field in every channel — no
+    // path, no corridor, lateral offset off the end of the rut set — so the
+    // ground renders correctly even if the field fails to build.
+    Object.assign(mat.userData.u, {
+      uWearMap: { value: emptyWear() },
+      uLampMap: { value: emptyWear() },
+      uWearOrg: { value: new THREE.Vector4(0, 0, 1, 1) },
+      uWearTexel: { value: new THREE.Vector2(1, 1) },
+      uTheta: { value: new THREE.Vector2(1, 0) },
+      uLampGain: { value: new THREE.Vector3(0, 0, 0) },
+      uWearCtl: { value: new THREE.Vector2(1, 0) },
+    });
+  }
 
   mat.customProgramCacheKey = () => `op${mode}|${side}|${alphaTest > 0 ? 'a' : ''}|${map ? 'm' : ''}`;
 
@@ -770,6 +902,7 @@ export function createSurface(opts = {}) {
          #if OP_MODE == 5
          vOPT = aTrack;
          vOPC = vec3(aGround.x, normalize(mat3(modelMatrix) * vec3(aGround.y, 0.0, aGround.z)).xz);
+         vOPL = transformed.xz;
          #endif
          #include <project_vertex>`,
       );
@@ -815,6 +948,24 @@ export function createSurface(opts = {}) {
            #endif
            float lower = clamp(0.55 - 0.55 * bn.y, 0.0, 1.0);
            reflectedLight.indirectDiffuse += diffuseColor.rgb * uBounce * lower;
+           #if OP_MODE == 5
+           // Baked lamp pools.
+           //
+           // Round 5 measured the site's lamps radially and found no pool at
+           // all: "the lamps are emissive decals, not lights". There are ~40 of
+           // them and three.js's forward path loops every light in every
+           // fragment of every material, so forty more real lights is not a
+           // trade this frame budget can make. What every one of them actually
+           // does for the image is light the FLOOR — and a fixed lamp over
+           // graded ground has an exactly computable floor pool, so it is
+           // rasterised once (wear.js addLamp: Lambert on a horizontal plane,
+           // inverse square, cut by the shade's own half-angle) and costs one
+           // texture fetch. The masts and floods that light objects as well as
+           // ground are still real lights.
+           vec2 lpv = (vOPL - uWearOrg.xy) * uWearOrg.zw;
+           vec3 pool = texture2D(uLampMap, lpv).rgb;
+           reflectedLight.indirectDiffuse += diffuseColor.rgb * pool * pool * uLampGain;
+           #endif
          }`,
       )
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\n roughnessFactor = gRough;`)

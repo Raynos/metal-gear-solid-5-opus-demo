@@ -492,6 +492,20 @@ export function makeClothMaterial(opts = {}) {
     uSeed: { value: opts.seed ?? 0 },
     uDust: { value: opts.dust ?? 0.55 },
     uWeave: { value: opts.weave ?? 1.0 },
+    // ROUND 6 — MAJOR 4, the "flat cutout" note.
+    //
+    // Fabric is not a Lambert surface. A worsted or ripstop weave is a forest
+    // of fibres standing off a substrate, so light arriving from behind the
+    // geometric terminator still scatters forward out of the fibre tips: the
+    // shading wraps a good 25-30 degrees past N.L = 0 instead of stopping dead
+    // at it. A hard Lambert cut is the single loudest "this is a game asset"
+    // cue on a rounded cloth form, because it puts a HARD-EDGED line across a
+    // SOFT-EDGED shape and the eye reads the contradiction instantly.
+    //
+    // Kept as its own uniform so it can be ablated to 0 from an `eval` probe
+    // against the SAME material — no rebuild, no second shader, so an A/B
+    // cannot differ in anything else.
+    uWrap: { value: opts.wrap ?? 0.30 },
     ...lightUniforms(opts),
   };
   mat.userData.uniforms = uniforms;
@@ -516,6 +530,7 @@ export function makeClothMaterial(opts = {}) {
          uniform float uSeed;
          uniform float uDust;
          uniform float uWeave;
+         uniform float uWrap;
          float gRough = 0.9;
          float gSheen = 0.5;
          float gGather = 0.0;
@@ -744,6 +759,51 @@ export function makeClothMaterial(opts = {}) {
         `#include <lights_physical_fragment>
          material.sheenColor = gSheenCol;
          material.sheenRoughness = 0.92;`,
+      )
+      // Wrapped diffuse on fabric. See uWrap.
+      .replace(
+        '#include <lights_physical_pars_fragment>',
+        `#include <lights_physical_pars_fragment>
+         void RE_Direct_Cloth(const in IncidentLight directLight, const in vec3 geometryPosition,
+                              const in vec3 geometryNormal, const in vec3 geometryViewDir,
+                              const in vec3 geometryClearcoatNormal, const in PhysicalMaterial material,
+                              inout ReflectedLight reflectedLight) {
+           float ndl = dot(geometryNormal, directLight.direction);
+           vec3 irradiance = saturate(ndl) * directLight.color;
+           reflectedLight.directSpecular += irradiance * BRDF_GGX(directLight.direction, geometryViewDir, geometryNormal, material);
+           #ifdef USE_SHEEN
+             sheenSpecularDirect += irradiance * BRDF_Sheen(directLight.direction, geometryViewDir, geometryNormal, material.sheenColor, material.sheenRoughness);
+           #endif
+           #ifdef USE_CLEARCOAT
+             float dotNLcc = saturate(dot(geometryClearcoatNormal, directLight.direction));
+             clearcoatSpecularDirect += dotNLcc * directLight.color * BRDF_GGX_Clearcoat(directLight.direction, geometryViewDir, geometryClearcoatNormal, material);
+           #endif
+
+           // ((N.L + w)/(1 + w)) ^ (1 + 2w).
+           //
+           // Both the wrap AND the exponent are load-bearing, and the exponent
+           // is the part everyone leaves out. Integrate the raw wrap lobe over
+           // the sphere (it is non-zero down to N.L = -w):
+           //     2*PI/(1+w) * INT[-w..1] (u + w) du  =  PI * (1 + w)
+           // i.e. 1.3x the PI that Lambert integrates to at w = 0.3, so a plain
+           // wrap hands every fabric panel on the character 30% of free light —
+           // a soften-the-terminator change that silently lands as a third of a
+           // stop of exposure drift for the lighting owner to chase.
+           //
+           // Raising it to the power p costs (1+w)^-p out front and gains
+           // (1+w)^(p+1)/(p+1), so the lobe integrates to PI when p = 1 + 2w,
+           // and that form ALSO leaves f(1) = 1 exactly. Energy identical to
+           // Lambert, normal incidence identical to Lambert, and the only thing
+           // that changes is the shape near the terminator: at N.L = 0 fabric
+           // now returns 9.6% of full instead of 0, falling to nothing by
+           // N.L = -0.3. That is the soft shoulder a fibre pile actually has,
+           // and it is the difference between a rounded arm and a paper cutout
+           // with a hard line ruled across it.
+           float wrapped = pow(saturate((ndl + uWrap) / (1.0 + uWrap)), 1.0 + 2.0 * uWrap);
+           reflectedLight.directDiffuse += wrapped * directLight.color * BRDF_Lambert(material.diffuseColor);
+         }
+         #undef RE_Direct
+         #define RE_Direct RE_Direct_Cloth`,
       );
 
     mat.userData.shader = shader;

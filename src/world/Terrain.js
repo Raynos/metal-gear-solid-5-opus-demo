@@ -641,6 +641,16 @@ class Grid {
     this.curv = new Float32Array(n * n);
     this.nx = new Float32Array(n * n);
     this.nz = new Float32Array(n * n);
+    // Stratigraphy, published to the fragment shader so the PAINTED beds are
+    // the beds the geometry was actually cut on — see `_addStrata`.
+    this.section = new Float32Array(n * n);   // is a bedded section outcropping
+    this.bandH = new Float32Array(n * n);     // bed thickness here, metres
+    this.bedRef = new Float32Array(n * n);    // drawn height -> bed index, in beds
+    // Mid-scale ground tone, 11-45 m. `macro` is a 7-octave fbm whose lowest
+    // octave is 900 m and therefore carries 64x the amplitude of its highest:
+    // over any patch smaller than a few hundred metres it is a constant, which
+    // is why 200 m of valley floor measured as one value.
+    this.mid = new Float32Array(n * n);
   }
 
   /** Continuous grid index for a world coordinate. */
@@ -850,6 +860,9 @@ export class Terrain {
         bandH[c] = out.bandH;
       }
     }
+    g.section.set(section);
+    g.bandH.set(bandH);
+    this._bakeMid(g);
 
     // Simulate: talus (build the faces), water (cut the wadis), drainage
     // incision (organise them into a hierarchy), stratigraphy (put the cliffs
@@ -883,6 +896,33 @@ export class Terrain {
     this._bakeChannels(g, dropFlow);
   }
 
+  /**
+   * Mid-scale ground tone: 45 m down to ~11 m, at FULL amplitude.
+   *
+   * This is the band the valley floor had nothing in. `macro` is 7 octaves
+   * from 900 m, so its 14 m octave carries 1/64 of the total — over a 60 m
+   * patch of pan it is a constant, and a 700x250 px region of the ridge shot
+   * measured mean 0.1396 with sd 0.0113, i.e. the whole thing inside a couple
+   * of codes. Desert pavement is patchy at 10-50 m; that is this field, and it
+   * drives the lag-gravel weight as well as the tone, so the patch EDGES carry
+   * a material change and not just a brightness one.
+   *
+   * Octave count is set by the grid: the far grid is 8 m, so an 11 m octave is
+   * below its Nyquist and would bake as noise rather than as a field.
+   */
+  _bakeMid(g) {
+    const n = g.n;
+    const oct = g.cell <= 2 ? 3 : 2;
+    for (let j = 0; j < n; j++) {
+      const wz = g.origin + j * g.cell;
+      for (let i = 0; i < n; i++) {
+        const wx = g.origin + i * g.cell;
+        g.mid[j * n + i] = clamp(
+          fbm2(wx * 0.022 + 13.0, wz * 0.022 - 71.0, oct) * 1.15 * 0.5 + 0.5, 0, 1);
+      }
+    }
+  }
+
   _buildNear() {
     const g = this.near;
     const f = this.far;
@@ -895,9 +935,18 @@ export class Terrain {
     for (let j = 0; j < n; j++) {
       const wz = g.origin + j * g.cell;
       for (let i = 0; i < n; i++) {
-        h[j * n + i] = f.sample(f.h, g.origin + i * g.cell, wz);
+        const c = j * n + i;
+        const wx = g.origin + i * g.cell;
+        h[c] = f.sample(f.h, wx, wz);
+        // Stratigraphy is a property of the ROCK, not of a grid: resample the
+        // far grid's bake rather than re-deriving it, so a bed crossing the
+        // near/far boundary is one bed and not two.
+        g.section[c] = f.sample(f.section, wx, wz);
+        g.bandH[c] = f.sample(f.bandH, wx, wz);
+        g.bedRef[c] = f.sample(f.bedRef, wx, wz);
       }
     }
+    this._bakeMid(g);
 
     // Fade every near-grid-only contribution to zero at the border.
     const lim = g.size / 2;
@@ -986,16 +1035,32 @@ export class Terrain {
   _addStrata(g, section, bandHF, talusOut) {
     const n = g.n;
     const h = g.h;
+    const ref = g.bedRef;
     for (let j = 0; j < n; j++) {
       const wz = g.origin + j * g.cell;
       for (let i = 0; i < n; i++) {
         const c = j * n + i;
-        const sec = section[c];
-        if (sec < 0.02) continue;
         const wx = g.origin + i * g.cell;
         const bandH = bandHF[c];
         const dip = wx * DIP_X + wz * DIP_Z;
-        const v = (h[c] - dip) / bandH;
+        // The bedding datum is FOLDED, not planar.
+        //
+        // A planar datum puts every bed at a constant altitude, so the outcrop
+        // trace of a bed is a topographic contour — and a whole range wearing
+        // contour lines is precisely what the vista measured as: an FFT of the
+        // high-passed row profile over the massif peaked at 11.00 px with 28x
+        // the noise floor. Real bedding is warped by folding, so its outcrop
+        // trace climbs and dives across a hillside and no two spurs show the
+        // same bed at the same height. Two wavelengths: 1.15 km limbs (~13 deg
+        // of dip) and a 330 m crumple on top of them.
+        const warp = fbm2(wx / 1150 + 31.0, wz / 1150 - 17.0, 3) * 1.7
+                   + fbm2(wx / 330 - 8.0, wz / 330 + 24.0, 2) * 0.55;
+        const sec = section[c];
+        if (sec < 0.02) {
+          ref[c] = warp;
+          continue;
+        }
+        const v = (h[c] - dip) / bandH - warp;
         const k = Math.floor(v);
         // Two decorrelated hashes: the per-bed offset must be a real 2D shift,
         // or every bed slides along one axis and all the cliffs face one way.
@@ -1011,11 +1076,17 @@ export class Terrain {
         // a contour line.
         let fr = v - k;
         fr = fr < 0.70 ? fr * 0.34 : 0.238 + (fr - 0.70) * 2.54;
-        h[c] += ((k + fr) * bandH + dip - h[c]) * hard * 0.42;
+        h[c] += ((k + fr + warp) * bandH + dip - h[c]) * hard * 0.42;
         const broad = fbm2(wx / 760 + ox * 47.0, wz / 760 + oz * 47.0, 3);
         // A finer term so the cliff LINE is ragged rather than a clean contour.
         const fine = fbm2(wx / 165 + ox * 23.0, wz / 165 + oz * 23.0, 2);
         h[c] += (broad * 0.85 + fine * 0.34) * bandH * sec;
+        // The key that lets the fragment shader recover THIS cell's bed index
+        // from the height it is drawn at: bedV = (y - dip)/bandH - bedRef. It
+        // absorbs the fold warp, the bench snap and the per-bed lateral offset
+        // in one number, so the painted beds land on the modelled ledges rather
+        // than being a second, independent set of lines drawn over them.
+        ref[c] = (h[c] - dip) / bandH - v;
         // 29 deg on fines and weak beds, up to 64 on the cliff-formers. Round 3
         // ran the whole map at 32 deg — the angle of repose of loose scree — and
         // a map relaxed everywhere to that angle is by definition a field of
@@ -1355,6 +1426,9 @@ export class Terrain {
           g.deposit[c] += (f.sample(f.deposit, wx, wz) - g.deposit[c]) * (1 - w);
           g.ao[c] += (f.sample(f.ao, wx, wz) - g.ao[c]) * (1 - w);
           g.curv[c] += (f.sample(f.curv, wx, wz) - g.curv[c]) * (1 - w);
+          // The near grid runs one more octave of `mid` than the far grid can
+          // hold, so the two disagree by that octave; cross-fade it out.
+          g.mid[c] += (f.sample(f.mid, wx, wz) - g.mid[c]) * (1 - w);
           // Normals too: a 2 m central difference of an upsampled 8 m field is
           // not the same vector as the 8 m one, and the mismatch would ring.
           g.nx[c] += (f.sample(f.nx, wx, wz) - g.nx[c]) * (1 - w);
@@ -1408,18 +1482,38 @@ export class Terrain {
     this.texMicro = tex;
   }
 
-  /** RGBA16F = normal.x, normal.z, drainage, sky occlusion. */
+  /**
+   * Two RGBA16F layers of ONE sampler:
+   *   layer 0 — normal.x, normal.z, drainage, sky occlusion
+   *   layer 1 — bed reference, bed thickness (m), section weight, mid-scale tone
+   *
+   * Layer 1 has to be float, not the 8-bit material texture. `bedRef` is a
+   * stratigraphic coordinate in beds: an 8-bit encoding over its ±4-bed range
+   * quantises to 0.031 beds, and the band edge it feeds is 0.2 beds wide, so
+   * the quantisation would draw its own 8 m staircase across every cliff —
+   * a second version of the artefact this channel exists to remove.
+   *
+   * It costs no extra sampler, which is the binding constraint here: see
+   * `_tileArray` on why this program cannot afford one.
+   */
   _packSurfaceTexture(g) {
     const n = g.n;
     const half = THREE.DataUtils.toHalfFloat;
-    const data = new Uint16Array(n * n * 4);
+    const data = new Uint16Array(n * n * 4 * 2);
+    const L1 = n * n * 4;
     for (let c = 0; c < n * n; c++) {
       data[c * 4] = half(g.nx[c]);
       data[c * 4 + 1] = half(g.nz[c]);
       data[c * 4 + 2] = half(clamp(g.flow[c], 0, 1));
       data[c * 4 + 3] = half(clamp(g.ao[c], 0, 1));
+      data[L1 + c * 4] = half(clamp(g.bedRef[c], -8, 8));
+      data[L1 + c * 4 + 1] = half(g.bandH[c] || 24);
+      data[L1 + c * 4 + 2] = half(clamp(g.section[c], 0, 1));
+      data[L1 + c * 4 + 3] = half(clamp(g.mid[c], 0, 1));
     }
-    const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat, THREE.HalfFloatType);
+    const tex = new THREE.DataArrayTexture(data, n, n, 2);
+    tex.format = THREE.RGBAFormat;
+    tex.type = THREE.HalfFloatType;
     tex.magFilter = THREE.LinearFilter;
     tex.minFilter = THREE.LinearMipmapLinearFilter;
     tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -1483,6 +1577,10 @@ export class Terrain {
     // Baked into textures; nothing on the CPU side queries these again.
     this.far.nx = this.far.nz = this.near.nx = this.near.nz = null;
     this.far.curv = this.near.curv = null;
+    this.far.section = this.near.section = null;
+    this.far.bandH = this.near.bandH = null;
+    this.far.bedRef = this.near.bedRef = null;
+    this.far.mid = this.near.mid = null;
   }
 
   /**
@@ -2256,10 +2354,17 @@ export class Terrain {
       uSandDark: { value: C(0.325, 0.282, 0.240) },   // 1.35
       uSilt: { value: C(0.640, 0.586, 0.510) },       // 1.25
       uGravel: { value: C(0.372, 0.328, 0.290) },     // 1.28
-      uRockLight: { value: C(0.456, 0.424, 0.386) },  // 1.18
-      uRockDark: { value: C(0.236, 0.212, 0.192) },   // 1.23
-      uRockRed: { value: C(0.410, 0.306, 0.262) },    // 1.56 iron stain
-      uVarnish: { value: C(0.188, 0.156, 0.142) },    // 1.32
+      // Round 5 measured the distant ranges rendering BRIGHTER than the sky
+      // directly above them, which no unlit surface can do. Two owners share
+      // that error: the volumetrics owner is cutting fog extinction, and this
+      // is the albedo half. Bedrock is not pale — dry Afghan limestone and
+      // schist photograph at 0.20-0.28 linear reflectance, and the varnished
+      // faces at half that. Round 5's 0.456 was a fresh-quarry value.
+      uRockLight: { value: C(0.318, 0.294, 0.266) },  // 1.20  (was 0.456)
+      uRockDark: { value: C(0.198, 0.178, 0.160) },   // 1.24  (was 0.236)
+      uRockRed: { value: C(0.352, 0.262, 0.222) },    // 1.59 iron stain
+      uVarnish: { value: C(0.150, 0.126, 0.116) },    // 1.29
+      uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
     };
     this.uniforms = u;
 
@@ -2351,8 +2456,9 @@ export class Terrain {
           '#include <common>',
           /* glsl */ `#include <common>
           varying vec3 vWPos;
-          uniform sampler2D uFarS;
-          uniform sampler2D uNearS;
+          // Layer 0 = normal/flow/AO, layer 1 = stratigraphy + mid tone.
+          uniform sampler2DArray uFarS;
+          uniform sampler2DArray uNearS;
           uniform sampler2D uFarM;
           uniform sampler2D uNearM;
           // Layer 0 = mask, layer 1 = normal. One sampler each; see _tileArray.
@@ -2374,6 +2480,7 @@ export class Terrain {
           uniform vec4 uFarInfo;
           uniform vec4 uNearInfo;
           uniform float uNearHalf;
+          uniform vec2 uClipCentre;
           uniform vec3 uSunDir;
           uniform vec2 uDip;
           uniform vec3 uSandLight;
@@ -2385,6 +2492,21 @@ export class Terrain {
           uniform vec3 uRockDark;
           uniform vec3 uRockRed;
           uniform vec3 uVarnish;
+          // Ablation hook. (strata, grit, mid-relief, varnish), all 1 in the
+          // shipped build. Every claim in this file's comments about "measured
+          // by ablating X" is measured by setting one of these to 0 from a
+          // shot.mjs eval probe — no rebuild, no second material, and so no
+          // chance of the A and the B differing in anything else.
+          uniform vec4 uDbg;
+
+          // The stratigraphic resistance hash, bit-identical to the CPU's in
+          // _addStrata. It has to be identical: it decides which beds the
+          // heightfield stood up as cliffs, so it is also what decides which
+          // beds may be painted as pale resistant ledges.
+          float bedHash(float k) {
+            uint x = (uint(int(k)) * 2654435761u) ^ 0x2f1bu;
+            return float((x * 0x27d4eb2fu) >> 8u) / 16777216.0;
+          }
 
           // One grit tile is GRIT_TILE metres of ground; clast relief spans
           // GRIT_H metres.
@@ -2398,6 +2520,7 @@ export class Terrain {
           float gRough;
           float gAO;
           float gMicroShadow;
+          float gStrataRough;
 
           vec2 gridUV(vec2 wxz, vec4 info) {
             return ((wxz - info.xy) * info.z + 0.5) / info.w;
@@ -2485,7 +2608,8 @@ export class Terrain {
           {
             bool nearField = abs(vWPos.x) < uNearHalf && abs(vWPos.z) < uNearHalf;
             vec2 uvS = nearField ? gridUV(vWPos.xz, uNearInfo) : gridUV(vWPos.xz, uFarInfo);
-            vec4 S = nearField ? texture2D(uNearS, uvS) : texture2D(uFarS, uvS);
+            vec4 S = nearField ? texture(uNearS, vec3(uvS, 0.0)) : texture(uFarS, vec3(uvS, 0.0));
+            vec4 G = nearField ? texture(uNearS, vec3(uvS, 1.0)) : texture(uFarS, vec3(uvS, 1.0));
             vec4 M = nearField ? texture2D(uNearM, uvS) : texture2D(uFarM, uvS);
 
             // Baked surface normal: shading is independent of tessellation, so a
@@ -2502,6 +2626,10 @@ export class Terrain {
             float screeM = M.g;
             float curv  = M.b * 2.0 - 1.0;
             float macro = M.a;
+            float bedRef = G.r;
+            float bandH  = max(6.0, G.g);
+            float sectionW = G.b;
+            float mid    = G.a;
 
             float slope = 1.0 - wn.y;
             float dist  = length(vWPos - cameraPosition);
@@ -2557,7 +2685,7 @@ export class Terrain {
             // --- material weights --------------------------------------------
             // Break the boundaries with the mid-scale mottle so nothing reads as
             // a smoothstep on slope.
-            float jitter = (D.a - 0.5) * 0.26 + (macro - 0.5) * 0.30;
+            float jitter = (D.a - 0.5) * 0.26 + (macro - 0.5) * 0.20 + (mid - 0.5) * 0.24;
             float rockW  = smoothstep(0.34, 0.60, rockM + jitter * 0.8 + slope * 0.30);
             float screeW = smoothstep(0.26, 0.62, screeM + jitter * 0.7);
             // Desert pavement: the flats are never uniform sand. Irregular
@@ -2566,7 +2694,14 @@ export class Terrain {
             // tap rather than the filtered D and it drives screeW, which swings
             // the albedo AND scales the normal perturbation — so it needs its own
             // footprint fade or it puts the same beat into both channels at once.
-            float lag = smoothstep(0.36, 0.62, macro * 0.95 + D.a * 0.32 + (mix(0.5, dB.g, sB) - 0.5) * 0.25);
+            // mid is the 11-45 m field, and it is most of what this line is
+            // for. Under macro alone the pavement patches were 900 m across,
+            // so any frame looking at less than a kilometre of ground saw one
+            // uniform patch: measured on ridge.png rows 800-1050, a 700x250
+            // region of pan at 155-240 m came out mean 0.1396 sd 0.0113, i.e.
+            // 8% relative modulation across a quarter of the frame.
+            float lag = smoothstep(0.36, 0.62,
+              macro * 0.46 + mid * 0.52 + D.a * 0.32 + (mix(0.5, dB.g, sB) - 0.5) * 0.25);
             screeW = max(screeW, lag * 0.9) * (1.0 - rockW);
             float flowW  = smoothstep(0.26, 0.70, flow + (D.a - 0.5) * 0.16) * (1.0 - rockW * 0.85);
             // Trunk washes only: the wide, sandy-floored part of the drainage.
@@ -2574,7 +2709,7 @@ export class Terrain {
 
             // --- sand: wind-packed khaki. Real dry desert sits near 0.35
             // linear reflectance, not the 0.6 that "pale" suggests on a swatch.
-            float sandT = clamp(D.r * 0.45 + D.a * 0.60 + macro * 0.35 - 0.24, 0.0, 1.0);
+            float sandT = clamp(D.r * 0.45 + D.a * 0.60 + macro * 0.20 + mid * 0.30 - 0.29, 0.0, 1.0);
             vec3 sand = mix(mix(uSandDark, uSandMid, clamp(sandT * 2.0, 0.0, 1.0)),
                             mix(uSandMid, uSandLight, clamp(sandT * 2.0 - 1.0, 0.0, 1.0)),
                             step(0.5, sandT));
@@ -2587,33 +2722,75 @@ export class Terrain {
 
             // --- bedrock: stratified, iron-stained ---------------------------
             vec3 rockBase = mix(uRockDark, uRockLight, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
-            // Bedding planes. Measured against the same tilted datum the
-            // geometric benches are cut on (uDip), so the painted strata and the
-            // modelled ledges are the same beds — and they are never horizontal
-            // lines drawn across the whole map.
-            float bedH = vWPos.y - dot(vWPos.xz, uDip);
-            // Round 4: the painted band period was 2.8 m, which is finer than a
-            // pixel past a couple of hundred metres — hence the 160-700 m fade,
-            // and hence a distant range with no strata on it at all, which is
-            // half of "the ranges read as meringue". The beds the GEOMETRY is
-            // now cut into are 9-20 m, so painting at the same period both
-            // agrees with the modelled ledges and survives to the horizon: a
-            // 15 m bed at 2 km is still 13 px of frame.
-            float band = fract(bedH * (0.078 - macro * 0.028) + (D.a - 0.5) * 0.35);
-            float strata = smoothstep(0.0, 0.22, band) * (1.0 - smoothstep(0.42, 0.66, band));
-            rockBase *= 1.0 + (strata - 0.45) * 0.22 * mix(0.30, 1.0, wallW)
-                      * (1.0 - smoothstep(1600.0, 3400.0, dist));
+
+            // --- stratigraphy -------------------------------------------------
+            // bedV is the STRATIGRAPHIC COORDINATE, counted in beds, and it is
+            // reconstructed from the bake rather than invented here:
+            // _addStrata recorded, per cell, the offset between the height it
+            // left the surface at and the bed index it quantised on, so
+            //     bedV = (y - dip) / bandH - bedRef
+            // returns the same bed number the HEIGHTFIELD used. bandH is the
+            // 18-45 m bed thickness the geometry was cut with, sampled from the
+            // same texture, and bedRef carries the fold warp, so the outcrop
+            // trace of a bed climbs and dives with the structure instead of
+            // ruling a contour line across the range.
+            //
+            // What this replaces was a hardcoded 12.8-20 m period against a
+            // planar datum. Measured on the vista massif: an FFT of the
+            // high-passed row profile over (820,260)-(1180,480) peaked at
+            // 11.00 px with 28x the noise floor — a fixed staircase running
+            // over ridgelines and through valleys, ignoring the landform.
+            float bedV = (vWPos.y - dot(vWPos.xz, uDip)) / bandH - bedRef;
+            // Screen-space guard. A fract() whose period falls below a couple of
+            // pixels is a moire generator, not a bed, and no distance fade can
+            // know that — the same bed is 40 px on a near butte and 3 px on the
+            // skyline. fwidth of the coordinate itself is the honest test.
+            float bedAA = 1.0 - smoothstep(0.10, 0.40, fwidth(bedV));
+            float bedK = floor(bedV);
+            float bedF = bedV - bedK;
+            // Resistance of THIS bed, from the hash the heightfield used, so the
+            // beds painted as pale ledges are the beds standing as ledges.
+            float bedHard = smoothstep(0.30, 0.70, bedHash(bedK));
+            // A bench: pale resistant cap, a darker recessive bed under it, and
+            // a hard shadow line where the riser undercuts.
+            float ledge = smoothstep(0.06, 0.30, bedF) * (1.0 - smoothstep(0.70, 0.95, bedF));
+            float riser = smoothstep(0.88, 1.0, bedF) * bedHard;
+            float bedTone = (bedHard - 0.5) * 0.62 + (ledge - 0.5) * 0.30 - riser * 0.60;
+            // The wallW floor used to be 0.35, and on a distant range that is
+            // effectively an off switch: wallW is smoothstep(0.17, 0.42) on
+            // 1 - n.y, and an 8 m-cell normal on a 30 deg flank gives 0.13, so
+            // every mountainside in the vista ran the beds at a third strength.
+            float bedW = sectionW * bedAA * mix(0.62, 1.0, wallW) * uDbg.x;
+            rockBase *= 1.0 + bedTone * 0.80 * bedW;
+            // A resistant bed is a different ROCK, not a different tint: it is
+            // harder, smoother and holds a sheen the recessive marl between the
+            // ledges never does. Without this the beds read as a print.
+            gStrataRough = -(bedHard - 0.5) * 0.10 * bedW;
+
             // Mineral zoning: whole massifs shift warm, which is what stops a
             // range from reading as one grey material at 2 km.
             float iron = smoothstep(0.44, 0.86, macro);
             vec3 rock = mix(rockBase, uRockRed, iron * 0.46);
             rock *= 1.0 - D.b * 0.40;                    // cracks read dark
             rock *= 0.95 + smoothstep(0.3, 0.9, D.r) * 0.10;
-            // Desert varnish: manganese-black staining builds on faces that are
-            // stable and unscoured, so it tracks sky occlusion and the absence
-            // of flow rather than a noise threshold.
-            float varnish = smoothstep(0.62, 0.22, bake) * (1.0 - flow) * smoothstep(0.15, 0.55, rockM);
-            rock = mix(rock, uVarnish, varnish * 0.55);
+            // Desert varnish — manganese-black rock coatings, and the single
+            // biggest reason real Afghan bedrock photographs dark while this
+            // range measured as bright as the sky above it.
+            //
+            // Round 5 drove it off sky occlusion alone: smoothstep(0.62, 0.22,
+            // bake). Sky occlusion on the vista massif measures 0.60-0.73, so
+            // that expression returned 0.00-0.06 over the whole range — the
+            // layer existed only inside gorges, which is exactly where a
+            // photograph shows the LEAST varnish. Varnish forms on stable,
+            // long-exposed clast surfaces: resistant beds, boulder tops, the
+            // ground that is not being scoured. So it tracks bed hardness and a
+            // mid-scale patch field, with occlusion left as a weak modifier.
+            float varnish = smoothstep(0.16, 0.68, mid * 0.46 + macro * 0.26
+                                                 + bedHash(bedK) * 0.34 * sectionW
+                                                 + (D.a - 0.5) * 0.22)
+                          * (1.0 - flow) * smoothstep(0.06, 0.40, rockM)
+                          * mix(0.62, 1.0, smoothstep(0.86, 0.42, bake));
+            rock = mix(rock, uVarnish, varnish * 0.66 * uDbg.w);
 
             // --- assemble -----------------------------------------------------
             vec3 albedo = sand;
@@ -2630,9 +2807,11 @@ export class Terrain {
             // Concave hollows collect pale wind-blown fines.
             albedo = mix(albedo, mix(albedo, uSilt, 0.34), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
 
-            // Regional tone: whole stretches of the floor are a shade darker or
-            // paler than their neighbours. Without it a 2 km pan is one flat value.
-            albedo *= 0.88 + macro * 0.28;
+            // Regional tone, at TWO scales. macro is the 900 m regional swing;
+            // mid is the 11-45 m patchiness that a frame looking at 200 m of
+            // ground is entirely composed of. Round 5 had only the first, which
+            // is why a quarter of the ridge frame measured as one value.
+            albedo *= 0.84 + macro * 0.20 + mid * 0.20;
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
@@ -2643,7 +2822,18 @@ export class Terrain {
             vec2 guv0 = baseUV * (1.0 / GRIT_TILE);
             vec2 gdx = dFdx(guv0);
             vec2 gdy = dFdy(guv0);
-            float gritW = (1.0 - smoothstep(13.0, 46.0, dist)) * sharpnessK(guv0, 6.0);
+            // Round 5 cut this off at 13-46 m, and past 46 m the near ground had
+            // no lit micro-geometry at all — only the albedo speckle that a
+            // shadow test cannot distinguish from paint. Measured: at 7-9 m the
+            // high-pass energy of near sand correctly DROPPED in shadow (0.89x,
+            // the signature of relief) and at 50 m it ROSE.
+            //
+            // The distance term is now a backstop, not the limiter. The real
+            // limiter is sharpnessK, which asks how many texels of THIS tile
+            // a pixel covers — the same question the mip chain asks — so the
+            // layer holds on wherever it is still resolvable and goes smoothly
+            // and silently where it is not, at any FOV or resolution.
+            float gritW = (1.0 - smoothstep(80.0, 150.0, dist)) * sharpnessK(guv0, 6.0) * uDbg.y;
             gMicroShadow = 1.0;
             float gritAO = 1.0;
             vec2 gpert = vec2(0.0);
@@ -2780,13 +2970,23 @@ export class Terrain {
               // Ripples only form on loose fines: bedrock has none, the coarse
               // lag patches interrupt them, and a wall never carries them.
               float sandW = (1.0 - rockW) * (1.0 - screeW * 0.45) * (1.0 - wallW);
-              float rippleW = sandW * (1.0 - smoothstep(38.0, 110.0, dist));
+              // Out to 340 m, not 110. This tile is the only NORMAL-MAPPED,
+              // direction-bearing layer the open pan has, and the mid ground of
+              // every landscape shot is pan: the ridge shot spends rows
+              // 800-1050 on ground 155-240 m away and had nothing on it. The
+              // coarse tap is what reaches: at 5.9 m it carries 37 cm crests,
+              // which is 3.5 px at 150 m and still 1.7 px at 300 m, and its own
+              // footprint fade (sRC) retires it when that stops being true.
+              float rippleW = sandW * (1.0 - smoothstep(150.0, 340.0, dist)) * uDbg.z;
+              // Weight shifts from the fine train to the coarse one with range,
+              // so the total relief stays roughly constant as the near tap dies.
+              float rFar = smoothstep(25.0, 110.0, dist);
               if (rippleW > 0.004 && max(sR, max(sRC, sRG)) > 0.004) {
                 vec4 RP = texture2D(uRipple, ruv);
                 vec4 RC = texture2D(uRipple, cuv);
                 float env = mix(0.45, 1.0, RP.a);
                 rpert = unrot(RP.rg * 2.0 - 1.0, WIND_SC) * (1.30 * sR * env)
-                      + unrot(RC.rg * 2.0 - 1.0, WIND_SC) * (0.20 * sRC);
+                      + unrot(RC.rg * 2.0 - 1.0, WIND_SC) * ((0.20 + 0.85 * rFar) * sRC);
                 if (sRG > 0.01) {
                   vec4 RG = texture2D(uRipple, fuv);
                   rpert += unrot(RG.rg * 2.0 - 1.0, WIND_SC) * (0.55 * sRG);
@@ -2806,16 +3006,26 @@ export class Terrain {
                 if (sl > 1e-3) {
                   const float RSTEP = 0.045;
                   vec2 sdir = rot(sxz / sl, WIND_SC);
+                  float tanE = uSunDir.y / sl;
                   float hs = texture2D(uRipple, ruv + sdir * (RSTEP / RIPPLE_TILE)).b;
-                  float rise = (hs - RP.b) * ${RIPPLE_H.toFixed(4)} - RSTEP * (uSunDir.y / sl);
+                  float rise = (hs - RP.b) * ${RIPPLE_H.toFixed(4)} - RSTEP * tanE;
                   gMicroShadow *= 1.0 - smoothstep(0.0, 0.004, rise) * 0.72 * sR * env * rippleW;
+                  // The same test on the coarse train. Without it the direct
+                  // light stops responding to the relief the moment the fine
+                  // tap's footprint fade retires it, which is the "detail rises
+                  // in shadow at 50 m" measurement: relief that only reaches
+                  // albedo brightens and darkens with nothing.
+                  const float RSTEP_C = 0.167;   // 3.7x the tile, 3.7x the step
+                  float hsC = texture2D(uRipple, cuv + rot(sdir, vec2(0.83, 0.5578)) * (RSTEP_C / (RIPPLE_TILE * 3.7))).b;
+                  float riseC = (hsC - RC.b) * ${(RIPPLE_H * 3.7).toFixed(4)} - RSTEP_C * tanE;
+                  gMicroShadow *= 1.0 - smoothstep(0.0, 0.012, riseC) * 0.46 * sRC * rippleW;
                 }
 
                 // Crests are winnowed to coarse grains and read a touch darker;
                 // the troughs bank pale fines. Small, and deliberately so: this
                 // is the only part of the ripple that survives into shadow, and
                 // the round-4 failure was a detail layer that was ALL albedo.
-                float crest = (RP.b - 0.5) * env * sR + (RC.b - 0.5) * 0.55 * sRC;
+                float crest = (RP.b - 0.5) * env * sR + (RC.b - 0.5) * (0.55 + 0.6 * rFar) * sRC;
                 albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.26, 0.26, crest)),
                              rippleW * 0.13);
               }
@@ -2825,21 +3035,29 @@ export class Terrain {
 
             // --- normal --------------------------------------------------------
             vec4 nC = texture(uDetail, vec3(uvC, 1.0));
-            // Round 5: 18-105 m. The vista's own measured band is 100-170 m of
-            // valley floor and every normal layer was gated out of it — sC by
-            // this fade, sB by the footprint limit — which is why the critic's
-            // autocorrelation on that band found a pure low-frequency gradient
-            // with no structure at any lag. The 4.6 m tile's features are 14 cm,
-            // still a pixel at 200 m, so it has no business ending at 105.
-            float midNear = 1.0 - smoothstep(45.0, 260.0, dist);
+            // Round 6: 90-320 m. The 4.6 m tile's features are 14 cm, still a
+            // pixel at 200 m, so its own footprint fade (sC) is the honest
+            // limiter and this is only a backstop. Round 5 ended it at 260 and
+            // round 4 at 105, which took every normal layer off the 100-250 m
+            // band of valley floor that the landscape shots are mostly made of.
+            float midNear = 1.0 - smoothstep(90.0, 320.0, dist);
+            // The 1.6 m tile's NORMAL used to be gated by nearW (6-42 m), which
+            // is the near-albedo blend weight and has no business deciding how
+            // far a relief layer reaches. Its own footprint fade already retires
+            // it — sA is 0.49 at 50 m and 0.0 by 90 — so gating on range as well
+            // just removed lit micro-geometry from ground that could still
+            // resolve it.
+            float nearNW = 1.0 - smoothstep(45.0, 120.0, dist);
             vec2 pert = unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.55 * midW * sB)
                       + unrot(nC.rg * 2.0 - 1.0, ROT_C) * (0.60 * midNear * sC)
-                      + (nA.rg * 2.0 - 1.0) * (0.85 * nearW * sA);
+                      + (nA.rg * 2.0 - 1.0) * (0.85 * nearNW * sA);
             // The mid detail height field is mostly clasts. Wind-packed sand has
             // no clasts at that scale, so leaving it fully bump-mapped tiles a
             // visible honeycomb across the pan. The grit layer is exempt: that
-            // one IS the stones.
-            pert *= mix(0.36, 1.0, clamp(screeW * 0.55 + rockW, 0.0, 1.0));
+            // one IS the stones. The floor is 0.52 rather than 0.36 because the
+            // pan is not clast-free — desert pavement is exactly a lag of them —
+            // and at 150-250 m this term is most of the relief there is.
+            pert *= mix(0.52, 1.0, clamp(screeW * 0.55 + rockW, 0.0, 1.0));
             pert += gpert + rpert;
 
             // The 7 cm geometric ripple in the vertex shader needs a matching
@@ -2848,7 +3066,12 @@ export class Terrain {
             {
               vec2 muv = vWPos.xz * ${(1 / MICRO_PERIOD).toFixed(8)};
               vec3 MR = texture2D(uMicro, muv).rgb;
-              pert += -MR.gb * (0.85 * nearW * sharpness(muv * 0.5));
+              // Gated on the SAME fade the vertex shader displaces by, not on
+              // the near-albedo weight: shading relief that the mesh does not
+              // carry (or failing to shade relief it does) is the one way to
+              // make real geometry look painted.
+              float microW = 1.0 - smoothstep(38.0, 95.0, length(vWPos.xz - uClipCentre));
+              pert += -MR.gb * (0.85 * microW * sharpness(muv * 0.5));
             }
 
             // The perturbation is a slope in the *projection's* frame. On a wall
@@ -2860,9 +3083,10 @@ export class Terrain {
             vec3 pv = mix(vec3(pert.x, 0.0, pert.y), Tw * pert.x + Bw * pert.y, wallW);
             gN = normalize(wn + pv);
 
-            float cav = mix(nB.a, mix(nC.a, nA.a, nearW), midNear);
-            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.25, 1.0)) * gritAO;
-            gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05, 0.55, 1.0);
+            float cav = mix(nB.a, mix(nC.a, nA.a, nearNW), midNear);
+            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.32, 1.0)) * gritAO;
+            gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05
+                           + gStrataRough * rockW, 0.55, 1.0);
           }`,
         )
         .replace(

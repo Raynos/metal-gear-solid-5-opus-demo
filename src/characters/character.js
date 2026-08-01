@@ -4,7 +4,7 @@ import { assemble } from './skinning.js';
 import { makeMaterialSet, Z, SZ, MZ } from './materials.js';
 import { frameMatrix } from './geometry.js';
 import {
-  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint,
+  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
 } from './body.js';
 import {
   buildChestRig, buildBelt, buildHolster, buildBackpack, buildHelmet, buildCap, buildBoonie,
@@ -29,6 +29,16 @@ export function buildCharacterGeometry(loadout) {
 
   const bulk = loadout.bulk ?? 1;
 
+  // Everything that lives on the skull — the skull, the hair shell, the eyes,
+  // the ears, and every piece of headgear in `gear.js` — is authored against
+  // absolute world-space y and then passed through this ONE matrix. See
+  // `headTransform` in body.js for why it is a matrix and not thirty edits.
+  const HEAD_M = headTransform();
+  const onHead = (surface) => surface.transform(HEAD_M);
+  const addHead = (list, group) => {
+    for (const p of list) parts.push({ surface: onHead(p.surface), mat: p.mat, group });
+  };
+
   // --- body ---------------------------------------------------------------
   one(buildTorso({ bulk }), 'cloth', 'torso');
   one(buildHips({ bulk }), 'cloth', 'hips');
@@ -36,16 +46,16 @@ export function buildCharacterGeometry(loadout) {
   // The collar rides the chest, not the neck: a collar that follows the skull
   // swings with every head turn and detaches from the shoulders.
   add(buildCollar({ bulk }), 'rigidChest');
-  one(buildHead(loadout.head ?? {}), 'skin', 'head');
-  one(buildEyes(), 'skin', 'rigidHead');
-  one(buildEar(1), 'skin', 'head');
-  one(buildEar(-1), 'skin', 'head');
+  one(onHead(buildHead(loadout.head ?? {})), 'skin', 'head');
+  one(onHead(buildEyes()), 'skin', 'rigidHead');
+  one(onHead(buildEar(1)), 'skin', 'head');
+  one(onHead(buildEar(-1)), 'skin', 'head');
   // Skinned to the same bones as the skull, NOT welded rigidly to the head
   // bone. The face blends across neck/head/headTip, so a rigid hair shell
   // drifts relative to it the moment the head turns — which is how round 1
   // ended up with the hair cap punched through the cheeks and the entire
   // lower face rendering as a dark mask.
-  if (loadout.hair !== false) one(buildHair({ backOnly: loadout.hairBack ?? false }), 'cloth', 'head');
+  if (loadout.hair !== false) one(onHead(buildHair({ backOnly: loadout.hairBack ?? false })), 'cloth', 'head');
 
   const legR = buildLeg({ bulk });
   one(legR, 'cloth', 'legR');
@@ -111,21 +121,21 @@ export function buildCharacterGeometry(loadout) {
 
   switch (loadout.headgear) {
     case 'helmet':
-      add(buildHelmet(), 'rigidHead');
+      addHead(buildHelmet(), 'rigidHead');
       break;
     case 'cap':
-      add(buildCap(), 'rigidHead');
+      addHead(buildCap(), 'rigidHead');
       break;
     case 'boonie':
-      add(buildBoonie(), 'rigidHead');
+      addHead(buildBoonie(), 'rigidHead');
       break;
     case 'bandana':
-      add(buildBandana(), 'rigidHead');
+      addHead(buildBandana(), 'rigidHead');
       break;
     default:
       break;
   }
-  if (loadout.eyepatch) add(buildEyepatch(), 'rigidHead');
+  if (loadout.eyepatch) addHead(buildEyepatch(), 'rigidHead');
 
   // --- weapon, welded into the firing hand --------------------------------
   const rifle = buildRifle({ optic: loadout.optic !== false });

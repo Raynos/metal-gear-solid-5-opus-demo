@@ -52,11 +52,12 @@ export function buildTorso(o = {}) {
     // its depth, which is what turns the top of the torso into a yoke.
     { p: V(0, 1.402, -0.010), rx: 0.201 * bulk, rz: 0.113 * bulk, n: 3.0, zone: Z.JACKET, mod: traps },
     { p: V(0, 1.441, -0.007), rx: 0.176 * bulk, rz: 0.102 * bulk, n: 2.8, zone: Z.JACKET, mod: traps },
-    { p: V(0, 1.468, -0.005), rx: 0.140 * bulk, rz: 0.094, n: 2.7, zone: Z.JACKET, mod: traps },
-    // The jacket's neck opening. It has to close ABOVE the collar's fold and
-    // BELOW the point where the neck itself becomes visible, or there is no
-    // neck in the silhouette at all.
-    { p: V(0, 1.487, -0.003), rx: 0.104, rz: 0.084, n: 2.5, zone: Z.COLLAR },
+    { p: V(0, 1.458, -0.005), rx: 0.132 * bulk, rz: 0.090, n: 2.7, zone: Z.JACKET, mod: traps },
+    // The jacket's neck opening. It has to close INSIDE the collar stand at
+    // every height the two share — otherwise the jacket shell pokes out
+    // through the collar — and below the point where the neck becomes visible.
+    // ROUND 6 dropped it 17 mm to stay under the collar, which came down 15.
+    { p: V(0, 1.470, -0.004), rx: 0.086, rz: 0.074, n: 2.5, zone: Z.COLLAR },
   ];
   return loftKeys(keys, 28, { radial: 26, capStart: true, capEnd: true });
 }
@@ -97,12 +98,16 @@ export function buildCollar(o = {}) {
   // short, and what you see is the fold lying flat with a cut edge, a notch at
   // the front and a shadow underneath. That is three value steps in the same
   // place the old one gave zero, and it leaves 10 cm of neck above it.
+  // ROUND 6: the stand tops out 15 mm lower (1.501 -> 1.486) and 8% tighter.
+  // With the head lifted 19 mm that turns 40 mm of exposed neck into 74 mm —
+  // a 43 px column at the gameplay camera's 579 px/m rather than 23 px, which
+  // is the difference between a neck you can see and a neck that is a seam.
   parts.push({
     surface: loftKeys(
       [
-        { p: V(0, 1.452, -0.006), rx: 0.114 * bulk, rz: 0.094 * bulk, n: 2.8, back: 1.04, zone: Z.COLLAR },
-        { p: V(0, 1.478, -0.005), rx: 0.096, rz: 0.084, n: 2.6, back: 1.06, zone: Z.COLLAR },
-        { p: V(0, 1.501, -0.004), rx: 0.083, rz: 0.077, n: 2.5, back: 1.09, zone: Z.COLLAR },
+        { p: V(0, 1.446, -0.006), rx: 0.114 * bulk, rz: 0.094 * bulk, n: 2.8, back: 1.04, zone: Z.COLLAR },
+        { p: V(0, 1.468, -0.005), rx: 0.092, rz: 0.081, n: 2.6, back: 1.06, zone: Z.COLLAR },
+        { p: V(0, 1.486, -0.004), rx: 0.077, rz: 0.072, n: 2.5, back: 1.09, zone: Z.COLLAR },
       ],
       8,
       { radial: 22, capStart: true, capEnd: true },
@@ -116,10 +121,10 @@ export function buildCollar(o = {}) {
   parts.push({
     surface: loftKeys(
       [
-        { p: V(0, 1.500, -0.004), rx: 0.085, rz: 0.079, n: 2.5, back: 1.10, zone: Z.COLLAR },
-        { p: V(0, 1.492, -0.004), rx: 0.107, rz: 0.090, n: 2.7, back: 1.16, zone: Z.COLLAR },
-        { p: V(0, 1.474, -0.005), rx: 0.128, rz: 0.100, n: 2.9, back: 1.22, zone: Z.COLLAR },
-        { p: V(0, 1.456, -0.006), rx: 0.136, rz: 0.104, n: 3.0, back: 1.24, zone: Z.COLLAR },
+        { p: V(0, 1.485, -0.004), rx: 0.079, rz: 0.074, n: 2.5, back: 1.10, zone: Z.COLLAR },
+        { p: V(0, 1.477, -0.004), rx: 0.103, rz: 0.087, n: 2.7, back: 1.16, zone: Z.COLLAR },
+        { p: V(0, 1.462, -0.005), rx: 0.126, rz: 0.099, n: 2.9, back: 1.22, zone: Z.COLLAR },
+        { p: V(0, 1.446, -0.006), rx: 0.136, rz: 0.104, n: 3.0, back: 1.24, zone: Z.COLLAR },
       ],
       10,
       { radial: 22, capStart: false, capEnd: true },
@@ -148,20 +153,29 @@ export function buildNeck() {
   const cords = (th) =>
     1 + 0.075 * (gauss(th - 1.02, 0.36) + gauss(th - (Math.PI - 1.02), 0.36));
   // Trapezius ridge at the back-sides, where the neck merges into the shoulder.
+  //
+  // ROUND 6: 0.17 -> 0.11 on the side lobes. The yoke was doing its job too
+  // well — it made the top of the neck loft as wide as the bottom of the skull
+  // for the whole 60 mm the collar does not cover, so the "column" never
+  // narrowed and head/neck/shoulder read as one continuous mass. The flare is
+  // now concentrated in the bottom two stations, where a trapezius actually is.
   const yoke = (th) =>
-    1 + 0.17 * (gauss(th - 0.35, 0.5) + gauss(th - (Math.PI - 0.35), 0.5)) + 0.10 * gauss(th - Math.PI * 1.5, 0.6);
+    1 + 0.11 * (gauss(th - 0.35, 0.5) + gauss(th - (Math.PI - 0.35), 0.5)) + 0.07 * gauss(th - Math.PI * 1.5, 0.6);
 
   const keys = [
     { p: V(0, 1.352, -0.004), rx: 0.118, rz: 0.104, n: 2.5, mod: yoke, zone: SZ.NECK },
     { p: V(0, 1.412, -0.005), rx: 0.092, rz: 0.090, n: 2.4, mod: yoke, zone: SZ.NECK },
-    { p: V(0, 1.462, -0.007), rx: 0.072, rz: 0.077, n: 2.4, mod: cords, zone: SZ.NECK },
-    { p: V(0, 1.508, -0.010), rx: 0.062, rz: 0.069, n: 2.4, mod: cords, zone: SZ.NECK },
-    { p: V(0, 1.552, -0.013), rx: 0.057, rz: 0.064, n: 2.4, mod: cords, zone: SZ.NECK },
+    // ROUND 6: the exposed column is 8-11% narrower and runs 22 mm higher, to
+    // meet a jaw that `headTransform` lifted by 19 mm. A neck seen from behind
+    // is about 0.62 of skull breadth; this lands at 0.60.
+    { p: V(0, 1.462, -0.007), rx: 0.066, rz: 0.072, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.508, -0.010), rx: 0.056, rz: 0.063, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.552, -0.013), rx: 0.052, rz: 0.059, n: 2.4, mod: cords, zone: SZ.NECK },
     // Up under the jaw. The last station widens again: the mastoid process and
     // the base of the skull are wider than the middle of the neck, and without
     // that the head looks pinned on.
-    { p: V(0, 1.592, -0.015), rx: 0.059, rz: 0.067, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.618, -0.016), rx: 0.064, rz: 0.072, n: 2.5, zone: SZ.NECK },
+    { p: V(0, 1.596, -0.015), rx: 0.054, rz: 0.062, n: 2.4, zone: SZ.NECK },
+    { p: V(0, 1.632, -0.017), rx: 0.060, rz: 0.068, n: 2.5, zone: SZ.NECK },
   ];
   return loftKeys(keys, 14, { radial: 20, capStart: true, capEnd: false });
 }
@@ -177,6 +191,43 @@ export function buildNeck() {
  * real proportions rather than eyeballed.
  */
 export const HEAD_CENTRE = new THREE.Vector3(0, 1.678, -0.006);
+
+/**
+ * ROUND 6 — one transform for everything worn on or made of the head.
+ *
+ * The skull was measurably too big. On a flat-mask silhouette render of the
+ * shipped gameplay frame, taking the longest CONTIGUOUS RUN per row, the skull
+ * was 152 px against a 250 px shoulder span — a ratio of 0.608 where a human
+ * seen from behind is 0.37-0.40. (Row *extent* is not a valid width here: the
+ * radio antenna crosses the head band 200 px out to the side and inflates the
+ * reading to 205 px. That is the same class of mistake as measuring ambient
+ * with a horizontal scan.)
+ *
+ * Half the error is size and half is the pose. A skull is near-spherical in
+ * plan so it projects at full width from any angle, whereas a 0.51 m shoulder
+ * span turned 63 degrees off the camera projects at 0.23 m. Both ends get
+ * fixed: the head shrinks here, the turn comes down in index.js.
+ *
+ * It is applied as a MATRIX at assembly time rather than by editing
+ * `headSurface`'s radii, because the helmet, cap, boonie, bandana, eyepatch,
+ * goggle strap, ear-defender cups and hair shell are all authored against
+ * absolute world-space y in `gear.js` — thirty-odd hard-coded stations that
+ * would every one of them have to move in step. One matrix over the whole set
+ * cannot desynchronise.
+ *
+ * Scale is about the head BONE at y 1.60, not the skull centre, so the jaw
+ * rises further than the crown: breadth 165 -> 150 mm and length 188 -> 177 mm
+ * against an anthropometric adult male 152 x 195, while the jaw underside lifts
+ * 19 mm and the crown only 12. That 19 mm is neck, which is half of MAJOR 3.
+ */
+export const HEAD_FIT = { sx: 0.912, sy: 0.968, sz: 0.942, lift: 0.018, pivotY: 1.6 };
+
+export function headTransform() {
+  const { sx, sy, sz, lift, pivotY } = HEAD_FIT;
+  return new THREE.Matrix4()
+    .makeScale(sx, sy, sz)
+    .setPosition(0, pivotY * (1 - sy) + lift, HEAD_CENTRE.z * (1 - sz));
+}
 
 /**
  * The skull as a displacement of the unit sphere. Exported because everything
@@ -410,21 +461,29 @@ export function buildArm(o = {}) {
     // where the profile BULGES before it tapers. Round 4 ran a single cap
     // straight into the taper and the shoulder read as the corner of the plate
     // carrier rather than as an arm.
-    { p: armPoint(0.05), rx: 0.081 * bulk, rz: 0.086 * bulk, n: 2.5, front: 1.1, zone: Z.SLEEVE },
-    { p: armPoint(0.13), rx: 0.077 * bulk, rz: 0.081 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
-    { p: armPoint(0.22), rx: 0.064 * bulk, rz: 0.068 * bulk, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.34), rx: 0.06 * bulk, rz: 0.064 * bulk, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.46), rx: 0.052 * bulk, rz: 0.056, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.52), rx: 0.051, rz: 0.057, n: 2.3, zone: Z.SLEEVE },
+    // ROUND 6: the whole limb is 11% slimmer through the shaft. Round 5's
+    // upper arm was 0.081 * 1.04 * 2 = 168 mm across inside the sleeve, against
+    // an adult male mid-biceps circumference of ~330 mm, i.e. a 105 mm
+    // diameter; even a loose BDU sleeve only adds about 20. Once the arm was
+    // posed clear of the ribs (see _POLE_R) that extra 40 mm stopped being
+    // hidden against the torso and started reading as a bolster strapped to the
+    // shoulder. The deltoid keeps most of its width — that bulge is real and it
+    // is the top of the silhouette.
+    { p: armPoint(0.05), rx: 0.078 * bulk, rz: 0.083 * bulk, n: 2.5, front: 1.1, zone: Z.SLEEVE },
+    { p: armPoint(0.13), rx: 0.071 * bulk, rz: 0.075 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
+    { p: armPoint(0.22), rx: 0.057 * bulk, rz: 0.061 * bulk, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.34), rx: 0.053 * bulk, rz: 0.057 * bulk, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.46), rx: 0.046 * bulk, rz: 0.050, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.52), rx: 0.045, rz: 0.051, n: 2.3, zone: Z.SLEEVE },
     rolled
-      ? { p: armPoint(rollT), rx: 0.058, rz: 0.062, n: 2.3, zone: Z.SLEEVE }
-      : { p: armPoint(0.62), rx: 0.054, rz: 0.057, n: 2.3, zone: Z.SLEEVE },
+      ? { p: armPoint(rollT), rx: 0.052, rz: 0.056, n: 2.3, zone: Z.SLEEVE }
+      : { p: armPoint(0.62), rx: 0.048, rz: 0.051, n: 2.3, zone: Z.SLEEVE },
     rolled
-      ? { p: armPoint(rollT + 0.03), rx: 0.049, rz: 0.051, n: 2.3, zone: SZ.ARM }
-      : { p: armPoint(0.74), rx: 0.048, rz: 0.05, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.85), rx: 0.041, rz: 0.043, n: 2.3, zone: rolled ? SZ.ARM : Z.SLEEVE },
-    { p: armPoint(0.95), rx: 0.033, rz: 0.037, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
-    { p: ARM.wrist.clone(), rx: 0.028, rz: 0.033, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
+      ? { p: armPoint(rollT + 0.03), rx: 0.044, rz: 0.046, n: 2.3, zone: SZ.ARM }
+      : { p: armPoint(0.74), rx: 0.043, rz: 0.045, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.85), rx: 0.037, rz: 0.039, n: 2.3, zone: rolled ? SZ.ARM : Z.SLEEVE },
+    { p: armPoint(0.95), rx: 0.030, rz: 0.034, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
+    { p: ARM.wrist.clone(), rx: 0.026, rz: 0.031, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
   ];
 
   if (rolled) {
@@ -476,12 +535,18 @@ export function buildArm(o = {}) {
       { radial: 14, capStart: true, capEnd: true },
     );
   };
-  parts.push({ surface: pocketAt(0.235, 0.075, 0.070 * bulk, Z.POUCH), mat: 'cloth' });
-  parts.push({ surface: pocketAt(0.163, 0.018, 0.072 * bulk, Z.WEBBING), mat: 'cloth' });
+  parts.push({ surface: pocketAt(0.235, 0.075, 0.0605 * bulk, Z.POUCH), mat: 'cloth' });
+  parts.push({ surface: pocketAt(0.163, 0.018, 0.065 * bulk, Z.WEBBING), mat: 'cloth' });
 
   // Elbow reinforcement patch: a second layer of cloth over the joint, which is
   // where the eye looks to decide whether an arm has a joint in it at all.
-  parts.push({ surface: pocketAt(0.50, 0.055, 0.058 * bulk, Z.POUCH), mat: 'cloth' });
+    // ROUND 6: 0.058 -> 0.052 -> 0.0475. `pocketAt` lofts a full 360-degree ring,
+  // so a patch standing 8.5 mm proud of a 45 mm-radius arm does not read as a
+  // reinforcement on the point of the elbow — it reads as a machined collar
+  // clamped round the limb, which on a foreshortened arm is the single loudest
+  // robot-arm cue in the frame. At 2 mm it is a value step, not a step in the
+  // silhouette, which is what a second layer of cloth actually is.
+  parts.push({ surface: pocketAt(0.50, 0.055, 0.0475 * bulk, Z.POUCH), mat: 'cloth' });
 
   // Shoulder seam where the sleeve head is set into the body, and the cuff.
   parts.push({
@@ -504,9 +569,9 @@ export function buildArm(o = {}) {
     parts.push({
       surface: loftKeys(
         [
-          { p: armPoint(0.905), rx: 0.040, rz: 0.043, n: 3.0, zone: Z.WEBBING },
-          { p: armPoint(0.945), rx: 0.037, rz: 0.041, n: 3.0, zone: Z.WEBBING },
-          { p: armPoint(0.985), rx: 0.031, rz: 0.036, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.905), rx: 0.036, rz: 0.039, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.945), rx: 0.033, rz: 0.037, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.985), rx: 0.028, rz: 0.033, n: 3.0, zone: Z.WEBBING },
         ],
         7,
         { radial: 14, capStart: true, capEnd: true },
@@ -687,6 +752,21 @@ export function buildLeg(o = {}) {
  * the critic who zooms in.
  */
 export function buildBoot() {
+  // ROUND 6 — this is where the silhouette furniture in `gear.js` (canteen,
+  // knife, holster suspender) is PAID FOR. That kit costs +1516 triangles on
+  // the player and +1388 on each guard, i.e. +12,748 over the nine characters
+  // in the frame; retessellating the boot gives back about 2,400 per character,
+  // ~21,600 in total, so the trade nets roughly -8,900.
+  //
+  // The boot is the right place to take it from. Its FORMS are all kept — shaft,
+  // padded collar, foot, toe cap, heel counter, the pale midsole rand, the
+  // lugged outsole, tongue, eyelet rows and laces are every one of them still
+  // there, because the horizontal value banding is what makes a boot legible.
+  // Only the tessellation drops (13 stations x 16 radial -> 9 x 12 and so on),
+  // and that resolution buys nothing: on the gameplay camera the boots are
+  // BELOW THE BOTTOM OF THE FRAME (the silhouette bbox clips at y = 1079), and
+  // on vista/outpost the whole soldier is 20-60 px tall, so a boot is under
+  // 6 px and every one of these cross-sections is sub-pixel.
   const parts = [];
   const x = 0.102;
   const cloth = (surface) => parts.push({ surface, mat: 'cloth' });
@@ -703,8 +783,8 @@ export function buildBoot() {
         { p: V(x, 0.105, 0.028), rx: 0.05, rz: 0.058, n: 2.7, zone: Z.BOOT },
         { p: V(x, 0.075, 0.03), rx: 0.05, rz: 0.062, n: 2.8, zone: Z.BOOT },
       ],
-      13,
-      { radial: 16, capStart: true },
+      9,
+      { radial: 12, capStart: true },
     ),
   );
   // Padded collar rolled over the top of the shaft — the ankle needs a width
@@ -716,8 +796,8 @@ export function buildBoot() {
         { p: V(x, 0.243, 0.022), rx: 0.069, rz: 0.074, n: 2.5, zone: Z.BOOT },
         { p: V(x, 0.228, 0.023), rx: 0.063, rz: 0.068, n: 2.6, zone: Z.BOOT },
       ],
-      7,
-      { radial: 14, capStart: true, capEnd: true },
+      5,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
 
@@ -732,8 +812,8 @@ export function buildBoot() {
         { p: V(x, 0.044, -0.105), rx: 0.048, rz: 0.036, n: 3.2, zone: Z.BOOT },
         { p: V(x, 0.04, -0.14), rx: 0.034, rz: 0.026, n: 3.0, zone: Z.BOOT },
       ],
-      13,
-      { radial: 16, capStart: true, capEnd: true },
+      10,
+      { radial: 12, capStart: true, capEnd: true },
     ),
   );
   // Toe cap, standing 2 mm proud with its own stitched border.
@@ -744,8 +824,8 @@ export function buildBoot() {
         { p: V(x, 0.045, -0.1), rx: 0.0498, rz: 0.038, n: 3.2, zone: Z.BOOT },
         { p: V(x, 0.041, -0.138), rx: 0.036, rz: 0.028, n: 3.0, zone: Z.BOOT },
       ],
-      7,
-      { radial: 12, capStart: true, capEnd: true },
+      5,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
   // Heel counter wrapping the back of the foot.
@@ -756,8 +836,8 @@ export function buildBoot() {
         { p: V(x, 0.05, 0.05), rx: 0.0468, rz: 0.05, n: 2.9, zone: Z.BOOT },
         { p: V(x, 0.052, 0.028), rx: 0.0505, rz: 0.05, n: 3.0, zone: Z.BOOT },
       ],
-      7,
-      { radial: 14, capStart: true, capEnd: true },
+      5,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
 
@@ -773,8 +853,8 @@ export function buildBoot() {
         { p: V(x, 0.031, -0.11), rx: 0.051, rz: 0.013, n: 4.4, zone: Z.BOOT },
         { p: V(x, 0.033, -0.147), rx: 0.035, rz: 0.011, n: 4.0, zone: Z.BOOT },
       ],
-      13,
-      { radial: 12, capStart: true, capEnd: true },
+      9,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
 
@@ -789,8 +869,8 @@ export function buildBoot() {
         { p: V(x, 0.015, -0.11), rx: 0.05, rz: 0.017, n: 4.5, zone: 0 },
         { p: V(x, 0.017, -0.146), rx: 0.034, rz: 0.014, n: 4.0, zone: 0 },
       ],
-      13,
-      { radial: 14, capStart: true, capEnd: true },
+      9,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
   rubber(
@@ -800,8 +880,8 @@ export function buildBoot() {
         { p: V(x, 0.026, 0.048), rx: 0.046, rz: 0.028, n: 4.5, zone: 0 },
         { p: V(x, 0.025, 0.028), rx: 0.048, rz: 0.024, n: 4.5, zone: 0 },
       ],
-      6,
-      { radial: 12, capStart: true, capEnd: true },
+      5,
+      { radial: 10, capStart: true, capEnd: true },
     ),
   );
 
@@ -814,8 +894,8 @@ export function buildBoot() {
         { p: V(x, 0.093, -0.03), rx: 0.032, rz: 0.012, n: 3.4, zone: Z.BOOT },
         { p: V(x, 0.083, -0.062), rx: 0.031, rz: 0.011, n: 3.4, zone: Z.BOOT },
       ],
-      7,
-      { radial: 12, capStart: true, capEnd: true, forward: V(0, 1, 0) },
+      5,
+      { radial: 8, capStart: true, capEnd: true, forward: V(0, 1, 0) },
     ),
   );
   for (const sgn of [-1, 1]) {
@@ -830,7 +910,7 @@ export function buildBoot() {
         0.013,
         0.007,
         Z.BOOT,
-        { stations: 10 },
+        { stations: 6 },
       ),
     );
   }
@@ -845,7 +925,7 @@ export function buildBoot() {
         0.008,
         0.0055,
         Z.WEBBING,
-        { stations: 7 },
+        { stations: 5 },
       ),
     );
   }

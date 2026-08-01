@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { makeRng, fbm3 } from './Noise.js';
 import { COLLARS, buildCollarLibrary } from './RockShapes.js';
-import { WIND_DIR } from './RockMaterial.js';
+import { WIND_DIR, createTalusMaterial } from './RockMaterial.js';
+import { solveApronField, buildApronGeometry } from './TalusApron.js';
 
 /**
  * Placement rules.
@@ -84,10 +85,10 @@ const DEFAULT_BANDS = [160, 520, 1500];
 // a real margin on every family, and `LOD_SHIFT` decouples the mesh resolution
 // from it so widening the ring buys shadows rather than triangles.
 const BANDS = {
-  chips: [66, 122, 176],
-  stones: [95, 220, 350],
+  chips: [78, 130, 190],
+  stones: [108, 220, 350],
   boulders: [128, 360, 600],
-  talus: [104, 320, 840],
+  talus: [110, 340, 1150],
   formations: [242, 700, 1120],
   outcrops: [214, 640, 1020],
 };
@@ -102,8 +103,12 @@ const BANDS = {
  * 182 m of an outcrop, so neither of those subdivided meshes is reachable
  * either. This is what pays for the shadows.
  */
+// Round 5: chips 1 -> 2. A 30 cm flake never needs more than the silhouette
+// mesh — at the closest range the keep-clear radius allows, 24 m, it is nine
+// pixels across — and denser gravel bought with the cheapest mesh is a better
+// trade than the same triangles spent on the middle LOD of a pebble.
 const LOD_SHIFT = {
-  chips: 1, stones: 1, boulders: 1, talus: 1, formations: 0, outcrops: 1,
+  chips: 2, stones: 1, boulders: 1, talus: 1, formations: 0, outcrops: 1,
 };
 
 /**
@@ -134,8 +139,15 @@ const CLAST = {
 
 /** Keep-clear radii, metres. The outpost owns the valley floor. */
 export const CLEAR = {
-  gravel: 34,
-  stone: 52,
+  // Round 5: gravel 34 -> 24, stone 52 -> 40. The critique measured the small
+  // rocks at 40-80 m in the outpost frame; with the old radii the whole of that
+  // band on the camera side of the compound was inside the keep-clear, so the
+  // pebbles being complained about were the far edge of the chip field rather
+  // than its body. The outpost module clears its own real footprint by calling
+  // `clearCircle` after this module installs, which is what these radii were
+  // standing in for before that hook existed.
+  gravel: 24,
+  stone: 40,
   boulder: 112,
   formation: 190,
   outcrop: 182,
@@ -195,10 +207,16 @@ const SCATTER_MAX_HEIGHT = 4.0;
  * landscape says, the rock field costs at most this much.
  */
 const CAPS = {
-  chips: 1750,
+  // Round 5: 1750 -> 2800. Measured by rendering every chip, stone and boulder
+  // in magenta with the depth test on, the whole near clast field covered 505
+  // pixels of the outpost frame — 7,706 instances, of which only ~120 fall
+  // inside a 45 degree cone, at a few pixels each. The critique's "small rocks
+  // read as flat decals" is partly a shading problem and partly this: there was
+  // not enough gravel in the near field to read as anything.
+  chips: 2400,
   stones: 1650,
-  boulders: 1650,
-  talus: 3300,
+  boulders: 1420,
+  talus: 2700,
   formations: 300,
   outcrops: 200,
 };
@@ -701,6 +719,14 @@ export function buildRockField(world, lib, material) {
       align = 0.5, sink = 0.25, tilt = 0.12, bands = DEFAULT_BANDS, shadowBand = 0,
       foot = 0.42, collar = null, maxHeight = SCATTER_MAX_HEIGHT, family = collar,
       lodShift = 0, clast = 0,
+      /**
+       * Ground supplied by the caller instead of probed off the terrain, for
+       * bodies that stand on geometry this module drew itself. A block lying on
+       * a talus apron is metres above `terrain.heightAt` by construction, so
+       * every seat test below would either reject it or bury it in the natural
+       * hillside the apron was welded over.
+       */
+      seatOverride = null, normalOverride = null,
     } = {},
   ) {
     if (family && spent[family] >= CAPS[family]) { rejected.cap++; return; }
@@ -739,22 +765,24 @@ export function buildRockField(world, lib, material) {
     const wMax = size * Math.max(ax, ay, az);
     if (wMax > maxHeight) size *= maxHeight / wMax;
 
-    const n = terrain.normalAt(x, z);
+    const n = normalOverride ?? terrain.normalAt(x, z);
 
     // --- FATAL 1: nothing seats on a wall ----------------------------------
     // Point normal first (cheap), then the plane through the body's own
     // footprint. The second test is the one that catches a spire: a 20 m body
     // straddling a ridge crest can have a gentle normal at its centre and 30 m
     // of air under one flank, and it is the residual, not the tilt, that says so.
-    if (n.y < MAX_SEAT_NY) { rejected.steep++; return; }
-    const footR = size * Math.max(0.22, foot);
-    if (footR > 0.9) {
-      const face = seatFace(x, z, footR);
-      if (face.tilt > MAX_SEAT_DEG) { rejected.steep++; return; }
-      // A body cannot bridge relief it is not much taller than. The bound is
-      // generous — half the body's longest dimension — because a rock DOES sit
-      // in broken ground; what it does not do is span a gully.
-      if (face.resid > size * 0.50) { rejected.rough++; return; }
+    if (seatOverride === null) {
+      if (n.y < MAX_SEAT_NY) { rejected.steep++; return; }
+      const footR = size * Math.max(0.22, foot);
+      if (footR > 0.9) {
+        const face = seatFace(x, z, footR);
+        if (face.tilt > MAX_SEAT_DEG) { rejected.steep++; return; }
+        // A body cannot bridge relief it is not much taller than. The bound is
+        // generous — half the body's longest dimension — because a rock DOES sit
+        // in broken ground; what it does not do is span a gully.
+        if (face.resid > size * 0.50) { rejected.rough++; return; }
+      }
     }
 
     // On steep ground a boulder beds itself into the slope: align harder and
@@ -775,8 +803,10 @@ export function buildRockField(world, lib, material) {
       spin.setFromEuler(euler);
       q.premultiply(spin);
     }
-    const centre = seatY(x, z, size);
-    const low = foot > 0 ? groundY(x, z, size * foot, size) : centre;
+    const centre = seatOverride !== null ? seatOverride : seatY(x, z, size);
+    const low = seatOverride !== null
+      ? seatOverride
+      : (foot > 0 ? groundY(x, z, size * foot, size) : centre);
     // Only a body fully aligned to the slope may sit at the centre height: its
     // base plane already follows the ground. Anything standing even slightly
     // upright has to be seated on the LOWEST ground under its footprint, or its
@@ -806,7 +836,7 @@ export function buildRockField(world, lib, material) {
     // height cannot get its underside down to the drawn surface. That case is
     // not a seating error to be corrected: it is a site that is not ground.
     const tol = height * 0.08 + 0.04;
-    let proud = proudOf(v, m, size, x, z);
+    let proud = seatOverride === null ? proudOf(v, m, size, x, z) : 0;
     if (proud > tol) {
       const drop = Math.min(proud - tol, height * 0.55 + 0.15);
       pos.y -= drop;
@@ -847,9 +877,9 @@ export function buildRockField(world, lib, material) {
   // those sheets are as characteristic as the sheets themselves.
   {
     let placed = 0;
-    for (let i = 0; i < 9000 && placed < 2400; i++) {
+    for (let i = 0; i < 13000 && placed < 3600; i++) {
       const a = rng() * Math.PI * 2;
-      const r = radius(CLEAR.gravel, 168, 1.3);
+      const r = radius(CLEAR.gravel, 150, 1.25);
       const cx = Math.cos(a) * r;
       const cz = Math.sin(a) * r;
       const slope = 1 - terrain.normalAt(cx, cz).y;
@@ -871,16 +901,20 @@ export function buildRockField(world, lib, material) {
       // 3400 of them were buying pixel fizz and a shadow-pass bill, not gravel.
       const spread = 2.4 + rng() * 7.5;
       const n = 5 + ((rng() * 12) | 0);
-      for (let k = 0; k < n && placed < 2400; k++) {
+      for (let k = 0; k < n && placed < 3600; k++) {
         const ang = rng() * Math.PI * 2;
         const rad = Math.pow(rng(), 0.55) * spread;
         place(pick(shapes.chips), cx + Math.cos(ang) * rad, cz + Math.sin(ang) * rad,
-          0.16 + Math.pow(rng(), 1.7) * 0.40, FAM('chips', {
+          0.24 + Math.pow(rng(), 1.5) * 0.62, FAM('chips', {
             // `foot` was 0 (seat on the centre height alone). Measured, that
             // left 5 chips proud of the drawn ground by more than their own
             // thickness where the surface falls away under them; seating on the
             // lowest ground under the footprint costs six height probes.
-            align: 1.0, sink: 0.52, tilt: 0.10, foot: 0.5,
+            // Round 5: sink 0.52 -> 0.38. A chip with 48% of a 25 cm body under
+            // the sand stands 12 cm proud, and at a 27 degree sun that is a
+            // 24 cm shadow — under a pixel past 40 m. A pebble with a contact
+            // shadow reads as a pebble; without one it is a stain.
+            align: 1.0, sink: 0.38, tilt: 0.10, foot: 0.5,
           }));
         placed++;
       }
@@ -889,123 +923,81 @@ export function buildRockField(world, lib, material) {
 
   // ----------------------------------------------------------- talus aprons --
   //
-  // MAJOR 3, round 4: "there is no talus anywhere in the world. The rock slope
-  // runs into the flat valley in a single smooth concave fillet with no debris
-  // at all." Correct, and the reason is that the previous pass was a scatter
-  // rule with `talus` in its name: it sampled a point, asked the erosion solve
-  // whether `scree` was high there, and dropped 20 cm chips around it. A 20 cm
-  // chip has a hard cull at 176 m, and the massifs whose feet the critic
-  // measured are 400-800 m out — so by construction not one clast of it could
-  // ever appear at the base of a mountain.
+  // MAJOR 1, round 5: "talus is present as props but not as a landform." The
+  // round-4 pass was a scatter walk — it found real apron SITES and then dropped
+  // a Poisson field of blocks on them, which is debris lying on the ground when
+  // what a range foot has is debris that IS the ground.
   //
-  // This is a WALK, not a sample, and it is the only pass in the file that is:
-  //   1. seed anywhere; climb the local gradient to find a real FACE (a slope
-  //      steeper than the angle of repose — material there is still moving);
-  //   2. walk the fall line DOWN from the face until the gradient falls through
-  //      the angle of repose. That crossing is the apex of the apron, and it is
-  //      where every rock face on earth puts one;
-  //   3. lay the apron from that apex on downhill, fanning sideways as it goes
-  //      and COARSENING toward the toe. Fines lodge in the first few metres, a
-  //      block that survives the fall keeps its momentum to the bottom — that
-  //      gradient is the most recognisable thing about a scree slope after its
-  //      angle, and it is why the toe of a real apron is a line of boulders.
-  //
-  // The clast SIZE is set by the range, not by taste: 1 px at 600 m is 0.41 m
-  // of world, so an apron built from 0.3 m chips at that range is sub-pixel
-  // fizz and an apron built from 1-3.5 m blocks is a legible band of debris.
-  // The family therefore carries its own band table out to 900 m.
+  // The wedge itself is now geometry: a cone dilation of the drawn heightfield
+  // at the angle of repose, seeded only from faces steeper than 40 degrees. See
+  // TalusApron.js — the construction, and the two wrong constructions before it,
+  // are documented there. This pass only DRESSES it: blocks seated on the apron
+  // surface with the grain-size gradient that is the second most recognisable
+  // thing about a scree slope after its angle.
+  const apronField = solveApronField(terrain);
+  const apronBuild = buildApronGeometry(apronField);
   {
-    let aprons = 0;
-    // Bound on SUCCESSES, not attempts. The first version counted attempts, and
-    // since the seat rule rejects a third of everything offered on a scree
-    // slope, the pass quietly stopped at 1,091 blocks having spent its whole
-    // 2,400 budget on rejections.
-    for (let i = 0; i < 88000 && aprons < 520 && spent.talus < CAPS.talus; i++) {
-      const a = rng() * Math.PI * 2;
-      const r = radius(76, 1500, 1.15);
-      let x = Math.cos(a) * r;
-      let z = Math.sin(a) * r;
-
-      // --- 1. is there a face here? ---------------------------------------
-      let g = downhill(x, z, 7);
-      if (g < REPOSE) continue;                       // not a face; nothing sheds
-      const s0 = surfaceAt(x, z);
-      // Bedrock sheds; a slope already buried under its own alluvium does not.
-      if (hasSurface && rng() > 0.18 + s0.rock * 1.15) continue;
-      const faceY = terrain.heightAt(x, z);
-
-      // --- 2. walk down to the break of slope ------------------------------
-      let steps = 0;
-      for (; steps < 46; steps++) {
-        g = downhill(x, z, 7);
-        if (g < REPOSE) break;                        // through the repose angle
-        x += grad.x * 5.5;
-        z += grad.y * 5.5;
-      }
-      if (steps === 0 || steps >= 46) continue;       // never left / never landed
-      const drop = faceY - terrain.heightAt(x, z);
-      if (drop < 9) continue;                         // too small a face to shed an apron
-      if (Math.hypot(x, z) < CLEAR.stone) continue;
-
-      // Fall-line frame at the apex. The apron is elongated along it and
-      // symmetric across it; a round blob of debris is the tell this replaces.
-      downhill(x, z, 9);
-      const fx = grad.x;
-      const fz = grad.y;
-      const dep = hasSurface ? Math.max(s0.scree, surfaceAt(x, z).deposit ?? 0) : 0.6;
-      if (hasSurface && dep < 0.10) continue;
-
-      // Apron size scales with the face that fed it, which is what stops every
-      // apron in the valley being the same apron.
-      const run = Math.min(120, 16 + drop * 1.35) * (0.7 + rng() * 0.6);
-      let n = 10 + ((rng() * 22) | 0) + ((drop * 0.35) | 0);
-      // Coarsest clast at the toe, in metres. A 60 m face throws 3 m blocks.
-      let coarse = Math.min(3.4, 0.85 + drop * 0.045) * (0.75 + rng() * 0.5);
-
-      // --- range-graded grain size -----------------------------------------
-      // The first version of this pass put real aprons at the right sites and
-      // still failed the critic's crop. Measured: 39-81 rock instances inside
-      // 70 m of the ground point under vista.png (1017, 387), and 1.14% of that
-      // crop's pixels changed when the whole rock group was hidden. The reason
-      // is arithmetic, not placement — that point is 856 m from the camera, the
-      // vista is a 42 degree field over 720 lines, so one pixel is 0.92 m of
-      // world there and the median talus block was 0.69 m. An apron built from
-      // sub-pixel clasts is not an apron, it is dither.
-      //
-      // So the far aprons are built from FEWER, BIGGER blocks: the same volume
-      // of debris, aggregated to the scale the frame can actually resolve. That
-      // is the same argument as an LOD, applied to the scatter instead of to
-      // the mesh, and it is also true of the real thing — the blocks you can
-      // pick out at a kilometre are the house-sized ones at the toe.
-      const far = THREE.MathUtils.clamp((Math.hypot(x, z) - 200) / 680, 0, 1);
-      const grain = 1 + far * 2.3;
-      coarse *= grain;
-      n = Math.max(6, Math.round(n * (1 - far * 0.42)));
-      aprons++;
-      for (let k = 0; k < n && spent.talus < CAPS.talus; k++) {
-        // t biased toward the head: an apron is densest where it is fed.
-        const t = Math.pow(rng(), 1.35);
-        // The fan widens downslope and the lateral profile is a cosine lobe,
-        // so the apron has a soft edge instead of a rectangular footprint.
-        const lat = (rng() + rng() - 1) * run * (0.20 + 0.42 * t);
-        const px = x + fx * run * t - fz * lat;
-        const pz = z + fz * run * t + fx * lat;
-        // Refuse to climb back up the face: the apron banks against it, it does
-        // not creep onto it.
-        if (downhill(px, pz, 6) > REPOSE * 1.25) continue;
-        // Grain-size gradient. `t^1.6` keeps the fines banked in the top third
-        // and puts the blocks on the toe.
-        const size = (0.28 + coarse * Math.pow(t, 1.6) * (0.45 + rng() * 1.1)) * (0.55 + 0.45 * grain);
-        const small = size < 0.72 && Math.hypot(px, pz) < 150;
-        place(pick(small ? shapes.chips : shapes.boulders), px, pz, size,
-          FAM('talus', {
-            // Scree lies where it lands: aligned to the slope, deeply keyed in,
-            // and with almost no free lean — a block that could lean would have
-            // kept rolling.
-            align: 0.92, sink: 0.40, tilt: 0.16, foot: 0.46,
-            collar: small ? null : 'boulders',
-            maxHeight: 3.2 + far * 5.0,
-          }));
+    const an = new THREE.Vector3();
+    const { N: aN, cell: aCell, origin: aOrigin, t: aT } = apronField;
+    // Walk the grid rather than rejection-sampling the disc: the apron is a few
+    // per cent of the map's area and a uniform sampler spends 97% of its budget
+    // missing it.
+    const step = 1;
+    for (let j = 1; j < aN - 1; j += step) {
+      for (let i = 1; i < aN - 1; i += step) {
+        if (spent.talus >= CAPS.talus) break;
+        const th = aT[j * aN + i];
+        if (th < 1.4) continue;
+        const cx = aOrigin + i * aCell;
+        const cz = aOrigin + j * aCell;
+        const dist = Math.hypot(cx, cz);
+        if (dist < CLEAR.stone) continue;
+        // Clast size is set by the RANGE, not by taste: one pixel at 600 m is
+        // 0.4 m of world, so an apron built from 30 cm chips out there is
+        // dither. Fewer, bigger blocks at range is the same argument as an LOD
+        // applied to the scatter, and it is also true of the real thing — the
+        // blocks you can pick out at a kilometre are the house-sized ones.
+        const far = THREE.MathUtils.clamp((dist - 200) / 700, 0, 1);
+        const grain = 1 + far * 2.4;
+        // Blocks per 36 m cell. Thin toward the head, where the surface is
+        // fines, and thin hard at range where each block is sub-pixel anyway.
+        const dens = (0.22 + 0.5 * Math.max(0, 1 - th / 9)) * (1 - far * 0.72);
+        const nb = rng() < dens ? 1 + ((rng() * 2) | 0) : 0;
+        for (let k = 0; k < nb && spent.talus < CAPS.talus; k++) {
+          const px = cx + (rng() - 0.5) * aCell;
+          const pz = cz + (rng() - 0.5) * aCell;
+          const y = apronField.surfaceAt(px, pz);
+          if (y === null) continue;
+          const lt = apronField.thickAt(px, pz);
+          if (lt < 0.8) continue;
+          // GRAIN SIZE GRADIENT. Fines lodge where the pile is deep — that is
+          // the head, against the rock — and a block that survived the fall
+          // kept its momentum to the toe, where the apron is thin.
+          const toe = Math.max(0, 1 - lt / 12);
+          const size = (0.24 + (0.45 + 2.9 * Math.pow(toe, 1.5)) * (0.5 + rng() * 1.0))
+            * (0.55 + 0.45 * grain);
+          // Surface normal from the apron heightfield itself.
+          const e = aCell;
+          const hL = apronField.surfaceAt(px - e, pz);
+          const hR = apronField.surfaceAt(px + e, pz);
+          const hD = apronField.surfaceAt(px, pz - e);
+          const hU = apronField.surfaceAt(px, pz + e);
+          if (hL === null || hR === null || hD === null || hU === null) continue;
+          an.set(hL - hR, 2 * e, hD - hU).normalize();
+          if (an.y < 0.55) continue;                 // steeper than repose: still moving
+          const small = size < 0.70 && dist < 190;
+          place(pick(small ? shapes.chips : shapes.boulders), px, pz, size,
+            FAM('talus', {
+              // Scree lies where it lands: aligned to the apron, deeply keyed
+              // in, and with almost no free lean — a block that could lean would
+              // have kept rolling.
+              align: 0.95, sink: 0.42, tilt: 0.14, foot: 0.46,
+              collar: null,
+              maxHeight: 3.4 + far * 5.4,
+              seatOverride: y,
+              normalOverride: an,
+            }));
+        }
       }
     }
   }
@@ -1017,7 +1009,7 @@ export function buildRockField(world, lib, material) {
     let placed = 0;
     for (let i = 0; i < 12000 && placed < 2300; i++) {
       const a = rng() * Math.PI * 2;
-      const r = radius(CLEAR.stone, 660, 1.5);
+      const r = radius(CLEAR.stone, 520, 1.4);
       const cx = Math.cos(a) * r;
       const cz = Math.sin(a) * r;
       const slope = 1 - terrain.normalAt(cx, cz).y;
@@ -1295,5 +1287,38 @@ export function buildRockField(world, lib, material) {
   }
   const meshes = field.build(group);
   const collars = field.buildCollars(group, buildCollarLibrary());
-  return { group, meshes, collars, records: field.records, spent, rejected, wind: WIND_DIR };
+
+  // The apron surface itself. One merged, non-instanced draw for the whole
+  // field: it is static, it never repeats, and it is the only thing in this
+  // module that changes the silhouette rather than dressing it.
+  let apronMesh = null;
+  if (apronBuild.triangles > 0) {
+    const talusMat = createTalusMaterial();
+    apronMesh = new THREE.Mesh(apronBuild.geo, talusMat);
+    apronMesh.name = 'talus-apron';
+    // It receives — the cliff above it throws a hard shadow down it, which is
+    // half of what makes the wedge read as a wedge. It does not cast: it is
+    // welded to the ground along its whole head, so its own shadow is an acne
+    // generator, and its silhouette against the sky is the terrain's already.
+    apronMesh.castShadow = false;
+    apronMesh.receiveShadow = true;
+    // The outer margin of the pile is coplanar with the terrain by construction
+    // (zero thickness) and the shader stipples it out, but the last surviving
+    // fragments still need to win the depth test against the ground they lie on.
+    talusMat.polygonOffset = true;
+    talusMat.polygonOffsetFactor = -2;
+    talusMat.polygonOffsetUnits = -4;
+    apronMesh.matrixAutoUpdate = false;
+    apronMesh.updateMatrix();
+    group.add(apronMesh);
+  }
+
+  return {
+    group, meshes, collars, records: field.records, spent, rejected, wind: WIND_DIR,
+    apron: apronMesh,
+    apronStats: {
+      triangles: apronBuild.triangles, vertices: apronBuild.vertices,
+      ...apronField.stats,
+    },
+  };
 }

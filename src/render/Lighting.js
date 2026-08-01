@@ -301,6 +301,15 @@ const AMB_APPLY = /* glsl */ `
 			// but a mirror looking straight out of a pit still sees the sky, so
 			// this is scaled well under the diffuse term.
 			radiance *= mix( 1.0, ambVis, uAmbAO.z * material.roughness );
+			// The same pocket, on the specular side. Below the horizon the env
+			// map holds the open landscape, and a rough surface facing down is
+			// not looking at the open landscape — it is looking at its own
+			// footing, with most of that footing's sky taken away by the body
+			// standing over it. uAmbScreen.z is the identical sky-visibility the
+			// diffuse model uses (AMBIENT.nearSkyBlock), so the two terms cannot
+			// disagree; a fragment the shadow map says is in the sun keeps its
+			// full lobe, because then the pocket really is lit.
+			radiance *= mix( 1.0, mix( uAmbScreen.z, 1.0, ambSun ), ambDown * ambDown );
 		#endif
 	}
 #endif
@@ -383,8 +392,12 @@ export const SHARED_UNIFORMS = {
    * w = exponent on the raw visibility.
    */
   uAmbAO: { x: 0, y: 1.0, z: 0.8, w: 1.25 },
-  /** xy = 1 / main render-target size, so gl_FragCoord maps to the AO buffer. */
-  uAmbScreen: { x: 1 / 1920, y: 1 / 1080, z: 0, w: 0 },
+  /**
+   * xy = 1 / main render-target size, so gl_FragCoord maps to the AO buffer.
+   * z  = fraction of the sky the ground DIRECTLY UNDER a surface still sees
+   *      (1 - AMBIENT.nearSkyBlock), used by the specular pocket term.
+   */
+  uAmbScreen: { x: 1 / 1920, y: 1 / 1080, z: 1, w: 0 },
   /**
    * pi * (radiance of sunlit ground - radiance of the ground in its own shade).
    * The lobe this drives is the difference between the two, so a fragment the
@@ -438,9 +451,41 @@ const AMBIENT = {
    * the sun. The remainder is the light that leaks into that pocket off the
    * sunlit sand a metre away, which is what this small number is.
    */
-  litNear: 0.03,
+  // Round 6: 0.03 -> 0.015. At noon the key is 8x the sky, so a 3% leak of it
+  // was 43% of the radiance of that pocket and set the floor the probe sphere's
+  // belly could not get under. A pocket under a body at a 68 degree sun is
+  // fully shadowed; 1.5% is the light bending in round the edges of it.
+  litNear: 0.015,
   /** The same fraction for a surface the shadow map says is standing in the sun. */
   litSun: 0.86,
+  /**
+   * How much of the SKY that near-field footing loses to the surface standing
+   * on it. ROUND 6: this is the fix for the missing sky-to-ground gradient.
+   *
+   * `litNear` already says the sand under a barrel gets almost none of the KEY.
+   * What round 5 still missed is that it gets much less of the SKY as well: the
+   * barrel is what is standing over it. A body of any size a metre off the sand
+   * subtends most of that sand's upper hemisphere, and the sand's radiance is
+   * albedo times whatever irradiance survives. Round 5 lit that pocket with the
+   * FULL sky dome and then handed it back as the whole lower hemisphere of the
+   * probe, which is why a shaded sphere measured only 0.74 stops between its
+   * crown and its belly where a real sky over real ground gives 1.5-2.0.
+   *
+   * Measured by ablating this one number on a 0.5-grey probe sphere in full
+   * cast shadow, binned by normal Y (tools/probes/sphere.js), crown over belly.
+   * The LINEAR-HDR column is the one to trust — it is a radiance ratio, whereas
+   * the display column also depends on where the tonemap toe happens to sit and
+   * moves by a quarter of a stop between runs of the same build:
+   *              linear HDR        presented frame
+   *   afternoon  0.60 -> 1.53      1.05 -> 2.09
+   *   noon       0.54 -> 1.47      0.70 -> 1.73
+   *   dusk       0.43 -> 1.06      0.52 -> 1.22
+   *   night      0.74 -> 1.58      0.85 -> 1.81
+   * It is deliberately applied to the sunlit footing as well, so the sun-gated
+   * bounce lobe — which is the DIFFERENCE between the two — does not move and
+   * nothing standing in the open changes.
+   */
+  nearSkyBlock: 0.80,
   /**
    * How far down you have to look before the ground you see stops being your
    * own footing, as -normal.y.
@@ -465,6 +510,87 @@ const AMBIENT = {
   aoRadius: 1.2,
   /** Thin-occluder heuristic: how much a receding sample re-opens the horizon. */
   aoThickness: 0.12,
+  /**
+   * TWILIGHT AMBIENT. Round 6 — the fix for "dusk has no cool colour anywhere,
+   * for the third round running".
+   *
+   * A dusk frame is a WARM KEY AGAINST A COOL AMBIENT; that opposition is the
+   * whole look, and rounds 3-5 had 62% of the dusk frame warm and 0.33% of it
+   * cool. The cause is in the atmosphere model, not in the print: the dome is
+   * projected from a SINGLE-SCATTERING integrator, and single scattering is
+   * exactly the term that collapses at low sun. What makes a real twilight sky
+   * blue overhead and away from the sun is light that has bounced two and three
+   * times through the Rayleigh column; a single-scattering dome at a 2 degree
+   * sun is one enormous forward-scattered Mie lobe and very little else, so
+   * every direction of it comes back orange and the shadows fill orange.
+   *
+   * This rotates the CHROMA of the sky's ambient toward a twilight dome, at
+   * CONSTANT LUMINANCE, weighted away from the sun. Constant luminance on
+   * purpose: the exposure the whole print is calibrated against is derived from
+   * this same sky irradiance (RenderPipeline's `_updateExposure` reads
+   * `atmosphere.skyRadiance`, which is this), so adding energy here would move
+   * every dusk and dawn frame's exposure as a side effect of a hue fix.
+   *
+   * It is applied to the sky radiance BEFORE the SH projection, so the light
+   * probe, the ground bounce that is derived from it and the post stack's
+   * aerial perspective all take the same number and cannot disagree.
+   */
+  twilight: {
+    /** sin(solar elevation) over which the term fades out: ~3 deg to ~14 deg. */
+    band: [0.05, 0.24],
+    /** How far the chroma is rotated, at the anti-solar point. */
+    amount: 1.0,
+    /**
+     * How much of that survives looking straight AT the key. Not zero: the
+     * aureole round a setting sun is genuinely orange and washing it out would
+     * trade one monochrome frame for another, but the whole sky within 90
+     * degrees of the sun is not the aureole.
+     */
+    sunward: 0.70,
+    /** Chroma of a twilight dome, ~11000 K. Only its ratios matter. */
+    chroma: [0.35, 0.50, 0.85],
+    /**
+     * The same for the night presets, where the model's own moonlit-air term is
+     * the thing being corrected rather than a low sun. Bluer, because a
+     * moonlit sky is Rayleigh scattering with no aureole in it at all.
+     */
+    nightChroma: [0.24, 0.50, 1.20],
+  },
+  /**
+   * Key:fill at night, overriding LIGHT_TRANSPORT.keyFillNight.
+   *
+   * That number was set in round 4 against a moon three times brighter than the
+   * one NIGHT_RIG now runs (see there). Fill is tied to the key by this ratio,
+   * so dropping the moon and leaving the ratio alone drops the fill with it and
+   * pushes another 2.3% of the night frame onto the print's black floor. The
+   * fill at night is starlight, airglow and the Rayleigh column — none of which
+   * dim when the moon does — so the honest response to a dimmer moon is a
+   * flatter ratio, not a darker sky.
+   */
+  nightKeyFill: 2.10,
+};
+
+/**
+ * NIGHT RIG. Round 6 — the fix for "night reads as a moonlit snowfield".
+ *
+ * Round 5's night preset drove the moon at an intensity that put open ground at
+ * display L 0.3301 with a saturation of 0.056 — 2.25x BRIGHTER than the sky it
+ * is lit by, and neutral grey. Ground brighter than its own source is not a
+ * grading choice, it is a rig error, and the neutrality follows from it: the
+ * print's black lift is a fixed pedestal, so the higher a night surface floats
+ * the more of it is pedestal and the less of it is moonlight.
+ *
+ * The preset is shared and read by Sky.js for the moon disc and the star field,
+ * so it is not edited here. The KEY is rigged separately instead: a real
+ * directional light, dimmer, and unambiguously cool. `_computeSkySH` derives
+ * the fill from the same two numbers, so the ambient carries the same hue.
+ */
+const NIGHT_RIG = {
+  /** Multiplier on the preset's moon intensity. */
+  keyScale: 0.38,
+  /** Moon colour, linear. Moonlight is sunlight, but the eye at scotopic
+   *  adaptation reads it blue and every night frame in the reference is blue. */
+  keyColor: [0.17, 0.42, 1.0],
 };
 
 /**
@@ -869,9 +995,21 @@ export class Lighting {
     this.lightAngularSize =
       night > 0.5 ? LIGHT_TRANSPORT.moonAngularSize : LIGHT_TRANSPORT.sunAngularSize;
 
+    // The key light's own colour and level, which at night are NOT the preset's
+    // (see NIGHT_RIG). Everything downstream — the cascades, the SH fill, the
+    // ground bounce, the haze — reads these two and never the preset again, so
+    // the fill cannot drift from the key it is supposed to be balanced against.
+    if (night > 0.5) {
+      this.keyColor = NIGHT_RIG.keyColor.slice();
+      this.keyIntensity = p.sunIntensity * NIGHT_RIG.keyScale;
+    } else {
+      this.keyColor = p.sunColor.slice();
+      this.keyIntensity = p.sunIntensity;
+    }
+
     for (const l of this.cascades) {
-      l.color.setRGB(...p.sunColor, THREE.LinearSRGBColorSpace);
-      l.intensity = p.sunIntensity;
+      l.color.setRGB(...this.keyColor, THREE.LinearSRGBColorSpace);
+      l.intensity = this.keyIntensity;
     }
 
     this.hemi.color.setRGB(...p.ambientColor, THREE.LinearSRGBColorSpace);
@@ -993,12 +1131,36 @@ export class Lighting {
     };
 
     // --- pass 1: sky radiance, and the irradiance it lays on flat ground -----
+    const AM = this.ambientModel;
+    // Twilight chroma rotation (see AMBIENT.twilight). Off entirely above ~14
+    // degrees of solar elevation; at night it runs at full strength against its
+    // own, bluer, target.
+    const TW = AM.twilight ?? AMBIENT.twilight;
+    const twGate = Math.max(
+      this.night,
+      1 - THREE.MathUtils.smoothstep(this.sunDirection.y, TW.band[0], TW.band[1]),
+    );
+    const twAmt = TW.amount * twGate;
+    const twTarget = this.night > 0.5 ? TW.nightChroma : TW.chroma;
+    const twLum = Math.max(lum3(twTarget), 1e-6);
+    // Normalised to unit luminance, so mixing toward it cannot change the level.
+    const twC = twTarget.map((v) => v / twLum);
+    const twSun = TW.sunward ?? 0;
+    const twKey = this.night > 0.5 ? this.moonDirection : this.sunDirection;
+
     const skyL = new Array(N);
     const eSky = [0, 0, 0];
     for (let i = 0; i < N; i++) {
       const d = SH_DIRS[i];
       if (d.y <= 0) continue;
       const c = this._skyRadiance(d, ctx);
+      if (twAmt > 0.001) {
+        // Strongest opposite the key, weakest (but not zero) straight at it.
+        const mu = d.dot(twKey);
+        const w = twAmt * (0.5 * (1 + twSun) - 0.5 * (1 - twSun) * mu);
+        const cl = lum3(c);
+        for (let k = 0; k < 3; k++) c[k] = c[k] * (1 - w) + twC[k] * cl * w;
+      }
       skyL[i] = c;
       for (let k = 0; k < 3; k++) eSky[k] += c[k] * d.y * dOmega;
     }
@@ -1007,7 +1169,7 @@ export class Lighting {
     const keyDir = this.night > 0.5 ? this.moonDirection : this.sunDirection;
     const eKey = [0, 0, 0];
     const cosKey = Math.max(0, keyDir.y);
-    for (let k = 0; k < 3; k++) eKey[k] = p.sunIntensity * p.sunColor[k] * cosKey;
+    for (let k = 0; k < 3; k++) eKey[k] = this.keyIntensity * this.keyColor[k] * cosKey;
 
     // Cloud cover shades a fair share of the landscape, so the *average* ground
     // is dimmer than a sunlit patch. Using the average here keeps the bounce
@@ -1020,21 +1182,30 @@ export class Lighting {
     // shade face that reads as dim sunlight and one that reads as sky.
     const litFrac = THREE.MathUtils.clamp(LT.terrainLitBase + LT.terrainLitSlope * cosKey, 0.18, 0.95);
     const alb = LT.groundAlbedo;
-    const AM = this.ambientModel;
-    /** Radiance of ground taking a given fraction of the key. */
-    const groundAt = (lit) => {
+    /**
+     * Radiance of ground taking a given fraction of the key, and seeing a given
+     * fraction of the sky. `skyVis` is what separates the open plain from the
+     * pocket of sand directly under a surface: the surface itself is standing
+     * over that pocket and takes most of its dome away.
+     */
+    const groundAt = (lit, skyVis = 1) => {
       const out = [0, 0, 0];
       for (let k = 0; k < 3; k++) {
-        out[k] = ((alb[k] * (eKey[k] * cloudMean * lit + eSky[k])) / Math.PI) * LT.bounceStrength;
+        out[k] =
+          ((alb[k] * (eKey[k] * cloudMean * lit + eSky[k] * skyVis)) / Math.PI) * LT.bounceStrength;
       }
       return out;
     };
+    const nearSkyVis = THREE.MathUtils.clamp(1 - AM.nearSkyBlock, 0.02, 1);
+    // Published to the shader so the specular pocket term (AMB_APPLY) uses the
+    // same number this function builds the diffuse pocket from.
+    SHARED_UNIFORMS.uAmbScreen.z = nearSkyVis;
     // The ground a surface sees DIRECTLY BENEATH IT. A surface standing on the
     // ground shadows its own footing, so this is sand at the fill level, not at
     // the key level — dim, and only as warm as the light leaking in off the
     // sunlit sand beside it. This is what an underside is filled by, and making
     // it the whole landscape average is what flattened everything out of the sun.
-    const groundNear = groundAt(AM.litNear);
+    const groundNear = groundAt(AM.litNear, nearSkyVis);
     // The open landscape: a real mix of lit facets and self-shadowed ones.
     const groundOpen = groundAt(litFrac);
     // ...seen through kilometres of the same dust that turns a distant ridge
@@ -1093,7 +1264,7 @@ export class Lighting {
     // A hazy desert midday sits about two stops between lit sand and its own
     // cast shadow. Low sun flattens toward the sky taking over.
     let ratio;
-    if (this.night > 0.5) ratio = LT.keyFillNight;
+    if (this.night > 0.5) ratio = AM.nightKeyFill ?? LT.keyFillNight;
     else {
       // Round 3 saturated this by a 33 degree sun, so a 27 degree afternoon and
       // a 68 degree noon were handed nearly the same contrast — which is why
@@ -1123,7 +1294,10 @@ export class Lighting {
     // a lobe rather than folding it into the probe is what keeps the two cases
     // apart: the same barrel reads hot underneath in the open and dead
     // underneath in a building's shade, which is the whole tell.
-    const groundSun = groundAt(AM.litSun);
+    // Same pocket, same missing sky: the difference between the two is then
+    // purely the key, so the sun-gated lobe is unchanged by `nearSkyBlock` and
+    // nothing standing in the open moves when that number is swept.
+    const groundSun = groundAt(AM.litSun, nearSkyVis);
     const ub = SHARED_UNIFORMS.uAmbBounce;
     const bounce = [0, 0, 0];
     for (let k = 0; k < 3; k++) {
@@ -1182,11 +1356,9 @@ export class Lighting {
     // Irradiance the haze is lit by, expressed in the SAME units the scene's
     // DirectionalLight uses. Deriving it from the light rather than from the
     // atmosphere model guarantees a hazy ridge and a lit ridge agree.
-    const sunRad = [
-      p.sunIntensity * p.sunColor[0],
-      p.sunIntensity * p.sunColor[1],
-      p.sunIntensity * p.sunColor[2],
-    ];
+    const kc = this.keyColor ?? p.sunColor;
+    const ki = this.keyIntensity ?? p.sunIntensity;
+    const sunRad = [ki * kc[0], ki * kc[1], ki * kc[2]];
     if (this.sunDirection.y <= 0.0) {
       for (let c = 0; c < 3; c++) sunRad[c] = 0;
     }
@@ -1200,12 +1372,15 @@ export class Lighting {
       ? this.ambient.hazeRadiance.slice()
       : [0.09, 0.11, 0.16];
 
-    // At night the moon is the only source; scale a cool ambient off it.
+    // At night the moon is the only source; scale a cool ambient off it. The
+    // floors ride on the rigged key (NIGHT_RIG), not on the preset, so dropping
+    // the moon drops the haze it lights by the same amount instead of leaving a
+    // bright neutral airglow standing over a darkened landscape.
     if (this.night > 0.01) {
-      const m = this.night * p.sunIntensity;
+      const m = this.night * ki;
       for (let c = 0; c < 3; c++) {
         sunRad[c] = Math.max(sunRad[c], [0.010, 0.016, 0.034][c] * m);
-        skyAvg[c] = Math.max(skyAvg[c], [0.0026, 0.0042, 0.0092][c] * m);
+        skyAvg[c] = Math.max(skyAvg[c], [0.0022, 0.0040, 0.0098][c] * m);
       }
     }
 

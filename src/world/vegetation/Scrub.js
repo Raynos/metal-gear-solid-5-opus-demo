@@ -97,6 +97,17 @@ const _scale = new THREE.Vector3();
 // smoothstep(a, a, x) is a division by zero and the whole plant becomes NaN.
 const NO_LOD = [1e7, 2e7];
 
+/**
+ * Where the woody field fades out and stops, in metres from the camera.
+ *
+ * Same numbers as `GRASS_FADE_START` / `GRASS_MAX_DIST` in Grass.js, and
+ * deliberately so: a landscape whose grass merges into the ground at 140 m while
+ * its bushes stay countable to 560 m has two different LOD philosophies visible
+ * in one frame. Past this the coverage is the cover layer's job — it paints the
+ * stand into the ground plane instead of standing it up in front of it.
+ */
+const BUSH_LOD = [60, 140];
+
 function injectBranchWind(mat, uniforms, flexAmount, lod = NO_LOD) {
   const local = {
     uFlex: { value: flexAmount },
@@ -354,8 +365,8 @@ export function createScrub(field, uniforms, seed = 20260731) {
   // Scale tops out just under 1.6: this is *low* dead scrub, knee to waist. A
   // 2.5 m specimen reads as a dead sapling and steals the dead trees' job.
   const scrubGeos = [0, 1, 2, 3].map((i) => growPlant(scrubParams(4100 + i * 137)));
-  const scrubMat = branchMaterial(uniforms, BRANCH_COLORS.scrub, SWAY.scrub, 0.92);
-  const scrubDepth = matchingDepthMaterial(uniforms, SWAY.scrub);
+  const scrubMat = branchMaterial(uniforms, BRANCH_COLORS.scrub, SWAY.scrub, 0.92, [44, 64]);
+  const scrubDepth = matchingDepthMaterial(uniforms, SWAY.scrub, [44, 64]);
   const near = scatterAnnulus({
     field, rng, rInner: 0, rOuter: 62, candidates: 2000,
     // Scrub survives where grass is only patchy — the drier margins — and it is
@@ -373,20 +384,22 @@ export function createScrub(field, uniforms, seed = 20260731) {
   scrubGeos.forEach((g, i) => add(buildTiles(g, near[i], scrubMat, scrubDepth, `scrub-n${i}`, 500, 62)));
   counts.scrubNear = near.reduce((a, b) => a + b.length, 0);
 
-  // ---- massed bush clumps, three tiers ------------------------------------
-  // A branching skeleton is the wrong LOD for distance. Its branches are two
-  // centimetres across, which is a third of a pixel at 150 m — round 1's
-  // "thousands of bushes" were mathematically present and optically absent.
-  // What has to survive at range is *projected area*, so the distant tiers are
-  // domes of wide arching ribbons instead: a metre and a half of silhouette for
-  // ten triangles.
-  //
-  // Each tier gets its OWN material so it can carry its own LOD band. They used
-  // to share one, which is why round 3 could not fade them independently and
-  // simply ran every tier at full size to its annulus edge.
-  const bushMatNear = branchMaterial(uniforms, BRANCH_COLORS.bush, SWAY.bush, 0.94);
+  // ---- massed bush clumps -------------------------------------------------
+  // ROUND 5, MAJOR 5. Round 4 ran three tiers: near (0-145 m, no fade at all),
+  // mid (118-345 m) and far (315-560 m). Measured by ablation on the shipped
+  // vista with the auto-exposure locked, the two distant tiers delivered
+  //   bush-m  6,414 instances -> 6,422 changed pixels = 1.0 px per bush
+  //   bush-f  4,579 instances -> 8,435 changed pixels = 1.8 px per bush
+  // That is the definition of countable specks: eleven thousand objects each
+  // covering one to two pixels, lit as a vertical translucent membrane in front
+  // of horizontal mineral ground. No amount of albedo tuning fixes a one-pixel
+  // object; the honest LOD for a thing smaller than a pixel is to darken the
+  // pixel instead, which is what createCoverMat does. Both tiers are gone, the
+  // 123k triangles they cost are what pays for the rocks' talus aprons, and the
+  // near tier now FADES over 60-140 m instead of ending on a hard circle.
+  const bushMatNear = branchMaterial(uniforms, BRANCH_COLORS.bush, SWAY.bush, 0.94, BUSH_LOD);
   bushMatNear.side = THREE.DoubleSide;
-  const bushDepth = matchingDepthMaterial(uniforms, SWAY.bush);
+  const bushDepth = matchingDepthMaterial(uniforms, SWAY.bush, BUSH_LOD);
   bushDepth.side = THREE.DoubleSide;
 
   const bushGeoNear = [0, 1].map((i) => buildTuft({
@@ -394,58 +407,19 @@ export function createScrub(field, uniforms, seed = 20260731) {
     minH: 0.34, maxH: 0.66, width: 0.085, spread: 0.16, curve: 1.15, dome: 0.7,
   }));
   const bushNear = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 145, candidates: 19000,
-    accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.52,
-    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.58, 2.30], sink: 0.05,
+    field, rng, rInner: 0, rOuter: 148, candidates: 19000,
+    accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.60,
+    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.52, 2.40], sink: 0.05,
   });
   bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMatNear, bushDepth, `bush-n${i}`, 500, 48)));
   counts.bushNear = bushNear.reduce((a, b) => a + b.length, 0);
 
-  // One segment, not two: past 130 m the arc of a branch is under a pixel of
-  // curvature and only its width and mass survive, so the second segment is
-  // 100k triangles buying nothing.
-  const bushMatMid = branchMaterial(uniforms, BRANCH_COLORS.bush, SWAY.bush, 0.94, [250, 345]);
-  bushMatMid.side = THREE.DoubleSide;
-  const bushGeoMid = buildTuft({
-    blades: 6, segments: 1, seed: 9021,
-    minH: 0.42, maxH: 0.86, width: 0.185, spread: 0.26, curve: 1.25, dome: 0.85,
-  });
-  const bushMid = scatterAnnulus({
-    field, rng, rInner: 118, rOuter: 345, candidates: 24000,
-    accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.78,
-    variants: [bushGeoMid], tilt: 0.5, scaleRange: [0.88, 3.00], sink: 0.06,
-  });
-  add(buildTiles(bushGeoMid, bushMid[0], bushMatMid, null, 'bush-m', 400));
-  counts.bushMid = bushMid[0].length;
-
-  // The last tier that is geometry at all. Round 3 ran this out to 1050 m at
-  // full size and its 9,767 instances are what every critic counted as dots on
-  // the vista's mid-ground: at 700 m a bush is three pixels, and three pixels
-  // that do not match the terrain behind them read as pepper however dense the
-  // field is. It is now half as long, a third as many, and each specimen is
-  // bigger — the same coverage carried by fewer, larger, clumpier objects, which
-  // is what merges into a tonal variation instead of resolving into a count.
-  // Past the cut it is the cover layer's job (see createCoverMat).
-  const bushMatFar = branchMaterial(uniforms, BRANCH_COLORS.bush, SWAY.bush, 0.94, [400, 560]);
-  bushMatFar.side = THREE.DoubleSide;
-  const bushGeoFar = buildTuft({
-    blades: 5, segments: 1, seed: 9313,
-    minH: 0.65, maxH: 1.15, width: 0.40, spread: 0.52, curve: 1.30, dome: 0.95,
-  });
-  const bushFar = scatterAnnulus({
-    field, rng, rInner: 315, rOuter: 560, candidates: 30000,
-    accept: (s, r) => r() < 0.0006 + Math.pow(s.woody, 0.85) * 0.62,
-    variants: [bushGeoFar], tilt: 0.45, scaleRange: [1.30, 3.80], sink: 0.10,
-  });
-  add(buildTiles(bushGeoFar, bushFar[0], bushMatFar, null, 'bush-f', 560));
-  counts.bushFar = bushFar[0].length;
-
   // ---- dry brush balls ----------------------------------------------------
   const brushGeos = [0, 1, 2].map((i) => growPlant(brushParams(7700 + i * 91)));
-  const brushMat = branchMaterial(uniforms, BRANCH_COLORS.brush, SWAY.brush, 0.95, [150, 195]);
-  const brushDepth = matchingDepthMaterial(uniforms, SWAY.brush, [150, 195]);
+  const brushMat = branchMaterial(uniforms, BRANCH_COLORS.brush, SWAY.brush, 0.95, BUSH_LOD);
+  const brushDepth = matchingDepthMaterial(uniforms, SWAY.brush, BUSH_LOD);
   const brush = scatterAnnulus({
-    field, rng, rInner: 0, rOuter: 195, candidates: 4200,
+    field, rng, rInner: 0, rOuter: 148, candidates: 4200,
     // Brush blows about and snags on open ground and against anything that
     // breaks the wind, rather than sitting in the wet lines. It is the one
     // scatter that legitimately covers open ground, so it keeps a real floor —

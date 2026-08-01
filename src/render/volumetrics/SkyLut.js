@@ -28,12 +28,32 @@ import * as THREE from 'three';
  * ## Parameterisation
  *
  *   u  azimuth, full circle, RepeatWrapping so the seam is continuous
- *   v  sqrt((dir.y + 0.05) / 1.05), ClampToEdge
+ *   v  sqrt((dir.y + 0.02) / 1.02), ClampToEdge
  *
  * The sqrt warp spends a third of the rows on the bottom 10 degrees of the sky,
  * which is where every distant ridge in the game actually sits and where the
  * radiance gradient is steepest. A linear parameterisation puts one row there
  * and the horizon band visibly quantises.
+ *
+ * ## Round 6: 48x14 -> 64x26, and the below-horizon margin 0.05 -> 0.02
+ *
+ * The old table spent its first THREE rows below dir.y = 0, all of which clamp
+ * onto the same horizon sample, and its fourth landed at 0.9 degrees. So the
+ * whole 0-6 degree band — where every distant ridge sits, and where this sky
+ * falls from a Rec.709 radiance of 1.05 to 0.72 — was carried by two linearly
+ * interpolated rows, against a function with real curvature. Measured on the
+ * afternoon dome along the vista azimuth:
+ *
+ *   elevation   0     1     2     3     5     8    12
+ *   radiance  1.029 1.046 1.012 0.953 0.825 0.667 0.525
+ *
+ * A chord from 0.9 to 3.35 degrees misses the maximum at ~1 degree entirely.
+ * That error is not academic: the far cloud deck composites as
+ * `dome * (1 - a) + lut * a`, so anywhere the table disagrees with the dome the
+ * deck's own alpha pattern is drawn onto the sky as a visible difference image.
+ * 26 rows on the tighter margin put samples at 0.6, 1.5, 2.5, 3.7, 5.1 degrees.
+ *
+ * Cost is 1664 CPU raymarches instead of 672, paid once per time-of-day change.
  *
  * Directions BELOW the horizon are stored too — a camera on a plateau looks
  * down at the valley — but they are all filled from the horizon itself, because
@@ -44,16 +64,16 @@ import * as THREE from 'three';
  * is precisely the sepia this whole rewrite exists to remove.
  */
 
-const DEFAULT_AZ = 48;
-const DEFAULT_EL = 14;
+const DEFAULT_AZ = 64;
+const DEFAULT_EL = 26;
 /** Path length at which the in-scatter has saturated in every direction. */
 const SATURATION_M = 400000;
 /** Lowest elevation Sky may be asked about; below it the march hits ground. */
 const MIN_MU = 0.004;
 
-/** v -> dir.y, the inverse of the storage warp above. */
+/** v -> dir.y, the inverse of the storage warp above. Mirrored in shaders.js. */
 function muFromV(v) {
-  return v * v * 1.05 - 0.05;
+  return v * v * 1.02 - 0.02;
 }
 
 export class SkyLut {

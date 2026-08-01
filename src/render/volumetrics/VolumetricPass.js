@@ -59,6 +59,101 @@ import { PALETTE } from '../../config/ArtDirection.js';
  * Round 3's equivalent (a dust albedo of 1.25/1.02/0.70, R/B 1.79, applied to a
  * warm ground-lit source) is what measured as sepia.
  *
+ * ## Round 6: `dustBeta` cut ~3.7x
+ *
+ * 4.4e-4 per metre at the valley floor is a meteorological visual range of
+ * 3.912 / sigma = 8.9 km. That is a dust event, not a clear Afghan afternoon,
+ * and it is what made the mid-field a grey card: measured on the vista frame,
+ * the valley floor at 600-1100 m was already picking up a third of its final
+ * radiance from haze, and the massif at 2.24 km was at 50% opacity converging
+ * onto a near-horizon sky that is 1.5x brighter than the sky five degrees above
+ * it — so the ridge measured BRIGHTER than the sky over it, which no scattering
+ * atmosphere can do. 1.1-1.45e-4 is a visual range of 27-36 km, which is a
+ * clear day with dust in it. Measured on the shipped vista frame, display
+ * Rec.709 luminance in a 140 px box at x 980-1120:
+ *
+ *                            round 5     round 6
+ *   sky above the ridge       0.2865      0.2404
+ *   massif top    (el 6.1)    0.2750      0.1586
+ *   massif upper  (el 5.0)    0.2771      0.1442
+ *   massif mid    (el 4.1)    0.3007  <-  0.1566
+ *   massif low    (el 2.3)    0.3312  <-  0.1681
+ *   mid-field sd/mean         0.219       0.418
+ *
+ * The two arrowed rows are the FATAL: a ridge brighter than the sky over it.
+ * Every band is now 0.60-0.70x that sky. Ablated on one build — this value
+ * alone put back to 4.4e-4, everything else round 6 — the massif's low band
+ * goes 0.189 -> 0.314 against a sky of 0.314, i.e. the defect comes back with
+ * it and the mid-field's sd/mean falls 0.423 -> 0.255.
+ *
+ * The distant blue-grey does NOT leave the frame with the density, because what
+ * supplies that colour is the convergence target — the sky's own radiance in
+ * the ridge's direction — not the amount of it.
+ *
+ * ## Round 6, integration: the cut went about 2.7x too far
+ *
+ * Two changes landed together above — the density cut, and the switch to ONE
+ * luminance-weighted scalar for both halves of the composite — and only the
+ * second was load-bearing for the fatal. With one scalar the composite is a
+ * true convex combination, so a surface darker than the sky converges onto it
+ * from below at ANY density; the density is then a free art-direction
+ * parameter again. Swept on the shipped build (`tools/probes/verify/
+ * d2-fogsweep.js`), five skyline bands of the vista frame, opacity measured by
+ * ablating `apGain` and dividing by the sky-only render along the same ray:
+ *
+ *   dustBeta  height  range   opacity @3.0km  @4.2km  worst ridge/sky
+ *   1.18e-4    360    33 km       0.18         0.07        1.555
+ *   1.80e-4    600    22 km       0.27         0.12        1.293
+ *   2.40e-4    900    16 km       0.36         0.17        1.138
+ *   3.00e-4   1200    13 km       0.44         0.21        1.072
+ *   3.60e-4   1600    11 km       0.50         0.26        1.037
+ *
+ * Convergence improves MONOTONICALLY with density and nothing inverts, which is
+ * the sweep the previous paragraph's ablation could not see because it moved
+ * `dustBeta` back to 4.4e-4 with the old per-channel alpha still in place. At
+ * 1.18e-4 the frame is not "a clear day with dust in it", it is a clear day
+ * with no dust in it: 7% opacity on a 4.2 km ridge, against an art direction
+ * that asks for ridges washing to pale dusty blue-grey within ~2 km.
+ *
+ * `dustHeight` is the other half of it. A 330-480 m scale height puts every
+ * ridge crest in this world ABOVE the dust, so distance stopped buying opacity
+ * at all — the measured opacity is LOWER on the 4.2 km band than on the 3.0 km
+ * one, because the far ridge is higher. Whatever is done about density, that
+ * inversion is the thing to fix first.
+ *
+ * ### …and why the values above are nonetheless unchanged
+ *
+ * I raised them, measured, and put them back. The density is coupled to the
+ * exposure, and the exposure lives in a different owner's file. Raising the
+ * haze lifts the whole mid-field; `_updateExposure` is illuminant-derived and
+ * does not move; the auto-exposure reduction downstream of it does, and the top
+ * of the range goes with it. Clean renders at 1920x1080, vista frame:
+ *
+ *   dustBeta/height   pixels at max-channel >=230   p99.99
+ *   1.18e-4 /  360          1.81%                     244   <- shipped
+ *   1.60e-4 /  650          0.70%                     241
+ *   1.90e-4 /  800          0.20%                     238
+ *   3.20e-4 / 1400          0.00%                     215
+ *
+ * 0.00% at max-channel 230 is *precisely* the round-5 defect that this round's
+ * `cloudGain` lift was raised to fix, so any density change made here alone
+ * trades a criterion that now passes for one that still would not reach target
+ * (55-65% opacity at 3-5 km needs 3.6e-4+, which is the bottom row). Doing it
+ * properly means moving `grade.exposureKey`/`exposureRefRadiance` in
+ * RenderPipeline in the same change. That is a two-owner edit and it is not
+ * mine to make halfway.
+ *
+ * `cloudGain` went 0.42-0.58 -> 0.74-0.82 in the same round. See the
+ * cloudScatter block in shaders.js: the vista frame's brightest pixel out of
+ * 2.07 M was rgb(229,213,198) and NOTHING in it reached max-channel 230.
+ *
+ * `cloudFar` is where the deck fades out (metres) and `cloudStreak` is how
+ * anisotropic the weather map is, 0 = none. Both exist to kill the radial
+ * spokes; see the deck block in shaders.js. Ablated: cloudFar back to round 5's
+ * 170 km reproduces the spokes exactly, and collapses the clear-sky saturation
+ * of the 8-13 degree band from 7.8% to 1.6% — so the far deck is also the whole
+ * of why that band measured achromatic.
+ *
  * `apDesat` is the multiple-scattering flattening of that chroma, and it is
  * large at dawn and dusk for a physical reason: those are the frames whose sky
  * carries a hard, saturated solar aureole, and a dense low haze re-scatters its
@@ -70,38 +165,43 @@ import { PALETTE } from '../../config/ArtDirection.js';
 export const ATMOS = {
   dawn: {
     shaftDensity: 0.00120, shaftHeight: 170, sunScatter: 0.055, phaseG: 0.80, dustBand: 2.0,
-    cloudCoverage: 0.46, cloudDensity: 1.05, cloudGain: 0.56, cloudAmb: 0.50, cirrus: 0.50,
+    cloudCoverage: 0.46, cloudDensity: 1.05, cloudGain: 0.80, cloudAmb: 0.34, cirrus: 0.50,
     cloudBase: 1500, cloudTop: 3000, cirrusAlt: 7600, heatHaze: 0.0, cloudShadow: 0.22,
     bounce: 0.40, cloudExt: 0.034, cloudLightExt: 0.052,
-    dustBeta: 4.2e-4, dustHeight: 330, apGain: 0.94, dustWarm: 0.04, apDesat: 0.48,
+    dustBeta: 1.30e-4, dustHeight: 330, apGain: 0.94, dustWarm: 0.04, apDesat: 0.48,
+    cloudFar: 17000, cloudStreak: 0.20,
   },
   noon: {
     shaftDensity: 0.00042, shaftHeight: 260, sunScatter: 0.020, phaseG: 0.74, dustBand: 0.7,
-    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.42, cloudAmb: 0.42, cirrus: 0.24,
+    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.74, cloudAmb: 0.30, cirrus: 0.24,
     cloudBase: 1900, cloudTop: 3800, cirrusAlt: 8200, heatHaze: 1.0, cloudShadow: 0.30,
     bounce: 0.28, cloudExt: 0.040, cloudLightExt: 0.078,
-    dustBeta: 4.4e-4, dustHeight: 420, apGain: 0.97, dustWarm: 0.05, apDesat: 0.12,
+    dustBeta: 1.10e-4, dustHeight: 420, apGain: 0.97, dustWarm: 0.05, apDesat: 0.12,
+    cloudFar: 20000, cloudStreak: 0.15,
   },
   afternoon: {
     shaftDensity: 0.00058, shaftHeight: 250, sunScatter: 0.026, phaseG: 0.76, dustBand: 1.0,
-    cloudCoverage: 0.32, cloudDensity: 1.0, cloudGain: 0.44, cloudAmb: 0.44, cirrus: 0.28,
+    cloudCoverage: 0.32, cloudDensity: 1.0, cloudGain: 0.75, cloudAmb: 0.31, cirrus: 0.28,
     cloudBase: 1800, cloudTop: 3600, cirrusAlt: 8000, heatHaze: 0.85, cloudShadow: 0.28,
     bounce: 0.34, cloudExt: 0.038, cloudLightExt: 0.075,
-    dustBeta: 4.4e-4, dustHeight: 360, apGain: 0.97, dustWarm: 0.05, apDesat: 0.14,
+    dustBeta: 1.18e-4, dustHeight: 360, apGain: 0.97, dustWarm: 0.05, apDesat: 0.14,
+    cloudFar: 18000, cloudStreak: 0.15,
   },
   dusk: {
     shaftDensity: 0.00135, shaftHeight: 165, sunScatter: 0.060, phaseG: 0.81, dustBand: 2.2,
-    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.58, cloudAmb: 0.48, cirrus: 0.52,
+    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.82, cloudAmb: 0.34, cirrus: 0.52,
     cloudBase: 1500, cloudTop: 3100, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.20,
     bounce: 0.44, cloudExt: 0.034, cloudLightExt: 0.052,
-    dustBeta: 4.2e-4, dustHeight: 320, apGain: 0.94, dustWarm: 0.03, apDesat: 0.52,
+    dustBeta: 1.35e-4, dustHeight: 320, apGain: 0.94, dustWarm: 0.03, apDesat: 0.52,
+    cloudFar: 17000, cloudStreak: 0.20,
   },
   night: {
     shaftDensity: 0.00060, shaftHeight: 200, sunScatter: 0.0, phaseG: 0.72, dustBand: 0.9,
-    cloudCoverage: 0.36, cloudDensity: 0.95, cloudGain: 1.1, cloudAmb: 0.48, cirrus: 0.22,
+    cloudCoverage: 0.36, cloudDensity: 0.95, cloudGain: 1.65, cloudAmb: 0.36, cirrus: 0.22,
     cloudBase: 1700, cloudTop: 3300, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.0,
     bounce: 0.02, cloudExt: 0.034, cloudLightExt: 0.050,
-    dustBeta: 5.0e-4, dustHeight: 480, apGain: 0.95, dustWarm: 0.0, apDesat: 0.10,
+    dustBeta: 1.45e-4, dustHeight: 480, apGain: 0.95, dustWarm: 0.0, apDesat: 0.10,
+    cloudFar: 17000, cloudStreak: 0.15,
   },
 };
 
@@ -229,6 +329,8 @@ export class VolumetricPass {
         uCirrusAlt: { value: 8000 },
         uHeatHaze: { value: 0.0 },
         uCloudShadow: { value: 0.28 },
+        uCloudFar: { value: 18000 },
+        uCloudStreak: { value: 0.15 },
       },
       depthTest: false,
       depthWrite: false,
@@ -518,6 +620,8 @@ export class VolumetricPass {
     u.uCloudTop.value = p.cloudTop;
     u.uHeatHaze.value = p.heatHaze;
     u.uCloudShadow.value = p.cloudShadow;
+    u.uCloudFar.value = p.cloudFar ?? 18000;
+    u.uCloudStreak.value = p.cloudStreak ?? 0.15;
     u.uHazeOwned.value = this.ownsHaze ? 1 : 0;
 
     // Dust load rides the art-directed fog density so the look stays tunable

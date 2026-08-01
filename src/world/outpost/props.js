@@ -93,14 +93,18 @@ export const DRIFT_VARIANTS = 3;
  * Authored with the obstruction at z = 0 and the wind arriving from +z, so the
  * caller only has to rotate the instance to face the wind.
  */
-export function driftGeo(variant = 0) {
+export function driftGeo(variant = 0, { lo = false } = {}) {
   const b = newBag();
   let s = (variant * 374761393 + 7) >>> 0;
   const rnd = () => ((s = (Math.imul(s ^ (s >>> 15), 2246822507) + 1) >>> 0) / 4294967296);
   // 12x6 = 144 triangles. A drift is a smooth surface with no silhouette
   // detail finer than its own ripples, and the ripples are in the shader.
-  const NX = 12;
-  const NZ = 6;
+  //
+  // `lo` is 6x3 = 36. The fillets banked along the foot of every wall are
+  // 190 mm tall and 1.7 m wide — a quarter of the resolution is still four
+  // times what their silhouette can carry, and there are two hundred of them.
+  const NX = lo ? 6 : 12;
+  const NZ = lo ? 3 : 6;
   const halfW = 1.0;
   const runOut = 1.0;   // how far upwind the toe of the drift reaches
   const crest = 1.0;    // height at the face, scaled by the instance
@@ -593,9 +597,12 @@ export function pipeGeo() {
  * underneath. That highlight running round the crown is the thing that makes a
  * wheel read as rubber.
  */
-function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.11, flat = 0.03, bead = true }) {
+function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.075, flat = 0.03, bead = true }) {
   const parts = [];
   // Carcass: a lathed section so the shoulder is a real radius, not a chamfer.
+  // The shoulder is deliberately tight — at 0.11 on a 0.62 tyre the sidewall
+  // silhouette sat at 0.51 while the tread crown was at 0.62, which is a
+  // balloon, not a lorry tyre, and it made the lugs read as gear teeth.
   const pts = [];
   const N = 6;
   for (let i = 0; i <= N; i++) {
@@ -603,19 +610,31 @@ function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.11, flat 
     const a = -Math.PI / 2 + t * Math.PI;
     pts.push(new THREE.Vector2(r - shoulder + Math.cos(a) * shoulder * 0.98, (Math.sin(a) * width) / 2));
   }
-  pts.unshift(new THREE.Vector2(r * 0.55, -width / 2 + 0.02));
-  pts.push(new THREE.Vector2(r * 0.55, width / 2 - 0.02));
+  // Inner edge of the sidewall. It has to run BELOW the rim it is mounted on
+  // (hubGeo's 0.30 on a 0.62 tyre) or there is an open annulus between tyre and
+  // wheel that you can see the sky through.
+  pts.unshift(new THREE.Vector2(r * 0.44, -width / 2 + 0.02));
+  pts.push(new THREE.Vector2(r * 0.44, width / 2 - 0.02));
+  // Round 5: this said `rotateZ`, and it is worth spelling out what that cost.
+  // A lathe is symmetric about Y, so rotateZ puts the wheel's axle along X —
+  // the truck's own LONGITUDINAL axis. Everything else in this file (the lug
+  // ring, the bead, the stud circle, the contact patch, the way tyreGeo lays a
+  // scrap tyre flat) is authored for an axle along Z, so the carcass ended up
+  // 90 degrees out of plane from its own tread: the lugs stood off in a ring
+  // that missed the tyre entirely, and the scrap tyres in the yard stacked on
+  // their rims like coins instead of lying flat. That is most of what a critic
+  // was seeing when they called the wheels "flat discs with no tread and no
+  // hub" — the tread was there, it was just orbiting the wrong axis.
   const carcass = new THREE.LatheGeometry(pts, 16);
-  carcass.rotateZ(Math.PI / 2);
+  carcass.rotateX(Math.PI / 2);
   parts.push(carcass);
-  // Sidewall bead ring, both faces. Skipped on scrap tyres in a stack, where the
-  // sidewall is never the silhouette and 35 of them add up.
+  // Sidewall bead ring, both faces. A torus is already normal to Z, so it needs
+  // no rotation at all — it only needs pushing out to the sidewall.
   if (bead) {
     for (const sz of [-1, 1]) {
       const ring = new THREE.TorusGeometry(r * 0.74, 0.035, 4, 14);
-      ring.rotateY(Math.PI / 2);
       ring.translate(0, 0, (sz * width) / 2 - sz * 0.03);
-      parts.push(xform(ring, {}));
+      parts.push(ring);
     }
   }
   // Tread: staggered lug blocks round the crown. The tangential length has to
@@ -626,9 +645,9 @@ function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.11, flat 
     const a = (i / lugs) * Math.PI * 2;
     const stag = i % 2 === 0 ? 1 : -1;
     for (const half of [-1, 1]) {
-      const g = box(pitch * 0.62, 0.038, width * 0.42, {
-        x: Math.cos(a) * (r + 0.004),
-        y: Math.sin(a) * (r + 0.004),
+      const g = box(pitch * 0.62, 0.034, width * 0.42, {
+        x: Math.cos(a) * (r - 0.004),
+        y: Math.sin(a) * (r - 0.004),
         z: half * width * 0.235,
         rz: a + stag * 0.26 * half,
         sharp: true,
@@ -651,15 +670,16 @@ function tyreProfile({ r = 0.62, width = 0.42, lugs = 14, shoulder = 0.11, flat 
 /** Steel disc wheel: rim, dish, hub, ten studs and a valve. */
 function hubGeo({ r = 0.30, width = 0.40 }) {
   const parts = [];
-  parts.push(xform(cyl(r, width * 0.55, 12), { rz: Math.PI / 2 }));
+  // Same axis correction as the carcass: the rim runs about Z, not X.
+  parts.push(xform(cyl(r, width * 0.55, 12), { rx: Math.PI / 2 }));
   for (const sz of [-1, 1]) {
-    parts.push(xform(cyl(r * 0.95, 0.05, 12), { rz: Math.PI / 2, z: (sz * width) / 2 - sz * 0.06 }));
-    parts.push(xform(cyl(r * 0.42, 0.10, 10), { rz: Math.PI / 2, z: (sz * width) / 2 }));
+    parts.push(xform(cyl(r * 0.95, 0.05, 12), { rx: Math.PI / 2, z: (sz * width) / 2 - sz * 0.06 }));
+    parts.push(xform(cyl(r * 0.42, 0.10, 10), { rx: Math.PI / 2, z: (sz * width) / 2 }));
     // Lightening holes read as holes because there is a dark disc behind them.
     for (let i = 0; i < 5; i++) {
       const a = (i / 5) * Math.PI * 2 + 0.3;
       parts.push(xform(cyl(0.055, 0.06, 6), {
-        rz: Math.PI / 2, x: Math.cos(a) * r * 0.66, y: Math.sin(a) * r * 0.66, z: (sz * width) / 2 - sz * 0.03,
+        rx: Math.PI / 2, x: Math.cos(a) * r * 0.66, y: Math.sin(a) * r * 0.66, z: (sz * width) / 2 - sz * 0.03,
       }));
     }
     for (let i = 0; i < 6; i++) {
@@ -859,10 +879,11 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
         new THREE.Vector3(ax + 0.10, 0.62, sz * 0.60), new THREE.Vector3(ax + 0.30, 1.00, sz * 0.50), 0.035, 5,
       ));
     }
-    // Live axle: tube, banjo housing and the diff cover.
-    b.metal.push(xform(cyl(0.075, track * 2 - 0.2, 8), { rz: Math.PI / 2, x: ax, y: axleY }));
-    b.metal.push(xform(cyl(0.20, 0.34, 10), { rz: Math.PI / 2, x: ax, y: axleY }));
-    b.metal.push(xform(cyl(0.155, 0.22, 10), { x: ax - 0.02, y: axleY, z: 0.20, rx: Math.PI / 2 }));
+    // Live axle: tube, banjo housing and the diff cover. The tube spans the
+    // TRACK, so it runs across the truck (Z) — it was running fore-and-aft.
+    b.metal.push(xform(cyl(0.075, track * 2 - 0.2, 8), { rx: Math.PI / 2, x: ax, y: axleY }));
+    b.metal.push(xform(cyl(0.20, 0.34, 10), { rx: Math.PI / 2, x: ax, y: axleY }));
+    b.metal.push(xform(cyl(0.155, 0.22, 10), { x: ax + 0.20, y: axleY, z: 0.0, rz: Math.PI / 2 }));
   }
   // Rear mudflaps behind the bogie.
   for (const sz of [-1, 1]) b.rubber.push(box(0.03, 0.50, 0.56, { x: -3.30, y: 0.70, z: sz * track }));
