@@ -7,3 +7,4 @@ shots/
 .claude/worktrees/
 node_modules/.gencache/
 bench-history.jsonl
+.vite-cache/

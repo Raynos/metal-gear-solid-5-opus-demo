@@ -746,7 +746,10 @@ export class Terrain {
    * changed. Bump SIM_VERSION whenever anything that feeds `_buildFar` or
    * `_buildNear` changes, or you will get a stale landscape.
    */
-  static SIM_VERSION = 'sim1';
+  // Hash of this file, injected by vite. The cache must invalidate when the
+  // generator changes — without it, a tree that edited Terrain.js would silently
+  // load a sibling tree's baked landscape from the shared cache directory.
+  static SIM_VERSION = typeof __TERRAIN_HASH__ !== 'undefined' ? __TERRAIN_HASH__ : 'dev';
 
   static async create(opts = {}) {
     const size = opts.size ?? QUALITY.terrainSize;

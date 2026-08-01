@@ -30,14 +30,52 @@ import {
   existsSync,
   statSync,
   renameSync,
+  readdirSync,
+  unlinkSync,
+  utimesSync,
 } from 'node:fs';
 import path from 'node:path';
 
 const MAX_ENTRY_BYTES = 256 * 1024 * 1024;
+// A baked terrain is 214 MB and its key changes with every edit to Terrain.js,
+// so an unbounded cache grows by a fifth of a gigabyte per iteration and never
+// shrinks. Evict by age, and by total size worst-first, on every start.
+const TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024;
+
+function sweep(root) {
+  let entries = [];
+  try {
+    entries = readdirSync(root)
+      .filter((f) => f.endsWith('.bin'))
+      .map((f) => {
+        const full = path.join(root, f);
+        const st = statSync(full);
+        return { full, size: st.size, atime: st.atimeMs };
+      });
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  let total = 0;
+  for (const e of entries) {
+    if (now - e.atime > TTL_MS) {
+      try { unlinkSync(e.full); } catch {}
+      e.dead = true;
+    } else total += e.size;
+  }
+  // Still too big: drop least-recently-used until under the cap.
+  const live = entries.filter((e) => !e.dead).sort((a, b) => a.atime - b.atime);
+  for (const e of live) {
+    if (total <= MAX_TOTAL_BYTES) break;
+    try { unlinkSync(e.full); total -= e.size; } catch {}
+  }
+}
 
 export function gencache({ dir = 'node_modules/.gencache' } = {}) {
   const root = path.resolve(dir);
   mkdirSync(root, { recursive: true });
+  sweep(root);
 
   const fileFor = (key) =>
     path.join(root, createHash('sha1').update(String(key)).digest('hex') + '.bin');
@@ -55,6 +93,7 @@ export function gencache({ dir = 'node_modules/.gencache' } = {}) {
       res.statusCode = 200;
       res.setHeader('content-type', 'application/octet-stream');
       res.setHeader('content-length', statSync(file).size);
+      try { const n = new Date(); utimesSync(file, n, statSync(file).mtime); } catch {}
       return createReadStream(file).pipe(res);
     }
 

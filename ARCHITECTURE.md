@@ -21,77 +21,60 @@ page errors is a failed build, not a style choice.
 
 ### The tooling changed — read this if you have older commands in your head
 
-`tools/calibrate.mjs`, `tools/eval.mjs`, `tools/pix.mjs` and `tools/probe-sky.mjs`
-are **gone**, and so is `npm run shot`. Every one of them booted its own vite
-server and its own chromium, which is the exact cost this change exists to
-delete. Their capabilities are folded into `tools/shot.mjs`:
+The shared render **daemon is gone**. `node tools/shot.mjs ...` works exactly as
+before; what is behind it changed.
 
-| Old command                              | New command                                  |
-| ---------------------------------------- | -------------------------------------------- |
-| `npm run shot`                           | `node tools/shot.mjs`                         |
-| `node tools/eval.mjs probe.js`           | `node tools/shot.mjs eval probe.js`           |
-| `node tools/pix.mjs stats a.png`         | `node tools/shot.mjs pix stats a.png`         |
-| `node tools/pix.mjs probe a.png 10,20`   | `node tools/shot.mjs pix probe a.png 10,20`   |
-| `node tools/pix.mjs crop …`              | `node tools/shot.mjs pix crop …`              |
-| `node tools/pix.mjs column …`            | `node tools/shot.mjs pix column …`            |
-| `node tools/calibrate.mjs`               | an `eval` probe that sweeps and calls `g.probeLuminance()` |
-| `node tools/probe-sky.mjs`               | an `eval` probe that toggles layers and samples |
+The daemon existed to keep worlds warm, because generating one cost 17 s. Both
+halves of that premise failed:
 
-`node tools/shot.mjs <shots>` is unchanged, including its flags and its
-non-zero-on-page-error contract. If a command you remember is missing, it is in
-the table above — do not re-create the deleted file.
+  1. The expensive part — an 11.6 s terrain erosion sim — is now baked through
+     GenCache, so a cold world is ~4.5 s.
+  2. Agents edit source constantly, so the warm world was invalidated anyway.
+     Measured hit rate: 40% of requests paid a full rebuild.
 
-### How the harness works
+What the shared daemon did deliver, measured with seven agents against it:
+queue depth 20, **p50 wait 302 s**, p50 total 360 s, and **29 errors against 9
+completions**. A private, short-lived chromium per invocation instead:
 
-`tools/shot.mjs` renders nothing. It talks to **one render daemon**
-(`tools/shotd.mjs`) — exactly one per machine, shared by every working tree:
-**one vite server, one chromium, one warm world**. It starts on demand and shuts
-down when idle; nothing needs starting by hand.
-
-This matters because generating the world costs ~17 s, of which ~12 s is the
-`Terrain.js` erosion simulation. The old harness paid that on **every**
-screenshot, and eight authors doing it at once turned an 18 s run into 55 s of
-pure contention.
-
-Because trees hold different source, the daemon owns which tree is loaded and
-switches on demand. Its queue is ordered to prefer the tree already loaded, so a
-switch is paid once for a whole batch rather than once per request — 8 requests
-interleaved across 2 trees complete in ~17 s, not ~112 s. A request that has
-waited 45 s jumps the queue so a busy tree cannot starve the others.
-
-Measured on an M3 Pro, 1280x720:
-
-| | old harness | daemon |
+| | daemon | private browser |
 | --- | --- | --- |
-| 4 shots, alone | 18.3 s | 25 s cold **/ 2.5 s warm** |
-| 4 shots, 8 authors at once | 39.9-67.5 s (avg 54.6) | **4.5-11.5 s** |
-| `eval` probe | ~25 s | **0.4 s** |
-| broken build reported in | 180 s (hang) | **2.5 s**, with file and line |
-| resident cost | 6 daemons, 47 procs, 7.8 GB | **1 daemon, 7 procs, 0.94 GB** |
+| 7 trees x 3 shots (21 screenshots) | did not complete | **21.4 s** |
+| errors | 29 / 9 completions | **0** |
+| leftover processes | 19 vite, 15 headless | **0** |
+| one shot, warm cache | 0.76 s | 6.9 s |
+| one shot, cold | 53 s | 13.5 s |
 
-Consequences worth knowing:
+A resident world is still faster for a single author taking repeated shots, and
+that is the one thing given up. It is not close to worth the rest.
 
-- **Any** edit under `src/` invalidates the warm world, so the first shot after
-  an edit pays one rebuild. Batch your edits, then screenshot.
-- Ask for every shot you want in one command. Extra shots cost ~0.6 s; a second
-  invocation may cost a rebuild.
-- `eval` and `pix` run against the same warm daemon, so probing the live page or
-  measuring a PNG is effectively free. Use them freely.
-- `node tools/shot.mjs reload` forces a rebuild if you ever need one explicitly.
-- **Do not write `sleep`/retry loops around the harness.** The old harness had a
-  latent bug where its readiness wait used Playwright's 30 s default instead of
-  the intended 90 s, so it failed spuriously under load and everyone wrapped it
-  in `for i in $(seq 1 40); ... sleep 15`. That is fixed. A broken build now
-  fails in ~2 s naming the offending file and line, rather than hanging.
-- **Never add another script that launches a browser.** That is the entire class
-  of problem this replaced. Add a subcommand to the daemon instead.
+**Batch your shots.** Each invocation pays ~4.5 s for the world, then ~0.6-1 s
+per screenshot, so ask for every shot you want in ONE command.
 
-Daemon control: `node tools/shot.mjs status` / `reload` / `stop`. State lives in
-`~/.cache/shotd/` (machine-wide, outside every tree) and the log is
-`~/.cache/shotd/log`. One instance is enforced by an `O_EXCL` lock: if nine
-authors run the client at the same instant, nine daemons start, one wins and the
-other eight exit before opening a vite server. `SHOTD_IDLE` sets the idle
-shutdown in seconds (default 600).
+```bash
+node tools/shot.mjs                       # every canonical shot
+node tools/shot.mjs vista ground --out shots/mine
+node tools/shot.mjs eval probe.js         # run a probe in the live page
+node tools/shot.mjs pix stats 'shots/*.png'
+node tools/bench.mjs --quick              # benchmark the whole inner loop
+```
+
+`tools/bench.mjs` measures cold/warm/resident build, single and batched photo
+cost, N-tree parallel drain, and leftover processes, appending each run to
+`bench-history.jsonl`. Run it before and after anything that touches the loop.
+
+### Worktrees share node_modules — two traps
+
+Agent worktrees symlink one `node_modules`, so anything vite keeps in there is
+shared. Both of these produced silent, confusing failures:
+
+- **Vite's cache.** Seven concurrent builds writing `node_modules/.vite`
+  corrupted each other and produced pages that loaded but never became ready.
+  `cacheDir` is now `.vite-cache`, inside each tree.
+- **The generation cache** is shared, which is desirable — but its key must
+  include a hash of the generator. `vite.config.js` injects `__TERRAIN_HASH__`
+  from the contents of `Terrain.js`, so editing terrain invalidates the bake
+  instead of silently loading a sibling tree's landscape. Entries expire after
+  24 h and the directory is capped at 4 GB, LRU.
 
 ## File ownership — DO NOT CROSS THESE LINES
 
