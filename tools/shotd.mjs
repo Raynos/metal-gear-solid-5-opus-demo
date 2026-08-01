@@ -66,7 +66,12 @@ const IDLE_MS = Math.max(60, +opt('idle', 600)) * 1000;
 // Each resident world is a page holding ~160 MB of terrain typed arrays plus GPU
 // textures, and a vite server at ~75 MB. Capped hard: unbounded residency is the
 // mistake that took the machine down.
-const MAX_WORLDS = Math.max(1, Math.min(+opt('worlds', 3), 6));
+// One daemon serves every worktree, so the cap must cover the number of authors
+// working at once, not the number of trees one author uses. At 3, nine parallel
+// agents evicted each other continuously: 138 rebuilds in one session, 98 of them
+// on a single tree, 44.7 min (17% of wall clock) spent regenerating worlds that
+// were about to be needed again. Resident worlds are ~0.15 GB each.
+const MAX_WORLDS = Math.max(1, Math.min(+opt('worlds', 10), 16));
 // How long a request may wait behind another tree's batch before it jumps the
 // queue. Without this, a busy tree starves every other tree indefinitely.
 const STARVATION_MS = 45000;
