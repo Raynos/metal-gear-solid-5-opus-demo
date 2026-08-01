@@ -616,9 +616,16 @@ async function shutdown(reason) {
   if (stopping) return;
   stopping = true;
   log(`shutting down (${reason})`);
-  releaseLock();
+  // Release the lock LAST. Releasing it first opens a window where a successor
+  // daemon starts while this one is still holding a browser and a vite server —
+  // which is exactly how two daemons ended up alive at once. And never linger:
+  // if browser.close() hangs we still die, and the 'exit' handler clears the
+  // lock on the way out.
+  const bail = setTimeout(() => process.exit(0), 5000);
   try { await browser?.close(); } catch {}
   killVite();
+  clearTimeout(bail);
+  releaseLock();
   process.exit(0);
 }
 
