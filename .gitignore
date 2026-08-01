@@ -4,3 +4,4 @@ shots/
 
 # render daemon runtime state
 .shotd/
+.claude/worktrees/
