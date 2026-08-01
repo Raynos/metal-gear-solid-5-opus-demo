@@ -1,176 +1,254 @@
 #!/usr/bin/env node
 /**
- * shot.mjs — deterministic screenshot harness.
+ * shot.mjs — client for the render daemon (tools/shotd.mjs).
  *
- *   node tools/shot.mjs                       # all shots -> shots/
- *   node tools/shot.mjs vista ground          # only those shots
- *   node tools/shot.mjs --out shots/round3    # custom output dir
- *   node tools/shot.mjs --width 1920 --height 1080
+ * This process does no rendering. It hands a request to the one warm daemon on
+ * this machine and prints the answer, so ten agents screenshotting at once cost
+ * one browser and one world, not ten of each.
  *
- * Boots a vite dev server on an ephemeral port, drives a headless Chromium with
- * real GPU-backed WebGL (SwiftShader fallback), poses the canonical camera
- * shots, settles N deterministic frames, and writes PNGs.
+ *   node tools/shot.mjs                          # all canonical shots -> shots/
+ *   node tools/shot.mjs vista ground             # only those shots
+ *   node tools/shot.mjs vista --out shots/mine   # custom output dir
+ *   node tools/shot.mjs vista --width 1920 --height 1080
  *
- * Exits non-zero if the page threw — a broken build must never be silently
- * screenshotted as "art direction".
+ *   node tools/shot.mjs eval probe.js [--shot vista] [--out shots/diag]
+ *   node tools/shot.mjs pix stats shots/r4/*.png
+ *   node tools/shot.mjs pix probe shots/r4/vista.png 100,200 300,400
+ *   node tools/shot.mjs pix crop shots/r4/ground.png 1030 810 220 160 3 out.png
+ *   node tools/shot.mjs pix column shots/r4/vista.png 1690 0.02,0.12,0.25,0.40
+ *
+ *   node tools/shot.mjs status | stop
+ *
+ * The daemon starts on demand and shuts itself down when idle. Exits non-zero
+ * if the page threw — a broken build must never be silently screenshotted as
+ * "art direction".
  */
-import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { readFile, mkdir } from 'node:fs/promises';
+import { openSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const RUN = path.join(ROOT, '.shotd');
+const PORTFILE = path.join(RUN, 'port');
+const LOCKFILE = path.join(RUN, 'lock');
+const LOGFILE = path.join(RUN, 'log');
 
-function parseArgs(argv) {
-  const out = { shots: [], dir: 'shots', width: 1920, height: 1080, frames: 6, keepOpen: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--out') out.dir = argv[++i];
-    else if (a === '--width') out.width = +argv[++i];
-    else if (a === '--height') out.height = +argv[++i];
-    else if (a === '--frames') out.frames = +argv[++i];
-    else if (a === '--keep-open') out.keepOpen = true;
-    else if (!a.startsWith('--')) out.shots.push(a);
-  }
-  return out;
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function freePort() {
-  return new Promise((res, rej) => {
-    const srv = createServer();
-    srv.on('error', rej);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => res(port));
-    });
-  });
-}
+// How long a client waits before deciding a spawned daemon is never coming and
+// electing a replacement. Must comfortably exceed daemon startup-to-lock time.
+const RESPAWN_BACKOFF_MS = 15000;
 
-async function startVite(port) {
-  const proc = spawn(
-    process.execPath,
-    [path.join(ROOT, 'node_modules/vite/bin/vite.js'), '--port', String(port), '--strictPort', '--host', '127.0.0.1', '--clearScreen', 'false'],
-    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
-  );
-  let log = '';
-  proc.stdout.on('data', (d) => (log += d));
-  proc.stderr.on('data', (d) => (log += d));
-
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/`);
-      if (r.ok) return proc;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  proc.kill('SIGKILL');
-  throw new Error(`vite failed to start on ${port}:\n${log}`);
-}
-
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  const outDir = path.resolve(ROOT, opts.dir);
-  await mkdir(outDir, { recursive: true });
-
-  const port = await freePort();
-  const vite = await startVite(port);
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--use-gl=angle',
-      '--use-angle=metal',
-      '--enable-unsafe-webgpu',
-      '--ignore-gpu-blocklist',
-      '--enable-gpu-rasterization',
-      '--enable-webgl',
-      '--disable-frame-rate-limit',
-      '--force-device-scale-factor=1',
-      '--hide-scrollbars',
-      '--mute-audio',
-    ],
-  });
-
-  const page = await browser.newPage({
-    viewport: { width: opts.width, height: opts.height },
-    deviceScaleFactor: 1,
-  });
-
-  const consoleErrors = [];
-  page.on('console', (m) => {
-    if (m.type() === 'error') consoleErrors.push(m.text());
-  });
-  page.on('pageerror', (e) => consoleErrors.push(String(e)));
-
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load', timeout: 60000 });
-
+async function ping() {
+  let port;
   try {
-    await page.waitForFunction(() => window.__GAME && window.__GAME.ready === true, { timeout: 90000 });
-  } catch (err) {
-    console.error('GAME never became ready.');
-    console.error(consoleErrors.join('\n'));
-    await browser.close();
-    try { process.kill(-vite.pid, 'SIGKILL'); } catch {}
-    process.exit(2);
+    port = (await readFile(PORTFILE, 'utf8')).trim();
+  } catch {
+    return null;
   }
+  if (!port) return null;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(2000) });
+    if (r.ok) return port;
+  } catch {
+    /* stale port file */
+  }
+  return null;
+}
 
-  const renderer = await page.evaluate(() => {
-    const gl = window.__GAME.engine.renderer.getContext();
-    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-    return dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+function spawnDaemon() {
+  const out = openSync(LOGFILE, 'a');
+  spawn(process.execPath, [path.join(ROOT, 'tools/shotd.mjs'), ...daemonFlags()], {
+    cwd: ROOT,
+    detached: true,
+    stdio: ['ignore', out, out],
+  }).unref();
+}
+
+/** Is some daemon process alive and holding the lock (possibly still booting)? */
+function daemonStarting() {
+  try {
+    const pid = +readFileSync(LOCKFILE, 'utf8').trim();
+    process.kill(pid, 0); // throws if that process is gone
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get a live daemon, starting one if needed.
+ *
+ * Nine agents can hit this at the same instant. They all try to spawn, and the
+ * daemon takes an O_EXCL lock the moment it starts: exactly one wins, the other
+ * eight log "another daemon holds the lock" and exit before opening so much as a
+ * vite server. Everyone then waits here for the winner's port file, which is
+ * only written once it is booted and listening — so nobody ever talks to a
+ * half-built daemon. If the winner dies mid-boot the lock goes with it, and the
+ * loop below notices and elects a new one.
+ */
+async function daemonPort({ quiet = false } = {}) {
+  const existing = await ping();
+  if (existing) return existing;
+
+  await mkdir(RUN, { recursive: true });
+  if (!quiet) process.stderr.write('starting render daemon (first run builds the world once)...\n');
+  spawnDaemon();
+  let lastSpawn = Date.now();
+
+  const deadline = Date.now() + 300000;
+  while (Date.now() < deadline) {
+    await sleep(300);
+    const port = await ping();
+    if (port) return port;
+    // No port and nobody holds the lock: the daemon we were waiting on died,
+    // so elect another. The backoff matters — for the first second or so after
+    // a spawn there is legitimately no lock file yet, and re-electing on that
+    // gap makes every client spawn a daemon every poll.
+    if (!daemonStarting() && Date.now() - lastSpawn > RESPAWN_BACKOFF_MS) {
+      spawnDaemon();
+      lastSpawn = Date.now();
+    }
+  }
+  throw new Error(`render daemon never came up — see ${path.relative(ROOT, LOGFILE)}`);
+}
+
+function daemonFlags() {
+  const f = [];
+  const pages = process.env.SHOTD_PAGES;
+  const idle = process.env.SHOTD_IDLE;
+  if (pages) f.push('--pages', pages);
+  if (idle) f.push('--idle', idle);
+  return f;
+}
+
+async function call(endpoint, body, { quiet = false } = {}) {
+  const port = await daemonPort({ quiet });
+  const r = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
   });
-  console.log(`renderer: ${renderer}`);
+  const json = await r.json();
+  if (!r.ok) throw new Error(json.error ?? `daemon returned ${r.status}`);
+  return json;
+}
 
-  const allShots = await page.evaluate(() => Object.keys(window.__GAME.shots));
-  const shots = opts.shots.length ? opts.shots.filter((s) => allShots.includes(s)) : allShots;
-  if (opts.shots.length && shots.length !== opts.shots.length) {
-    const missing = opts.shots.filter((s) => !allShots.includes(s));
-    console.error(`unknown shots: ${missing.join(', ')} (have: ${allShots.join(', ')})`);
+// --- argument parsing -----------------------------------------------------
+const argv = process.argv.slice(2);
+const flags = { out: 'shots', width: 1280, height: 720, frames: 6, shot: null };
+const positional = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '--out') flags.out = argv[++i];
+  else if (a === '--width') flags.width = +argv[++i];
+  else if (a === '--height') flags.height = +argv[++i];
+  else if (a === '--frames') flags.frames = +argv[++i];
+  else if (a === '--shot') flags.shot = argv[++i];
+  else if (!a.startsWith('--')) positional.push(a);
+}
+
+const SUBCOMMANDS = new Set(['eval', 'pix', 'status', 'stop']);
+const cmd = SUBCOMMANDS.has(positional[0]) ? positional.shift() : 'shot';
+
+// --- subcommands ----------------------------------------------------------
+async function runShot() {
+  const report = await call('/shot', {
+    shots: positional,
+    out: flags.out,
+    width: flags.width,
+    height: flags.height,
+    frames: flags.frames,
+  });
+
+  console.log(`renderer: ${report.renderer}`);
+  if (report.missing?.length) {
+    console.error(`unknown shots: ${report.missing.join(', ')}`);
   }
-
-  const report = { renderer, shots: {}, errors: consoleErrors };
-
-  for (const name of shots) {
-    const meta = await page.evaluate(
-      ({ name, frames }) => {
-        const g = window.__GAME;
-        const s = g.applyShot(name);
-        const ms = g.settle(frames);
-        return { note: s.note, tod: s.tod, ms: Math.round(ms * 100) / 100, stats: g.stats(), errors: g.errors.slice() };
-      },
-      { name, frames: opts.frames },
-    );
-    const file = path.join(outDir, `${name}.png`);
-    const buf = await page.screenshot({ type: 'png' });
-    await writeFile(file, buf);
-    report.shots[name] = { file: path.relative(ROOT, file), ...meta };
+  const names = Object.keys(report.shots);
+  for (const name of names) {
+    const s = report.shots[name];
     console.log(
-      `  ${name.padEnd(10)} ${meta.tod.padEnd(10)} ${String(meta.ms).padStart(7)}ms ` +
-        `calls=${String(meta.stats.calls).padStart(4)} tris=${String(meta.stats.triangles).padStart(8)} -> ${path.relative(ROOT, file)}`,
+      `  ${name.padEnd(10)} ${s.tod.padEnd(10)} ${String(s.ms).padStart(7)}ms ` +
+        `calls=${String(s.stats.calls).padStart(4)} tris=${String(s.stats.triangles).padStart(8)} -> ${s.file}`,
     );
   }
 
-  await writeFile(path.join(outDir, 'report.json'), JSON.stringify(report, null, 2));
-
-  if (!opts.keepOpen) {
-    await browser.close();
-    try { process.kill(-vite.pid, 'SIGKILL'); } catch {}
-  }
-
-  if (consoleErrors.length) {
-    console.error(`\n${consoleErrors.length} page error(s):`);
-    for (const e of consoleErrors.slice(0, 20)) console.error('  ' + e);
+  if (report.errors?.length) {
+    console.error(`\n${report.errors.length} page error(s):`);
+    for (const e of report.errors.slice(0, 20)) console.error('  ' + e);
     process.exit(1);
   }
-  console.log(`\nwrote ${shots.length} shot(s) to ${path.relative(ROOT, outDir)}`);
+  console.log(`\nwrote ${names.length} shot(s) to ${report.dir}`);
 }
 
-main().catch((e) => {
-  console.error(e);
+async function runEval() {
+  const file = positional[0];
+  if (!file) throw new Error('usage: shot.mjs eval <probe.js> [--shot vista] [--out shots/diag]');
+  const code = await readFile(path.resolve(ROOT, file), 'utf8');
+  const res = await call('/eval', {
+    code,
+    shot: flags.shot,
+    width: flags.width === 1280 ? 1920 : flags.width,
+    height: flags.height === 720 ? 1080 : flags.height,
+    out: flags.out === 'shots' ? 'shots/diag' : flags.out,
+  });
+  console.log(JSON.stringify(res.result, null, 2));
+  for (const s of res.snaps) console.error('snap ->', s);
+  if (res.errors?.length) {
+    console.error('PAGE ERRORS:\n' + res.errors.slice(0, 10).join('\n'));
+    process.exit(1);
+  }
+}
+
+async function runPix() {
+  const op = positional.shift();
+  if (!op) throw new Error('usage: shot.mjs pix <stats|probe|crop|column> ...');
+  let files = positional;
+  let args = [];
+  if (op === 'probe') {
+    files = [positional[0]];
+    args = positional.slice(1);
+  } else if (op === 'crop' || op === 'column') {
+    files = [positional[0]];
+    args = positional.slice(1);
+  }
+  const res = await call('/pix', { op, files, args });
+  if (res.rows) console.table(res.rows);
+  else if (res.points) console.table(res.points);
+  else if (res.wrote) console.log(res.wrote);
+  else console.log(JSON.stringify(res, null, 2));
+}
+
+async function runStatus() {
+  const port = await ping();
+  if (!port) {
+    console.log('render daemon: not running');
+    return;
+  }
+  const r = await fetch(`http://127.0.0.1:${port}/status`);
+  const s = await r.json();
+  console.log(
+    `render daemon: up  pid=${s.pid} port=${port} pages=${s.pages} idle=${s.idlePages} ` +
+      `queued=${s.queued} uptime=${s.uptimeSec}s\nrenderer: ${s.renderer}`,
+  );
+}
+
+async function runStop() {
+  const port = await ping();
+  if (!port) {
+    console.log('render daemon: not running');
+    return;
+  }
+  await fetch(`http://127.0.0.1:${port}/stop`).catch(() => {});
+  console.log('render daemon: stopped');
+}
+
+const RUNNERS = { shot: runShot, eval: runEval, pix: runPix, status: runStatus, stop: runStop };
+
+RUNNERS[cmd]().catch((err) => {
+  console.error(String(err?.message ?? err));
   process.exit(1);
 });

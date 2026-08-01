@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite --port 5173",
     "build": "vite build",
-    "preview": "vite preview --port 4173",
-    "shot": "node tools/shot.mjs"
+    "preview": "vite preview --port 4173"
   },
   "dependencies": {
     "three": "^0.180.0"

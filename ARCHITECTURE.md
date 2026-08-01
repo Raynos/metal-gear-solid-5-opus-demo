@@ -11,11 +11,79 @@ generated in code.
 npm run dev                       # http://127.0.0.1:5173 — WASD + drag to look
 node tools/shot.mjs               # all canonical shots -> shots/
 node tools/shot.mjs vista ground --out shots/mine
-node tools/calibrate.mjs vista    # sweep lighting params, print luminance response
+node tools/shot.mjs eval probe.js # run a probe inside the live page
+node tools/shot.mjs pix stats shots/mine/*.png
+node tools/shot.mjs status | stop # inspect / shut down the render daemon
 ```
 
 `tools/shot.mjs` exits **non-zero** if the page threw. A shot run that reports
 page errors is a failed build, not a style choice.
+
+### The tooling changed — read this if you have older commands in your head
+
+`tools/calibrate.mjs`, `tools/eval.mjs`, `tools/pix.mjs` and `tools/probe-sky.mjs`
+are **gone**, and so is `npm run shot`. Every one of them booted its own vite
+server and its own chromium, which is the exact cost this change exists to
+delete. Their capabilities are folded into `tools/shot.mjs`:
+
+| Old command                              | New command                                  |
+| ---------------------------------------- | -------------------------------------------- |
+| `npm run shot`                           | `node tools/shot.mjs`                         |
+| `node tools/eval.mjs probe.js`           | `node tools/shot.mjs eval probe.js`           |
+| `node tools/pix.mjs stats a.png`         | `node tools/shot.mjs pix stats a.png`         |
+| `node tools/pix.mjs probe a.png 10,20`   | `node tools/shot.mjs pix probe a.png 10,20`   |
+| `node tools/pix.mjs crop …`              | `node tools/shot.mjs pix crop …`              |
+| `node tools/pix.mjs column …`            | `node tools/shot.mjs pix column …`            |
+| `node tools/calibrate.mjs`               | an `eval` probe that sweeps and calls `g.probeLuminance()` |
+| `node tools/probe-sky.mjs`               | an `eval` probe that toggles layers and samples |
+
+`node tools/shot.mjs <shots>` is unchanged, including its flags and its
+non-zero-on-page-error contract. If a command you remember is missing, it is in
+the table above — do not re-create the deleted file.
+
+### How the harness works
+
+`tools/shot.mjs` renders nothing itself. It talks to **one** render daemon
+(`tools/shotd.mjs`) shared by every author on the machine: one vite server, one
+chromium, a small pool of pages each holding a fully generated world. The daemon
+starts on demand and shuts down when idle; nothing needs starting by hand.
+
+This matters because generating the world costs ~17 s, of which ~12 s is the
+`Terrain.js` erosion simulation. The old harness paid that on **every**
+screenshot, and eight authors doing it at once turned an 18 s run into 55 s of
+pure contention. Against the warm daemon a repeat shot is well under a second,
+and the world is rebuilt only when a source file actually changes — once for the
+whole machine, not once per author.
+
+Measured on an M3 Pro, 1280×720:
+
+| | old harness | daemon |
+| --- | --- | --- |
+| 4 shots, alone | 18.3 s | 25 s cold **/ 2.5 s warm** |
+| 4 shots, 8 authors at once | 39.9–67.5 s (avg 54.6) | **4.5–11.5 s** |
+| `eval` probe | ~25 s | **0.4 s** |
+| shot after an edit | 18.3 s | ~16 s (one rebuild, then warm) |
+
+Consequences worth knowing:
+
+- **Any** edit under `src/` invalidates the warm world, so the first shot after
+  an edit pays one rebuild. Batch your edits, then screenshot.
+- Ask for every shot you want in one command. Extra shots cost ~0.6 s; a second
+  invocation may cost a rebuild.
+- `eval` and `pix` run against the same warm daemon, so probing the live page or
+  measuring a PNG is effectively free. Use them freely.
+- **Do not write `sleep`/retry loops around the harness.** The old harness had a
+  latent bug where its readiness wait used Playwright's 30 s default instead of
+  the intended 90 s, so it spuriously failed under load and everyone wrapped it
+  in `for i in $(seq 1 40); … sleep 15`. That is fixed. A broken build now fails
+  in ~2 s with the offending file and line, rather than hanging.
+
+Daemon control: `node tools/shot.mjs status` / `stop`. Its state lives in
+`.shotd/` (gitignored) and its log is `.shotd/log`. One daemon per working tree,
+enforced by an `O_EXCL` lock: if nine authors run the client at the same instant,
+nine daemons start, one wins the lock and the other eight exit before opening a
+vite server. Tune with `SHOTD_PAGES` (default 3) and `SHOTD_IDLE` (seconds,
+default 1800).
 
 ## File ownership — DO NOT CROSS THESE LINES
 

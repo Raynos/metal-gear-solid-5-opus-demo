@@ -1,3 +1,6 @@
 node_modules/
 dist/
 shots/
+
+# render daemon runtime state
+.shotd/
