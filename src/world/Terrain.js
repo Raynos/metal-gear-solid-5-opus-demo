@@ -2273,7 +2273,6 @@ export class Terrain {
     const vmap = new Int32Array(stride * stride).fill(-1);
     const pos = [];
     const st = [];
-    const idx = [];
 
     const vid = (i, j) => {
       const key = j * stride + i;
@@ -2290,6 +2289,9 @@ export class Terrain {
       return k;
     };
 
+    // NOT split into cullable blocks, and that is a measured decision — see the
+    // note on `_buildClipmap`.
+    const idx = [];
     for (let j = 0; j < G; j++) {
       for (let i = 0; i < G; i++) {
         if (!full && i >= lo && i < hi && j >= lo && j < hi) continue;
@@ -2329,6 +2331,32 @@ export class Terrain {
     this.mesh.name = 'terrain';
     this._rings = [];
 
+    // The clipmap stays EIGHT draw calls, uncullable, and that is a measured
+    // decision rather than an oversight. Round 8 built and benchmarked the
+    // obvious fix, and it lost.
+    //
+    // The observation is real: with `frustumCulled = false` all 461 k triangles
+    // of clipmap go into the main pass and all 184 k of L0..L2 into each of the
+    // three shadow cascades — including into the 28 m cascade, which cannot
+    // contain one triangle of the 12 km level. Culling cannot help as written,
+    // because a level's bounding sphere is centred on the camera and a sphere
+    // that contains the eye is inside every frustum there is. Only a 4x4 block
+    // split makes the twelve outer blocks of a level rejectable.
+    //
+    // Built, measured on `gameplay` at 1920x1080, blocks vs this:
+    //     triangles/frame   5.03 M -> 4.45 M     (-12%)
+    //     draw calls        559    -> 659        (+18%)
+    //     frame time, static  44.4 ms -> 45.3 ms
+    //     frame time, panning 42.9 ms -> 48.3 ms
+    // Both timings are back-to-back on the same machine and the same load. The
+    // scene is submission-bound, not vertex-bound — the resolution sweep says
+    // the same thing, 640x360 costs 85% of what 1920x1080 costs — so trading
+    // 100 draw calls for 580 k triangles is the wrong direction, and the extra
+    // cost of re-fitting a hundred bounding spheres on every 8 m re-centre is
+    // what makes the panning number worse still. Cut draw calls here, not
+    // triangles. If the levels are ever split, the per-block height range has to
+    // come from a min/max pyramid baked with the heightfield, not from sampling
+    // the grid on every snap.
     for (let l = 0; l < LEVELS; l++) {
       const spacing = 0.5 * Math.pow(2, l);
       const geo = Terrain._ringGeometry(G, spacing, l === 0);

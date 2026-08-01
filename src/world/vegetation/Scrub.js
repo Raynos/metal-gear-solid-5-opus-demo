@@ -328,6 +328,51 @@ function buildTiles(geo, mats, mat, depthMat, name, tile, shadowRadius = 0) {
     if (!list) buckets.set(key, (list = []));
     list.push(m);
   }
+
+  // Merge back every tile whose bounding circle still contains the play centre.
+  //
+  // A tile is only worth its draw call if the frustum can throw it away, and a
+  // bounding sphere that contains the eye is inside every frustum there is.
+  // Measured on `gameplay` at 1920x1080, this module was submitting 67 meshes of
+  // which the near tiers' 48 were all of that kind: the tile grid was 500 m
+  // across a field 148 m in radius, so the split was a quadranting of the field
+  // about the origin and every quadrant reached back to it. Forty-odd draw calls
+  // that could never be culled and never were. The far tiers (dead trees out to
+  // 740 m) do stand clear of the centre, and those keep their tiles.
+  // Key well outside the (bx * 4096 + bz) range so it cannot collide with a tile.
+  const CORE = 2000000;
+  for (const [key, list] of [...buckets]) {
+    if (key >= CORE) continue;
+    let x0 = Infinity; let x1 = -Infinity; let z0 = Infinity; let z1 = -Infinity;
+    for (const m of list) {
+      const x = m.elements[12];
+      const z = m.elements[14];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (z < z0) z0 = z;
+      if (z > z1) z1 = z;
+    }
+    const cx = (x0 + x1) * 0.5;
+    const cz = (z0 + z1) * 0.5;
+    // True enclosing radius, not the box diagonal: a quarter-annulus of plants
+    // hugs its corner, and the box measure reads 12% small there — exactly the
+    // margin this test turns on.
+    let r = 0;
+    for (const m of list) {
+      const d = Math.hypot(m.elements[12] - cx, m.elements[14] - cz);
+      if (d > r) r = d;
+    }
+    // A tile has to clear the play centre by a real margin to be worth a draw
+    // call; grazing it means the camera is inside its sphere from anywhere in
+    // the compound and the frustum can never reject it.
+    if (Math.hypot(cx, cz) > r * 1.3) continue;
+    const merged = CORE + (key & 1);
+    const into = buckets.get(merged);
+    if (into) into.push(...list);
+    else buckets.set(merged, list);
+    buckets.delete(key);
+  }
+
   const meshes = [];
   let tris = 0;
   for (const [key, list] of buckets) {
