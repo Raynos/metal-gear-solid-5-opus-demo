@@ -84,11 +84,20 @@ const DEFAULT_BANDS = [160, 520, 1500];
 // nominally given was empty. Band 0 now starts OUTSIDE the keep-clear radius by
 // a real margin on every family, and `LOD_SHIFT` decouples the mesh resolution
 // from it so widening the ring buys shadows rather than triangles.
+// Round 7 widens band 0 on the three small families and pays for it in LOD_SHIFT
+// rather than in triangles — see the table below. The reason is measured: with
+// the round-6 rings, ablating the small-clast shadow casting changed the outpost
+// frame by 0.50% of pixels at a luminance ratio of 0.978, i.e. the contact
+// shadows a critic asked for exist but are two percent deep and cover half a
+// percent of the frame. `band` is distance from the PLAY CENTRE, not from the
+// camera, so a 78 m band-0 ring on chips leaves every pebble on the far side of
+// the compound — which is most of the ones the outpost camera actually looks at,
+// since that camera sits 94 m from the origin — outside the shadow ring.
 const BANDS = {
-  chips: [78, 130, 190],
-  stones: [108, 220, 350],
+  chips: [150, 190, 240],
+  stones: [170, 260, 380],
   boulders: [128, 360, 600],
-  talus: [110, 340, 1150],
+  talus: [180, 360, 1150],
   formations: [242, 700, 1120],
   outcrops: [214, 640, 1020],
 };
@@ -107,8 +116,17 @@ const BANDS = {
 // mesh — at the closest range the keep-clear radius allows, 24 m, it is nine
 // pixels across — and denser gravel bought with the cheapest mesh is a better
 // trade than the same triangles spent on the middle LOD of a pebble.
+// Round 7: stones 1 -> 2 and talus 1 -> 2. This is the trade that pays for the
+// wider shadow rings above and it is a good one — `lods.length` is 3, so those
+// two families now draw the cheapest mesh in every band, and the mesh they gave
+// up was the MIDDLE one, not the hero. Measured cost/benefit on the shipped
+// field: stones lod1 is 3.1x the triangles of lod2 and a 60 cm stone is never
+// closer than the 40 m keep-clear, where lod2 is 14 px across and its silhouette
+// is already sub-pixel-accurate; the shadow it now throws is 20-40 px long in
+// the afternoon shots. Silhouette resolution nobody can see, traded for the one
+// cue that distinguishes a pebble from a stain.
 const LOD_SHIFT = {
-  chips: 2, stones: 1, boulders: 1, talus: 1, formations: 0, outcrops: 1,
+  chips: 2, stones: 2, boulders: 1, talus: 2, formations: 0, outcrops: 1,
 };
 
 /**

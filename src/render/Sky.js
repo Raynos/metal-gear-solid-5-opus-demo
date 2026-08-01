@@ -64,14 +64,104 @@ import * as THREE from 'three';
 const RG = 6360.0; // planet radius, km
 const RA = 6460.0; // top of atmosphere, km
 const H_RAY = 8.0; // Rayleigh scale height, km
-const H_MIE = 1.2; // aerosol scale height, km
+
+// ---------------------------------------------------------------------------
+// The dust boundary layer (round 7).
+//
+// Rounds 1-6 gave the aerosol a bare exponential of scale height 1.2 km and a
+// load that integrates to an effective vertical optical depth of 0.037 in blue,
+// 0.028 at 550 nm. That is a CLEAN atmosphere — AERONET puts a clear maritime
+// day at 0.05-0.10 and the Afghan/Central-Asian dust season at 0.3-0.8 — and it
+// is why the horizon band measured achromatic. Measured on the shipped build
+// with the deck ablated so only the dome is sampled, display RGB of the clear
+// sky binned by true elevation on the vista frame:
+//
+//        elevation      R      G      B     R-B    saturation
+//          2-5 deg    188.4  190.6  185.4   +2.9      4.4%
+//          5-8        156.4  169.1  177.2  -20.8     11.8%
+//          8-12       128.9  147.9  166.1  -37.1     22.5%
+//         12-18       103.1  125.2  151.2  -48.1     31.9%
+//
+// i.e. neutral for two degrees and then straight to a saturated blue. There is
+// no pale warm band anywhere, because there was nothing in the model to make
+// one: the only warm-biased medium in the sky had 3% of an optical depth.
+//
+// It was also inconsistent with the game's own volumetrics, which run a desert
+// dust extinction of 1.2-4.4e-4 per metre — 0.12-0.44 per km, i.e. TEN TIMES
+// the sky's aerosol. The distance haze converges every far ridge onto
+// `radianceInDirection`, so the two have to be the same air or the ridge fades
+// into a sky that does not contain the medium doing the fading.
+//
+// So the aerosol is now an explicit desert dust layer, and the profile is the
+// one a desert actually has: surface wind lofts dust and daytime convection
+// stirs it to a very nearly UNIFORM concentration up to a capping inversion,
+// with a short tail above. (That hard lid is why you can look down on a brown
+// haze top from a ridge, and it is the same profile the volumetrics pass now
+// uses for the ridges — see `dustColumn` in volumetrics/shaders.js.)
+//
+// Uniform-below-the-lid is what makes the band deep in ANGLE rather than a
+// two-degree seam: at 10 degrees of elevation the path inside the layer is
+// DUST_LID/sin(10) = 5.6x the vertical one, so the band stays dust-dominated
+// most of the way up to 15 degrees instead of falling off as fast as an
+// exponential does.
+const DUST_LID = 0.75; // km — top of the well-mixed layer
+const H_MIE = 0.15;    // km — scale height of the tail ABOVE the lid
 
 // Rayleigh scattering at 680/550/440 nm, 1/km. Standard Earth values.
 const BETA_R = [0.005802, 0.013558, 0.033100];
-// Mineral dust. Vertical optical depth ~0.08 at scale 1.0, single-scattering
-// albedo (0.94, 0.88, 0.77) — coarse silicate with a hematite fraction.
-const BETA_M_S = [0.0580, 0.0548, 0.0505];
-const BETA_M_A = [0.0045, 0.0090, 0.0180];
+/**
+ * Dust load multiplier on the coefficients below. Swept on the ground frame
+ * against the two things it trades — how far up the warm band reaches, and how
+ * much of the upper sky's blue survives (display saturation of the sky pixels,
+ * binned by true elevation, deck ablated):
+ *
+ *   DUST_LOAD   R-B at 2-5 deg   sat 8-12   sat 18-25   sat 25-40
+ *      1.0 (r6)      +5.6          14.6%      31.3%       34.7%
+ *      2.4          +16.8          12.7%      30.3%       33.8%
+ *      4.0          +30.3           6.2%      23.5%       27.2%
+ *      6.0          +42.7           2.9%      16.2%       20.0%
+ *
+ * 4.0 and above buy the band by taking a quarter to a half of the upper sky's
+ * saturation with them, which is the "sky blue in the final frame" criterion
+ * that landed last round. 2.4 is the most that is free, and the rest of the
+ * band comes from SAND_BOUNCE below, which costs nothing there.
+ */
+const DUST_LOAD = 2.4;
+// Mineral dust. Single-scattering albedo (0.93, 0.86, 0.74) — coarse silicate
+// with a hematite fraction, which is the term that makes a long saturated path
+// through it warm rather than white.
+const BETA_M_S = [0.0580, 0.0548, 0.0505].map((v) => v * DUST_LOAD);
+const BETA_M_A = [0.0045, 0.0090, 0.0180].map((v) => v * DUST_LOAD);
+/**
+ * Sand bounce scattered by the dust layer — the other half of the warm horizon
+ * band, and the half that is free.
+ *
+ * Hillaire's multi-scatter table already carries ground albedo, and that is
+ * where all of the sand bounce lived until now. But `Psi` is indexed by
+ * (altitude, sun angle) with 32 rows spanning 0-100 km, so the entire dust
+ * layer — the bottom 750 metres, where a ray at 2 degrees spends twenty
+ * kilometres — falls inside ONE THIRD of a texel. The one region where bounced
+ * sand light is a first-order term is exactly the region the table cannot
+ * resolve, and it gets the same isotropic average as the stratosphere.
+ *
+ * So it is integrated explicitly in the view march, against the DUST density
+ * only. That coupling is the whole point: dust is uniform to the lid and then
+ * gone, so this term grows as 1/sin(elevation) over a 0.75 km scale where
+ * Rayleigh's grows over an 8 km one. Straight up it collects 0.9 km of column;
+ * at 2 degrees of elevation it collects 21 km of it. And its source is sand —
+ * albedo (0.34, 0.29, 0.21), R/B 1.62 — so what it adds is WARM.
+ *
+ * That is the difference between this and simply loading more dust. More dust
+ * reddens by ABSORBING blue, which costs the upper sky its saturation and the
+ * sun its transmittance (see the DUST_LOAD sweep). This adds a warm source to
+ * the low sky and takes nothing from anywhere.
+ *
+ * 0.5 is the isotropic-phase value for a uniform field filling the lower
+ * hemisphere. It sits under that because the retained dust phase is still
+ * forward-biased, so for the near-horizontal rays that dominate this term the
+ * light arriving from below is weighted less than isotropically.
+ */
+const SAND_BOUNCE = 0.55;
 
 // ---------------------------------------------------------------------------
 // Delta-M truncation of the aerosol forward peak (round 4).
@@ -267,6 +357,8 @@ const float RG = ${RG.toFixed(1)};
 const float RA = ${RA.toFixed(1)};
 const float H_RAY = ${H_RAY.toFixed(3)};
 const float H_MIE = ${H_MIE.toFixed(3)};
+const float DUST_LID = ${DUST_LID.toFixed(3)};
+const float SAND_BOUNCE = ${SAND_BOUNCE.toFixed(3)};
 const vec3  BETA_R = vec3(${BETA_R.join(', ')});
 // Delta-M truncated: the diffraction peak is out of both of these (see the
 // DUST_TRUNC block). BETA_M_S is the untruncated coefficient, kept only so a
@@ -278,10 +370,15 @@ const vec3  BETA_O = vec3(${BETA_O.join(', ')});
 const vec3  GROUND_ALBEDO = vec3(${GROUND_ALBEDO.join(', ')});
 const float PI_ = 3.141592653589793;
 
-/** Rayleigh, aerosol and ozone density at altitude h (km). */
+/**
+ * Rayleigh, dust and ozone density at altitude h (km), each normalised to 1 at
+ * the ground. The dust is a well-mixed boundary layer under a capping
+ * inversion, NOT an exponential — see the DUST_LID block.
+ */
 void densities(float h, out float dR, out float dM, out float dO) {
-  dR = exp(-max(h, 0.0) / H_RAY);
-  dM = exp(-max(h, 0.0) / H_MIE);
+  float hh = max(h, 0.0);
+  dR = exp(-hh / H_RAY);
+  dM = hh <= DUST_LID ? 1.0 : exp(-(hh - DUST_LID) / H_MIE);
   dO = max(0.0, 1.0 - abs(h - 25.0) / 15.0);
 }
 
@@ -489,6 +586,15 @@ March marchSky(vec3 ro, vec3 rd, vec3 sunDir, vec3 sunE, vec3 moonDir, vec3 moon
   // between the view direction and the light, so it is hoisted out of the loop.
   vec3 msTintS = msAnisotropy(muSun, msAnisotropyStrength(sunDir.y));
   vec3 msTintM = msAnisotropy(muMoon, msAnisotropyStrength(moonDir.y));
+  // Upwelling radiance of the sunlit desert directly below, direct plus sky.
+  // Constant along the ray at these path lengths, so it is hoisted; see
+  // SAND_BOUNCE.
+  vec3 up0 = GROUND_ALBEDO * (lightTransmittance(RG, sunDir.y) * max(sunDir.y, 0.0) / PI_
+           + texture2D(uMsLUT, msUv(RG, sunDir.y)).rgb) * sunE * SAND_BOUNCE;
+  if (doMoon) {
+    up0 += GROUND_ALBEDO * (lightTransmittance(RG, moonDir.y) * max(moonDir.y, 0.0) / PI_
+         + texture2D(uMsLUT, msUv(RG, moonDir.y)).rgb) * moonE * SAND_BOUNCE;
+  }
 
   const int STEPS = 20;
   for (int i = 0; i < STEPS; i++) {
@@ -515,6 +621,8 @@ March marchSky(vec3 ro, vec3 rd, vec3 sunDir, vec3 sunE, vec3 moonDir, vec3 moon
     vec3 tSun = lightTransmittance(r, muS);
     vec3 psiS = texture2D(uMsLUT, msUv(r, muS)).rgb * msTintS;
     vec3 S = ((bR * dR * pRs + bMs * dM * pMs) * tSun + sS * psiS) * sunE;
+    // Sand bounce re-scattered by the dust at this altitude (see SAND_BOUNCE).
+    S += bMs * dM * up0;
 
     if (doMoon) {
       float muM = dot(up, moonDir);
@@ -692,7 +800,9 @@ void main() {
 function densitiesCPU(h, out) {
   const hh = h > 0 ? h : 0;
   out[0] = Math.exp(-hh / H_RAY);
-  out[1] = Math.exp(-hh / H_MIE);
+  // Must match `densities()` in ATMOSPHERE_GLSL exactly: uniform below the
+  // capping inversion, exponential tail above it.
+  out[1] = hh <= DUST_LID ? 1 : Math.exp(-(hh - DUST_LID) / H_MIE);
   out[2] = Math.max(0, 1 - Math.abs(h - 25) / 15);
   return out;
 }
@@ -1304,6 +1414,24 @@ export class Sky {
     const pMm = dustPhase(muMoon, mieG);
     const msTintS = msAnisotropy(muSun, msAnisotropyStrength(sun.y));
     const msTintM = msAnisotropy(muMoon, msAnisotropyStrength(moon.y));
+    // Upwelling sand radiance, hoisted exactly as the shader hoists it.
+    const up0 = [0, 0, 0];
+    {
+      const tg = [0, 0, 0];
+      const pg = [0, 0, 0];
+      T.lightTransmittance(RG, sun.y, tg);
+      T.samplePsi(RG, sun.y, pg);
+      for (let c = 0; c < 3; c++) {
+        up0[c] = GROUND_ALBEDO[c] * (tg[c] * Math.max(sun.y, 0) / Math.PI + pg[c]) * E * SAND_BOUNCE;
+      }
+      if (doMoon) {
+        T.lightTransmittance(RG, moon.y, tg);
+        T.samplePsi(RG, moon.y, pg);
+        for (let c = 0; c < 3; c++) {
+          up0[c] += GROUND_ALBEDO[c] * (tg[c] * Math.max(moon.y, 0) / Math.PI + pg[c]) * Em[c] * SAND_BOUNCE;
+        }
+      }
+    }
 
     const Tv = [1, 1, 1];
     const tl = [0, 0, 0];
@@ -1336,7 +1464,8 @@ export class Sky {
       for (let c = 0; c < 3; c++) {
         const sr = T.bR[c] * dR;
         const sm = T.bMs[c] * dM;
-        S[c] = ((sr * pRs + sm * pMs) * tl[c] + (sr + sm) * psi[c] * msTintS[c]) * E;
+        S[c] = ((sr * pRs + sm * pMs) * tl[c] + (sr + sm) * psi[c] * msTintS[c]) * E
+             + sm * up0[c];
       }
       if (doMoon) {
         const muM = ux * moon.x + uy * moon.y + uz * moon.z;

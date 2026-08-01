@@ -186,6 +186,7 @@ uniform float uWarmMix;
 uniform vec3 uRimColor;
 uniform float uRimAmt;
 uniform float uSunRim;
+uniform float uSpecAbl;
 float gAO = 1.0;
 const vec3 CH_LUMA = vec3(0.2126, 0.7152, 0.0722);
 `;
@@ -285,12 +286,43 @@ function lightUniforms(o = {}) {
     uBounceAmt: { value: o.bounce ?? 0.11 },
     uWarmMix: { value: o.warmMix ?? 0.10 },
     uRimColor: { value: new THREE.Vector3(...(o.rimColor ?? [1.0, 0.94, 0.86])) },
-    // Now a REFLECTANCE (the lobe is 1/PI-normalised in CHAR_RIM), so 0.30 means
-    // a grazing sheen of 0.30 against a fabric whose diffuse albedo is 0.20:
-    // a rim that is a stop brighter than the panel at the extreme silhouette
-    // and invisible two degrees inboard of it.
-    uRimAmt: { value: o.rim ?? 0.22 },
+    // ROUND 6: 0.22 -> 0.10, and this is MAJOR 4.
+    //
+    // `probes/r7c/verify.js` bins the character's SHADED pixels by world normal
+    // Y, isolated to one cloth zone at a time so albedo is constant. On the
+    // round-5 build the jacket came back V-SHAPED, not ramped:
+    //
+    //   normal Y   -0.83   -0.50   -0.17   +0.17   +0.50   +0.83
+    //   linear     0.124   0.094   0.067   0.111   0.147   0.166
+    //
+    // The GROUND-facing band was brighter than every band above it up to +0.5.
+    // That is not the sky ramp; it is this term. A Fresnel lobe keyed to N.V
+    // fires hardest wherever the surface turns away from the CAMERA, and from
+    // a level camera both the top and the underside of a rounded form are at
+    // grazing incidence — so a rim at 0.22 reflectance against a 0.25-albedo
+    // fabric was adding ~87% of the surface's own diffuse to both extremes
+    // equally and flattening the form it was supposed to describe.
+    //
+    // A cloth sheen edge is real, but it is 0.08-0.12, and the job of holding
+    // the silhouette against a dark background belongs to the ENV reflection,
+    // which is direction-aware: it reflects sky where the reflection vector
+    // points up and ground where it points down. That is now funded properly
+    // through CLOTH_SPEC instead of by a normal-independent constant.
+    uRimAmt: { value: o.rim ?? 0.10 },
     uSunRim: { value: o.sunRim ?? 0.05 },
+    // ROUND 6 — in-place specular ablation, and the reason the round-5
+    // "characters have no specular" measurement could not have been right
+    // either way. `tools/probes/verify/c-specular.js` ablates by setting
+    // `material.roughness = 1` on every material in the scene — but every
+    // material in this file replaces `<roughnessmap_fragment>` with
+    // `roughnessFactor = gRough`, so `material.roughness` is dead code here and
+    // that probe was ablating NOTHING on the characters. Whatever it measured,
+    // it was not a controlled A/B.
+    //
+    // At 1 this drives roughness to 1.0 and the sheen lobe to zero on whichever
+    // materials it is set on, with no rebuild and no second shader, so an A/B
+    // differs in the specular response and in nothing else.
+    uSpecAbl: { value: 0 },
   };
 }
 
@@ -368,18 +400,76 @@ function defaultClothPalette() {
   return c;
 }
 
+/**
+ * ROUND 6 — authored roughness, MAJOR 2.
+ *
+ * Measured on the shipped build: 36 of 75 materials in the game sat at 0.9-1.0
+ * and an ablation that forced everything to 1.0 moved the highlight count by
+ * less than noise. Everything a soldier carries was in that bucket. It is not
+ * that the renderer cannot do specular — at 0.2 the same scene throws real
+ * highlights — it is that nothing was ever authored below 0.58.
+ *
+ * These are measured-ish values for the actual materials, not a global "make it
+ * shinier" pass. Woven fabric REALLY IS 0.85-0.95 and stays there; what changes
+ * is everything that is not woven fabric:
+ *   leather 0.52  — a boot upper that has been oiled and then sanded by grit
+ *   boot    0.60  — rough-out suede is matt, but the toe and heel burnish
+ *   kneepad 0.48  — moulded EVA/nylon shell, the glossiest thing below the belt
+ *   belt    0.55, glove 0.60 — palm leather and nylon web with a poly coat
+ *   helmet  0.62  — the cover is nylon, but it is stretched over a hard shell
+ *                   and 40 years of photographs say a covered helmet has a
+ *                   broad sheen across its crown. It is also the one horizontal
+ *                   on a soldier that ever catches the sky.
+ *   hair    0.62  — keratin is a fibre with a cuticle; it has a real sheen lobe
+ */
 const CLOTH_ROUGH = (() => {
   const r = new Array(18).fill(0.9);
-  r[Z.LEATHER] = 0.58;
-  r[Z.GLOVE] = 0.7;
-  r[Z.KNEEPAD] = 0.62;
-  r[Z.BELT] = 0.64;
+  r[Z.LEATHER] = 0.52;
+  r[Z.GLOVE] = 0.6;
+  r[Z.KNEEPAD] = 0.48;
+  r[Z.BELT] = 0.55;
   r[Z.POUCH] = 0.82;
   r[Z.VEST] = 0.84;
   r[Z.BANDANA] = 0.85;
-  r[Z.HAIR] = 0.72;
-  r[Z.BOOT] = 0.72;
+  r[Z.HAIR] = 0.62;
+  r[Z.BOOT] = 0.6;
+  r[Z.HELMCOVER] = 0.62;
+  r[Z.CAP] = 0.78;
+  // Coated cordura, not cotton. The pack is the biggest single form on the
+  // character's silhouette and the one that most needs a Fresnel sky edge to
+  // separate it from a dark background (MAJOR 4).
+  r[Z.PACK] = 0.78;
   return r;
+})();
+
+/**
+ * Per-zone dielectric F0 multiplier, applied to `material.specularColor`.
+ *
+ * A MeshPhysicalMaterial hands every zone the same 0.04 F0 scaled by one
+ * material-wide `specularIntensity`, and that number was 0.2 — i.e. F0 = 0.008,
+ * a fifth of the reflectance of ANY real dielectric. That single constant is
+ * why a rifle sling, a boot and a kneepad all had no highlight: even at the
+ * right roughness there was nothing to reflect. Cotton twill genuinely is a
+ * weak, broad reflector and stays near the bottom of this table; moulded
+ * plastic, oiled leather and a helmet cover are ordinary 0.04-0.05 dielectrics.
+ */
+const CLOTH_SPEC = (() => {
+  const s = new Array(18).fill(0.55);
+  s[Z.JACKET] = 0.5;
+  s[Z.SLEEVE] = 0.5;
+  s[Z.TROUSER] = 0.5;
+  s[Z.COLLAR] = 0.5;
+  s[Z.SHIRT] = 0.45;
+  s[Z.WEBBING] = 0.6;
+  s[Z.LEATHER] = 1.15;
+  s[Z.BOOT] = 1.0;
+  s[Z.KNEEPAD] = 1.3;
+  s[Z.BELT] = 1.0;
+  s[Z.GLOVE] = 0.9;
+  s[Z.HELMCOVER] = 1.0;
+  s[Z.HAIR] = 1.0;
+  s[Z.PACK] = 0.85;
+  return s;
 })();
 
 const CLOTH_SHEEN = (() => {
@@ -391,7 +481,15 @@ const CLOTH_SHEEN = (() => {
   s[Z.JACKET] = 0.7;
   s[Z.SLEEVE] = 0.7;
   s[Z.TROUSER] = 0.68;
-  s[Z.HAIR] = 0.9;
+  // ROUND 6: 0.9 -> 0.30, and this is why the head read as a bald egg. Sheen is
+  // an ADDITIVE, view-independent, omnidirectional lobe. At 0.9 the hair's
+  // sheen term reached 0.036 against a diffuse of albedo/PI = 0.026 — the
+  // brightest thing on the hair was a term that carries no form at all, and it
+  // lifted a 0.083 keratin to the same rendered value as 0.348 skin. The 2.1
+  // stops of albedo step between the hair and the neck were being erased in the
+  // material, not by the tone curve. Keratin's real sheen is a TIGHT
+  // directional lobe, which is now carried by roughness 0.62 + F0 instead.
+  s[Z.HAIR] = 0.3;
   s[Z.BOOT] = 0.28;
   return s;
 })();
@@ -476,7 +574,10 @@ export function makeClothMaterial(opts = {}) {
     sheen: 1.0,
     sheenRoughness: 0.9,
     sheenColor: new THREE.Color(0.5, 0.47, 0.42),
-    specularIntensity: 0.2,
+    // Was 0.2, i.e. F0 = 0.008. See CLOTH_SPEC: the per-zone table below is the
+    // real reflectance ladder and it needs the material-wide factor out of the
+    // way at 1.0, or every zone is multiplied back into invisibility.
+    specularIntensity: 1.0,
     envMapIntensity: 1.0,
     dithering: true,
   });
@@ -489,6 +590,7 @@ export function makeClothMaterial(opts = {}) {
     uZoneColor: { value: palette },
     uZoneRough: { value: CLOTH_ROUGH.slice() },
     uZoneSheen: { value: CLOTH_SHEEN.slice() },
+    uZoneSpec: { value: CLOTH_SPEC.slice() },
     uSeed: { value: opts.seed ?? 0 },
     uDust: { value: opts.dust ?? 0.55 },
     uWeave: { value: opts.weave ?? 1.0 },
@@ -527,12 +629,14 @@ export function makeClothMaterial(opts = {}) {
          uniform vec3 uZoneColor[18];
          uniform float uZoneRough[18];
          uniform float uZoneSheen[18];
+         uniform float uZoneSpec[18];
          uniform float uSeed;
          uniform float uDust;
          uniform float uWeave;
          uniform float uWrap;
          float gRough = 0.9;
          float gSheen = 0.5;
+         float gSpec = 0.5;
          float gGather = 0.0;
          float gStitch = 0.0;
          float gPix = 0.001;
@@ -548,6 +652,16 @@ export function makeClothMaterial(opts = {}) {
          // whole rig reads as plaid. Tapes get the sag and the stitching only.
          bool ch_isKit(int zi) {
            return zi == 3 || zi == 5 || zi == 9 || zi == 12 || zi == 10 || zi == 15;
+         }
+         // ROUND 6 — which of those is actually QUILTED. A pouch is; a rucksack
+         // body and a plate carrier are not, they are single laminated panels
+         // with webbing rows sewn across them. Running the 42 mm lattice over
+         // the pack and the carrier put a regular, axis-aligned grid across the
+         // two largest flat areas on the character, and at gameplay range that
+         // does not read as padding — it reads as TARTAN. It was the loudest
+         // thing on the back of the shipped frame.
+         bool ch_isQuilted(int zi) {
+           return zi == 5 || zi == 12;
          }
          // Quilted padding: a stitch lattice at 42 mm with the pad puffing
          // between the lines. UVs are authored in metres, so this is a real
@@ -569,6 +683,7 @@ export function makeClothMaterial(opts = {}) {
            vec3 base = uZoneColor[zi];
            float rough = uZoneRough[zi];
            gSheen = uZoneSheen[zi];
+           gSpec = uZoneSpec[zi];
            float ao = clamp(vAO, 0.0, 1.0);
            gAO = mix(0.35, 1.0, ao);
 
@@ -628,9 +743,17 @@ export function makeClothMaterial(opts = {}) {
            // purpose: padding is a SHAPE, so almost all of this should arrive
            // through the normal, and a strong colour lattice reads as printed
            // plaid rather than as a stitched pad.
-           if (kit) {
+           if (ch_isQuilted(zi)) {
              gQuilt = ch_quilt(vUvC, gPix);
              base *= 1.0 + gQuilt * 0.030;
+           }
+
+           // Strand clumping, on the same stretched field the hair normal uses
+           // so the value break and the relief agree. A cropped head is not one
+           // value: the tips catch and the roots are in their own shadow.
+           if (zi == 16) {
+             vec3 hp2 = vec3(vBind.x * 260.0, vBind.y * 34.0, vBind.z * 60.0) + uSeed;
+             base *= 0.84 + 0.36 * ch_ridge(hp2, 3);
            }
 
            // Tailoring. Seams are a hair darker with a thread highlight beside
@@ -654,7 +777,27 @@ export function makeClothMaterial(opts = {}) {
            float dust = clamp(low * 0.85 + (1.0 - ao) * 0.4, 0.0, 1.0) *
                         smoothstep(0.32, 0.82, dirtN) * uDust;
            base = mix(base, vec3(0.290, 0.245, 0.166), dust * 0.24);
-           rough = mix(rough, 0.97, dust * 0.6);
+           // Dust matts woven cloth hard — it sits down between the threads.
+           // On leather, moulded nylon and a helmet cover it sits ON the
+           // surface and gets rubbed off wherever the body touches anything,
+           // so matting the whole boot to 0.97 was quietly deleting every
+           // authored value in CLOTH_ROUGH below the belt.
+           rough = mix(rough, 0.97, dust * (garment ? 0.6 : 0.35));
+
+           // Contact burnish. A boot toe, a heel, a kneepad crown and a belt
+           // are POLISHED by wear, not roughened by it: grit acts as a very
+           // fine abrasive and the high spots end up glossier than the field
+           // finish, which is why worn leather has a broken, patchy shine
+           // rather than an even one. This is the term that puts an actual
+           // highlight on the one part of a soldier that is close to the
+           // ground and therefore in every wide shot.
+           if (zi == 6 || zi == 8 || zi == 12 || zi == 17) {
+             float scuff = smoothstep(0.52, 0.88, ch_fbm(bp * 22.0 + 7.0, 3));
+             // Toe and heel first: they are what actually drags.
+             float contact = 1.0 - smoothstep(0.02, 0.16, abs(vBind.y - 0.045));
+             rough = mix(rough, 0.28, clamp(scuff * 0.55 + contact * 0.35, 0.0, 0.8));
+             base *= 1.0 + scuff * 0.09;
+           }
            // A darker grime in the deep creases keeps it from looking floured.
            base *= 1.0 - 0.10 * (1.0 - ao) * smoothstep(0.55, 0.2, fold);
 
@@ -667,7 +810,9 @@ export function makeClothMaterial(opts = {}) {
            base *= mix(0.72, 1.0, pow(ao, 1.1));
 
            diffuseColor.rgb *= base;
-           gRough = clamp(rough + (meso - 0.5) * 0.09 - seam * 0.06, 0.25, 1.0);
+           // Floor was 0.25; leather and moulded nylon legitimately burnish
+           // below that and clamping there is how the whole ladder collapsed.
+           gRough = clamp(rough + (meso - 0.5) * 0.09 - seam * 0.06, 0.12, 1.0);
            // Sheen is a *whisper*. Cranked up it lights the whole garment from
            // the environment and fatigues turn into pale nylon.
            // Round 5: halved. Sheen is an ADDITIVE lobe that three adds on top
@@ -679,7 +824,7 @@ export function makeClothMaterial(opts = {}) {
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-         roughnessFactor = gRough;`,
+         roughnessFactor = mix(gRough, 1.0, uSpecAbl);`,
       )
       .replace(
         '#include <normal_fragment_maps>',
@@ -724,12 +869,29 @@ export function makeClothMaterial(opts = {}) {
            // same lattice the albedo uses so the shading and the value step
            // agree, which is what stops it reading as a printed pattern.
            vec2 nQuilt = vec2(0.0);
-           if (kit) {
+           if (ch_isQuilted(zi)) {
              vec2 q = fract(vUvC / 0.042) - 0.5;
              float fade = 1.0 - smoothstep(0.0035, 0.011, max(fwidth(vUvC.x), fwidth(vUvC.y)));
-             nQuilt = -q * 2.0 * fade * 0.95
+             // Halved with the restriction to genuinely quilted zones: a pouch
+             // lid is 90 mm across, i.e. two cells, so the lattice reads as
+             // padding there instead of as a printed grid.
+             nQuilt = -q * 2.0 * fade * 0.48
                       - vec2(sign(q.x) * (1.0 - smoothstep(0.02, 0.10, abs(q.x))),
-                             sign(q.y) * (1.0 - smoothstep(0.02, 0.10, abs(q.y)))) * 0.55 * fade;
+                             sign(q.y) * (1.0 - smoothstep(0.02, 0.10, abs(q.y)))) * 0.30 * fade;
+           }
+
+           // Hair is not cloth. A crop is a field of 60-100 um fibres lying in
+           // one flow direction over the skull, so its relief is STRETCHED —
+           // fine across the strands, smooth along them — and that anisotropy is
+           // the only thing that separates a haircut from a rubber swim cap at
+           // any distance. Without it the round-5/6 head rendered as one smooth
+           // dome no matter how the albedo was tuned.
+           vec2 nHair = vec2(0.0);
+           if (zi == 16) {
+             vec3 hp2 = vec3(vBind.x * 260.0, vBind.y * 34.0, vBind.z * 60.0) + uSeed;
+             float k0 = ch_ridge(hp2, 3);
+             nHair = vec2(k0 - ch_ridge(hp2 + vec3(0.9, 0.0, 0.0), 3),
+                          k0 - ch_ridge(hp2 + vec3(0.0, 0.0, 0.4), 3)) * 3.4;
            }
 
            // The one octave that survives the mip at gameplay range.
@@ -746,7 +908,7 @@ export function makeClothMaterial(opts = {}) {
            // Bounded. See ch_tangentNormal: the raw sum of these six terms
            // reaches 4-6, which tilts the shading normal 76-81 degrees off the
            // panel and lets a backlit 0.20-albedo pack catch the full key.
-           vec2 nSum = nRip + nWeave + nFold + nDrape + nQuilt + nSag + vec2(stitchN);
+           vec2 nSum = nRip + nWeave + nFold + nDrape + nQuilt + nSag + nHair + vec2(stitchN);
            // Load-bearing kit is a stiff laminated panel and gets the tighter
            // bound; a sleeve or a trouser leg genuinely gathers harder.
            // tan(19 deg) / tan(24 deg).
@@ -757,8 +919,10 @@ export function makeClothMaterial(opts = {}) {
       .replace(
         '#include <lights_physical_fragment>',
         `#include <lights_physical_fragment>
-         material.sheenColor = gSheenCol;
-         material.sheenRoughness = 0.92;`,
+         material.sheenColor = gSheenCol * (1.0 - uSpecAbl);
+         material.sheenRoughness = 0.92;
+         // Per-zone dielectric F0. See CLOTH_SPEC.
+         material.specularColor *= mix(gSpec, 0.0, uSpecAbl);`,
       )
       // Wrapped diffuse on fabric. See uWrap.
       .replace(
@@ -818,11 +982,15 @@ export function makeClothMaterial(opts = {}) {
 export function makeSkinMaterial(opts = {}) {
   const mat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
-    roughness: 0.52,
+    roughness: 0.5,
     metalness: 0.0,
-    // Skin's specular is broad and weak. A default dielectric F0 with low
-    // roughness is exactly the "wet plastic doll" look we must avoid.
-    specularIntensity: 0.42,
+    // Skin's specular is broad and weak, but it is NOT absent — a face with no
+    // highlight at all is a clay maquette. Sebum on the forehead, nose and the
+    // top of the cheekbone is a real 0.045 dielectric; 0.42 * 0.04 = 0.017 was
+    // under half of that and put the face in the same no-highlight bucket as
+    // everything else. The doll look comes from a TIGHT lobe, not a present
+    // one, so the energy goes up and the roughness stays at 0.5.
+    specularIntensity: 1.0,
     envMapIntensity: 1.0,
     dithering: true,
   });
@@ -837,7 +1005,7 @@ export function makeSkinMaterial(opts = {}) {
     uBrow: { value: opts.brow ?? 1.0 },
     // Skin wants a warmer, weaker rim than cloth: a cold sky rim on a face
     // reads as a chrome edge.
-    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.26, sunRim: 0.06, bounce: 0.09, warmMix: 0.14, ...opts }),
+    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.13, sunRim: 0.06, bounce: 0.09, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -891,7 +1059,13 @@ export function makeSkinMaterial(opts = {}) {
              vec2 iv = vec2(ax2 - 0.0325, hp.y - 0.006);
              float fwd = smoothstep(-0.061, -0.069, hp.z);
              float ir = length(vec2(iv.x, iv.y * 1.03));
-             vec3 sclera = vec3(0.62, 0.575, 0.545) * (0.9 + 0.16 * ch_fbm(vBind * 900.0, 2));
+             // ROUND 6: 0.62 -> 0.40. A sclera is not white paper — it is a wet,
+             // veined membrane sitting at the bottom of a socket that occludes
+             // most of the sky, and it measures well under half the reflectance
+             // of the skin around it in situ. At 0.62 against a 0.35 cheek the
+             // eye rendered as a bright almond blob at every distance, which is
+             // the single most doll-like thing a face can do.
+             vec3 sclera = vec3(0.40, 0.372, 0.352) * (0.9 + 0.16 * ch_fbm(vBind * 900.0, 2));
              vec3 iris = vec3(0.085, 0.062, 0.038) * (0.7 + 0.9 * ch_fbm(vBind * 2600.0, 2));
              vec3 c2 = mix(sclera, iris, smoothstep(0.0064, 0.0048, ir) * fwd);
              c2 = mix(c2, vec3(0.004), smoothstep(0.0028, 0.0019, ir) * fwd);
@@ -904,7 +1078,10 @@ export function makeSkinMaterial(opts = {}) {
              c2 = mix(lid, c2, open);
              c2 *= mix(0.45, 1.0, ao);
              diffuseColor.rgb *= c2;
-             gRough = mix(0.58, 0.13, open);
+             // A wet cornea is the sharpest specular on a human being — 0.05,
+             // not 0.13. It is one or two pixels at gameplay range and it is
+             // the first thing a viewer's eye locks onto.
+             gRough = mix(0.58, 0.05, open);
            } else {
            float isHead = smoothstep(-0.14, -0.06, hp.y) * step(vZone, 0.5);
            if (isHead > 0.0) {
@@ -960,15 +1137,18 @@ export function makeSkinMaterial(opts = {}) {
            diffuseColor.rgb *= c;
 
            // Oilier on the forehead and nose, drier on the cheeks and hands.
+           // Centred on 0.5: dry forearm skin measures ~0.55 and a sweating
+           // forehead ~0.35, and the T-zone is where the one highlight on a
+           // face belongs.
            float oily = smoothstep(-0.02, 0.06, hp.y) * isHead;
-           gRough = clamp(mix(0.60, 0.40, oily) + (m2 - 0.5) * 0.10, 0.3, 0.9);
+           gRough = clamp(mix(0.56, 0.36, oily) + (m2 - 0.5) * 0.10, 0.25, 0.9);
            }
          }`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-         roughnessFactor = gRough;`,
+         roughnessFactor = mix(gRough, 1.0, uSpecAbl);`,
       )
       .replace(
         '#include <normal_fragment_maps>',
@@ -1027,24 +1207,43 @@ export function makeSkinMaterial(opts = {}) {
 export function makeMetalMaterial(opts = {}) {
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
-    roughness: 0.55,
+    roughness: 0.42,
     metalness: 1.0,
-    envMapIntensity: 1.0,
+    // The receiver, the optic body and the bionic arm are the only genuinely
+    // reflective things on a soldier, and they are what tell a viewer the
+    // silhouette is carrying a machine. Slightly over unity so the weapon
+    // separates from a khaki torso in shade.
+    envMapIntensity: 1.15,
     dithering: true,
   });
   mat.name = 'char-metal';
 
+  /**
+   * ROUND 6 — MAJOR 2. For a metal, this vector IS F0: it is the specular
+   * reflectance, not a diffuse albedo, because at metalness 1 three folds
+   * diffuseColor straight into `material.specularColor`.
+   *
+   * Gunmetal was authored at 0.135. NO metal is that dark. Manganese phosphate
+   * (parkerising) on steel measures ~0.30-0.35 normal-incidence reflectance and
+   * bluing ~0.45; 0.135 is the reflectance of a matte black PAINT, and a black
+   * paint reflects 4% specularly, not 13.5% — so the receiver was simultaneously
+   * too dark to be steel and too dark to throw a highlight. That one number is
+   * most of "the rifle reads as plastic": it is not the lobe shape, it is that
+   * there was no energy in the lobe to shape.
+   */
   const colors = [
-    new THREE.Vector3(0.135, 0.133, 0.130), // gunmetal, phosphate-black
-    new THREE.Vector3(0.145, 0.048, 0.036), // prosthetic: matte oxide red
-    new THREE.Vector3(0.52, 0.40, 0.19), // brass
-    new THREE.Vector3(0.048, 0.047, 0.045), // polymer furniture (dielectric)
-    new THREE.Vector3(0.035, 0.055, 0.065), // optic glass
+    // 0.28, the LOW end of the parkerising range: at 0.315 the prosthetic's
+    // steel bands went to full chrome in direct sun and out-shouted the head.
+    new THREE.Vector3(0.282, 0.274, 0.263), // gunmetal: manganese-phosphate steel
+    new THREE.Vector3(0.205, 0.072, 0.052), // prosthetic: oxide-red painted metal
+    new THREE.Vector3(0.60, 0.46, 0.22), // brass
+    new THREE.Vector3(0.052, 0.050, 0.047), // polymer furniture (dielectric)
+    new THREE.Vector3(0.028, 0.042, 0.050), // optic glass (dielectric)
   ];
   const uniforms = {
     uMetalColor: { value: colors },
     uSeed: { value: opts.seed ?? 0 },
-    ...lightUniforms({ rim: 0.30, sunRim: 0.05, bounce: 0.07, warmMix: 0.14, ...opts }),
+    ...lightUniforms({ rim: 0.16, sunRim: 0.05, bounce: 0.07, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -1074,37 +1273,48 @@ export function makeMetalMaterial(opts = {}) {
            float ao = clamp(vAO, 0.0, 1.0);
            gAO = mix(0.4, 1.0, ao);
 
-           // Anodised / phosphated finishes are MATTE — the read is a soft wide
-           // highlight, never a mirror. Roughness stays high; variation comes
-           // from handling wear, not from a gloss coat.
-           float rough = 0.6;
+           // ROUND 6. Was 0.60 / 0.70 / 0.68 / 0.12 — i.e. the whole weapon sat
+           // in the same 0.6-0.7 band as dusty webbing. A parkerised receiver is
+           // matte but it is not FABRIC: measured gloss on phosphate steel puts
+           // it near 0.40-0.45, a fresh barrel under its finish near 0.35, and a
+           // scope lens is glass at 0.03-0.05. The band 0.35-0.5 is the whole
+           // difference between "there is metal in this frame" and "there is a
+           // dark shape in this frame", because a 0.6 lobe spread over a 55 mm
+           // receiver is 3 display codes wide and a 0.4 lobe is 30.
+           float rough = 0.40;
            float metal = 1.0;
-           if (zi == 1) { rough = 0.7; metal = 0.6; }
-           if (zi == 3) { rough = 0.68; metal = 0.0; }
-           if (zi == 4) { rough = 0.12; metal = 0.0; }
+           if (zi == 1) { rough = 0.46; metal = 0.85; } // painted bionic arm
+           if (zi == 3) { rough = 0.52; metal = 0.0; }  // glass-filled polymer
+           if (zi == 4) { rough = 0.045; metal = 0.0; } // coated optic glass
 
            float grain = ch_fbm(vBind * 900.0 + uSeed, 2);
-           rough += (grain - 0.5) * 0.16;
+           rough += (grain - 0.5) * (zi == 4 ? 0.01 : 0.11);
 
            // Directional micro-scratches from cleaning and carry.
            float scr = ch_fbm(vec3(vBind.x * 40.0, vBind.y * 620.0, vBind.z * 40.0) + uSeed * 5.0, 3);
-           rough -= smoothstep(0.62, 0.9, scr) * 0.2;
+           rough -= smoothstep(0.62, 0.9, scr) * (zi == 4 ? 0.0 : 0.13);
 
            // Edge wear: exposed geometry (high AO) polishes down to bright steel.
+           // The polished value is now a real steel F0 (0.56), not a mid grey —
+           // at metalness 1 a "bright" 0.38 was still darker than the phosphate
+           // around it once the phosphate was authored correctly.
            float wear = smoothstep(0.9, 1.0, ao) * smoothstep(0.55, 0.85, ch_fbm(vBind * 90.0 + 3.0, 3));
-           base = mix(base, vec3(0.38, 0.375, 0.365), wear * 0.35 * (zi == 4 ? 0.0 : 1.0));
-           rough = mix(rough, 0.28, wear * 0.5);
+           base = mix(base, vec3(0.52, 0.512, 0.498), wear * 0.35 * (zi == 4 ? 0.0 : 1.0));
+           rough = mix(rough, 0.24, wear * 0.55);
 
-           base *= mix(0.52, 1.0, pow(ao, 1.1));
+           // Was mix(0.52, 1.0): a 48% cut to F0 in every crevice. AO belongs on
+           // the diffuse lobe, and a metal has none — darkening F0 is how a
+           // receiver ends up with no highlight anywhere the bake touched it.
+           base *= mix(0.78, 1.0, pow(ao, 1.1));
            diffuseColor.rgb *= base;
-           gRough = clamp(rough, 0.06, 1.0);
+           gRough = clamp(rough, 0.03, 1.0);
            gMetal = metal;
          }`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-         roughnessFactor = gRough;`,
+         roughnessFactor = mix(gRough, 1.0, uSpecAbl);`,
       )
       .replace(
         '#include <metalnessmap_fragment>',
@@ -1120,10 +1330,15 @@ export function makeMetalMaterial(opts = {}) {
            float e = 0.5;
            float h0 = ch_fbm(pp, 2);
            vec2 g = vec2(h0 - ch_fbm(pp + vec3(e, 0.0, 0.0), 2), h0 - ch_fbm(pp + vec3(0.0, e, 0.0), 2));
-           // Machined metal is FLAT: tan(11 deg) is already generous for a
-           // phosphate finish, and an over-tilted normal on a metalness-1
-           // surface samples a random mip of the sky and glitters.
-           normal = normalize(tbn * ch_tangentNormal(g * 1.1, 0.20));
+           // Machined metal is FLAT, and now that roughness is low enough for a
+           // real lobe the bound has to come down with it: at roughness 0.40 a
+           // tan(11 deg) wobble is WIDER than the lobe it perturbs, so it
+           // shatters a single travelling highlight into speckle — which is the
+           // read that made the old surface look like moulded plastic even
+           // where it did catch light. tan(6.8 deg), and a scope lens is glass
+           // and gets none at all.
+           float machined = (int(vZone + 0.5) == 4) ? 0.0 : 1.0;
+           normal = normalize(tbn * ch_tangentNormal(g * 0.8 * machined, 0.12));
          }`,
       );
 
@@ -1136,19 +1351,22 @@ export function makeMetalMaterial(opts = {}) {
 export function makeRubberMaterial(opts = {}) {
   const mat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(0.048, 0.045, 0.041),
-    roughness: 0.84,
+    roughness: 0.72,
     metalness: 0.0,
+    // Vulcanised rubber is a 0.045 dielectric with a broad but real lobe; a
+    // sole edge catching the sky is one of the few horizontals on a boot.
+    specularIntensity: 1.0,
     envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
-  const uniforms = lightUniforms({ rim: 0.28, sunRim: 0.035, bounce: 0.10, warmMix: 0.14, ...opts });
+  const uniforms = lightUniforms({ rim: 0.13, sunRim: 0.035, bounce: 0.10, warmMix: 0.14, ...opts });
   mat.userData.uniforms = uniforms;
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     injectVertex(shader);
     injectLighting(shader);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${VARYINGS}\n${NOISE}\n${CHAR_LIGHT_PARS}\nfloat gRough = 0.84;`)
+      .replace('#include <common>', `#include <common>\n${VARYINGS}\n${NOISE}\n${CHAR_LIGHT_PARS}\nfloat gRough = 0.72;`)
       .replace(
         '#include <map_fragment>',
         `#include <map_fragment>
@@ -1160,13 +1378,16 @@ export function makeRubberMaterial(opts = {}) {
            float low = smoothstep(0.16, 0.0, vBind.y);
            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.235, 0.198, 0.138), dust * (0.35 + low * 0.5));
            diffuseColor.rgb *= mix(0.6, 1.0, ao);
-           gRough = mix(0.84, 0.96, dust);
+           // The tread face is caked and matt; the sole EDGE and the heel
+           // breast are moulded, wiped by grass and gravel, and shine.
+           float edge = 1.0 - smoothstep(0.010, 0.030, abs(vBind.y - 0.024));
+           gRough = mix(mix(0.72, 0.95, dust), 0.34, edge * 0.65);
          }`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-         roughnessFactor = gRough;`,
+         roughnessFactor = mix(gRough, 1.0, uSpecAbl);`,
       )
       .replace(
         '#include <normal_fragment_maps>',

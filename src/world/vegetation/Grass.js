@@ -434,6 +434,9 @@ export function createGrassRing(field, uniforms, opts) {
            // tussock is a dense mat that transmits almost nothing.
            reflectedLight.directDiffuse +=
              vegDryShading(normalize(vVegN), V, diffuseColor.rgb, 0.40 + 0.60 * vVegT, vegSunVis, camDist);
+           // See VEG_BOUNCE in shaderLib: a tussock's own shadow side is lit by
+           // the sand under it, not by the sky over it.
+           reflectedLight.indirectDiffuse *= vegBounceTint(normalize(vVegN));
          }`,
       );
 
@@ -692,9 +695,19 @@ export function createCoverMat(field, uniforms) {
          // that, and neither of them is round.
          float mA = vegFbm(vCoverXZ * 0.20 + 3.7, 2);
          float mB = vegNoise(vCoverXZ * 0.85 - 11.0);
-         float mott = smoothstep(0.30, 0.80, mA * 0.72 + mB * 0.28);
-         diffuseColor.rgb *= vCoverTint * mix(0.86, 1.10, mott);
-         diffuseColor.a *= vCoverA * mix(0.30, 1.30, mott);
+         // ROUND 7, third octave at 0.4 m. This layer is the only thing this
+         // module puts on the mid ground of a wide shot, and the mid ground is
+         // where the round-6 critique measured a quarter of the ridge frame at
+         // 2.85% high-pass modulation. mA is a 5 m structure and mB a 1.2 m one;
+         // at 60-95 m those are 100 px and 25 px, which is macro tone, not
+         // texture. mC is 8 px at 90 m — the scale a pixel can still resolve —
+         // and it is carried in ALPHA as well as tone, so it breaks the patch
+         // into a stipple of stand and bare ground rather than tinting it.
+         float mC = vegNoise(vCoverXZ * 2.6 + 41.0);
+         float mott = smoothstep(0.30, 0.80, mA * 0.66 + mB * 0.24 + mC * 0.10);
+         float fine = mC - 0.5;
+         diffuseColor.rgb *= vCoverTint * mix(0.86, 1.10, mott) * (1.0 + fine * 0.30);
+         diffuseColor.a *= vCoverA * mix(0.30, 1.30, mott) * (1.0 + fine * 0.55);
          if (diffuseColor.a < 0.004) discard;`,
       );
     mat.userData.shader = shader;

@@ -168,14 +168,17 @@ export function buildNeck() {
     // ROUND 6: the exposed column is 8-11% narrower and runs 22 mm higher, to
     // meet a jaw that `headTransform` lifted by 19 mm. A neck seen from behind
     // is about 0.62 of skull breadth; this lands at 0.60.
-    { p: V(0, 1.462, -0.007), rx: 0.066, rz: 0.072, n: 2.4, mod: cords, zone: SZ.NECK },
-    { p: V(0, 1.508, -0.010), rx: 0.056, rz: 0.063, n: 2.4, mod: cords, zone: SZ.NECK },
-    { p: V(0, 1.552, -0.013), rx: 0.052, rz: 0.059, n: 2.4, mod: cords, zone: SZ.NECK },
+    // ROUND 6: narrowed 4.6% in step with HEAD_FIT.sx, so the exposed column
+    // keeps the 0.60-of-skull-breadth relationship round 5 landed instead of
+    // silently becoming 0.63 when the skull came in.
+    { p: V(0, 1.462, -0.007), rx: 0.063, rz: 0.069, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.508, -0.010), rx: 0.053, rz: 0.060, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.552, -0.013), rx: 0.050, rz: 0.056, n: 2.4, mod: cords, zone: SZ.NECK },
     // Up under the jaw. The last station widens again: the mastoid process and
     // the base of the skull are wider than the middle of the neck, and without
     // that the head looks pinned on.
-    { p: V(0, 1.596, -0.015), rx: 0.054, rz: 0.062, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.632, -0.017), rx: 0.060, rz: 0.068, n: 2.5, zone: SZ.NECK },
+    { p: V(0, 1.596, -0.015), rx: 0.051, rz: 0.059, n: 2.4, zone: SZ.NECK },
+    { p: V(0, 1.632, -0.017), rx: 0.057, rz: 0.065, n: 2.5, zone: SZ.NECK },
   ];
   return loftKeys(keys, 14, { radial: 20, capStart: true, capEnd: false });
 }
@@ -220,7 +223,31 @@ export const HEAD_CENTRE = new THREE.Vector3(0, 1.678, -0.006);
  * against an anthropometric adult male 152 x 195, while the jaw underside lifts
  * 19 mm and the crown only 12. That 19 mm is neck, which is half of MAJOR 3.
  */
-export const HEAD_FIT = { sx: 0.912, sy: 0.968, sz: 0.942, lift: 0.018, pivotY: 1.6 };
+/**
+ * ROUND 6 continues the shrink, but the interesting part is WHERE the width was.
+ *
+ * `probes/r7c/headwidth.js` decomposes the head's bounding half-width by part
+ * instead of reporting one number, and on the round-5 build it came back:
+ *
+ *   char-skin  ear shell      0.0925   <- the widest thing on the head
+ *   char-skin  skull          0.0910
+ *   char-cloth bandana        0.0888
+ *   char-cloth eyepatch strap 0.0793
+ *
+ * The SKULL was not the widest part of the head — the ear was, and the ear was
+ * a 20 mm-thick shell whose outer face stood 14 mm proud of a skull that had
+ * already been swollen 13 mm by `headSurface`'s attachment bump. A pinna is
+ * 2-3 mm of cartilage that stands 8-15 mm off the skull; this one was modelled
+ * at the thickness of a hand. Round 5 shrank the skull three times and the
+ * measurement barely moved, because the skull was never what it was measuring.
+ *
+ * So: skull breadth to 150 mm (anthropometric adult male 152), attachment bump
+ * more than halved now that there is real ear geometry to root, and the ear
+ * shell down to 15 mm thick standing 9 mm proud. Depth comes down with it —
+ * 224 mm was 15% longer than a human head (195-200 mm) and read as a muzzle
+ * from every three-quarter angle.
+ */
+export const HEAD_FIT = { sx: 0.870, sy: 0.962, sz: 0.900, lift: 0.018, pivotY: 1.6 };
 
 export function headTransform() {
   const { sx, sy, sz, lift, pivotY } = HEAD_FIT;
@@ -301,8 +328,10 @@ export function headSurface(dir, out, o = {}) {
       // The bulge where the ear is ATTACHED. Round 5 halved it: the ear itself
       // is now real geometry (`buildEar`), and a 13 mm swelling under a 20 mm
       // shell reads as a swollen skull rather than as an ear root.
+      // ROUND 6: 0.0065 -> 0.0032. See HEAD_FIT — this bump plus a 20 mm ear
+      // shell was making the ear, not the skull, the widest part of the head.
       const ear = gauss((y + 0.004) / 0.024, 1) * gauss((z - 0.022) / 0.02, 1);
-      x += 0.0065 * ear * Math.sign(x || 1) * THREE.MathUtils.smoothstep(Math.abs(dir.x), 0.55, 0.9);
+      x += 0.0032 * ear * Math.sign(x || 1) * THREE.MathUtils.smoothstep(Math.abs(dir.x), 0.55, 0.9);
 
       out.set(cx + x, cy + y, cz + z);
     }
@@ -350,11 +379,12 @@ export function buildEyes(o = {}) {
  * exactly where the eye goes to find the profile of a head seen from behind.
  */
 export function buildEar(sgn = 1) {
-  // The skull surface at the ear latitude sits at |x| ~ 0.088 (0.0825 base
+  // The skull surface at the ear latitude sits at |x| ~ 0.0857 (0.0825 base
   // half-width plus the attachment swelling in `headSurface`), so the shell is
-  // centred at 0.0925: its inner face is buried 6 mm inside the skull and its
-  // outer face stands 14 mm proud.
-  const cx = sgn * 0.0925;
+  // centred at 0.0888: its inner face is buried 4.4 mm inside the skull and its
+  // outer face stands 9.6 mm proud — a pinna, rather than the 14 mm slab that
+  // made the ear the widest part of the head. See HEAD_FIT.
+  const cx = sgn * 0.0888;
   const cy = 1.6765;
   const cz = 0.0205;
   return displacedSphere(
@@ -366,7 +396,7 @@ export function buildEar(sgn = 1) {
       // thickness, so the RIM of the ear catches light and the middle does not
       // — which is the only part of an ear that is legible at 28 px.
       const bowl = Math.exp(-((r / 0.46) ** 2));
-      const thick = 0.0100 * (1 - 0.55 * bowl);
+      const thick = 0.0076 * (1 - 0.55 * bowl);
       // 60 mm tall, 33 mm fore-aft, tapering into the lobe and raked back at
       // the top the way a real ear sits against the skull.
       const lobe = 1 - 0.28 * Math.max(0, -v);
@@ -399,7 +429,20 @@ export function buildHair(o = {}) {
       //   `above` — hair stops above the jawline. Separate, because the ear sits
       //     at y = -0.2 and the jaw at y = -0.6, and no single plane splits them.
       const front = THREE.MathUtils.smoothstep(dir.y * 0.62 + dir.z * 1.0, -0.42, 0.04);
-      let cover = front * THREE.MathUtils.smoothstep(dir.y, -0.46, -0.16);
+      // ROUND 6 — the nape. `above` was one latitude band for the whole skull,
+      // so hair stopped at the same height at the BACK of the head as it does
+      // in front of the ear. On a real head those are nowhere near each other:
+      // the frontal hairline is above the brow, but the posterior hairline runs
+      // down to the base of the occiput, a good 60 mm lower.
+      //
+      // Measured on the shipped build that left 87 mm of bare scalp between the
+      // occiput and the collar — a 34 px pink column at the gameplay camera,
+      // continuous with the neck, which is why the character reads as
+      // bald-and-long-necked from the one angle the game actually frames him
+      // from. It is the same class of bug as round 5's buried hair shell: the
+      // hair is authored, it is simply not where a head has hair.
+      const nape = 0.75 * THREE.MathUtils.smoothstep(dir.z, 0.05, 0.55);
+      let cover = front * THREE.MathUtils.smoothstep(dir.y + nape, -0.46, -0.16);
       if (back) cover *= THREE.MathUtils.smoothstep(dir.y * 0.4 + dir.z, -0.1, 0.45);
       const clump = 1 + 0.26 * Math.sin(dir.x * 34) * Math.sin(dir.z * 29) * cover;
       // Offset ALONG the skull's own radius: negative where there is no hair, so
@@ -413,7 +456,12 @@ export function buildHair(o = {}) {
       // 14 mm brow; the nose does not matter because `cover` is zero across the
       // whole face. At full cover the shell stands 12 mm proud, a regulation
       // crop.
-      const t = -0.024 + cover * (0.0345 + 0.0035 * clump);
+      // ROUND 6: 0.0345 -> 0.0305. At full cover the shell stood 13.5 mm proud
+      // of the skull, which made the HAIR the widest thing on the head
+      // (`probes/r7c/headwidth.js`: 0.0858 half, ahead of the bandana at 0.0843
+      // and the skull itself at 0.0820) and forced the bandana out to a 17 mm
+      // stand-off to clear it. A No.2 crop is 6-10 mm; this lands at 9.5.
+      const t = -0.024 + cover * (0.0305 + 0.0030 * clump);
       out.copy(tmp).sub(c);
       const len = out.length() || 1;
       out.multiplyScalar(1 + t / len).add(c);
@@ -429,10 +477,12 @@ export function buildHair(o = {}) {
 // Arms
 // -------------------------------------------------------------------------
 
+// Must track rig.js' armR / forearmR / handR exactly — the loft is the skin over
+// those bones. ROUND 6 moved the whole limb out 14 mm; see rig.js.
 const ARM = {
-  shoulder: V(0.176, 1.452, -0.014),
-  elbow: V(0.336, 1.192, -0.02),
-  wrist: V(0.471, 0.962, -0.014),
+  shoulder: V(0.190, 1.452, -0.014),
+  elbow: V(0.350, 1.192, -0.02),
+  wrist: V(0.485, 0.962, -0.014),
 };
 
 function armPoint(t) {
@@ -455,8 +505,8 @@ export function buildArm(o = {}) {
   const rollT = 0.62;
   const keys = [
     // Root buried inside the torso so the shoulder never shows a seam.
-    { p: V(0.085, 1.478, -0.014), rx: 0.086, rz: 0.09, n: 2.6, zone: Z.SLEEVE },
-    { p: V(0.135, 1.475, -0.014), rx: 0.081 * bulk, rz: 0.085 * bulk, n: 2.5, zone: Z.SLEEVE },
+    { p: V(0.085, 1.478, -0.014), rx: 0.082, rz: 0.086, n: 2.6, zone: Z.SLEEVE },
+    { p: V(0.135, 1.475, -0.014), rx: 0.0755 * bulk, rz: 0.0795 * bulk, n: 2.5, zone: Z.SLEEVE },
     // Deltoid: three heads over a ball joint, so it is the one place on a limb
     // where the profile BULGES before it tapers. Round 4 ran a single cap
     // straight into the taper and the shoulder read as the corner of the plate
@@ -469,21 +519,30 @@ export function buildArm(o = {}) {
     // hidden against the torso and started reading as a bolster strapped to the
     // shoulder. The deltoid keeps most of its width — that bulge is real and it
     // is the top of the silhouette.
-    { p: armPoint(0.05), rx: 0.078 * bulk, rz: 0.083 * bulk, n: 2.5, front: 1.1, zone: Z.SLEEVE },
-    { p: armPoint(0.13), rx: 0.071 * bulk, rz: 0.075 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
-    { p: armPoint(0.22), rx: 0.057 * bulk, rz: 0.061 * bulk, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.34), rx: 0.053 * bulk, rz: 0.057 * bulk, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.46), rx: 0.046 * bulk, rz: 0.050, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.52), rx: 0.045, rz: 0.051, n: 2.3, zone: Z.SLEEVE },
+    // ROUND 6b, and this is a second 8% off the shaft on top of round 6a's 11%.
+    // Round 6a took the upper arm from 168 mm to 148 mm across the sleeve; an
+    // adult male mid-biceps is ~330 mm circumference, i.e. 105 mm of arm, and a
+    // loose BDU sleeve adds about 20, so the target is 125 and 148 was still
+    // 18% over. It shows: on every close-up the upper arm and the FOREARM both
+    // read as one continuous padded bolster with no taper between them, and a
+    // limb that does not taper is the single loudest inflated-mannequin cue
+    // there is. The forearm came down hardest — it was 0.048 against an upper
+    // arm of 0.053, a 90% ratio where a real forearm is about 72% of a biceps.
+    { p: armPoint(0.05), rx: 0.0745 * bulk, rz: 0.0795 * bulk, n: 2.5, front: 1.1, zone: Z.SLEEVE },
+    { p: armPoint(0.13), rx: 0.0645 * bulk, rz: 0.0685 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
+    { p: armPoint(0.22), rx: 0.0525 * bulk, rz: 0.0560 * bulk, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.34), rx: 0.0487 * bulk, rz: 0.0523 * bulk, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.46), rx: 0.0420 * bulk, rz: 0.0455, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.52), rx: 0.0405, rz: 0.0460, n: 2.3, zone: Z.SLEEVE },
     rolled
-      ? { p: armPoint(rollT), rx: 0.052, rz: 0.056, n: 2.3, zone: Z.SLEEVE }
-      : { p: armPoint(0.62), rx: 0.048, rz: 0.051, n: 2.3, zone: Z.SLEEVE },
+      ? { p: armPoint(rollT), rx: 0.0455, rz: 0.0490, n: 2.3, zone: Z.SLEEVE }
+      : { p: armPoint(0.62), rx: 0.0420, rz: 0.0450, n: 2.3, zone: Z.SLEEVE },
     rolled
-      ? { p: armPoint(rollT + 0.03), rx: 0.044, rz: 0.046, n: 2.3, zone: SZ.ARM }
-      : { p: armPoint(0.74), rx: 0.043, rz: 0.045, n: 2.3, zone: Z.SLEEVE },
-    { p: armPoint(0.85), rx: 0.037, rz: 0.039, n: 2.3, zone: rolled ? SZ.ARM : Z.SLEEVE },
-    { p: armPoint(0.95), rx: 0.030, rz: 0.034, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
-    { p: ARM.wrist.clone(), rx: 0.026, rz: 0.031, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
+      ? { p: armPoint(rollT + 0.03), rx: 0.0385, rz: 0.0405, n: 2.3, zone: SZ.ARM }
+      : { p: armPoint(0.74), rx: 0.0372, rz: 0.0392, n: 2.3, zone: Z.SLEEVE },
+    { p: armPoint(0.85), rx: 0.0322, rz: 0.0341, n: 2.3, zone: rolled ? SZ.ARM : Z.SLEEVE },
+    { p: armPoint(0.95), rx: 0.0272, rz: 0.0306, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
+    { p: ARM.wrist.clone(), rx: 0.0245, rz: 0.0288, n: 2.4, zone: rolled ? SZ.ARM : Z.SLEEVE },
   ];
 
   if (rolled) {
@@ -498,9 +557,9 @@ export function buildArm(o = {}) {
     parts.push({
       surface: loftKeys(
         [
-          { p: a, rx: 0.05, rz: 0.054, n: 2.3, zone: Z.SLEEVE },
-          { p: a.clone().lerp(b, 0.5), rx: 0.06, rz: 0.064, n: 2.2, zone: Z.SLEEVE },
-          { p: b, rx: 0.049, rz: 0.053, n: 2.3, zone: Z.SLEEVE },
+          { p: a, rx: 0.0455, rz: 0.0490, n: 2.3, zone: Z.SLEEVE },
+          { p: a.clone().lerp(b, 0.5), rx: 0.0545, rz: 0.0582, n: 2.2, zone: Z.SLEEVE },
+          { p: b, rx: 0.0445, rz: 0.0482, n: 2.3, zone: Z.SLEEVE },
         ],
         7,
         { radial: 16 },
@@ -535,8 +594,11 @@ export function buildArm(o = {}) {
       { radial: 14, capStart: true, capEnd: true },
     );
   };
-  parts.push({ surface: pocketAt(0.235, 0.075, 0.0605 * bulk, Z.POUCH), mat: 'cloth' });
-  parts.push({ surface: pocketAt(0.163, 0.018, 0.065 * bulk, Z.WEBBING), mat: 'cloth' });
+  // Radii track the slimmed shaft: these are 8-11 mm of pocket standing proud
+  // of the sleeve, and if they are left at the old absolute values on a shaft
+  // that is 8% narrower they become 15-20 mm collars round the limb.
+  parts.push({ surface: pocketAt(0.235, 0.075, 0.0565 * bulk, Z.POUCH), mat: 'cloth' });
+  parts.push({ surface: pocketAt(0.163, 0.018, 0.0625 * bulk, Z.WEBBING), mat: 'cloth' });
 
   // Elbow reinforcement patch: a second layer of cloth over the joint, which is
   // where the eye looks to decide whether an arm has a joint in it at all.
@@ -546,17 +608,20 @@ export function buildArm(o = {}) {
   // clamped round the limb, which on a foreshortened arm is the single loudest
   // robot-arm cue in the frame. At 2 mm it is a value step, not a step in the
   // silhouette, which is what a second layer of cloth actually is.
-  parts.push({ surface: pocketAt(0.50, 0.055, 0.0475 * bulk, Z.POUCH), mat: 'cloth' });
+  parts.push({ surface: pocketAt(0.50, 0.055, 0.0432 * bulk, Z.POUCH), mat: 'cloth' });
 
   // Shoulder seam where the sleeve head is set into the body, and the cuff.
   parts.push({
     surface: strap(
       [
-        armPoint(0.055).add(V(0, 0.062, 0.0)),
-        armPoint(0.05).add(V(0, 0.0, -0.064)),
-        armPoint(0.048).add(V(0, -0.062, 0.0)),
-        armPoint(0.05).add(V(0, 0.0, 0.064)),
-        armPoint(0.055).add(V(0, 0.062, 0.0)),
+        // ROUND 6: 0.062/0.064 sat INSIDE the deltoid (rx 0.081) and drew
+        // nothing at all — a set-in sleeve seam that has been invisible since
+        // it was written. It now rides the surface of the slimmed shaft.
+        armPoint(0.055).add(V(0, 0.077, 0.0)),
+        armPoint(0.05).add(V(0, 0.0, -0.082)),
+        armPoint(0.048).add(V(0, -0.077, 0.0)),
+        armPoint(0.05).add(V(0, 0.0, 0.082)),
+        armPoint(0.055).add(V(0, 0.077, 0.0)),
       ],
       0.014,
       0.005,
@@ -569,9 +634,9 @@ export function buildArm(o = {}) {
     parts.push({
       surface: loftKeys(
         [
-          { p: armPoint(0.905), rx: 0.036, rz: 0.039, n: 3.0, zone: Z.WEBBING },
-          { p: armPoint(0.945), rx: 0.033, rz: 0.037, n: 3.0, zone: Z.WEBBING },
-          { p: armPoint(0.985), rx: 0.028, rz: 0.033, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.905), rx: 0.0325, rz: 0.0352, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.945), rx: 0.0298, rz: 0.0334, n: 3.0, zone: Z.WEBBING },
+          { p: armPoint(0.985), rx: 0.0253, rz: 0.0298, n: 3.0, zone: Z.WEBBING },
         ],
         7,
         { radial: 14, capStart: true, capEnd: true },

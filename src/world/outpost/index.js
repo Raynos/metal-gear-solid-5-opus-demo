@@ -295,7 +295,8 @@ export async function install(world) {
     concrete: createSurface({
       mode: MODE.CONCRETE, name: 'op-concrete', dust: DUST,
       color: [0.402, 0.358, 0.282], color2: [0.248, 0.218, 0.170], color3: [0.545, 0.492, 0.396],
-      rust: [0.34, 0.163, 0.072], wear: 0.42, dustAmt: 0.40, scale: 1.0, roughness: 0.93, envMapIntensity: 1.15,
+      rust: [0.34, 0.163, 0.072], wear: 0.42, dustAmt: 0.40, scale: 1.0, roughness: 0.84, envMapIntensity: 1.15,
+      roughChip: 0.36, dustMatt: 0.50,
     }),
     // Whitewashed blockwork: the original 1960s barrack. Lime over grey block,
     // failing in patches, with the municipal ochre socle every Soviet building
@@ -311,7 +312,8 @@ export async function install(world) {
       // longer be confused at any distance. Tiling scale 1.0 -> 1.75: a lime
       // skim crazes at a much finer pitch than shutter-marked in-situ concrete.
       color: [0.302, 0.262, 0.196], color2: [0.368, 0.318, 0.242], color3: [0.782, 0.742, 0.646],
-      rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.36, scale: 1.75, roughness: 0.86, envMapIntensity: 1.22,
+      rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.36, scale: 1.75, roughness: 0.82, envMapIntensity: 1.22,
+      roughChip: 0.34, dustMatt: 0.50,
       dado: 0.195, dadoStrength: 0.95, dadoColor: [0.212, 0.132, 0.046],
     }),
     // The later pour. Round 3: the critics measured that every wall on the site
@@ -328,7 +330,8 @@ export async function install(world) {
       // which reads as the grey-green cement it is rather than as more khaki.
       // Scale 0.55 -> 0.42, so its shutter-patch octave is now 4x the masonry's.
       color: [0.428, 0.398, 0.320], color2: [0.276, 0.256, 0.206], color3: [0.576, 0.542, 0.462],
-      rust: [0.30, 0.140, 0.058], wear: 0.30, dustAmt: 0.46, scale: 0.42, roughness: 0.97, envMapIntensity: 1.10,
+      rust: [0.30, 0.140, 0.058], wear: 0.30, dustAmt: 0.46, scale: 0.42, roughness: 0.88, envMapIntensity: 1.10,
+      roughChip: 0.38, dustMatt: 0.50,
     }),
     // Painted joinery. Institutional sage-green oil paint on every reveal,
     // architrave and door surround. It is deliberately the only cool hue on the
@@ -337,8 +340,8 @@ export async function install(world) {
     trim: createSurface({
       mode: MODE.METAL, name: 'op-trim', dust: DUST,
       color: [0.108, 0.142, 0.108], color2: [0.146, 0.176, 0.140], color3: [0.222, 0.248, 0.208],
-      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.30, metalness: 0.02, roughness: 0.60, scale: 2.4,
-      envMapIntensity: 1.0,
+      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.30, metalness: 0.0, roughness: 0.38, scale: 2.4,
+      envMapIntensity: 1.0, roughWorn: 0.88, roughChip: 0.26, dustMatt: 0.32,
     }),
     // Broken slab and rubble. It lies in the dirt, so it must read *darker* than
     // the hardstanding it sits on. On the shared concrete material a tumbling
@@ -352,17 +355,20 @@ export async function install(world) {
       // hole in the frame rather than a piece of concrete. Broken slab is
       // DIRTIER than the road it lies on, not black.
       color: [0.315, 0.282, 0.222], color2: [0.208, 0.184, 0.146], color3: [0.392, 0.354, 0.286],
-      rust: [0.30, 0.145, 0.062], wear: 0.85, dustAmt: 0.34, scale: 3.2, roughness: 0.96, envMapIntensity: 1.05,
+      rust: [0.30, 0.145, 0.062], wear: 0.85, dustAmt: 0.34, scale: 3.2, roughness: 0.89, envMapIntensity: 1.05,
+      roughChip: 0.42, dustMatt: 0.50,
     }),
     wall: createSurface({
       mode: MODE.CONCRETE, name: 'op-wall', dust: DUST,
       color: [0.428, 0.380, 0.296], color2: [0.258, 0.226, 0.176], color3: [0.578, 0.518, 0.412],
-      rust: [0.34, 0.163, 0.072], wear: 0.62, dustAmt: 0.46, scale: 2.05, roughness: 0.94, envMapIntensity: 1.15,
+      rust: [0.34, 0.163, 0.072], wear: 0.62, dustAmt: 0.46, scale: 2.05, roughness: 0.85, envMapIntensity: 1.15,
+      roughChip: 0.36, dustMatt: 0.50,
     }),
     metal: createSurface({
       mode: MODE.METAL, name: 'op-metal', dust: DUST,
       color: [0.098, 0.104, 0.062], color2: [0.148, 0.146, 0.126], color3: [0.088, 0.100, 0.106],
-      rust: [0.240, 0.115, 0.052], wear: 0.34, dustAmt: 0.36, metalness: 0.62, roughness: 0.55, scale: 1.6, envMapIntensity: 1.05,
+      rust: [0.240, 0.115, 0.052], wear: 0.34, dustAmt: 0.36, metalness: 0.0, roughness: 0.36, scale: 1.6, envMapIntensity: 1.15,
+      roughWorn: 0.90, roughChip: 0.20, dustMatt: 0.20,
     }),
     corr: createSurface({
       mode: MODE.CORRUGATED, name: 'op-corr', dust: DUST,
@@ -371,13 +377,14 @@ export async function install(world) {
       // the only genuinely cool-hued large surface in the compound and it is
       // what stops the three barracks reading as one building repeated.
       color: [0.176, 0.196, 0.198], color2: [0.132, 0.148, 0.132], color3: [0.316, 0.322, 0.300],
-      rust: [0.225, 0.112, 0.056], wear: 0.34, dustAmt: 0.44, metalness: 0.55, roughness: 0.58,
+      rust: [0.225, 0.112, 0.056], wear: 0.34, dustAmt: 0.44, metalness: 0.0, roughness: 0.48,
+      roughWorn: 0.90, roughChip: 0.26, dustMatt: 0.28,
       corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.18,
     }),
     wood: createSurface({
       mode: MODE.WOOD, name: 'op-wood', dust: DUST,
       color: [0.086, 0.062, 0.036], color2: [0.132, 0.100, 0.058], color3: [0.152, 0.138, 0.114],
-      rust: [0.26, 0.13, 0.05], wear: 0.55, dustAmt: 0.34, roughness: 0.92, scale: 1.0, envMapIntensity: 1.15,
+      rust: [0.26, 0.13, 0.05], wear: 0.55, dustAmt: 0.34, roughness: 0.88, scale: 1.0, envMapIntensity: 1.15, dustMatt: 0.50,
     }),
     cloth: createSurface({
       mode: MODE.CLOTH, name: 'op-cloth', dust: DUST,
@@ -387,12 +394,13 @@ export async function install(world) {
     rubber: createSurface({
       mode: MODE.CLOTH, name: 'op-rubber', dust: DUST,
       color: [0.038, 0.035, 0.032], color2: [0.058, 0.054, 0.050], color3: [0.082, 0.077, 0.070],
-      wear: 0.3, dustAmt: 0.40, roughness: 0.88, scale: 3.0, envMapIntensity: 0.9,
+      wear: 0.3, dustAmt: 0.40, roughness: 0.66, scale: 3.0, envMapIntensity: 0.9, dustMatt: 0.34,
     }),
     paint: createSurface({
       mode: MODE.CONCRETE, name: 'op-paint', dust: DUST,
       color: [0.585, 0.545, 0.455], color2: [0.372, 0.345, 0.290], color3: [0.712, 0.672, 0.572],
-      rust: [0.34, 0.163, 0.072], wear: 1.05, dustAmt: 0.48, scale: 1.6, roughness: 0.90, envMapIntensity: 1.1,
+      rust: [0.34, 0.163, 0.072], wear: 1.05, dustAmt: 0.48, scale: 1.6, roughness: 0.58, envMapIntensity: 1.1,
+      roughChip: 0.30, dustMatt: 0.40,
     }),
     // Vehicle bodywork. Soviet military kit is olive drab, not the pale
     // architectural paint the trucks were sharing in round 1 — a near-white
@@ -400,8 +408,8 @@ export async function install(world) {
     mil: createSurface({
       mode: MODE.METAL, name: 'op-mil', dust: DUST,
       color: [0.070, 0.082, 0.042], color2: [0.100, 0.104, 0.058], color3: [0.124, 0.118, 0.074],
-      rust: [0.205, 0.098, 0.044], wear: 0.06, dustAmt: 0.34, metalness: 0.06, roughness: 0.74, scale: 1.4,
-      envMapIntensity: 0.80,
+      rust: [0.205, 0.098, 0.044], wear: 0.06, dustAmt: 0.34, metalness: 0.0, roughness: 0.34, scale: 1.4,
+      envMapIntensity: 0.80, roughWorn: 0.86, roughChip: 0.20, dustMatt: 0.26,
     }),
     // The painted socle. Deliberately the most saturated thing on any building:
     // one band of institutional ochre at waist height does more to say "Soviet
@@ -409,17 +417,20 @@ export async function install(world) {
     dado: createSurface({
       mode: MODE.CONCRETE, name: 'op-dado', dust: DUST,
       color: [0.228, 0.118, 0.026], color2: [0.140, 0.070, 0.016], color3: [0.300, 0.172, 0.048],
-      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.26, scale: 2.0, roughness: 0.66, envMapIntensity: 0.95,
+      rust: [0.30, 0.145, 0.062], wear: 0.55, dustAmt: 0.26, scale: 2.0, roughness: 0.44, envMapIntensity: 0.95,
+      roughChip: 0.28, dustMatt: 0.34,
     }),
     paintWarn: createSurface({
       mode: MODE.METAL, name: 'op-paintwarn', dust: DUST,
       color: [0.255, 0.036, 0.020], color2: [0.190, 0.030, 0.018], color3: [0.318, 0.066, 0.034],
-      rust: [0.28, 0.115, 0.045], wear: 0.72, dustAmt: 0.44, metalness: 0.10, roughness: 0.72, scale: 1.8,
+      rust: [0.28, 0.115, 0.045], wear: 0.72, dustAmt: 0.44, metalness: 0.0, roughness: 0.42, scale: 1.8,
+      roughWorn: 0.90, roughChip: 0.24, dustMatt: 0.30,
     }),
     link: createSurface({
       mode: MODE.METAL, name: 'op-link', map: linkTex, alphaTest: 0.30, side: THREE.DoubleSide, dust: DUST,
       color: [0.62, 0.605, 0.560], color2: [0.44, 0.428, 0.396], color3: [0.72, 0.700, 0.652],
-      rust: [0.34, 0.148, 0.055], wear: 0.60, dustAmt: 0.20, metalness: 0.70, roughness: 0.52, scale: 2.0,
+      rust: [0.34, 0.148, 0.055], wear: 0.60, dustAmt: 0.20, metalness: 1.0, roughness: 0.34, scale: 2.0,
+      roughWorn: 0.88, roughChip: 0.22, dustMatt: 0.30, f0: [0.62, 0.615, 0.600],
     }),
     net: createSurface({
       mode: MODE.CLOTH, name: 'op-net', map: netTex, alphaTest: 0.26, side: THREE.DoubleSide, dust: DUST,
@@ -431,7 +442,7 @@ export async function install(world) {
     sign: createSurface({
       mode: MODE.CONCRETE, name: 'op-sign', map: signTex, alphaTest: 0.42, side: THREE.DoubleSide, dust: DUST,
       color: [1.180, 1.130, 1.010], color2: [0.840, 0.800, 0.720], color3: [1.360, 1.310, 1.190],
-      rust: [0.34, 0.163, 0.072], wear: 0.30, dustAmt: 0.26, scale: 2.6, roughness: 0.92, envMapIntensity: 1.0,
+      rust: [0.34, 0.163, 0.072], wear: 0.30, dustAmt: 0.26, scale: 2.6, roughness: 0.78, envMapIntensity: 1.0, dustMatt: 0.45,
     }),
     // Wind-deposited fines. Paler and finer than the graded ground it banks up
     // against — that value break is what makes a drift read as *deposited*
@@ -472,9 +483,27 @@ export async function install(world) {
     // they measured as flat holes, which is the other half of "the openings
     // disappear" — the reveal fixed the geometry, this fixes the pane.
     glass: new THREE.MeshStandardMaterial({
-      color: 0x0d1116, roughness: 0.11, metalness: 0.04, envMapIntensity: 1.9, name: 'op-glass',
+      color: 0x0d1116, roughness: 0.06, metalness: 0.0, envMapIntensity: 2.1, name: 'op-glass',
     }),
   };
+  // Bare, un-painted steel. Everything else on the site that reads as "metal" is
+  // actually PAINT over metal — a dielectric film, F0 0.04 — and painting the
+  // whole compound that way is right. But a handful of fittings genuinely are
+  // exposed steel: an exhaust stack that burns its paint off in a week, a grab
+  // handle and a stair rail polished by hands, a mirror arm, a hasp. Those are
+  // the only surfaces in the outpost with a metal F0 (0.56, coloured, not a grey
+  // albedo at metalness 0), and being the only ones is the point — a sun-facing
+  // steel fitting next to fifty matt painted ones is what reads as a real engine.
+  //
+  // Cost: one extra material key, which is 1-3 draw calls per bag that uses it.
+  M.steel = createSurface({
+    mode: MODE.METAL, name: 'op-steel', dust: DUST,
+    color: [0.560, 0.552, 0.535], color2: [0.470, 0.462, 0.448], color3: [0.640, 0.630, 0.612],
+    rust: [0.255, 0.122, 0.055], wear: 0.30, dustAmt: 0.16, metalness: 1.0, roughness: 0.18,
+    roughWorn: 0.78, roughChip: 0.12, dustMatt: 0.18, scale: 2.6, envMapIntensity: 1.25,
+    f0: [0.575, 0.565, 0.548],
+  });
+
   // Glazing that lights up; emissive is driven from the time of day below.
   M.glow = new THREE.MeshStandardMaterial({
     color: 0x07070a, roughness: 0.4, metalness: 0.0, name: 'op-glow',
@@ -495,7 +524,12 @@ export async function install(world) {
     // ramp crown. Round 5 took it from 1.7 to 1.9 because the last thing on it
     // that NEEDED vertex resolution — the footpath and rut masks — moved to a
     // 0.5 m texture (wear.js); that is the trade that pays for the fillets.
-    u0: RECT.u0 - R, u1: RECT.u1 + R, v0: RECT.v0 - R, v1: Math.max(RECT.v1 + R, 250), step: 1.9,
+    // Round 6: 1.9 -> 1.95, which is 3.3 k triangles back. That is the trade
+    // that pays for the container markings and door header (76 tris on each of
+    // 17 instances = 1.3 k): the pad's shape is all shader work and its grid
+    // only has to resolve the embankment and the ramp crown, so 50 mm of extra
+    // spacing on a 300x400 m platform is the cheapest triangle on the site.
+    u0: RECT.u0 - R, u1: RECT.u1 + R, v0: RECT.v0 - R, v1: Math.max(RECT.v1 + R, 250), step: 1.95,
   }), M.ground);
   groundMesh.receiveShadow = true;
   groundMesh.castShadow = true;
@@ -843,7 +877,7 @@ export async function install(world) {
     concrete: M.concrete, concrete2: M.concrete2, masonry: M.masonry, metal: M.metal, corr: M.corr,
     wood: M.wood, cloth: M.cloth, net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp,
     paint: M.paint, trim: M.trim, paintWarn: M.paintWarn, sign: M.sign, dark: M.dark, mil: M.mil,
-    dado: M.dado, drift: M.drift,
+    dado: M.dado, drift: M.drift, steel: M.steel,
   };
   addInst(P.bagToGeos(P.containerGeo()), containers, matMap, { wearAmp: 0.8 });
   for (let v = 0; v < P.DRUM_VARIANTS; v++) {
@@ -1182,12 +1216,18 @@ export async function install(world) {
 
   const wearOut = wear.build();
   {
-    const u = M.ground.userData.u;
-    u.uWearMap.value = wearOut.wearMap;
-    u.uLampMap.value = wearOut.lampMap;
-    u.uWearOrg.value.copy(wearOut.org);
-    u.uWearTexel.value.copy(wearOut.texel);
-    u.uTheta.value.set(Math.cos(THETA), Math.sin(THETA));
+    const gu = M.ground.userData.u;
+    gu.uWearMap.value = wearOut.wearMap;
+    gu.uWearTexel.value.copy(wearOut.texel);
+    // The lamp pool is handed to EVERY outpost surface, not only the pad — an
+    // object standing in a lit pool has to receive it or the pool is a decal.
+    for (const m of Object.values(M)) {
+      const u = m.userData?.u;
+      if (!u?.uLampMap) continue;
+      u.uLampMap.value = wearOut.lampMap;
+      u.uWearOrg.value.copy(wearOut.org);
+      u.uTheta.value.set(Math.cos(THETA), Math.sin(THETA));
+    }
   }
 
   // ---------------------------------------------------------------- lights --
@@ -1289,6 +1329,10 @@ export async function install(world) {
   // lamp pool in the frame (the high mast's shadowed spot) so the baked ones
   // sit in the same family rather than reading as painted discs.
   const POOL_GAIN = 3.2;
+  // Ablation switch for the whole baked-pool feature: 0 removes every lamp pool
+  // from every surface and changes nothing else, so "do the lamps light
+  // anything" is answered by a diff of two frames of the same build.
+  let lampAbl = 1;
   let lastN = -1;
   let tick = 0;
   world.engine.addSystem({
@@ -1331,7 +1375,10 @@ export async function install(world) {
       glowMats[1].emissiveIntensity = 2.4 * n;
       // The baked lamp pools switch on with everything else. `lampPeak` undoes
       // the texture's own normalisation, so POOL_GAIN is a plain radiance scale.
-      M.ground.userData.u.uLampGain.value.setScalar(wearOut.lampPeak * POOL_GAIN * n);
+      // Zero in daylight, which is also what keeps the fetch out of the day
+      // shots — the shader branches on this uniform.
+      const pool = wearOut.lampPeak * POOL_GAIN * n * lampAbl;
+      for (const m of surfaces) m.userData.u.uLampGain.value.setScalar(pool);
     },
   });
 
@@ -1385,6 +1432,24 @@ export async function install(world) {
     // Test hook for the wear layer: (amount, debug). `amount` 0 ablates it in
     // place so a before/after is a diff of two frames of the same build.
     wearCtl: M.ground.userData.u.uWearCtl.value,
+    /**
+     * In-place specular ablation for every outpost surface: 1 forces roughness
+     * to 1 and metalness to 0 in the fragment shader, which deletes the specular
+     * lobe and changes nothing else.
+     *
+     * This exists because the round-5 "no specular anywhere" measurement set
+     * `material.roughness` — and every surface in this module overwrites
+     * `roughnessFactor` from its own shader, so that ablation was a no-op here
+     * and the null result it produced was an artefact of the probe.
+     */
+    setSpecAblate(v) {
+      for (const m of surfaces) m.userData.u.uAbl.value = v ? 1 : 0;
+    },
+    /** Ablate the baked lamp pools in place (see lampAbl). */
+    setLampAblate(v) {
+      lampAbl = v ? 0 : 1;
+      lastN = -1;
+    },
     guardPosts: guards,
     patrolWaypoints: patrolLoops,
     coverPoints,

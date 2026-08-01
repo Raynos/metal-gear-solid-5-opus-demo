@@ -25,7 +25,7 @@ export const DOOR_W = 1.1;
 // material can answer, because the tiling scale is what gives it away.
 const GEO_KEYS = [
   'concrete', 'concrete2', 'masonry', 'metal', 'corr', 'wood', 'glass', 'glow', 'cloth', 'net',
-  'rubber', 'paint', 'trim', 'paintWarn', 'sign', 'dark', 'mil', 'dado', 'drift',
+  'rubber', 'paint', 'trim', 'paintWarn', 'sign', 'dark', 'mil', 'dado', 'drift', 'steel',
 ];
 
 /**

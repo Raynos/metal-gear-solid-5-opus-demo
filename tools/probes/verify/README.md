@@ -17,6 +17,10 @@ across an unknown surface, because round 5 produced three mutually contradictory
 | `f-wear.js` | Ground wear, via the outpost's own `uWearCtl` kill switch. |
 | `horizon-rows.js` | True horizon row per shot, from the camera matrices. |
 | `j-guards.js` | AO ablation and the exposure spread across the afternoon shots. |
+| `i1-ambient-codes.js` | Round 7. The shadowed sphere in DISPLAY CODES, ablated against the raw ACES toe — stops of linear light stopped being the acceptance number the moment the finding was that the print, not the transport, was wrong. Also reports what scene-linear radiance each shipped frame actually contains, which is what says whether the black-point guard is measuring the curve or measuring a frame with nothing dark in it. |
+| `i2-specular.js` | Round 7. The specular ablation that reaches the surfaces. `c-specular.js` writes `material.roughness`, which is dead code on Terrain, rocks, outpost and characters alike — all four replace `<roughnessmap_fragment>`. This drives the modules' own uniforms instead. |
+| `i3-fog.js` | Round 7. `d5-haze.js` reads a `SHOT_NAME` global the eval harness does not inject, so it always measured the vista — which contains no geometry past 2.7 km, which is why the 3-5 km acceptance band came back empty. Same ablation, every framing, binned by range. |
+| `i4-gradesweep.js` | Round 7. The two grade levers the toe rebuild moved (`splitShadowEdge`, mid-band warmth) swept against dusk cool AND daylight R-B together, because they trade against each other and sweeping either alone picks a winner by breaking the other. |
 
 Three traps that cost me measurements, so they do not cost you any:
 

@@ -228,6 +228,9 @@ function injectBranchShading(mat) {
            float vegDist = length(vegToCam);
            reflectedLight.directDiffuse +=
              vegDryShading(normalize(vVegNW), vegToCam / max(vegDist, 1e-4), diffuseColor.rgb, 0.30, vegSunVis, vegDist);
+           // See VEG_BOUNCE. The IBL is a sky projection and nothing else, so
+           // without this the interior of every bush is lit by blue light only.
+           reflectedLight.indirectDiffuse *= vegBounceTint(normalize(vVegNW));
          }`,
       );
     mat.userData.shader = shader;

@@ -640,12 +640,22 @@ export function createRockMaterial() {
            // reads as a pattern, which is the failure the terrain's own grit
            // shader calls out.
            if (clast > 0.003) {
-             float pale = smoothstep(0.62, 0.88, vTint.x);            // quartzy minority
-             float coat = clast * (1.0 - pale * 0.85)
+             // ROUND 7: the quartzy exemption was the loudest thing in the frame.
+             // smoothstep(0.62, 0.88) leaves 38% of every clast family partly and
+             // 12% wholly unvarnished, and since the exemption also cancelled 85%
+             // of the coat AND most of the value cut below, one stone in eight
+             // rendered as bare pale rock. That is the near-white boulder sitting
+             // beside the player in the gameplay frame, and with an ablation mask
+             // it is also why the family's MEAN came back at 1.011 of the sand it
+             // sat on: the pale minority is bright enough to cancel the majority's
+             // separation. A desert quartzite pebble is buff, not white; the
+             // minority is now 1 in 25 and it only buys back half the coat.
+             float pale = smoothstep(0.80, 0.97, vTint.x);            // quartzy minority
+             float coat = clast * (1.0 - pale * 0.55)
                         * (0.42 + 0.58 * pow(up, 0.7))
                         * (0.55 + 0.45 * smoothstep(0.15, 0.75, hFrac))
                         * (0.70 + 0.60 * smoothstep(0.30, 0.85, rfbm(vWPos.xz * 1.7 + 5.1, 3)));
-             albedo = mix(albedo, uVarnish, clamp(coat, 0.0, 1.0) * 0.56);
+             albedo = mix(albedo, uVarnish, clamp(coat, 0.0, 1.0) * 0.68);
              // And a flat value cut on top of the coat, which the varnish alone
              // could not deliver because it is gated on up-facing, uncrevassed,
              // unpale surfaces and a pebble is small enough that half its pixels
@@ -658,8 +668,17 @@ export function createRockMaterial() {
              // applied in a way that RAISES R/B (the blue channel takes twice
              // the cut of the red), because the other half of the same finding
              // is that the family must never read cooler than the sand.
-             float sep = clast * (1.0 - pale * 0.7);
-             albedo *= mix(vec3(1.0), vec3(0.72, 0.65, 0.55), sep);
+             // Round 7: 0.72/0.65/0.55 -> 0.62/0.55/0.44, and the pale exemption
+             // on the cut drops from 0.7 to 0.35. Ablated against the exact sand
+             // pixels each clast covered, round 6 shipped ratios of 1.011
+             // (outpost), 0.965 (vista) and 1.003 (ground) — a field of objects
+             // measuring within 4% of its own background in every frame, i.e.
+             // still a stain. The blue channel keeps taking twice the red's cut,
+             // because the second half of the same finding is that 46-54% of
+             // clast pixels were COOLER in R/B than the ground they sat on and
+             // the rule in this file is that they never may be.
+             float sep = clast * (1.0 - pale * 0.35);
+             albedo *= mix(vec3(1.0), vec3(0.62, 0.55, 0.44), sep);
            }
 
            // --- the fines apron banked against the base ---

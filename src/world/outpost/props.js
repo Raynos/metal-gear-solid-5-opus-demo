@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { box, post, cyl, strut, xform, flip, bakeWeather, merge, lattice, catenary, membraneSag } from './geo.js';
-import { newBag } from './buildings.js';
+import { newBag, signPlane } from './buildings.js';
 
 /**
  * Set dressing.
@@ -61,13 +61,32 @@ export function containerGeo() {
     b.metal.push(box(0.05, H - 0.26, W / 2 - 0.08, { x: dx, y: y0 + H / 2, z: sz * (W / 4) }));
     for (let i = 0; i < 2; i++) {
       const rz = sz * (W / 4) + (i - 0.5) * (W / 4 - 0.1);
-      b.metal.push(cyl(0.026, H - 0.4, 6, { x: dx + 0.05, y: y0 + H / 2, z: rz }));
-      b.metal.push(box(0.09, 0.19, 0.07, { x: dx + 0.08, y: y0 + H / 2 - 0.1, z: rz }));
+      b.steel.push(cyl(0.026, H - 0.4, 6, { x: dx + 0.05, y: y0 + H / 2, z: rz }));
+      b.steel.push(box(0.09, 0.19, 0.07, { x: dx + 0.08, y: y0 + H / 2 - 0.1, z: rz }));
     }
     for (const sy of [y0 + 0.45, y0 + H - 0.45]) {
       b.metal.push(box(0.11, 0.1, 0.09, { x: dx + 0.03, y: sy, z: sz * (W / 2 - 0.12) }));
     }
   }
+  // Door header and the rain gutter over it. The header is the flat band that
+  // makes the door end read as a DOOR end at thirty metres — without it both
+  // ends of a container are the same corrugated rectangle.
+  b.metal.push(box(0.16, 0.17, W + 0.02, { x: dx - 0.05, y: y0 + H - 0.20 }));
+  b.metal.push(box(0.26, 0.05, W + 0.06, { x: dx + 0.06, y: y0 + H - 0.05, rz: -0.18 }));
+  // Markings. A container with no placard is a crate; a container with an owner
+  // code, a serial and a hazard placard is freight. 12 triangles each across 17
+  // instances is 204 triangles for the loudest "real object" cue the box has.
+  signPlane(b, { x: dx + 0.055, y: y0 + H * 0.62, z: -W * 0.24, w: 1.05, h: 0.62, cell: 11, ry: Math.PI / 2 });
+  signPlane(b, { x: dx + 0.055, y: y0 + H * 0.26, z: W * 0.26, w: 0.42, h: 0.30, cell: 15, ry: Math.PI / 2 });
+  for (const sz of [-1, 1]) {
+    signPlane(b, {
+      x: -L * 0.20, y: y0 + H * 0.58, z: sz * (W / 2 + 0.045), w: 1.55, h: 0.85, cell: 9,
+      ry: sz > 0 ? 0 : Math.PI,
+    });
+  }
+  // Consolidated data plate on the left leaf: bare steel, and the only thing on
+  // the whole box that is allowed to flash.
+  b.steel.push(box(0.02, 0.30, 0.22, { x: dx + 0.07, y: y0 + 1.05, z: -W * 0.34 }));
   return bake(b, y0 + H, 0.5);
 }
 
@@ -205,15 +224,24 @@ export function drumGeo(variant = 0) {
   body.computeVertexNormals();
   b.metal.push(body);
 
-  for (const sy of [h * 0.3, h * 0.7]) b.metal.push(cyl(r + 0.022, 0.055, 18, { y: sy }));
+  // Rolling hoops in BARE steel, not paint. A drum is moved by tipping it and
+  // rolling it on these two rings, so they are the one part of the body whose
+  // paint is gone by the second time it is handled — and a pair of polished
+  // steel bands round a matt painted cylinder is the single cheapest specular
+  // cue on the site, because it is a curved surface that sweeps the whole
+  // mirror direction and therefore ALWAYS finds the sun from some angle.
+  for (const sy of [h * 0.3, h * 0.7]) b.steel.push(cyl(r + 0.022, 0.055, 18, { y: sy }));
   // Chime rings top and bottom. On the wrecked drum the top is dished in.
   b.metal.push(cyl(r + 0.012, 0.045, 18, { y: h - 0.02 }));
   b.metal.push(cyl(r + 0.012, 0.045, 18, { y: 0.02 }));
   if (variant === 3) {
     b.metal.push(cyl(r * 0.72, 0.05, 14, { y: h - 0.075 }));
   } else {
-    b.metal.push(cyl(0.05, 0.03, 8, { x: r * 0.55, y: h + 0.005 }));
-    if (variant !== 1) b.metal.push(cyl(0.032, 0.022, 8, { x: -r * 0.5, y: h + 0.004 }));
+    // Bungs are unpainted plugs on the one face of a drum that points at the
+    // sun. Two 100 mm discs of bare steel per drum, times ~80 drums, is a
+    // scatter of real highlights across the yard for 32 triangles each.
+    b.steel.push(cyl(0.05, 0.03, 8, { x: r * 0.55, y: h + 0.005 }));
+    if (variant !== 1) b.steel.push(cyl(0.032, 0.022, 8, { x: -r * 0.5, y: h + 0.004 }));
   }
   if (variant === 2) {
     // Painted contents band and a stencil panel. One drum in four carrying a
@@ -734,7 +762,7 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
     const zf = sz * 1.155;
     b.mil.push(box(1.30, 1.62, 0.05, { x: cabX - 0.06, y: 1.75, z: zf }));
     for (const sy of [1.06, 2.30]) b.metal.push(box(0.10, 0.16, 0.05, { x: cabX + 0.55, y: sy, z: zf + sz * 0.03 }));
-    b.metal.push(box(0.20, 0.05, 0.05, { x: cabX - 0.52, y: 1.72, z: zf + sz * 0.05 }));
+    b.steel.push(box(0.20, 0.05, 0.05, { x: cabX - 0.52, y: 1.72, z: zf + sz * 0.05 }));
     // Window aperture: painted frame, dark interior, glass proud of the interior.
     b.dark.push(box(1.02, 0.62, 0.03, { x: cabX - 0.06, y: 2.18, z: zf - sz * 0.10 }));
     b.glass.push(box(1.02, 0.62, 0.02, { x: cabX - 0.06, y: 2.18, z: zf + sz * 0.026 }));
@@ -742,10 +770,10 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
     for (const sx of [-0.53, 0.53]) b.mil.push(box(0.06, 0.70, 0.07, { x: cabX - 0.06 + sx, y: 2.18, z: zf + sz * 0.02 }));
     // Step under the door and a grab handle on the A-pillar.
     b.metal.push(box(0.55, 0.05, 0.20, { x: cabX - 0.1, y: 0.92, z: sz * 1.28 }));
-    b.metal.push(cyl(0.022, 0.60, 5, { x: cabX + 0.66, y: 2.05, z: sz * 1.22 }));
-    // Mirror on a proper double-arm bracket.
-    b.metal.push(strut(new THREE.Vector3(cabX + 0.72, 2.36, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.62, sz * 1.62), 0.022, 5));
-    b.metal.push(strut(new THREE.Vector3(cabX + 0.72, 1.98, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.20, sz * 1.62), 0.022, 5));
+    b.steel.push(cyl(0.022, 0.60, 5, { x: cabX + 0.66, y: 2.05, z: sz * 1.22 }));
+    // Mirror on a proper double-arm bracket, in bare tube.
+    b.steel.push(strut(new THREE.Vector3(cabX + 0.72, 2.36, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.62, sz * 1.62), 0.022, 5));
+    b.steel.push(strut(new THREE.Vector3(cabX + 0.72, 1.98, sz * 1.20), new THREE.Vector3(cabX + 0.60, 2.20, sz * 1.62), 0.022, 5));
     b.mil.push(box(0.09, 0.52, 0.24, { x: cabX + 0.58, y: 2.40, z: sz * 1.66 }));
     b.glass.push(box(0.02, 0.44, 0.19, { x: cabX + 0.63, y: 2.40, z: sz * 1.66 }));
   }
@@ -767,11 +795,11 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
   b.mil.push(box(1.20, 0.86, 2.02, { x: 3.94, y: 1.52 }));
   b.metal.push(box(0.06, 0.60, 1.90, { x: 4.56, y: 1.58 }));
   b.dark.push(box(0.06, 0.56, 1.48, { x: 4.53, y: 1.46 }));
-  for (let i = 0; i < 9; i++) b.metal.push(box(0.10, 0.56, 0.05, { x: 4.57, y: 1.46, z: -0.70 + i * 0.175 }));
+  for (let i = 0; i < 9; i++) b.steel.push(box(0.10, 0.56, 0.05, { x: 4.57, y: 1.46, z: -0.70 + i * 0.175 }));
   b.metal.push(box(0.26, 0.26, 2.34, { x: 4.62, y: 0.86 }));
   for (const sz of [-1, 1]) {
     b.metal.push(box(0.34, 0.30, 0.14, { x: 4.72, y: 0.86, z: sz * 0.85 }));
-    b.metal.push(xform(cyl(0.17, 0.18, 10), { rz: Math.PI / 2, x: 4.50, y: 1.78, z: sz * 0.76 }));
+    b.steel.push(xform(cyl(0.17, 0.18, 10), { rz: Math.PI / 2, x: 4.50, y: 1.78, z: sz * 0.76 }));
     b.glow.push(xform(cyl(0.14, 0.05, 10), { rz: Math.PI / 2, x: 4.60, y: 1.78, z: sz * 0.76 }));
     b.paintWarn.push(xform(cyl(0.07, 0.05, 8), { rz: Math.PI / 2, x: 4.58, y: 1.44, z: sz * 0.98 }));
     // Wing, and a mudflap behind the front wheel.
@@ -781,8 +809,8 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
   b.metal.push(cyl(0.055, 0.42, 6, { x: 4.30, y: 2.02, z: -0.5 }));
 
   // Vertical exhaust stack behind the cab, with a perforated heat shield.
-  b.metal.push(cyl(0.075, 2.45, 8, { x: 1.30, y: 2.02, z: 1.02 }));
-  b.metal.push(xform(cyl(0.10, 0.16, 8), { rz: 0.35, x: 1.34, y: 3.22, z: 1.02 }));
+  b.steel.push(cyl(0.075, 2.45, 8, { x: 1.30, y: 2.02, z: 1.02 }));
+  b.steel.push(xform(cyl(0.10, 0.16, 8), { rz: 0.35, x: 1.34, y: 3.22, z: 1.02 }));
   for (let i = 0; i < 5; i++) b.metal.push(box(0.16, 0.05, 0.05, { x: 1.30, y: 1.2 + i * 0.4, z: 1.10 }));
 
   // Fuel tank on a strap, battery box, and a spare wheel on the headboard.

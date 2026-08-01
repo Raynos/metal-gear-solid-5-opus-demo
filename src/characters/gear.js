@@ -1095,7 +1095,11 @@ export function buildBandana() {
       // inside it everywhere except the bare forehead, which is why the head
       // came back from the gameplay camera as one undifferentiated dark bowl.
       // The 1.5 mm ripple is the fold the cloth takes over the ear.
-      p3.multiplyScalar(1 + (0.0168 + 0.0012 * Math.sin(th * 7)) / len).add(HEAD_CENTRE);
+      // ROUND 6: 0.0168 -> 0.0128. The stand-off exists to clear the hair shell,
+      // and the hair shell came down from 13.5 mm proud to 9.5 (body.js) — left
+      // at 17 mm the band would now float 7 mm off the head and be the widest
+      // thing on it again.
+      p3.multiplyScalar(1 + (0.0128 + 0.0012 * Math.sin(th * 7)) / len).add(HEAD_CENTRE);
       band.vert(p3.x, p3.y, p3.z, (i / R) * 0.5, j * 0.03, Z.BANDANA);
     }
   }

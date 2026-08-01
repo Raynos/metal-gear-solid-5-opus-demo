@@ -103,7 +103,23 @@ const LUT_N = 32;
  * per-channel film curve) instead of the per-channel multiply the composite
  * used to do, which could only ever tint and never actually shape colour.
  */
-function buildGradeLUT(grade) {
+/**
+ * @param {(l:number)=>number} bandWarp
+ *   Maps a display luminance to the display luminance the SAME scene radiance
+ *   used to have under the raw-ACES curve. Identity ablates it.
+ *
+ *   The grade's band selectors — the split tone, the deep-shadow fill — are
+ *   authored as display numbers ("a cast shadow on sunlit sand lands around
+ *   0.25"), and every one of those numbers is a statement about scene content,
+ *   not about code values. Rebuilding the tone curve's toe moved that content:
+ *   the same dusk cast shadow went from display 0.10 to display 0.30, walked
+ *   out from under the cool half of the split tone, and took the ridge frame's
+ *   cool fraction from 14.0% to 3.2% without one tint changing. Selecting
+ *   through this warp anchors the bands to the radiance they were authored
+ *   against, so round 4's and round 5's band placement survives this change and
+ *   any future one.
+ */
+function buildGradeLUT(grade, bandWarp = (l) => l) {
   const N = LUT_N;
   const data = new Uint8Array(N * N * N * 4);
   const sh = grade.shadowTint;
@@ -149,8 +165,37 @@ function buildGradeLUT(grade) {
         // 1 - smoothstep(0, 0.30, 0.25) = 0.08 of the shadow tint. The cool
         // half of the split tone was, in practice, only reaching pixels the
         // frame had already crushed. At 0.42 the same pixel gets 0.36.
-        const sw = 1 - smoothstep(0.0, 0.42, lum0);
-        const hw = smoothstep(0.62, 1.0, lum0);
+        //
+        // Round 6: these two edges are the ONLY thing in the grade that had to
+        // move with the tone curve, and it had to move a long way. The band is
+        // keyed to DISPLAY luminance, and rebuilding the toe re-placed every
+        // shadow in the game inside that space: measured on the dusk ridge, a
+        // sky-filled cast shadow went from display luminance ~0.10 to ~0.30, so
+        // at the old edge its cool-band weight fell from 0.92 to 0.59 and it
+        // picked up the midtone's warmth instead. The frame's cool fraction
+        // (B > R+4) collapsed from 14.0% to 3.2% — the tint had not changed at
+        // all, the pixels had walked out from under it.
+        //
+        // The edge itself then moves 0.42 -> 0.58, in the warped (round-5
+        // equivalent) space, and that is a real widening rather than a
+        // re-registration. Same argument round 4 made when it moved the edge
+        // from 0.30 to 0.42, one crush later: the cool half of the split tone
+        // IS the sky fill, and it now has a shadow region with real gradient in
+        // it to fill instead of a plate. Swept on all six daylight-and-dusk
+        // shots (tools/probes/verify — the k7 sweep in the report), the trade
+        // is monotone and this is where it lands:
+        //
+        //   edge   ridge cool%   vista R-B   ground R-B   outpost R-B
+        //   0.42      11.07         12.5         10.5        14.0
+        //   0.50      11.43         11.2          9.7        13.0
+        //   0.58      12.12          9.7          8.5        12.0   <- shipped
+        //   0.66      12.43          8.2          7.0        11.0
+        //
+        // 0.58 is the widest edge that keeps every daylight frame inside the
+        // +8..+18 R-B band while putting the dusk criterion (>= 12%) back.
+        const bandL = bandWarp(lum0);
+        const sw = 1 - smoothstep(0.0, grade.splitShadowEdge ?? 0.58, bandL);
+        const hw = smoothstep(grade.splitHighlightEdge ?? 0.62, 1.0, bandL);
         const mw = Math.max(0, 1 - sw - hw);
         r *= sh[0] * sw + mi[0] * mw + hi[0] * hw;
         g *= sh[1] * sw + mi[1] * mw + hi[1] * hw;
@@ -178,10 +223,27 @@ function buildGradeLUT(grade) {
         // highlights were actually manufactured — after the tonemap, in the
         // grade. This form maps 0 -> 0 and 1 -> 1 exactly and cannot overshoot,
         // so the tonemap's white point survives the grade intact.
+        //
+        // Round 6 rebuilt the LOWER branch. It used to be
+        // `pivot * pow(v/pivot, contrast)`, which is pivot-preserving but whose
+        // derivative collapses toward the black end: at display 0.02 it scaled
+        // the value by 0.66 AND cut its slope by 23%, and both of those get
+        // worse the darker the pixel is. That is a second toe stacked on the
+        // tonemap's, sitting in exactly the band this round exists to open up;
+        // measured through the full chain it cost 20-30% of the shadow slope.
+        //
+        // The offset form is the same curve everywhere it matters — 0 -> 0,
+        // pivot -> pivot, monotone, the same midtone contrast — with the
+        // singular gain at the black end replaced by the constant gain it was
+        // tending to. `contrastToeOffset` is how far down the curve behaves
+        // like a power; below it, like a straight line.
         const pivot = 0.42;
+        const cto = grade.contrastToeOffset ?? 0.06;
+        const conK = Math.pow(cto / (pivot + cto), grade.contrast);
         const con = (v) =>
           v < pivot
-            ? pivot * Math.pow(Math.max(v, 0) / pivot, grade.contrast)
+            ? (pivot * (Math.pow((Math.max(v, 0) + cto) / (pivot + cto), grade.contrast) - conK)) /
+              (1 - conK)
             : 1 - (1 - pivot) * Math.pow(Math.max(1 - v, 0) / (1 - pivot), grade.contrast);
         r = con(r);
         g = con(g);
@@ -205,6 +267,15 @@ function buildGradeLUT(grade) {
         // cast survives into the band this fills.
         const sf = grade.shadowFill ?? 0;
         if (sf > 0) {
+          // Deliberately NOT put through the band warp, unlike the split tone.
+          // This gate is not a statement about scene radiance, it is a statement
+          // about the PRINT — "lift whatever is sitting just above display
+          // black" — and after the toe rebuild the pixels sitting there are a
+          // different, deeper set, which is exactly right. Warping it was tried
+          // and measured: it stretched the fill's rise across display 31-50 and
+          // its taper across 54-140, putting a +22.6/-17.8 codes-per-stop
+          // ripple into the middle of the shadow region the rebuild exists to
+          // make smooth.
           const fill = (v) => v + sf * smoothstep(0.055, 0.105, v) * (1 - smoothstep(0.13, 0.42, v));
           r = fill(r);
           g = fill(g);
@@ -431,6 +502,11 @@ export class RenderPipeline {
 
     this._createTargets(width, height, pixelRatio);
     this._createMaterials();
+    // The grade's band warp reads the tone curve, and the curve is only solved
+    // once the composite exists, so the shipping LUT is baked here rather than
+    // above. The one built above is the placeholder the material is created
+    // with and is disposed by this call.
+    this.refreshGrade();
   }
 
   // -------------------------------------------------------------------------
@@ -582,8 +658,31 @@ export class RenderPipeline {
     const sceneL = Math.max((EXPOSURE_REF_ALBEDO / Math.PI) * (keyE + skyE), 1e-5);
     const refL = this.grade.exposureRefRadiance ?? 1.65;
     const adapt = this.grade.exposureAdapt ?? 0.72;
-    this._physExposure =
-      ((this.grade.exposureKey ?? 0.60) / refL) * Math.pow(refL / sceneL, adapt);
+    const key = this.grade.exposureKey ?? 0.60;
+
+    /**
+     * Round 6 tried solving this ON THE PRINT and put it back. Recording it so
+     * nobody spends the day I did on it.
+     *
+     * `exposureAdapt` is documented as "the rendered brightness moves by
+     * (1 - adapt) of the scene's own change", and this form solves that on the
+     * curve's INPUT, which only means the same thing if the curve is a power
+     * law. It is not. The honest version — solve for the exposure that puts the
+     * reference surface's DISPLAY value where the law asks — is two lines
+     * (`_displayInv(_display(key) * pow(sceneL/refL, 1-adapt)) / sceneL`) and
+     * measurably more correct. It is also not worth it. Measured on all seven
+     * shots (tools/probes/verify/k4-exposurelaw.js), it moved night by 0.30
+     * stops and dusk by 0.22 — not nearly enough to fix the thing it was aimed
+     * at — while moving the afternoon by 0.11 stops, which took the vista's
+     * pixels at max-channel >= 230 from 1.87% to 1.40% and cost a criterion
+     * that currently passes.
+     *
+     * The night frame IS a stop too bright now that the toe no longer crushes
+     * it, and the fix for that is `TIME_OF_DAY.night.exposure`, not this. See
+     * the report: the numbers are measured and the change is one constant in a
+     * file this pass does not own.
+     */
+    this._physExposure = (key / refL) * Math.pow(refL / sceneL, adapt);
     this._finalExposure = this.exposure * this._physExposure;
     this.exposureInfo = {
       keyE,
@@ -597,25 +696,188 @@ export class RenderPipeline {
     return sceneL;
   }
 
+  /**
+   * ABLATION SWITCH for round 6's tone-curve work. `false` restores the round-5
+   * print exactly: the raw ACES toe in the tonemap and the pure power contrast
+   * in the grade LUT. Both have to move together — they are two toes stacked on
+   * the same band — so toggling either one alone measures half an effect.
+   */
+  setToneToe(on) {
+    this.grade.toeAmount = on ? 1 : 0;
+    this.grade.contrastToeOffset = on ? (GRADE.contrastToeOffset ?? 0.06) : 0;
+    // The band warp and the widened split-tone edge exist only because the
+    // curve moved; ablating the curve without them measures a half-change and
+    // reproduces nothing that ever shipped. `_bandWarp` follows `toeAmount`.
+    this.grade.splitShadowEdge = on ? (GRADE.splitShadowEdge ?? 0.58) : 0.42;
+    this.refreshGrade();
+  }
+
+  /**
+   * The band-selector warp handed to `buildGradeLUT` — display luminance under
+   * the current curve -> display luminance the same radiance had under raw
+   * ACES. Sampled into a 513-entry table because the inverse is a bisection and
+   * the LUT asks for it 32768 times.
+   */
+  _bandWarp() {
+    if ((this.grade.toeAmount ?? 1) <= 0 || (this.grade.bandWarp ?? 1) <= 0) return (l) => l;
+    const ws = this._whiteScale ?? 1;
+    const W = this.grade.whitePoint ?? 2.6;
+    const knee = W * (this.grade.shoulder ?? 0.3);
+    const span = Math.max(W - knee, 1e-3);
+    const aces = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081);
+    const srgb = (c) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(Math.max(c, 0), 1 / 2.4) - 0.055);
+    const srgbInv = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    const M = 512;
+    const tab = new Float64Array(M + 1);
+    for (let i = 0; i <= M; i++) {
+      const v = this._displayInv(srgbInv(i / M));
+      const x = Math.max(v - knee, 0) / span;
+      const folded = Math.min(v, knee) + span * (x / (1 + x));
+      tab[i] = Math.min(1, Math.max(0, srgb(Math.min(1, Math.max(0, aces(folded) * ws)))));
+    }
+    return (l) => {
+      const t = Math.min(1, Math.max(0, l)) * M;
+      const i = Math.min(M - 1, Math.floor(t));
+      return tab[i] + (tab[i + 1] - tab[i]) * (t - i);
+    };
+  }
+
   /** Rebuild the baked grade after changing `this.grade`. */
   refreshGrade() {
-    if (this.lut) this.lut.dispose();
-    this.lut = buildGradeLUT(this.grade);
-    this.compositeMat.uniforms.tLUT.value = this.lut;
+    // The warp reads the tone curve, so the curve's constants have to be solved
+    // before the LUT is baked, not after.
     this._refreshWhitePoint();
+    if (this.lut) this.lut.dispose();
+    this.lut = buildGradeLUT(this.grade, this._bandWarp());
+    this.compositeMat.uniforms.tLUT.value = this.lut;
+  }
+
+  /**
+   * Solve the tone curve's toe anchor and push it to the composite.
+   *
+   * The anchor is the point where the raw ACES fit's own log-log slope passes
+   * through 1 — i.e. the last point at which it is still printing a stop of
+   * scene as a stop of display. Everything above it is left alone; everything
+   * below it is where the long toe lives. Solving for it rather than hard-coding
+   * it means the join stays exact if the fit is ever re-derived.
+   *
+   * `toeSlope` is the log-log slope of the rebuilt section. 1.0 is a straight
+   * line in stops; slightly under 1.0 spends a little of the scene's shadow
+   * range to buy display codes, which is what a film's straight-line section
+   * does (constant density per stop needs a falling log-log slope, because the
+   * sRGB encode is already handing out codes as y^(1/2.4)).
+   */
+  _toeConstants() {
+    const fit = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081);
+    const slope = (v) => {
+      const h = v * 1e-4;
+      return (Math.log(fit(v + h)) - Math.log(fit(v - h))) / (Math.log(v + h) - Math.log(v - h));
+    };
+    let lo = 0.01;
+    let hi = 2.0;
+    for (let i = 0; i < 50; i++) {
+      const m = Math.sqrt(lo * hi);
+      if (slope(m) > 1) lo = m;
+      else hi = m;
+    }
+    const x = Math.sqrt(lo * hi);
+    const p = this.grade.toeSlope ?? 0.92;
+    /**
+     * ROUND 7 INTEGRATION — the deep toe moves 0.0030 -> 0.0080 and its
+     * exponent 2.0 -> 2.6. Both are tonemap-INPUT units, i.e. print positions:
+     * 0.0080 is scene linear 0.0141 at the afternoon exposure.
+     *
+     * Round 6 put the short toe below every shadow in the game and then ran a
+     * straight 0.92 section from there all the way up to the anchor. Measured
+     * with k-tonecurve.js that delivered 8.8-11.6 codes per stop across scene
+     * linear 0.007-0.045 — better than the 0-2.4 it replaced, but still short
+     * of the 12-15 the round was accepted against, AND it left 22 codes of
+     * dead pedestal underneath it: the vista's and the outpost's p0.01 black
+     * point went from 12 to 33, which is the one guard the rebuild broke.
+     *
+     * Those two failures are the same failure. A power toe hands out
+     * `0.2887 * slope * (code + 14)` codes per stop, so codes bought at the
+     * very bottom are the most expensive ones there are — 22 codes of pedestal
+     * under the darkest content is 22 codes not spent as gradient above it.
+     * Raising the knee to just under the darkest content in the frames spends
+     * that pedestal on slope: the worst codes-per-stop between scene linear
+     * 0.008 and 0.36 goes 8.8 -> 13.5 while p0.01 comes back DOWN, and neither
+     * the shadowed-sphere band (0.018-0.029) nor mid-grey moves by a code.
+     *
+     * Where the frontier is, solved over toeSlope x toeKnee x toeExp x
+     * shadowFill with mid-grey pinned at 120 +/- 2 (i.e. no exposure change):
+     *
+     *   worst codes/stop over    best achievable
+     *   scene linear 0.005-0.36        11.0
+     *   scene linear 0.008-0.36        14.0
+     *   scene linear 0.010-0.36        15.5
+     *
+     * So the acceptance target of 12-15 codes/stop *from linear 0.005* is not
+     * reachable at this key at all, and no toe shape gets there: 0.005 is six
+     * stops under mid-grey, and six stops under mid-grey at 120 codes leaves
+     * fewer than 12 codes/stop of range to hand out however they are
+     * distributed. From 0.008 up it is reachable with margin, and that is
+     * where the frames' content actually starts — the darkest 0.01% of the
+     * vista and the outpost measures scene linear 0.008-0.010.
+     */
+    const kn = this.grade.toeKnee ?? 0.0080;
+    const q = this.grade.toeExp ?? 2.6;
+    return { fit, x, fx: fit(x), p, kn, q, amt: this.grade.toeAmount ?? 1 };
+  }
+
+  /**
+   * The neutral display-linear response, CPU mirror of `acesFitted`: fold,
+   * curve, white-point normalisation. The ACES matrices preserve neutrals, so
+   * for a grey they drop out. This is what the exposure law is solved against.
+   */
+  _display(v) {
+    const W = this.grade.whitePoint ?? 2.6;
+    const knee = W * (this.grade.shoulder ?? 0.3);
+    const span = Math.max(W - knee, 1e-3);
+    const x = Math.max(v - knee, 0) / span;
+    const folded = Math.min(v, knee) + span * (x / (1 + x));
+    return Math.min(1, Math.max(0, this._fitCurve(folded) * (this._whiteScale ?? 1)));
+  }
+
+  /** Inverse of `_display`, by bisection. Monotone, so 44 halvings is exact. */
+  _displayInv(d) {
+    let lo = 1e-6;
+    let hi = 64;
+    for (let i = 0; i < 44; i++) {
+      const m = 0.5 * (lo + hi);
+      if (this._display(m) < d) lo = m;
+      else hi = m;
+    }
+    return 0.5 * (lo + hi);
+  }
+
+  /** The full tone curve, CPU mirror of `filmicFit` in the composite. */
+  _fitCurve(v) {
+    const t = this._toe ?? (this._toe = this._toeConstants());
+    if (t.amt <= 0 || v > t.x || v < 0) return t.fit(v);
+    const s = v / t.kn;
+    const s3 = s * s * s;
+    return t.fx * Math.pow(v / t.x, t.p) * Math.pow(s3 / (1 + s3), (t.q - t.p) / 3);
   }
 
   /**
    * Normalise the tonemap so `grade.whitePoint` linear maps to display 1.0.
    * The ACES input/output matrices preserve neutrals (their rows sum to one),
-   * so the scalar is just the reciprocal of the RRT/ODT fit at the white point.
+   * so the scalar is just the reciprocal of the fit at the white point.
    */
   _refreshWhitePoint() {
     const W = this.grade.whitePoint ?? 2.6;
     const shoulder = this.grade.shoulder ?? 0.3;
     const reach = this.grade.whiteReach ?? 0.86;
-    const fit = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081);
+    this._toe = this._toeConstants();
+    const t = this._toe;
+    const fit = (v) => this._fitCurve(v);
     const u = this.compositeMat.uniforms;
+    u.uToeAmt.value = t.amt;
+    u.uToeX.value = t.x;
+    u.uToeFX.value = t.fx;
+    u.uToeP.value = t.p;
+    u.uToeDeep.value.set(t.kn, t.q, (t.q - t.p) / 3);
     u.uWhitePoint.value = W;
     u.uShoulder.value = shoulder;
     /**
@@ -636,7 +898,8 @@ export class RenderPipeline {
      * which live an order of magnitude below it — still roll off on exactly the
      * same curve they did before.
      */
-    u.uWhiteScale.value = 1 / Math.max(fit(W * reach), 1e-4);
+    this._whiteScale = 1 / Math.max(fit(W * reach), 1e-4);
+    u.uWhiteScale.value = this._whiteScale;
   }
 
   // -------------------------------------------------------------------------
@@ -1483,6 +1746,11 @@ export class RenderPipeline {
       uniform float uShoulder;
       uniform float uWhiteScale;
       uniform float uHiDesat;
+      uniform float uToeAmt;    // 0 = raw ACES toe (ablation), 1 = rebuilt toe
+      uniform float uToeX;      // where the ACES fit's own log-log slope hits 1
+      uniform float uToeFX;     // RRTAndODTFit(uToeX) — the anchor's value
+      uniform float uToeP;      // log-log slope of the rebuilt shadow section
+      uniform vec3  uToeDeep;   // x = short-toe knee, y = its exponent, z = (y-P)/3
 
       const mat3 ACESInput = mat3(
         0.59719, 0.07600, 0.02840,
@@ -1499,6 +1767,70 @@ export class RenderPipeline {
         vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
         return a / b;
       }
+
+      /**
+       * The ACES fit with its TOE REBUILT. Round 6's headline change.
+       *
+       * Measured on the shipped round-6 build with an unlit emissive patch at
+       * frame centre stepped in half-stops (tools/probes/verify/k-tonecurve.js),
+       * the delivered response was:
+       *
+       *   scene linear   display code   codes per stop
+       *   0.0050            12.0            0.0
+       *   0.0071            12.3            0.6
+       *   0.0100            13.1            1.6
+       *   0.0200            16.1            3.8
+       *   0.0400            26.2           14.0
+       *   0.3200           102.8           42.6
+       *
+       * The toe was TWENTY TIMES flatter than the upper midtones, and below
+       * scene linear 0.0053 the curve was not flat, it was DEAD: RRTAndODTFit
+       * has a constant of -0.000090537 in its numerator, so it returns exactly
+       * zero for everything under 0.00358 and every one of those pixels printed
+       * the grade's black point and nothing else.
+       *
+       * That band is not an edge case. A neutral 0.5-grey sphere in full cast
+       * shadow measures 0.018-0.029 scene linear, so the 1.7-2.5 stops of
+       * directional ambient, all of the AO, the sky-coloured shade, and the
+       * whole dusk and night frames were being resolved into ~6 display codes.
+       * Four rounds of light transport were arriving at the display encode and
+       * dying there.
+       *
+       * The fix is anchored so it can only ever move shadows. uToeX is the
+       * point where the ACES fit's OWN log-log slope passes through 1 (0.4574,
+       * solved on the CPU in _toeConstants()). Above it the fit is untouched,
+       * bit for bit — mids, shoulder, white point, the highlight range and the
+       * per-hour exposure all inherit exactly what they had. Below it the fit's
+       * slope climbs from 1 to 5.5 as it dives into the crush; that climb IS
+       * the long toe, and it is replaced by:
+       *
+       *   - a straight log-log section of slope uToeP (0.92), which prints a
+       *     constant ~9-15 codes per stop through the whole shadow region, and
+       *   - a SHORT power toe below uToeDeep.x, exponent uToeDeep.y, which
+       *     takes the last stop and a half to black so the frame keeps a real
+       *     black point instead of a pedestal.
+       *
+       * Value and slope both match at the anchor (slope to within 0.08 in
+       * log-log, which is under a tenth of a code anywhere), so there is no
+       * visible join. This is the classic filmic prescription — SHORT toe, LONG
+       * shoulder — where before there was a long toe and a short shoulder.
+       */
+      vec3 filmicFit(vec3 v) {
+        vec3 aces = RRTAndODTFit(v);
+        if (uToeAmt <= 0.0) return aces;              // ablation: raw ACES
+        vec3 x = max(v, 0.0);
+        vec3 s = x / uToeDeep.x;
+        vec3 s3 = s * s * s;
+        vec3 toe = uToeFX
+                 * pow(x / uToeX, vec3(uToeP))
+                 * pow(s3 / (1.0 + s3), vec3(uToeDeep.z));
+        // Only below the anchor, and only where the working-space value is
+        // positive (the ACES input matrix can emit small negatives on saturated
+        // primaries, and pow() has nothing to say about those).
+        vec3 sel = step(v, vec3(uToeX)) * step(0.0, v);
+        return mix(aces, mix(aces, toe, sel), uToeAmt);
+      }
+
       /**
        * Filmic tonemap with an explicit white point.
        *
@@ -1527,7 +1859,7 @@ export class RenderPipeline {
         vec3 x = over / span;
         color = min(color, knee) + span * (x / (1.0 + x));
         color = ACESInput * color;
-        color = RRTAndODTFit(color);
+        color = filmicFit(color);
         color = ACESOutput * color;
         return clamp(color * uWhiteScale, 0.0, 1.0);
       }
@@ -1671,6 +2003,11 @@ export class RenderPipeline {
         uShoulder: { value: GRADE.shoulder ?? 0.3 },
         uWhiteScale: { value: 1.0 },
         uHiDesat: { value: GRADE.highlightDesat ?? 0.85 },
+        uToeAmt: { value: 1 },
+        uToeX: { value: 0.45745 },
+        uToeFX: { value: 0.34333 },
+        uToeP: { value: 0.92 },
+        uToeDeep: { value: new THREE.Vector3(0.0030, 2.0, 0.36) },
       },
     );
     this._refreshWhitePoint();

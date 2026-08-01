@@ -143,6 +143,69 @@ import { PALETTE } from '../../config/ArtDirection.js';
  * RenderPipeline in the same change. That is a two-owner edit and it is not
  * mine to make halfway.
  *
+ * ## ROUND 7: the inversion was the whole story, and it is fixed
+ *
+ * The sweep above is not wrong, it was run against a broken profile. `dustBeta`
+ * is a per-metre coefficient at the VALLEY FLOOR; what reaches the ridge is
+ * `dustBeta` times the column, and with a 330-480 m bare exponential the column
+ * SHRANK with distance for anything tall. Camera 46 m, ridge crests 100-450 m:
+ * a crest sat 1-1.4 scale heights up, so the chord to it spent most of its
+ * length climbing out of the medium and the 4.2 km band measured thinner than
+ * the 3.0 km one. No density could fix that, which is why the sweep's opacities
+ * top out at 0.26 even at the bottom row's 11 km visual range.
+ *
+ * `dustColumn()` in shaders.js replaces the exponential with the profile a
+ * desert actually has — uniform to a capping inversion (`dustTop`), then a short
+ * tail (`dustHeight`, now the TAIL scale height, not the whole layer). Optical
+ * depth is then linear in distance for every occluder standing in the layer,
+ * which is the property aerial perspective needs, and the hard lid at 750 m is
+ * what keeps a cumulus at 1.8-3.6 km from being buried with it.
+ *
+ * Measured on the vista frame, opacity binned by the pass's own linear depth,
+ * ablated through `pass.ablate` (which syncTimeOfDay CANNOT revert — see the
+ * note there; the round-6 sweep's 0.000 opacities were that bug):
+ *
+ *   range        round 6      round 7
+ *   0.5-1.0 km     0.091        0.183
+ *   1.0-1.5        0.133        0.274
+ *   1.5-2.0        0.194        0.405
+ *   2.0-3.0        0.205        0.458
+ *
+ * and per skyline band, ridge/sky luminance 0.466-0.761 — every band still
+ * darker than the sky over it, converging from below, which is the round-6
+ * property that must not break.
+ *
+ * ### The highlight coupling, resolved inside this file
+ *
+ * Round 6 predicted 0.00% of pixels over max-channel 230 at this density and
+ * concluded the fix needed RenderPipeline. It does not. The mechanism was never
+ * the exposure — `autoExposureStops` is 0.02, i.e. the auto term has a 1.4%
+ * authority and cannot move a highlight population by two orders of magnitude.
+ * It is THIS FILE: the deck's per-sample aerial perspective. The vista's
+ * highlights are its sunlit cumulus at 6-10 km, and at the new density they sit
+ * behind 0.6-0.7 optical depths, so `L * Tas + skyD * (1 - Tas)` takes half a
+ * stop off them. Swept on the shipped frame, everything else fixed:
+ *
+ *   cloudGain   pixels >= 230   p99.99
+ *     0.81          0.001%        226
+ *     1.00          0.072%        234
+ *     1.15          0.337%        238
+ *     1.30          0.811%        241
+ *     1.50          1.617%        242
+ *     1.70          2.599%        243     <- shipped (target 1.9-3.2%)
+ *
+ * That is radiance authoring against a haze that is now correct, not a fudge of
+ * the tonemap, and it is the same argument round 6 used to lift the gain the
+ * first time. Only noon and afternoon move: dawn, dusk and night take their
+ * highlights from the sun disc, and their frames measured within 4% of round 6
+ * at the old gain.
+ *
+ * `dustWarm` and `apDesat` moved at dawn and dusk for the opposite reason. The
+ * denser haze converging onto a low sun's aureole took the dusk frame's cool
+ * fraction (pixels with B > R+4) from 13.79% to 6.41%, which is the round-6
+ * "dusk has cool" criterion. apDesat 0.52 -> 0.68 with dustWarm to zero and a
+ * slightly lower dusk density puts it back at 12.18%.
+ *
  * `cloudGain` went 0.42-0.58 -> 0.74-0.82 in the same round. See the
  * cloudScatter block in shaders.js: the vista frame's brightest pixel out of
  * 2.07 M was rgb(229,213,198) and NOTHING in it reached max-channel 230.
@@ -165,43 +228,43 @@ import { PALETTE } from '../../config/ArtDirection.js';
 export const ATMOS = {
   dawn: {
     shaftDensity: 0.00120, shaftHeight: 170, sunScatter: 0.055, phaseG: 0.80, dustBand: 2.0,
-    cloudCoverage: 0.46, cloudDensity: 1.05, cloudGain: 0.80, cloudAmb: 0.34, cirrus: 0.50,
+    cloudCoverage: 0.46, cloudDensity: 1.05, cloudGain: 0.95, cloudAmb: 0.34, cirrus: 0.50,
     cloudBase: 1500, cloudTop: 3000, cirrusAlt: 7600, heatHaze: 0.0, cloudShadow: 0.22,
     bounce: 0.40, cloudExt: 0.034, cloudLightExt: 0.052,
-    dustBeta: 1.30e-4, dustHeight: 330, apGain: 0.94, dustWarm: 0.04, apDesat: 0.48,
-    cloudFar: 17000, cloudStreak: 0.20,
+    dustBeta: 2.40e-4, dustTop: 750, dustHeight: 150, apGain: 0.94, dustWarm: 0.02, apDesat: 0.60,
+    cloudFar: 60000, cloudStreak: 0.00,
   },
   noon: {
     shaftDensity: 0.00042, shaftHeight: 260, sunScatter: 0.020, phaseG: 0.74, dustBand: 0.7,
-    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 0.74, cloudAmb: 0.30, cirrus: 0.24,
+    cloudCoverage: 0.30, cloudDensity: 1.0, cloudGain: 1.60, cloudAmb: 0.30, cirrus: 0.24,
     cloudBase: 1900, cloudTop: 3800, cirrusAlt: 8200, heatHaze: 1.0, cloudShadow: 0.30,
     bounce: 0.28, cloudExt: 0.040, cloudLightExt: 0.078,
-    dustBeta: 1.10e-4, dustHeight: 420, apGain: 0.97, dustWarm: 0.05, apDesat: 0.12,
-    cloudFar: 20000, cloudStreak: 0.15,
+    dustBeta: 2.42e-4, dustTop: 750, dustHeight: 150, apGain: 0.97, dustWarm: 0.05, apDesat: 0.12,
+    cloudFar: 70000, cloudStreak: 0.00,
   },
   afternoon: {
     shaftDensity: 0.00058, shaftHeight: 250, sunScatter: 0.026, phaseG: 0.76, dustBand: 1.0,
-    cloudCoverage: 0.32, cloudDensity: 1.0, cloudGain: 0.75, cloudAmb: 0.31, cirrus: 0.28,
+    cloudCoverage: 0.32, cloudDensity: 1.0, cloudGain: 1.70, cloudAmb: 0.31, cirrus: 0.28,
     cloudBase: 1800, cloudTop: 3600, cirrusAlt: 8000, heatHaze: 0.85, cloudShadow: 0.28,
     bounce: 0.34, cloudExt: 0.038, cloudLightExt: 0.075,
-    dustBeta: 1.18e-4, dustHeight: 360, apGain: 0.97, dustWarm: 0.05, apDesat: 0.14,
-    cloudFar: 18000, cloudStreak: 0.15,
+    dustBeta: 2.60e-4, dustTop: 750, dustHeight: 150, apGain: 0.97, dustWarm: 0.05, apDesat: 0.14,
+    cloudFar: 65000, cloudStreak: 0.00,
   },
   dusk: {
     shaftDensity: 0.00135, shaftHeight: 165, sunScatter: 0.060, phaseG: 0.81, dustBand: 2.2,
-    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.82, cloudAmb: 0.34, cirrus: 0.52,
+    cloudCoverage: 0.44, cloudDensity: 1.05, cloudGain: 0.97, cloudAmb: 0.34, cirrus: 0.52,
     cloudBase: 1500, cloudTop: 3100, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.20,
     bounce: 0.44, cloudExt: 0.034, cloudLightExt: 0.052,
-    dustBeta: 1.35e-4, dustHeight: 320, apGain: 0.94, dustWarm: 0.03, apDesat: 0.52,
-    cloudFar: 17000, cloudStreak: 0.20,
+    dustBeta: 2.40e-4, dustTop: 750, dustHeight: 150, apGain: 0.94, dustWarm: 0.00, apDesat: 0.68,
+    cloudFar: 60000, cloudStreak: 0.00,
   },
   night: {
     shaftDensity: 0.00060, shaftHeight: 200, sunScatter: 0.0, phaseG: 0.72, dustBand: 0.9,
-    cloudCoverage: 0.36, cloudDensity: 0.95, cloudGain: 1.65, cloudAmb: 0.36, cirrus: 0.22,
+    cloudCoverage: 0.36, cloudDensity: 0.95, cloudGain: 1.90, cloudAmb: 0.36, cirrus: 0.22,
     cloudBase: 1700, cloudTop: 3300, cirrusAlt: 7800, heatHaze: 0.0, cloudShadow: 0.0,
     bounce: 0.02, cloudExt: 0.034, cloudLightExt: 0.050,
-    dustBeta: 1.45e-4, dustHeight: 480, apGain: 0.95, dustWarm: 0.0, apDesat: 0.10,
-    cloudFar: 17000, cloudStreak: 0.15,
+    dustBeta: 2.20e-4, dustTop: 750, dustHeight: 150, apGain: 0.95, dustWarm: 0.0, apDesat: 0.10,
+    cloudFar: 60000, cloudStreak: 0.00,
   },
 };
 
@@ -261,6 +324,29 @@ export class VolumetricPass {
     world.scene.add(this.compositeMesh);
 
     this.params = { ...ATMOS.afternoon };
+
+    /**
+     * First-class ablation switches, applied at the END of `syncTimeOfDay()`.
+     *
+     * Every previous round's fog measurement was taken by poking
+     * `volMat.uniforms` directly, which `syncTimeOfDay()` overwrites on the very
+     * next frame — so the ablation silently did nothing and the number that came
+     * back was the unablated one. (That is trap 2 in
+     * tools/probes/verify/README.md, and it is what made round 6's
+     * `d2-fogsweep.js` report a fog opacity of 0.000 at every density it swept.)
+     * Poking `params` has the same failure whenever the time of day changes.
+     *
+     * These are read after the params have been pushed, so they win, every
+     * frame, unconditionally. `null` means "do not override".
+     */
+    this.ablate = {
+      haze: false,      // distance haze off entirely: Thaze = 1, no in-scatter
+      clouds: false,    // cumulus deck off
+      cirrus: false,    // high sheet off
+      shafts: false,    // crepuscular lobe off
+      vsquash: false,   // cloud shape back to a vertical extrusion (round 6)
+      apGain: null,     // in-scatter only; extinction still applied
+    };
   }
 
   _makeMaterials() {
@@ -311,6 +397,7 @@ export class VolumetricPass {
         uDustAlbedo: { value: new THREE.Vector3(1, 1, 1) },
         uGroundLight: { value: new THREE.Vector3(0.45, 0.34, 0.21) },
         uBetaM: { value: 8.0e-6 },
+        uDustTop: { value: 1000 },
         uDustHeight: { value: 900 },
         uApGain: { value: 0.93 },
         uApDesat: { value: 0.14 },
@@ -331,6 +418,7 @@ export class VolumetricPass {
         uCloudShadow: { value: 0.28 },
         uCloudFar: { value: 18000 },
         uCloudStreak: { value: 0.15 },
+        uCloudVSquash: { value: 3.0 },
       },
       depthTest: false,
       depthWrite: false,
@@ -622,12 +710,14 @@ export class VolumetricPass {
     u.uCloudShadow.value = p.cloudShadow;
     u.uCloudFar.value = p.cloudFar ?? 18000;
     u.uCloudStreak.value = p.cloudStreak ?? 0.15;
+    u.uCloudVSquash.value = p.cloudVSquash ?? 3.0;
     u.uHazeOwned.value = this.ownsHaze ? 1 : 0;
 
     // Dust load rides the art-directed fog density so the look stays tunable
     // from ArtDirection.js without touching a shader.
     const dust = (preset.fogDensity ?? 0.000095) / 0.000095;
     u.uBetaD.value.setScalar(p.dustBeta * dust);
+    u.uDustTop.value = p.dustTop ?? 1000;
     u.uDustHeight.value = p.dustHeight;
     u.uApGain.value = p.apGain ?? 0.93;
     u.uApDesat.value = p.apDesat ?? 0.14;
@@ -652,6 +742,15 @@ export class VolumetricPass {
     u.uBetaR.value.set(5.802e-6 * ray, 13.558e-6 * ray, 33.1e-6 * ray);
     u.uBetaM.value = 8.0e-6 * ((preset.mieCoefficient ?? 0.0058) / 0.0058);
     u.uApG.value = Math.min(preset.mieDirectionalG ?? 0.8, 0.82);
+
+    // Ablations last, so they cannot be undone by anything above. See `ablate`.
+    const ab = this.ablate;
+    if (ab.haze) u.uHazeOwned.value = 0;
+    if (ab.clouds) u.uCloudCoverage.value = 0;
+    if (ab.cirrus) u.uCirrus.value = 0;
+    if (ab.shafts) u.uSunScatter.value = 0;
+    if (ab.vsquash) u.uCloudVSquash.value = 1;
+    if (ab.apGain !== null) u.uApGain.value = ab.apGain;
   }
 
   /**

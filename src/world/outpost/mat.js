@@ -96,17 +96,35 @@ uniform float uCorrAmp;
 uniform vec3 uDadoCol;
 uniform vec2 uDado;
 uniform vec3 uBounce;
-#if OP_MODE == 5
-uniform sampler2D uWearMap;
+// Authored specular. Round 6: every mode used to hard-code its own roughness
+// constant, and the material's own roughness property was dead code: the
+// injected roughnessFactor = gRough overwrote it unconditionally. That is why
+// round-5 ablation that forced every material in the scene to roughness 1.0
+// measured no change: on this half of the scene it was not ablating anything.
+//   x = clean/painted roughness   y = fully corroded roughness
+//   z = polished-arris roughness  w = how much the dust film matts it (0..1)
+uniform vec4 uRgh;
+// Bare metal showing through a chipped edge. A metal's specular colour IS its
+// albedo, so this has to be a real reflectance (steel ~0.56) rather than the
+// dark rust tint the chip used to inherit, or metalness 1 makes it darker
+// instead of shinier.
+uniform vec3 uF0;
+// Specular ablation, in place: 1 forces roughness 1 / metalness 0 on every
+// outpost surface, which deletes the specular lobe and nothing else.
+uniform float uAbl;
+// The baked lamp pool. Shared by EVERY mode, not just the ground: see the
+// lights_fragment_end injection.
 uniform sampler2D uLampMap;
 uniform vec4 uWearOrg;    // (u0, v0, 1/extentU, 1/extentV)
-uniform vec2 uWearTexel;  // (1/width, 1/height) in texture uv
 uniform vec2 uTheta;      // (cos, sin) of the compound yaw, local -> world
 uniform vec3 uLampGain;   // pool radiance scale, driven by time of day
+#if OP_MODE == 5
+uniform sampler2D uWearMap;
+uniform vec2 uWearTexel;  // (1/width, 1/height) in texture uv
 // (amount, debug). Amount 0 ablates the whole authored-wear layer in place,
 // which is how this feature is measured: render twice, diff. Debug 1 dumps the
 // three masks straight to albedo.
-uniform vec2 uWearCtl;
+uniform vec3 uWearCtl;
 #endif
 `;
 
@@ -163,11 +181,18 @@ const EPILOGUE = /* glsl */ `
   float dustMask = uDustAmt * (0.28 + 0.42 * up) * (0.40 + 0.85 * m1);
   dustMask += uDustAmt * splash * 0.7;
   c = mix(c, uDust * (0.8 + 0.4 * m2), clamp(dustMask, 0.0, 0.85));
-  gRough = clamp(mix(gRough, 0.96, clamp(dustMask, 0.0, 1.0) * 0.55), 0.05, 1.0);
-  gMetal = gMetal * (1.0 - clamp(dustMask, 0.0, 1.0) * 0.6);
+  // Dust matts a surface, but it does not matt it uniformly and it does not
+  // matt a vertical panel at all — a drum that has stood in the yard for a
+  // decade still has a wiped, glossy belly where hands and sleeves go past it.
+  // uRgh.w lets steel keep its lobe where flat concrete legitimately loses one.
+  gRough = clamp(mix(gRough, 0.96, clamp(dustMask, 0.0, 1.0) * uRgh.w), 0.05, 1.0);
+  gMetal = gMetal * (1.0 - clamp(dustMask, 0.0, 1.0) * 0.6 * uRgh.w);
   c *= 0.90 + 0.19 * vOPV.z;
   diffuseColor.rgb *= max(c, vec3(0.0));
   gNorm = normalize(nrm);
+  // In-place specular ablation (see uAbl). Last, so it beats every mode.
+  gRough = mix(gRough, 1.0, uAbl);
+  gMetal = mix(gMetal, 0.0, uAbl);
 `;
 
 /**
@@ -225,7 +250,7 @@ const BODY = {
     // Fine pinholing and aggregate at arm's length.
     float fine = optri(vOPP, wn, 26.0 * uScale, 2);
     c *= 0.93 + 0.14 * fine;
-    gRough = clamp(0.90 + (m2 - 0.5) * 0.18, 0.5, 1.0);
+    gRough = clamp(uRgh.x + (m2 - 0.5) * 0.18, 0.5, 1.0);
     gMetal = 0.0;
     // Chipped arris. This is the payoff for baking the bevel mask: the cement
     // skin has gone off every edge in the compound, so the edge is a PALE,
@@ -246,7 +271,7 @@ const BODY = {
     float chipE = arris * (0.35 + 0.65 * smoothstep(0.30, 0.78, m3 * 0.7 + m2 * 0.5));
     c = mix(c, uBase3 * 1.42 + vec3(0.034, 0.030, 0.023), clamp(chipE * 0.80, 0.0, 0.84));
     c = mix(c, uRust * 0.85, clamp(chipE * (streak * 1.1 + 0.18 * wear), 0.0, 0.32));
-    gRough = mix(gRough, 0.44, chipE * 0.62);
+    gRough = mix(gRough, uRgh.z, chipE * 0.62);
     ${DADO}
     // Relief so a shaded facade still catches a gradient from the sky.
     nrm = normalize(wn + vec3(m3 - 0.5, m2 - 0.5, m2 - 0.5) * 0.22 * (0.4 + chip)
@@ -320,8 +345,8 @@ const BODY = {
     // opposite sign, which is what stops the two shells looking alike.
     float chipE = arris * (0.30 + 0.70 * smoothstep(0.28, 0.75, m3 * 0.7 + m2 * 0.5));
     c = mix(c, uBase2 * 0.80, clamp(chipE * 0.82, 0.0, 0.86));
-    gRough = clamp(0.88 + (m2 - 0.5) * 0.16 + joint * 0.08, 0.5, 1.0);
-    gRough = mix(gRough, 0.46, chipE * 0.58);
+    gRough = clamp(uRgh.x + (m2 - 0.5) * 0.16 + joint * 0.08, 0.5, 1.0);
+    gRough = mix(gRough, uRgh.z, chipE * 0.58);
     gMetal = 0.0;
     ${DADO}
     nrm = normalize(wn
@@ -344,11 +369,20 @@ const BODY = {
     // Paint never survives on an edge: every folded arris in the compound is
     // bare steel going to rust, which is a bright specular line on a matt body.
     float chipE = arris * (0.40 + 0.60 * smoothstep(0.25, 0.80, m3));
-    c = mix(c, mix(uRust * 1.15, vec3(0.20, 0.19, 0.18), 0.35) * (0.7 + 0.5 * m2), clamp(chipE * 0.65, 0.0, 0.75));
-    gRough = clamp(mix(0.46, 0.94, rustM) + (m3 - 0.5) * 0.08 + run * 0.35, 0.08, 1.0);
-    gRough = mix(gRough, 0.42, chipE * 0.45);
-    gMetal = mix(uMetal, 0.04, max(rustM, run * 0.8));
-    gMetal = mix(gMetal, 0.55, chipE * 0.35);
+    // Paint is a DIELECTRIC film over the steel: the panel's specular is the 4%
+    // Fresnel lobe of the varnish and its diffuse is the pigment underneath.
+    // Authoring the whole drum as metalness 0.62 over a dark khaki albedo — which
+    // is what this did — gets the worst of both ends: two thirds of the diffuse
+    // is deleted AND the F0 that replaces it is a near-black 0.08, i.e. a
+    // specular lobe with nothing in it. Only the bare steel showing through a
+    // chipped arris is actually metal, and it gets a real steel reflectance.
+    float bare = chipE * 0.62;
+    c = mix(c, mix(uRust * 1.15, uF0, 0.45) * (0.72 + 0.46 * m2), clamp(chipE * 0.65, 0.0, 0.78));
+    c = mix(c, uF0 * (0.86 + 0.28 * m2), clamp(bare * 0.55, 0.0, 0.55));
+    gRough = clamp(mix(uRgh.x, uRgh.y, rustM) + (m3 - 0.5) * 0.06 + run * 0.30, 0.06, 1.0);
+    gRough = mix(gRough, uRgh.z, chipE * 0.55);
+    gMetal = mix(uMetal, 0.02, max(rustM, run * 0.8));
+    gMetal = mix(gMetal, 1.0, clamp(bare * 0.75, 0.0, 0.75));
     nrm = normalize(wn + vec3(m3 - 0.5, 0.0, m2 - 0.5) * 0.14 * rustM);
     ${DADO}
   `,
@@ -379,8 +413,13 @@ const BODY = {
     c = mix(c, c * 1.5 + 0.02, fix * 0.35);
     c *= 1.0 - 0.20 * topWash;
     c = mix(c, c * 1.18 + vec3(0.02, 0.017, 0.009), southFace * 0.36);
-    gRough = clamp(mix(0.50, 0.95, rustM) - fix * 0.25, 0.1, 1.0);
-    gMetal = mix(uMetal, 0.04, rustM);
+    // Profiled sheet is factory-coated steel: the coating is the dielectric, and
+    // the valleys hold enough dirt to matt them while the ridge crowns stay
+    // wiped clean by every rainstorm. That gloss DIFFERENCE along the profile is
+    // most of what makes corrugated iron legible at 60 m — a uniformly matt
+    // sheet is a striped painting of a sheet.
+    gRough = clamp(mix(uRgh.x, uRgh.y, rustM) + valley * 0.10 - fix * 0.20, 0.08, 1.0);
+    gMetal = mix(uMetal, 0.02, rustM);
     nrm = normalize(wn + tdir * cos(ph) * uCorrAmp);
   `,
   [MODE.WOOD]: /* glsl */ `
@@ -406,7 +445,7 @@ const BODY = {
     c = mix(c, uBase * 0.5, knot * 0.7);
     c *= 1.0 - 0.34 * streak * wear;
     c = mix(c, uBase * 0.42, splash * 0.7);
-    gRough = clamp(0.86 + (grain - 0.5) * 0.2 + gap * 0.1, 0.5, 1.0);
+    gRough = clamp(uRgh.x + (grain - 0.5) * 0.2 + gap * 0.1, 0.5, 1.0);
     gMetal = 0.0;
     nrm = normalize(wn + tangentFromGrain(wn, grain, gap) + vec3(0.0, (bvar - 0.5) * 0.06, 0.0));
   `,
@@ -448,7 +487,7 @@ const BODY = {
     c *= 0.72 + 0.28 * smoothstep(0.0, 0.35, y01);
     // Split seams weep sand down the face of the course.
     c = mix(c, uDust * 1.25, clamp(run * 0.85 + streak * 0.35 * wear, 0.0, 0.7));
-    gRough = 0.98;
+    gRough = uRgh.x;
     gMetal = 0.0;
     nrm = normalize(nrm + vec3(fold - 0.5, 0.0, m2 - 0.5) * 0.50);
   `,
@@ -479,7 +518,7 @@ const BODY = {
     // reads as rubble.
     float ampR = 0.030 * (0.4 + 0.6 * up) * (0.35 + 0.65 * smoothstep(0.05, 0.5, y01));
     nrm = normalize(wn + vec3(wd.x, 0.0, wd.y) * cos(wp.x * 46.0) * ampR);
-    gRough = clamp(0.93 + (n2s - 0.5) * 0.08, 0.6, 1.0);
+    gRough = clamp(uRgh.x + (n2s - 0.5) * 0.08, 0.6, 1.0);
     gMetal = 0.0;
   `,
   [MODE.GROUND]: /* glsl */ `
@@ -575,10 +614,38 @@ const BODY = {
     // Only the BOUNDARY is broken up. Applying the fine octaves to the whole
     // mask sprinkles patches of borrow material across undisturbed desert;
     // 4k(1-k) is 1 in the transition band and 0 either side of it.
-    float gEdge = 4.0 * grade * (1.0 - grade);
-    float hEdge = 4.0 * hard * (1.0 - hard);
-    float gradeN = clamp(grade * 1.35 - 0.30 + (n1 - 0.5) * 0.50
-                         + (fineE * 0.60 + (fbA - 0.5) * 0.36) * gEdge, 0.0, 1.0);
+    // Round 6, and the fourth round this has been raised: "material junctions
+    // step with no transitional third material". Two separate defects were
+    // hiding under that one sentence and only one of them was noise.
+    //
+    // (1) WIDTH. Both masks arrive as VERTEX attributes on a 1.9 m mesh, so a
+    //     hardstanding edge authored as a 2.6 m ramp is interpolated out to
+    //     4-5 m before the shader ever sees it. Breaking a 5 m ramp with a
+    //     0.4 m fbm does nothing you can see: the fingers are a twentieth of
+    //     the amplitude of the ramp they are perturbing. Re-contrasting the
+    //     mask about its own half-value pulls the transition back to ~1.4 m,
+    //     which is what a bladed toe actually measures, and only THEN is the
+    //     0.4 m octave big enough to break it into fingers a boot wide.
+    // (2) THE THIRD MATERIAL. Even a perfect fingered boundary is still a
+    //     boundary between exactly two materials. Real ground has a verge: the
+    //     metre at the toe of a bladed surface where the plant has kicked the
+    //     stone out and the wind has blown the fines back in, which is coarser
+    //     than the hardstanding AND paler than the desert. hEdge and gEdge are
+    //     1 in the transition band and 0 either side of it, so they are exactly
+    //     the weight that material wants.
+    // uWearCtl.z is the ablation for exactly this: 1 restores the round-5
+    // junction — the raw vertex ramp, the weaker break, and no verge — so the
+    // work can be diffed in place against itself.
+    float jAbl = uWearCtl.z;
+    float gradeS = mix(clamp((grade - 0.48) * 2.10 + 0.5, 0.0, 1.0),
+                       clamp(grade * 1.35 - 0.30, 0.0, 1.0), jAbl);
+    float hardS = mix(clamp((hard - 0.46) * 3.60 + 0.5, 0.0, 1.0),
+                      clamp(hard * 1.25 - 0.25, 0.0, 1.0), jAbl);
+    float gEdge = 4.0 * gradeS * (1.0 - gradeS);
+    float hEdge = 4.0 * hardS * (1.0 - hardS);
+    float gradeN = clamp(gradeS + (n1 - 0.5) * mix(0.34, 0.50, jAbl)
+                         + (fineE * mix(0.78, 0.60, jAbl)
+                            + (fbA - 0.5) * mix(0.52, 0.36, jAbl)) * gEdge, 0.0, 1.0);
     vec3 c = mix(sand, fill, gradeN * 0.78);
 
     // Graded gravel hardstanding: cooler, coarser, crushed rock through the fines.
@@ -586,9 +653,28 @@ const BODY = {
     gravel = mix(gravel, uBase3 * 1.9, smoothstep(0.60, 0.95, n4) * 0.45);
     gravel = mix(gravel, uBase * 0.82, smoothstep(0.62, 0.30, n3) * 0.4);
     gravel *= 0.90 + 0.20 * n4;
-    float hardN = clamp(hard * 1.25 - 0.25 + (n1 - 0.5) * 0.55
-                        + (fineE * 0.66 + (fbA - 0.5) * 0.40) * hEdge, 0.0, 1.0);
+    float hardN = clamp(hardS + (n1 - 0.5) * mix(0.34, 0.55, jAbl)
+                        + (fineE * mix(0.86, 0.66, jAbl)
+                           + (fbA - 0.5) * mix(0.58, 0.40, jAbl)) * hEdge, 0.0, 1.0);
     c = mix(c, gravel, hardN);
+    // The verge. Coarse, kicked-over, half-buried: the stone of the surface it
+    // came off with the fines of the desert blown through it, and markedly more
+    // loose stone standing proud than either neighbour has.
+    // It has to be a real THIRD VALUE, not an average of its two neighbours —
+    // an interpolated colour in the transition band is what a plain crossfade
+    // already produced, and a crossfade is the thing being complained about.
+    // A bladed toe is the pale end of the site: the fines that the blade pushed
+    // off the surface are the finest fraction there is, they dry out first, and
+    // the stone standing proud in them is picked out on both sides of the
+    // surround's value.
+    vec3 verge = mix(gravel, sand, 0.42) * (1.22 + 0.34 * (n4 - 0.5));
+    verge = mix(verge, uBase3 * 2.05, smoothstep(0.52, 0.86, n4) * 0.55);
+    verge = mix(verge, uBase2 * 0.52, smoothstep(0.68, 0.92, 1.0 - n3) * 0.42);
+    // Broken along its length: a continuous rim is a kerb, and a kerb is worse
+    // than a step.
+    float vergeBreak = 0.35 + 0.85 * smoothstep(0.25, 0.75, opfbm(vOPP.xz * 0.85, 3));
+    float vergeK = clamp((hEdge * 0.78 + gEdge * 0.52) * vergeBreak, 0.0, 0.82) * (1.0 - jAbl);
+    c = mix(c, verge, vergeK);
     // Big, slow tonal drift across the platform: fill from different borrow pits.
     c *= 0.80 + 0.42 * n0;
 
@@ -682,8 +768,12 @@ const BODY = {
     float ashRim = smoothstep(0.10, 0.26, scorchRaw) * smoothstep(0.52, 0.28, scorchRaw);
     c = mix(c, uBase3 * 1.55, ashRim * 0.34);
 
-    gRough = clamp(0.94 - hard * 0.03 + (n4 - 0.5) * 0.12 - oilN * 0.55
-                   - corridor * 0.10 - footCore * 0.14 + scorch * 0.05, 0.16, 1.0);
+    // The verge is loose stone standing on fines, so it is the roughest thing
+    // on the site — that gloss break is what keeps the transition visible when
+    // the sun is high enough to flatten the value break.
+    gRough = clamp(uRgh.x - hard * 0.03 + (n4 - 0.5) * 0.12 - oilN * 0.55
+                   - corridor * 0.10 - footCore * 0.14 + scorch * 0.05
+                   + vergeK * 0.05, 0.16, 1.0);
     gMetal = 0.0;
     if (uWearCtl.y > 0.5) c = vec3(foot * 0.9 + footCore * 0.1, corridor * 0.6 + rut, max(spill, scorch));
 
@@ -799,6 +889,13 @@ export function createSurface(opts = {}) {
     scale = 1.0,
     metalness = 0.0,
     roughness = 0.9,
+    // The corroded end of the range, the polished-arris end, and how much the
+    // dust film is allowed to matt the surface. Defaults are the round-5
+    // numbers, so a material that says nothing renders exactly as it used to.
+    roughWorn = 0.94,
+    roughChip = 0.45,
+    dustMatt = 0.55,
+    f0 = [0.560, 0.550, 0.530],
     corrFreq = 26.0,
     corrAmp = 0.55,
     dado = 0,
@@ -844,19 +941,24 @@ export function createSurface(opts = {}) {
     uDadoCol: { value: toV3(dadoColor) },
     uDado: { value: new THREE.Vector2(dado, dado > 0 ? dadoStrength : 0) },
     uBounce: { value: new THREE.Vector3(0, 0, 0) },
+    uRgh: { value: new THREE.Vector4(roughness, roughWorn, roughChip, dustMatt) },
+    uF0: { value: toV3(f0) },
+    uAbl: { value: 0 },
+    // A 1x1 black default is a valid *empty* field — no pool anywhere — so a
+    // surface renders correctly even if the bake fails to build.
+    uLampMap: { value: emptyWear() },
+    uWearOrg: { value: new THREE.Vector4(0, 0, 1, 1) },
+    uTheta: { value: new THREE.Vector2(1, 0) },
+    uLampGain: { value: new THREE.Vector3(0, 0, 0) },
   };
   if (mode === MODE.GROUND) {
-    // A 1x1 black default is a valid *empty* wear field in every channel — no
-    // path, no corridor, lateral offset off the end of the rut set — so the
-    // ground renders correctly even if the field fails to build.
+    // Same argument for the wear field: black is "no path, no corridor, and a
+    // lateral offset off the end of the rut set".
     Object.assign(mat.userData.u, {
       uWearMap: { value: emptyWear() },
-      uLampMap: { value: emptyWear() },
-      uWearOrg: { value: new THREE.Vector4(0, 0, 1, 1) },
       uWearTexel: { value: new THREE.Vector2(1, 1) },
-      uTheta: { value: new THREE.Vector2(1, 0) },
-      uLampGain: { value: new THREE.Vector3(0, 0, 0) },
-      uWearCtl: { value: new THREE.Vector2(1, 0) },
+      // (wear amount, debug dump, junction ablation).
+      uWearCtl: { value: new THREE.Vector3(1, 0, 0) },
     });
   }
 
@@ -948,24 +1050,62 @@ export function createSurface(opts = {}) {
            #endif
            float lower = clamp(0.55 - 0.55 * bn.y, 0.0, 1.0);
            reflectedLight.indirectDiffuse += diffuseColor.rgb * uBounce * lower;
-           #if OP_MODE == 5
            // Baked lamp pools.
            //
            // Round 5 measured the site's lamps radially and found no pool at
            // all: "the lamps are emissive decals, not lights". There are ~40 of
            // them and three.js's forward path loops every light in every
            // fragment of every material, so forty more real lights is not a
-           // trade this frame budget can make. What every one of them actually
+           // trade this frame budget can make. What every one of them mostly
            // does for the image is light the FLOOR — and a fixed lamp over
            // graded ground has an exactly computable floor pool, so it is
            // rasterised once (wear.js addLamp: Lambert on a horizontal plane,
            // inverse square, cut by the shade's own half-angle) and costs one
            // texture fetch. The masts and floods that light objects as well as
            // ground are still real lights.
-           vec2 lpv = (vOPL - uWearOrg.xy) * uWearOrg.zw;
-           vec3 pool = texture2D(uLampMap, lpv).rgb;
-           reflectedLight.indirectDiffuse += diffuseColor.rgb * pool * pool * uLampGain;
-           #endif
+           //
+           // Round 6: the pool used to be applied to OP_MODE 5 only, i.e. to the
+           // pad and nothing else, and that is why the night frame still read as
+           // "lamps that emit no light" even with the pool switched on — a drum
+           // standing in the middle of a lit pool was drawn at exactly its
+           // moonlit value, so the pool became a painted disc that objects
+           // occlude but never receive. Every mode samples it now. The compound
+           // is one rigid group, so the local coordinate the pool is rasterised
+           // in is just the world position turned back through the yaw.
+           //
+           // The branch is on a UNIFORM, so it is coherent and derivatives
+           // inside it are well defined; in daylight uLampGain is zero and the
+           // fetch does not happen at all.
+           if (uLampGain.x > 0.0) {
+             #if OP_MODE == 5
+             vec2 lpl = vOPL;
+             #else
+             vec2 lpl = vec2(vOPP.x * uTheta.x - vOPP.z * uTheta.y,
+                             vOPP.x * uTheta.y + vOPP.z * uTheta.x);
+             #endif
+             vec3 pool = texture2D(uLampMap, (lpl - uWearOrg.xy) * uWearOrg.zw).rgb;
+             pool *= pool;
+             #if OP_MODE != 5
+             // The field is irradiance on the FLOOR. A surface a metre up is
+             // nearer the lamp, not further, but it is also progressively out
+             // from under the shade, so the honest cheap answer is to hold it
+             // for the first couple of metres and let it die by the eaves —
+             // a lit ground plane under an unlit building is exactly the tell
+             // this is here to remove, and a lit parapet nine metres up is the
+             // opposite one.
+             pool *= 1.0 - smoothstep(1.3, 4.6, vOPP.y);
+             // Light arrives from above and from the side. A downward-facing
+             // face sees the pool's own bounce; an up-facing one sees the
+             // fixture. Neither is zero, so this only shapes it.
+             //
+             // The 0.72: a floor irradiance field over-reads on a wall, and the
+             // whole point of a night frame is that it stays a night frame —
+             // measured, every extra 10% here costs about 0.4 of the ground
+             // band's blue-minus-red, which is the criterion this must not eat.
+             pool *= (0.72) * (0.42 + 0.58 * (1.0 - abs(bn.y)));
+             #endif
+             reflectedLight.indirectDiffuse += diffuseColor.rgb * pool * uLampGain;
+           }
          }`,
       )
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\n roughnessFactor = gRough;`)

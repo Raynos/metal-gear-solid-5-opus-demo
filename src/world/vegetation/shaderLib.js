@@ -321,6 +321,24 @@ uniform vec2 uTranslucency; // (through-scatter, sky wrap gain)
  */
 const vec3 VEG_TRANSMIT = vec3(1.24, 0.94, 0.52);
 
+/**
+ * Warm ground bounce, as a TINT normalised on green so it moves hue without
+ * moving the value the round-3/4 brightness calibration was set against.
+ *
+ * ROUND 7. A bush stands on sunlit sand. The light reaching its underside, its
+ * interior and its shadow side has bounced off that sand and is the warmest
+ * radiance in the scene — but round 6 filled all of it with uSkyColor, which
+ * is the coldest. Measured by ablating the woody field against the exact ground
+ * pixels it covered, 63% of woody pixels in the vista frame and 36% in the
+ * outpost frame came back COOLER in R/B than the ground they grow out of. The
+ * rock module found and fixed the identical bug in round 5 (see uBounce in
+ * RockMaterial.js) and vegetation never got the same treatment.
+ *
+ * The ratios track LIGHT_TRANSPORT.groundAlbedo (0.54, 0.44, 0.345), which is
+ * the same surface this is modelling.
+ */
+const vec3 VEG_BOUNCE = vec3(1.30, 1.00, 0.71);
+
 vec3 vegDryShading(vec3 N, vec3 V, vec3 albedo, float exposure, float sunVis, float dist) {
   float ndl = dot(N, uSunDir);
   float through = clamp(-ndl * 0.62 + 0.48, 0.0, 1.0);
@@ -339,6 +357,17 @@ vec3 vegDryShading(vec3 N, vec3 V, vec3 albedo, float exposure, float sunVis, fl
   // a blade edge-on to the sky, which is what stops the dark side crushing.
   float sky = (N.y + 1.0) * 0.5;
   sky = mix(sky, 1.0, 0.35) * uTranslucency.y * mix(0.35, 1.0, near);
-  return (sun + uSkyColor * sky) * exposure * albedo * RECIPROCAL_PI;
+  // Split the fill by hemisphere: what a downward-facing twig sees is ground,
+  // not sky, and the two are three quarters of a hue apart.
+  vec3 fill = mix(uSkyColor, uSkyColor * VEG_BOUNCE, clamp(-N.y, 0.0, 1.0) * 0.9);
+  return (sun + fill * sky) * exposure * albedo * RECIPROCAL_PI;
+}
+
+/**
+ * The same correction on the IBL half, which is where most of a shaded plant's
+ * light actually comes from. Call with the plant's world normal.
+ */
+vec3 vegBounceTint(vec3 N) {
+  return mix(vec3(1.0), VEG_BOUNCE, clamp(0.52 - N.y * 0.52, 0.0, 1.0) * 0.62);
 }
 `;

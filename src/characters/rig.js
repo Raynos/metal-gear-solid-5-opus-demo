@@ -24,17 +24,27 @@ const SPEC = [
   ['head', 'neck', [0, 1.6, -0.008]],
   ['headTip', 'head', [0, 1.79, -0.02]],
 
-  ['clavR', 'chest', [0.046, 1.472, -0.024]],
-  ['armR', 'clavR', [0.176, 1.452, -0.014]],
-  ['forearmR', 'armR', [0.336, 1.192, -0.02]],
-  ['handR', 'forearmR', [0.471, 0.962, -0.014]],
-  ['handTipR', 'handR', [0.524, 0.872, -0.008]],
+  // ROUND 6 — the glenohumeral joints move out 14 mm each (0.176 -> 0.190) and
+  // the whole limb translates with them, so every bone LENGTH is unchanged and
+  // nothing downstream of the IK has to be re-tuned.
+  //
+  // This is an anatomy fix, not a metric fix. The torso's own acromion measures
+  // 0.4225 m across (`probes/r7c/headwidth.js`), and a shoulder joint centre
+  // sits about 20-25 mm inboard of the acromion — so the joints belonged near
+  // +/-0.190, not +/-0.176, which put them 35 mm inboard and hung both arms off
+  // the middle of the ribcage. The visible consequence was that the deltoid
+  // never cleared the chest rig, so the arm and the torso read as one mass.
+  ['clavR', 'chest', [0.050, 1.472, -0.024]],
+  ['armR', 'clavR', [0.190, 1.452, -0.014]],
+  ['forearmR', 'armR', [0.350, 1.192, -0.02]],
+  ['handR', 'forearmR', [0.485, 0.962, -0.014]],
+  ['handTipR', 'handR', [0.538, 0.872, -0.008]],
 
-  ['clavL', 'chest', [-0.046, 1.472, -0.024]],
-  ['armL', 'clavL', [-0.176, 1.452, -0.014]],
-  ['forearmL', 'armL', [-0.336, 1.192, -0.02]],
-  ['handL', 'forearmL', [-0.471, 0.962, -0.014]],
-  ['handTipL', 'handL', [-0.524, 0.872, -0.008]],
+  ['clavL', 'chest', [-0.050, 1.472, -0.024]],
+  ['armL', 'clavL', [-0.190, 1.452, -0.014]],
+  ['forearmL', 'armL', [-0.350, 1.192, -0.02]],
+  ['handL', 'forearmL', [-0.485, 0.962, -0.014]],
+  ['handTipL', 'handL', [-0.538, 0.872, -0.008]],
 
   ['upLegR', 'root', [0.094, 0.942, -0.004]],
   ['lowLegR', 'upLegR', [0.099, 0.508, 0.008]],
