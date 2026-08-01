@@ -877,14 +877,32 @@ export class Lighting {
     // visibly along a 40 m shadow instead of staying pin-sharp.
     this.lightAngularSize = LIGHT_TRANSPORT.sunAngularSize;
 
-    const mapSizes = [QUALITY.shadowMapSize, QUALITY.shadowMapSize, QUALITY.shadowMapSize, 1024];
+    // Per-cascade shadow map resolution, near to far.
+    //
+    // Every cascade used to run at the full 2048, which is three 2048 maps
+    // rasterised from the whole scene — 12.6 M shadow texels per full refresh
+    // for a 2 MP frame. The texel footprints that buys are absurd at the far
+    // end: cascade 0 fits a ~40 m box, so 2048 is a 2 cm texel, while cascade 2
+    // fits ~400 m and 2048 is 20 cm. The contact hardening this project is
+    // judged on lives entirely in cascade 0 (its penumbra search is 11 texels =
+    // ~22 cm there), so the near map keeps its resolution and the outer two are
+    // stepped down to what their own footprint justifies: 1536 gives cascade 1
+    // a ~7 cm texel and 1024 gives cascade 2 a ~40 cm one, at 88-380 m where
+    // aerial perspective has already washed the shadow edge out.
+    const S = QUALITY.shadowMapSize;
+    const mapSizes = [S, Math.round(S * 0.75), Math.round(S * 0.5), Math.round(S * 0.5)];
     // How often each cascade is re-rendered, in frames. The far cascades cover
     // hundreds of metres and are snapped to a coarse texel grid, so refreshing
     // them every frame costs a full scene draw for a result that is bit-identical
     // most of the time. Staggering the phases keeps any single frame cheap.
     // Phases are chosen so no two outer cascades ever land on the same frame.
-    this.refreshInterval = [1, 2, 4, 8];
-    this._refreshPhase = [0, 0, 1, 3];
+    //
+    // 2/4 -> 3/6: at 60 fps a mid cascade refreshed every third frame is 50 ms
+    // of lag on a shadow 30-90 m away, which is below what a moving caster shows
+    // at that distance, and it takes the amortised cost of the cascade set from
+    // 1.75 scene depth passes per frame to 1.50.
+    this.refreshInterval = [1, 3, 6, 12];
+    this._refreshPhase = [0, 0, 2, 5];
 
     /** @type {THREE.DirectionalLight[]} */
     this.cascades = [];
@@ -1683,10 +1701,14 @@ export class Lighting {
     const renderer = engine.renderer;
     const cam = engine.camera;
 
+    // The scene is rasterised into the pipeline's HDR target, which is the
+    // drawing buffer only while renderScale is 1. Materials turn gl_FragCoord
+    // into a UV with this, so it has to be the size they are actually being
+    // rasterised at or every AO lookup lands in the wrong place at reduced scale.
     const size = renderer.getDrawingBufferSize(this._tmp.v2 || (this._tmp.v2 = new THREE.Vector2()));
     const us = SHARED_UNIFORMS.uAmbScreen;
-    us.x = 1 / Math.max(size.x, 1);
-    us.y = 1 / Math.max(size.y, 1);
+    us.x = 1 / Math.max(pipeline.width || size.x, 1);
+    us.y = 1 / Math.max(pipeline.height || size.y, 1);
 
     const au = ao.aoMat.uniforms;
     au.tDepth.value = depth;
@@ -1769,6 +1791,97 @@ export class Lighting {
    * every shadow edge would crawl. The centre is then snapped to whole shadow
    * texels, which removes the remaining shimmer under translation.
    */
+  // -------------------------------------------------------------------------
+  // Shadow-caster tiers — the API src/world/ uses to keep clutter out of the
+  // far cascades.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Register `object` as a NEAR-TIER shadow caster.
+   *
+   *     world.lighting.addNearShadowCaster(mesh);              // near split
+   *     world.lighting.addNearShadowCaster(mesh, 45);          // explicit metres
+   *     world.lighting.removeNearShadowCaster(mesh);
+   *
+   * A near-tier caster is a caster only while the camera is within `distance`
+   * of it; past that its `castShadow` is cleared and it disappears from every
+   * cascade. That is the per-cascade filter this scheme can actually offer:
+   * three.js resolves object visibility in the shadow pass against the MAIN
+   * camera's layer mask, not the shadow camera's (WebGLShadowMap.renderObject
+   * tests `object.layers.test( camera.layers )` with the render camera), so a
+   * true per-cascade mask is not expressible without hand-driving the shadow
+   * pass. Distance from the camera is equivalent in effect: the near split is
+   * exactly the range cascade 0 covers, so an object dropped past it was only
+   * ever appearing in cascades 1 and 2.
+   *
+   * WHAT TO REGISTER: anything whose shadow is at most a couple of texels at
+   * 30 m — small rocks, scrub, ground clutter, loose props, debris. Each one
+   * costs a draw call plus its triangles in EVERY refresh of EVERY cascade it
+   * falls inside, and a 4 cm pebble at 200 m contributes nothing that survives
+   * the aerial perspective. Do NOT register anything a player reads as cover,
+   * or anything tall enough to throw a shadow across a path.
+   *
+   * The default distance is the first cascade's far split, which is derived
+   * from the view frustum, so it tracks `QUALITY.shadowDistance` rather than
+   * being a second number to keep in sync.
+   *
+   * Registration is idempotent, survives the object being re-parented, and the
+   * per-frame cost is one squared-distance test per registered object — so
+   * register the InstancedMesh or the cluster root, not ten thousand leaves.
+   */
+  addNearShadowCaster(object, distance) {
+    if (!object) return;
+    const near = this._nearCasters || (this._nearCasters = []);
+    const existing = near.find((e) => e.o === object);
+    if (existing) {
+      existing.d = distance ?? null;
+      return;
+    }
+    near.push({ o: object, d: distance ?? null, was: object.castShadow });
+  }
+
+  removeNearShadowCaster(object) {
+    const near = this._nearCasters;
+    if (!near) return;
+    const i = near.findIndex((e) => e.o === object);
+    if (i < 0) return;
+    // Hand it back the way it arrived: a module that unregisters mid-session
+    // must not inherit whichever state the distance test happened to leave.
+    near[i].o.castShadow = near[i].was;
+    near.splice(i, 1);
+  }
+
+  /** Range of the first cascade — what "near tier" means, in metres. */
+  get nearShadowDistance() {
+    // Zero until the first fit; a registered caster must not be culled on the
+    // strength of a split that has not been solved yet.
+    const s = this._splits && this._splits.length > 1 ? this._splits[1] : 0;
+    return s > 0 ? s : 30;
+  }
+
+  /**
+   * Clear `castShadow` on near-tier casters the camera has left behind.
+   *
+   * Runs every fourth frame: the cutoff is a soft one (nothing pops, the object
+   * is 30+ m away and its shadow was a texel), so paying a full pass over the
+   * registry at 60 Hz would cost more CPU than the draw calls it removes.
+   */
+  _updateNearCasters(camera) {
+    const near = this._nearCasters;
+    if (!near || near.length === 0) return;
+    if ((this._frame ?? 0) % 4 !== 0) return;
+    const dflt = this.nearShadowDistance;
+    const p = this._tmp.v;
+    for (let i = 0; i < near.length; i++) {
+      const e = near[i];
+      const o = e.o;
+      if (!o.parent && o !== this.engine.scene) continue;
+      o.getWorldPosition(p);
+      const r = (e.d ?? dflt) + (o.geometry?.boundingSphere?.radius ?? 0);
+      o.castShadow = e.was && p.distanceToSquared(camera.position) <= r * r;
+    }
+  }
+
   /** Force every cascade to redraw on the next frame (shot cut, time change). */
   invalidateShadows() {
     for (const l of this.cascades) l.shadow.needsUpdate = true;
@@ -1909,6 +2022,10 @@ export class Lighting {
       this.cascades[i].color.copy(key.color);
       this.cascades[i].visible = key.visible;
     }
+
+    // Before the cascades are fitted and rasterised, not after: a caster the
+    // camera has left behind has to be gone from the map this frame draws.
+    this._updateNearCasters(engine.camera);
 
     this._fitCascades(engine.camera);
 

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { GRADE } from '../config/ArtDirection.js';
+import { GRADE, QUALITY } from '../config/ArtDirection.js';
 
 /**
  * RenderPipeline — HDR post stack.
@@ -455,6 +455,15 @@ export class RenderPipeline {
       motionBlur: true,
       autoExposure: true,
     };
+    /** Internal resolution fraction; see setRenderScale. 1.0 = native. */
+    this.renderScale = Math.max(0.5, Math.min(1, QUALITY.renderScale ?? 1));
+    /**
+     * Levels of the bloom pyramid actually walked (2..6). The widest level sets
+     * the reach of the glow; the finest sets how tightly it hugs a highlight.
+     */
+    this.bloomMips = 6;
+    /** Per-pass GPU profiler hook; see _mark. Null unless a probe installs one. */
+    this.profiler = null;
     /**
      * Per-time-of-day exposure TRIM, set by `Lighting` from
      * `TIME_OF_DAY[x].exposure`. It is dimensionless and lives near 1.0: the
@@ -522,9 +531,37 @@ export class RenderPipeline {
     });
   }
 
+  /**
+   * Internal resolution as a fraction of the drawing buffer.
+   *
+   * Everything from the scene render to the composite runs at
+   * `renderScale * drawingBuffer`, and the final present pass magnifies to the
+   * canvas. This is the standard lever for a fill-bound chain — eight
+   * full-resolution passes at 1920x1080 is 16 MP of post per frame, and 0.8
+   * scale deletes 36% of every one of them for a cost the eye reads as a
+   * slightly softer image rather than as a missing effect.
+   *
+   * DEFAULT IS 1.0 AND MUST STAY 1.0: the screenshot harness and every visual
+   * regression check compare pixels at native resolution. `play` mode is where
+   * a lower scale belongs; see `setRenderScale`.
+   */
+  setRenderScale(scale) {
+    const s = Math.max(0.5, Math.min(1, scale || 1));
+    if (Math.abs(s - this.renderScale) < 1e-4) return;
+    this.renderScale = s;
+    // setSize early-outs on an unchanged size, so the cached one has to go.
+    this.width = -1;
+    this.setSize(this._reqW, this._reqH, this._reqDpr);
+  }
+
   _createTargets(width, height, dpr) {
-    const w = Math.max(2, Math.floor(width * dpr));
-    const h = Math.max(2, Math.floor(height * dpr));
+    this._reqW = width;
+    this._reqH = height;
+    this._reqDpr = dpr;
+    this._outW = Math.max(2, Math.floor(width * dpr));
+    this._outH = Math.max(2, Math.floor(height * dpr));
+    const w = Math.max(2, Math.floor(this._outW * this.renderScale));
+    const h = Math.max(2, Math.floor(this._outH * this.renderScale));
     this.width = w;
     this.height = h;
 
@@ -535,8 +572,16 @@ export class RenderPipeline {
 
     // Full-res AO. Contact darkening lives in a 2-3 pixel band and a half-res
     // buffer cannot carry it however good the upsample is.
-    this.aoRT = this._rt(w, h);
-    this.aoBlurRT = this._rt(w, h);
+    //
+    // Two channels, not four. This buffer only ever holds (occlusion, view
+    // depth) — the blur reads .rg and the prepare pass reads .r — and it is the
+    // most-fetched surface in the chain: the separable blur takes 15 taps per
+    // pixel per axis, so 2 MP of it is 60 M fetches a frame. RG16F halves every
+    // one of those against the RGBA16F it used to be, for no change to a single
+    // pixel of output.
+    const ao = { format: THREE.RGFormat };
+    this.aoRT = this._rt(w, h, ao);
+    this.aoBlurRT = this._rt(w, h, ao);
 
     this.prepRT = this._rt(w, h);
     this.taaA = this._rt(w, h);
@@ -565,8 +610,13 @@ export class RenderPipeline {
   }
 
   setSize(width, height, dpr) {
-    const w = Math.max(2, Math.floor(width * dpr));
-    const h = Math.max(2, Math.floor(height * dpr));
+    this._reqW = width;
+    this._reqH = height;
+    this._reqDpr = dpr;
+    this._outW = Math.max(2, Math.floor(width * dpr));
+    this._outH = Math.max(2, Math.floor(height * dpr));
+    const w = Math.max(2, Math.floor(this._outW * this.renderScale));
+    const h = Math.max(2, Math.floor(this._outH * this.renderScale));
     if (w === this.width && h === this.height) return;
     // three's RenderTarget.setSize resizes `textures` — the COLOUR attachments —
     // and nothing else. An explicitly attached `depthTexture` keeps its original
@@ -1589,6 +1639,7 @@ export class RenderPipeline {
       uniform float uCoCFloor;   // CoC below this costs nothing and is dropped
       uniform float uEdgeSoftness;
       uniform float uMotionScale;
+      uniform float uDofScale;   // 0 leaves motion blur running with no defocus
       uniform float uFrame;
       uniform float uEnabled;
       ${COMMON_GLSL}
@@ -1639,6 +1690,10 @@ export class RenderPipeline {
         vec2 cen = vUv - 0.5;
         float r2 = dot(cen, cen);
         coc += uEdgeSoftness * smoothstep(0.06, 0.28, r2);
+        // Defocus and motion blur share this pass and this gather; uDofScale is
+        // what lets enabled.dof be ablated on its own without also taking the
+        // motion blur out, which is why round 7 could not price either of them.
+        coc *= uDofScale;
 
         // Camera velocity from depth reprojection (static geometry).
         vec2 vel = vec2(0.0);
@@ -1712,6 +1767,7 @@ export class RenderPipeline {
         uCoCFloor: { value: 0.9 },
         uEdgeSoftness: { value: 0.25 },
         uMotionScale: { value: 0.55 },
+        uDofScale: { value: 1 },
         uFrame: { value: 0 },
         uEnabled: { value: 1 },
       },
@@ -2082,6 +2138,21 @@ export class RenderPipeline {
     this.renderer.render(this.quadScene, this.quadCamera);
   }
 
+  /**
+   * Pass boundary marker for the GPU profiler.
+   *
+   * Set `pipeline.profiler = { mark(name) }` and every pass boundary calls it;
+   * `probes/r8_gpu.js` turns those marks into EXT_disjoint_timer_query_webgl2
+   * spans. This exists because CPU wall-clock A/B on a machine shared by eight
+   * working trees reported bloom at 18 ms and the ENTIRE post chain at 4 ms in
+   * the same run — the contention noise is larger than every pass being
+   * measured. A timer query bills the GPU work between two marks and does not
+   * care what else is queued. Null in normal operation: one property read.
+   */
+  _mark(name) {
+    if (this.profiler) this.profiler.mark(name);
+  }
+
   _updateAtmosphereUniforms(camera) {
     const a = this.atmosphere;
     const u = this.prepMat.uniforms;
@@ -2140,6 +2211,7 @@ export class RenderPipeline {
     this._invViewProj.copy(this._tmpM).invert();
 
     // ---- 1. main scene into HDR ----
+    this._mark('scene');
     renderer.setRenderTarget(this.hdr);
     renderer.clear(true, true, false);
     renderer.render(scene, camera);
@@ -2154,6 +2226,7 @@ export class RenderPipeline {
     camera.projectionMatrixInverse.copy(this._baseProj).invert();
 
     // ---- 2. ambient occlusion ----
+    this._mark('ssao');
     if (this.enabled.ssao) {
       const au = this.aoMat.uniforms;
       au.tDepth.value = this.hdr.depthTexture;
@@ -2172,6 +2245,7 @@ export class RenderPipeline {
     }
 
     // ---- 3. prepare: AO + aerial perspective ----
+    this._mark('prep');
     this._updateAtmosphereUniforms(camera);
     const pu = this.prepMat.uniforms;
     pu.tColor.value = this.hdr.texture;
@@ -2184,6 +2258,7 @@ export class RenderPipeline {
     this._blit(this.prepMat, this.prepRT);
 
     // ---- 4. TAA resolve ----
+    this._mark('taa');
     let resolved = this.prepRT;
     if (useTAA) {
       const tu = this.taaMat.uniforms;
@@ -2204,6 +2279,7 @@ export class RenderPipeline {
     this._prevViewProj.copy(this._viewProj);
 
     // ---- 5. auto exposure ----
+    this._mark('exposure');
     this.lumMat.uniforms.tColor.value = resolved.texture;
     this._blit(this.lumMat, this.lumRTs[0]);
     for (let i = 1; i < this.lumRTs.length; i++) {
@@ -2231,6 +2307,7 @@ export class RenderPipeline {
     const sceneL = this._updateExposure();
 
     // ---- 6. bloom ----
+    this._mark('bloom');
     if (this.enabled.bloom) {
       this.brightMat.uniforms.tDiffuse.value = resolved.texture;
       this.brightMat.uniforms.uThreshold.value = this.grade.bloomThreshold;
@@ -2238,7 +2315,8 @@ export class RenderPipeline {
       // or the bloom threshold means a different scene radiance in every shot.
       this.brightMat.uniforms.uExposure.value = this._finalExposure;
       this._blit(this.brightMat, this.bloomRTs[0].a);
-      for (let i = 0; i < this.bloomRTs.length; i++) {
+      const mips = Math.max(2, Math.min(this.bloomMips, this.bloomRTs.length));
+      for (let i = 0; i < mips; i++) {
         const rt = this.bloomRTs[i];
         if (i > 0) {
           this.blurMat.uniforms.tDiffuse.value = this.bloomRTs[i - 1].a.texture;
@@ -2252,7 +2330,7 @@ export class RenderPipeline {
         this.blurMat.uniforms.uDir.value.set(0, 1 / rt.h);
         this._blit(this.blurMat, rt.a);
       }
-      for (let i = this.bloomRTs.length - 1; i > 0; i--) {
+      for (let i = mips - 1; i > 0; i--) {
         this.upsampleMat.uniforms.tLower.value = this.bloomRTs[i].a.texture;
         this.upsampleMat.uniforms.tHigher.value = this.bloomRTs[i - 1].a.texture;
         this.upsampleMat.uniforms.uMix.value = this.grade.bloomRadius + 0.25;
@@ -2285,6 +2363,14 @@ export class RenderPipeline {
     }
 
     // ---- 7. bokeh DOF + motion blur ----
+    //
+    // Skipped outright when both are off, rather than run with uEnabled = 0.
+    // Round 7 measured this pass as "-6 ms" because switching the flag left a
+    // full-resolution blit of the whole frame in place and only turned the
+    // gather off inside it: the ablation was measuring nothing, and a build
+    // that wants neither effect was still paying a 2 MP copy every frame.
+    this._mark('dof');
+    const wantDof = this.enabled.dof || this.enabled.motionBlur;
     const du = this.dofMat.uniforms;
     du.tColor.value = resolved.texture;
     du.tDepth.value = this.hdr.depthTexture;
@@ -2310,12 +2396,14 @@ export class RenderPipeline {
     du.uCoCFloor.value = (this.grade.cocFloor ?? 0.9) * cocScale;
     du.uFrame.value = this.frame % 64;
     du.uMotionScale.value = this.enabled.motionBlur ? 0.55 : 0.0;
-    du.uEnabled.value = this.enabled.dof || this.enabled.motionBlur ? 1 : 0;
-    this._blit(this.dofMat, this.dofRT);
+    du.uDofScale.value = this.enabled.dof ? 1 : 0;
+    du.uEnabled.value = wantDof ? 1 : 0;
+    if (wantDof) this._blit(this.dofMat, this.dofRT);
 
     // ---- 8. composite ----
+    this._mark('composite');
     const u = this.compositeMat.uniforms;
-    u.tDiffuse.value = this.dofRT.texture;
+    u.tDiffuse.value = wantDof ? this.dofRT.texture : resolved.texture;
     u.tBloom.value = this.enabled.bloom ? this.bloomRTs[0].a.texture : null;
     u.tStreak.value = this.enabled.bloom ? this.streakA.texture : null;
     u.tAdapt.value = adaptTex;
@@ -2341,6 +2429,7 @@ export class RenderPipeline {
 
     this._blit(this.compositeMat, this.compositeRT);
 
+    this._mark('present');
     this.fxaaMat.uniforms.tDiffuse.value = this.compositeRT.texture;
     this.fxaaMat.uniforms.uTexel.value.set(1 / w, 1 / h);
     this.fxaaMat.uniforms.uSharpen.value = this.grade.sharpen;
@@ -2350,5 +2439,6 @@ export class RenderPipeline {
     this._blit(this.fxaaMat, null);
 
     renderer.setRenderTarget(null);
+    this._mark('end');
   }
 }

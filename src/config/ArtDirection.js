@@ -344,6 +344,17 @@ export const QUALITY = {
   shadowDistance: 380,
   terrainSize: 4096,
   viewDistance: 6000,
+  /**
+   * Internal render resolution as a fraction of the drawing buffer (round 8).
+   *
+   * The scene and every post pass run at this fraction and the final present
+   * pass magnifies to the canvas; see RenderPipeline.setRenderScale. MUST STAY
+   * 1.0 here — the screenshot harness and every visual regression check compare
+   * pixels at native resolution. Lower it at runtime for play mode
+   * (`engine.pipeline.setRenderScale(0.8)`), which is 36% off eight full-screen
+   * passes and off the scene's own fill.
+   */
+  renderScale: 1.0,
 };
 
 /**
