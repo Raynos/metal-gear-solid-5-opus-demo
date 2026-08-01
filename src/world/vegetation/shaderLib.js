@@ -156,9 +156,7 @@ float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
  * the drainage lines the terrain's erosion pass carved, breaks into patches on
  * the open flats, and is simply absent from bedrock, talus and steep faces.
  *
- * Round 3 rebuilt this around three signals that were missing, all of which the
- * critics read straight off the frame as "a uniform field of near-identical
- * specks at uniform density":
+ * Four signals, all of which the critics read off the frame as missing:
  *
  *   slope     hard zero past 30 degrees (1 - cos 30 = 0.134). Tussock does not
  *             hold a scree face; the old mask only reached zero at 62 degrees,
@@ -168,15 +166,22 @@ float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
  *             the open plain genuinely bare. Bare ground between stands is not
  *             an absence of work, it IS the read: it is what gives the
  *             remaining stands a shape.
- *
- * and it triples the weight on the drainage channel, so a wadi carries several
- * times what the pan does rather than 1.3x.
+ *   drainage  ROUND 4: s.a, the D8 flow ACCUMULATION Terrain started publishing
+ *             this round, not s.r. s.r is the thresholded mask the terrain
+ *             shader paints wadis with, and it measures identically zero over
+ *             the whole 640x800 m of valley floor the vista frames — so every
+ *             previous round's "grass follows water" term contributed exactly
+ *             nothing on the ground the critics were looking at. Under the
+ *             accumulation the wet lines carry ~4x what the divides do.
  *
  * vegCover is the same field with the per-tussock clump term left out — the
  * smooth, 40 m-scale *coverage* of the ground, which is what the distant tonal
  * layer paints with. Both come out of one call so the extra texture work is a
  * couple of noise octaves rather than a second ground query.
  */
+float vegWetness(vec4 s) {
+  return max(s.r, smoothstep(0.18, 0.62, s.a));
+}
 float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
   float curv;
   vec3 n = vegGroundAt(p, 7.0, curv);
@@ -194,12 +199,15 @@ float vegDensity(vec2 p, out float slope, out float dev, out float cover) {
   float clump = vegFbm(p * 0.42 + 7.0, 2);
   float stand = vegFbm(p * 0.025 + 17.0, 2);
 
-  float raw = 0.24 + s.r * 1.85 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
+  float raw = 0.10 + vegWetness(s) * 2.55 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
   float d = smoothstep(0.0, 0.62, raw);
-  d *= smoothstep(0.455, 0.630, stand);
   d *= clamp(0.72 + curv * 5.5, 0.16, 1.85);
-  d *= 1.0 - smoothstep(0.075, 0.140, slope);
   d *= 1.0 - smoothstep(0.18, 0.68, max(s.g, s.b * 0.6));
+  // A wadi carries grass whatever the 40 m stand field says about the range
+  // condition around it — the water beats the grazing.
+  float standCut = 0.448 - vegWetness(s) * 0.200;
+  d *= smoothstep(standCut, standCut + 0.185, stand);
+  d *= 1.0 - smoothstep(0.075, 0.140, slope);
   cover = clamp(vegDevelopment(p, d, pad.g, pad.b, slope), 0.0, 1.0);
   return clamp(cover * smoothstep(0.24, 0.58, clump), 0.0, 1.0);
 }
@@ -230,7 +238,13 @@ float vegGust(vec2 wxz) {
   float g1 = vegNoise(wxz * 0.026 - d * uTime * 0.42);
   float g2 = vegNoise(wxz * 0.085 - d * uTime * 1.35);
   float g3 = vegNoise(wxz * 0.30 - d * uTime * 3.60);
-  return (g1 * 0.55 + g2 * 0.32 + g3 * 0.13) * uWind.w;
+  // Contrast on the long octave only. A raw value noise spends most of its life
+  // near its mean, so summing three of them gives a field that hovers around 0.5
+  // everywhere and reads as everything wobbling at once. Steepening the 38 m
+  // octave gives the field genuine lulls and genuine fronts — the gust arrives
+  // as an edge with still grass ahead of it, which is what makes it a wave.
+  g1 = smoothstep(0.24, 0.78, g1);
+  return (g1 * 0.60 + g2 * 0.28 + g3 * 0.12) * uWind.w;
 }
 `;
 
@@ -281,14 +295,30 @@ uniform vec3 uSunColor;
 uniform vec3 uSkyColor;
 uniform vec2 uTranslucency; // (through-scatter, sky wrap gain)
 
+/**
+ * Light that came through the blade rather than off it, in the blade's own
+ * colour. Dry straw is a selective filter: what survives a pass through half a
+ * millimetre of dead cellulose is the long end of the spectrum, which is why a
+ * back-lit stand of dead grass goes amber while the same stand front-lit is
+ * khaki. Multiplying by the albedo alone cannot produce that — it gives back
+ * exactly the reflected colour — so the transmitted lobe carries its own tint.
+ */
+const vec3 VEG_TRANSMIT = vec3(1.24, 0.94, 0.52);
+
 vec3 vegDryShading(vec3 N, vec3 V, vec3 albedo, float exposure, float sunVis, float dist) {
   float ndl = dot(N, uSunDir);
   float through = clamp(-ndl * 0.62 + 0.48, 0.0, 1.0);
   float lobe = pow(clamp(dot(-uSunDir, V), 0.0, 1.0), 2.5);
   // Sub-pixel geometry cannot be back-lit: there is no thickness left to see
-  // through. Beyond 90 m the effect tapers, and past 300 m it is gone.
-  float near = 1.0 - smoothstep(90.0, 300.0, dist);
-  vec3 sun = uSunColor * (through * (0.48 + 0.52 * lobe)) * uTranslucency.x * sunVis * near;
+  // through. Round 4 pulled the taper in from 90-300 m to 45-150 m. The dawn
+  // camera looks straight into a low sun across a hillside that is entirely in
+  // its own shade, and at 200-400 m a back-lit bush there was a bright speck on
+  // a near-black slope — the white confetti round 2 was pulled up for, arriving
+  // by a different route. Whatever is happening inside a plant 200 m away is
+  // sub-pixel by definition; all a glow can do at that range is detach it from
+  // the ground it stands on.
+  float near = 1.0 - smoothstep(45.0, 150.0, dist);
+  vec3 sun = uSunColor * VEG_TRANSMIT * (through * (0.48 + 0.52 * lobe)) * uTranslucency.x * sunVis * near;
   // Wrapped sky: (N.up + w) / (1 + w) with w = 1 gives a floor of 0.5 even for
   // a blade edge-on to the sky, which is what stops the dark side crushing.
   float sky = (N.y + 1.0) * 0.5;

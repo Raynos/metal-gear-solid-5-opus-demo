@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { makeRng, fbm3 } from './Noise.js';
 import { COLLARS, buildCollarLibrary } from './RockShapes.js';
+import { WIND_DIR } from './RockMaterial.js';
 
 /**
  * Placement rules.
@@ -69,12 +70,66 @@ const DEFAULT_BANDS = [160, 520, 1500];
 // is 2,458 triangles a body: 83 of them in the band-0 ring were 29% of the whole
 // module, for bodies the keep-clear radius already puts 112 m from the play
 // space, so that ring is now 20 m wide instead of 34.
+// Round 5 rebuilt this table around the SHADOW ring, because the reason three
+// critics have called the small rocks "flat decals printed on the ground" is
+// that not one of them has ever cast a shadow. `castShadow` is set from
+// `band <= shadowBand`, and band 0 was a dead ring on every small family:
+//   chips     band 0 was r < 26 m, but CLEAR.gravel refuses a chip inside 34 m
+//   stones    band 0 was 52-60 m, an 8 m wide annulus
+//   boulders  band 0 was 112-126 m
+// Measured on the shipped field: 0 of 1445 chips, 0 of 1555 boulders and 0 of
+// 166 outcrops cast a shadow; 74 stones did. So the hero mesh each of those
+// families builds was uploaded and never drawn, and the shadow band each was
+// nominally given was empty. Band 0 now starts OUTSIDE the keep-clear radius by
+// a real margin on every family, and `LOD_SHIFT` decouples the mesh resolution
+// from it so widening the ring buys shadows rather than triangles.
 const BANDS = {
-  chips: [26, 66, 104],
-  stones: [60, 220, 355],
-  boulders: [126, 360, 640],
-  formations: [242, 760, 1180],
-  outcrops: [214, 660, 1060],
+  chips: [66, 122, 176],
+  stones: [95, 220, 350],
+  boulders: [128, 360, 600],
+  talus: [104, 320, 840],
+  formations: [242, 700, 1120],
+  outcrops: [214, 640, 1020],
+};
+
+/**
+ * Extra LOD steps taken on top of the band index, per family.
+ *
+ * LOD was welded to band, so the only way to give a family a wider shadow ring
+ * was to give it a wider *hero* ring at the same time — and the hero mesh is 4x
+ * to 16x the triangles. A 0.4 m shale flake does not need 126 triangles (that
+ * is 4 mm of edge each), and no player can get within 112 m of a boulder or
+ * 182 m of an outcrop, so neither of those subdivided meshes is reachable
+ * either. This is what pays for the shadows.
+ */
+const LOD_SHIFT = {
+  chips: 1, stones: 1, boulders: 1, talus: 1, formations: 0, outcrops: 1,
+};
+
+/**
+ * Highest band that still submits to the shadow cascades, per family.
+ *
+ * Round 5 dropped `formations` from 1 to 0. QUALITY.shadowDistance is 380 m and
+ * a band-1 formation is 242-700 m out, so most of that band was paying three
+ * cascades' worth of vertices to cast a shadow outside the shadow frustum
+ * entirely — 38k triangles a frame for nothing. That is what pays for the chip
+ * and stone rings, which are inside 95 m and land on ground the player is
+ * standing on.
+ */
+const SHADOW_BAND = {
+  chips: 0, stones: 0, boulders: 0, talus: 0, formations: 0, outcrops: 0,
+};
+
+/**
+ * Desert-varnish weight per family, handed to the shader as `aTint.z`.
+ *
+ * A clast that has lain still for centuries grows a manganese-iron coat and
+ * goes dark; a face that is actively spalling off a butte does not. So this
+ * tracks size: 1 on the pebbles, ~0 on the skyline furniture. It is also what
+ * separates a small rock from the sand it sits on — see RockMaterial's uVarnish.
+ */
+const CLAST = {
+  chips: 1.0, stones: 0.72, talus: 0.80, boulders: 0.30, formations: 0.08, outcrops: 0.05,
 };
 
 /** Keep-clear radii, metres. The outpost owns the valley floor. */
@@ -87,6 +142,33 @@ export const CLEAR = {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Steepest ground any body may be seated on, degrees.
+ *
+ * FATAL, round 4: a scatter instance was found cantilevered horizontally out of
+ * a near-vertical ridge face into open sky. The mechanism is in `place`: `al`
+ * (alignment to the slope normal) saturates at 1 on steep ground, so the body is
+ * laid flat ON the face and seated at the face's own centre height. On a 70
+ * degree spire that means a 20 m outcrop lying on its side, half of it in mid
+ * air. Measured over the whole shipped instance set with a 24-point lower-flank
+ * support ring:
+ *   outcrops    median 5.45 m of underside above the drawn ground, max 18.8 m;
+ *               99.4% of them more than 0.5 m proud; 59% seated past 50 degrees
+ *   formations  median 2.03 m proud, 86% past 0.5 m, 35% seated past 50 degrees
+ *   boulders    median 0.14 m proud, 12% past 0.5 m, 21% past 50 degrees
+ * There is no family exemption. The outcrops and formations wanted steep ground
+ * and that is exactly how they earned the worst numbers in the set.
+ */
+const MAX_SEAT_DEG = 50;
+const MAX_SEAT_NY = Math.cos((MAX_SEAT_DEG * Math.PI) / 180);   // 0.643
+
+/**
+ * Angle of repose of dry angular scree, as a terrain gradient (rise/run).
+ * Talus aprons stand at it; above it material is still moving, below it the
+ * apron has run out onto the pediment.
+ */
+const REPOSE = Math.tan((34 * Math.PI) / 180);   // 0.675
 
 /**
  * Largest world height a body placed by the *scatter* rules may have.
@@ -115,7 +197,8 @@ const SCATTER_MAX_HEIGHT = 4.0;
 const CAPS = {
   chips: 1750,
   stones: 1650,
-  boulders: 2200,
+  boulders: 1650,
+  talus: 3300,
   formations: 300,
   outcrops: 200,
 };
@@ -208,8 +291,8 @@ class Field {
     g.xz.push(x, z);
   }
 
-  add(variant, band, matrix, tint, x, z, shadowBand = 0) {
-    const lod = Math.min(band, variant.lods.length - 1);
+  add(variant, band, matrix, tint, x, z, shadowBand = 0, lodShift = 0) {
+    const lod = Math.min(band + lodShift, variant.lods.length - 1);
     // Band is part of the key as well as LOD: a far group must be able to drop
     // out of the shadow pass even when it shares a mesh resolution with a near one.
     const key = `${variant.id}:${lod}:${band}`;
@@ -236,13 +319,15 @@ class Field {
       geo.boundingBox = src.boundingBox;
       geo.boundingSphere = src.boundingSphere;
       const mesh = new THREE.InstancedMesh(geo, this.material, n);
-      const tint = new Float32Array(n * 2);
+      // vec3: value shift, strata phase, desert-varnish weight.
+      const tint = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) {
         mesh.setMatrixAt(i, g.matrices[i]);
-        tint[i * 2] = g.tints[i][0];
-        tint[i * 2 + 1] = g.tints[i][1];
+        tint[i * 3] = g.tints[i][0];
+        tint[i * 3 + 1] = g.tints[i][1];
+        tint[i * 3 + 2] = g.tints[i][2] ?? 0;
       }
-      geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tint, 2));
+      geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tint, 3));
       mesh.instanceMatrix.needsUpdate = true;
       // A 15 cm drift casts no shadow anything can see, and it is lying in the
       // ground plane, so its own self-shadow is a shadow-acne generator.
@@ -277,13 +362,15 @@ class Field {
       geo.boundingBox = src.boundingBox;
       geo.boundingSphere = src.boundingSphere;
       const mesh = new THREE.InstancedMesh(geo, this.material, n);
-      const tint = new Float32Array(n * 2);
+      // vec3: value shift, strata phase, desert-varnish weight.
+      const tint = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) {
         mesh.setMatrixAt(i, g.matrices[i]);
-        tint[i * 2] = g.tints[i][0];
-        tint[i * 2 + 1] = g.tints[i][1];
+        tint[i * 3] = g.tints[i][0];
+        tint[i * 3 + 1] = g.tints[i][1];
+        tint[i * 3 + 2] = g.tints[i][2] ?? 0;
       }
-      geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tint, 2));
+      geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tint, 3));
       mesh.instanceMatrix.needsUpdate = true;
       // The sun's shadow frustum is only ~240 m wide: submitting the far field
       // to the depth pass costs vertices and buys nothing.
@@ -358,7 +445,7 @@ export function buildRockField(world, lib, material) {
     return l / (2 * e);                    // gradient magnitude
   }
 
-  const spent = { chips: 0, stones: 0, boulders: 0, formations: 0, outcrops: 0 };
+  const spent = { chips: 0, stones: 0, boulders: 0, talus: 0, formations: 0, outcrops: 0 };
 
   const pos = new THREE.Vector3();
   const q = new THREE.Quaternion();
@@ -402,6 +489,83 @@ export function buildRockField(world, lib, material) {
     ? (x, z, size) => terrain.seatHeightAt(x, z, size)
     : (x, z) => terrain.heightAt(x, z);
 
+  // --- seat qualification ---------------------------------------------------
+  //
+  // Two tests and one guarantee, in that order. Every one of them is here
+  // because the round-4 audit measured the failure it catches.
+
+  /**
+   * Is this a face a body of this footprint can rest on at all?
+   *
+   * Six probes around the footprint, least-squares plane through them. Returns
+   * the plane's tilt in degrees and the worst deviation of the real ground from
+   * that plane, in metres. A spire passes a point-normal test — the normal at
+   * one sample on a knife edge can be anything — but it cannot pass this one,
+   * because no plane fits a knife edge.
+   */
+  function seatFace(x, z, r) {
+    const h0 = terrain.heightAt(x, z);
+    let sxx = 0; let szz = 0; let sxz = 0; let sxy = 0; let szy = 0;
+    const P = 6;
+    const dxs = new Array(P);
+    const dzs = new Array(P);
+    const dys = new Array(P);
+    for (let i = 0; i < P; i++) {
+      const a = (i / P) * Math.PI * 2 + 0.41;
+      const dx = Math.cos(a) * r;
+      const dz = Math.sin(a) * r;
+      const dy = terrain.heightAt(x + dx, z + dz) - h0;
+      dxs[i] = dx; dzs[i] = dz; dys[i] = dy;
+      sxx += dx * dx; szz += dz * dz; sxz += dx * dz;
+      sxy += dx * dy; szy += dz * dy;
+    }
+    const det = sxx * szz - sxz * sxz;
+    let a = 0;
+    let b = 0;
+    if (Math.abs(det) > 1e-8) {
+      a = (sxy * szz - szy * sxz) / det;
+      b = (szy * sxx - sxy * sxz) / det;
+    }
+    let resid = 0;
+    for (let i = 0; i < P; i++) {
+      const e = Math.abs(dys[i] - (a * dxs[i] + b * dzs[i]));
+      if (e > resid) resid = e;
+    }
+    return { tilt: (Math.atan(Math.hypot(a, b)) * 180) / Math.PI, resid };
+  }
+
+  /**
+   * How far the highest point of a placed body's lower flank floats above the
+   * ground the clipmap actually draws.
+   *
+   * `v.support` is the body's own lower-flank silhouette in local space, so
+   * pushing it through the FINISHED matrix is the only honest way to ask the
+   * question — the transform has already applied slope alignment, a random lean
+   * and a non-uniform scale, and a cantilever is precisely a body whose lean put
+   * its flank in the air. `dy` corrects the cheap fine-field probes to the drawn
+   * surface with one expensive `seatY` call at the centre, which is what makes
+   * this affordable at ~12,000 placements.
+   */
+  const sv = new THREE.Vector3();
+  function proudOf(v, matrix, size, x, z) {
+    const S = v.support;
+    if (!S || S.length < 9) return 0;
+    const dy = terrain.heightAt(x, z) - seatY(x, z, size);
+    let hi = -Infinity;
+    // 12 azimuths is enough to find a cantilever: the failure mode is half the
+    // body in the air, not one vertex.
+    const step = S.length > 36 ? 6 : 3;
+    for (let i = 0; i < S.length; i += step) {
+      sv.set(S[i], S[i + 1], S[i + 2]).applyMatrix4(matrix);
+      const d = sv.y - (terrain.heightAt(sv.x, sv.z) - dy);
+      if (d > hi) hi = d;
+    }
+    return hi === -Infinity ? 0 : hi;
+  }
+
+  /** Rejection tally, published for the audit. */
+  const rejected = { steep: 0, rough: 0, float: 0, cull: 0, cap: 0 };
+
   // --- collar solve scratch ------------------------------------------------
   const cq = new THREE.Quaternion();
   const cyaw = new THREE.Quaternion();
@@ -426,6 +590,10 @@ export function buildRockField(world, lib, material) {
   function addCollar(v, matrix, family, band, x, z, worldH) {
     const prof = COLLARS[family];
     if (!prof || band > 1) return;
+    // A 20 cm drift banked against a stone is sub-pixel past a couple of
+    // hundred metres, and the collar meshes were the third largest line in the
+    // module's budget. Band 1 reaches 700 m on the big families; this does not.
+    if (x * x + z * z > 300 * 300) return;
     const S = v.support;
     if (!S || S.length < 9) return;
     basis.copy(matrix).setPosition(0, 0, 0);
@@ -510,8 +678,10 @@ export function buildRockField(world, lib, material) {
     // Cap the correction: a collar is allowed to bury itself, not to chase a
     // cliff edge down and drag the whole drift underground.
     cpos.set(x, g.y - ry * 0.05 - Math.min(excess, ry * 3.0), z);
+    // Clast weight 0: past the inner lip the collar is drifted SAND, and the
+    // varnish term must not touch it.
     field.addCollar(family, band === 0 ? 0 : 1, band,
-      new THREE.Matrix4().compose(cpos, cq, cscl), [rng(), rng()], x, z);
+      new THREE.Matrix4().compose(cpos, cq, cscl), [rng(), rng(), 0], x, z);
   }
 
   /**
@@ -530,13 +700,14 @@ export function buildRockField(world, lib, material) {
     {
       align = 0.5, sink = 0.25, tilt = 0.12, bands = DEFAULT_BANDS, shadowBand = 0,
       foot = 0.42, collar = null, maxHeight = SCATTER_MAX_HEIGHT, family = collar,
+      lodShift = 0, clast = 0,
     } = {},
   ) {
-    if (family && spent[family] >= CAPS[family]) return;
+    if (family && spent[family] >= CAPS[family]) { rejected.cap++; return; }
     const d = Math.hypot(x, z);
     // Past the cull radius the body is smaller than the pixel it would land in.
     // Scale it out of the count entirely rather than shipping it to the GPU.
-    if (bands[2] !== undefined && d > bands[2]) return;
+    if (bands[2] !== undefined && d > bands[2]) { rejected.cull++; return; }
 
     // --- per-instance scale, with a hard anisotropy clamp -------------------
     // Non-uniform scale is worth having: it is the cheapest way to stop six
@@ -569,6 +740,23 @@ export function buildRockField(world, lib, material) {
     if (wMax > maxHeight) size *= maxHeight / wMax;
 
     const n = terrain.normalAt(x, z);
+
+    // --- FATAL 1: nothing seats on a wall ----------------------------------
+    // Point normal first (cheap), then the plane through the body's own
+    // footprint. The second test is the one that catches a spire: a 20 m body
+    // straddling a ridge crest can have a gentle normal at its centre and 30 m
+    // of air under one flank, and it is the residual, not the tilt, that says so.
+    if (n.y < MAX_SEAT_NY) { rejected.steep++; return; }
+    const footR = size * Math.max(0.22, foot);
+    if (footR > 0.9) {
+      const face = seatFace(x, z, footR);
+      if (face.tilt > MAX_SEAT_DEG) { rejected.steep++; return; }
+      // A body cannot bridge relief it is not much taller than. The bound is
+      // generous — half the body's longest dimension — because a rock DOES sit
+      // in broken ground; what it does not do is span a gully.
+      if (face.resid > size * 0.50) { rejected.rough++; return; }
+    }
+
     // On steep ground a boulder beds itself into the slope: align harder and
     // bury deeper, or it reads as a prop balanced on a hillside. A *slabby*
     // body lies down regardless — the single change that stops the mid sizes
@@ -610,12 +798,47 @@ export function buildRockField(world, lib, material) {
     scl.set(size * ax, size * ay, size * az);
     const band = d < bands[0] ? 0 : d < bands[1] ? 1 : 2;
     const m = new THREE.Matrix4().compose(pos, q, scl);
+
+    // --- FATAL 1, the guarantee --------------------------------------------
+    // Everything above is a rule about where a body MAY go. This is the check
+    // that it actually landed there. Sink first — burying a rock is what the
+    // ground does to one — and reject only if even a sink of half the body's
+    // height cannot get its underside down to the drawn surface. That case is
+    // not a seating error to be corrected: it is a site that is not ground.
+    const tol = height * 0.08 + 0.04;
+    let proud = proudOf(v, m, size, x, z);
+    if (proud > tol) {
+      const drop = Math.min(proud - tol, height * 0.55 + 0.15);
+      pos.y -= drop;
+      proud -= drop;
+      if (proud > tol) { rejected.float++; return; }
+      m.compose(pos, q, scl);
+    }
+
     if (family) spent[family]++;
-    field.add(v, band, m, [rng(), rng()], x, z, shadowBand);
+    field.add(v, band, m, [rng(), rng(), clast], x, z, shadowBand, lodShift);
     if (collar) addCollar(v, m, collar, band, x, z, height);
   }
 
   const pick = (arr) => arr[(rng() * arr.length) | 0];
+
+  /**
+   * Per-family placement defaults.
+   *
+   * The band table, the shadow ring, the LOD shift and the varnish weight all
+   * belong to the family, not to the call site — and the reason the small
+   * families went three rounds without a shadow is that each of those four
+   * numbers had to be repeated by hand at every `place` call and one of them was
+   * always missing. Spread this and then override.
+   */
+  const FAM = (family, extra) => ({
+    bands: BANDS[family],
+    shadowBand: SHADOW_BAND[family],
+    lodShift: LOD_SHIFT[family],
+    clast: CLAST[family],
+    family,
+    ...extra,
+  });
 
   // ------------------------------------------------------------- desert lag --
   // Ground litter, but in *sheets*, not broadcast. A stone pavement forms where
@@ -652,56 +875,137 @@ export function buildRockField(world, lib, material) {
         const ang = rng() * Math.PI * 2;
         const rad = Math.pow(rng(), 0.55) * spread;
         place(pick(shapes.chips), cx + Math.cos(ang) * rad, cz + Math.sin(ang) * rad,
-          0.14 + Math.pow(rng(), 1.7) * 0.34, {
+          0.16 + Math.pow(rng(), 1.7) * 0.40, FAM('chips', {
             // `foot` was 0 (seat on the centre height alone). Measured, that
             // left 5 chips proud of the drawn ground by more than their own
             // thickness where the surface falls away under them; seating on the
             // lowest ground under the footprint costs six height probes.
-            align: 1.0, sink: 0.58, tilt: 0.10, bands: BANDS.chips, foot: 0.5,
-            family: 'chips',
-          });
+            align: 1.0, sink: 0.52, tilt: 0.10, foot: 0.5,
+          }));
         placed++;
       }
     }
   }
 
-  // ------------------------------------------------------------- scree fans --
-  // Talus aprons. The erosion solve already knows where material came to rest,
-  // so the fan is seeded off `scree` and then *combed down the fall line*: a
-  // real apron is elongated along the slope, coarsens toward its toe, and thins
-  // out sideways. Round 1 scattered chips isotropically inside a qualifying
-  // radius, which gives a round blob — the shape is the whole tell.
+  // ----------------------------------------------------------- talus aprons --
+  //
+  // MAJOR 3, round 4: "there is no talus anywhere in the world. The rock slope
+  // runs into the flat valley in a single smooth concave fillet with no debris
+  // at all." Correct, and the reason is that the previous pass was a scatter
+  // rule with `talus` in its name: it sampled a point, asked the erosion solve
+  // whether `scree` was high there, and dropped 20 cm chips around it. A 20 cm
+  // chip has a hard cull at 176 m, and the massifs whose feet the critic
+  // measured are 400-800 m out — so by construction not one clast of it could
+  // ever appear at the base of a mountain.
+  //
+  // This is a WALK, not a sample, and it is the only pass in the file that is:
+  //   1. seed anywhere; climb the local gradient to find a real FACE (a slope
+  //      steeper than the angle of repose — material there is still moving);
+  //   2. walk the fall line DOWN from the face until the gradient falls through
+  //      the angle of repose. That crossing is the apex of the apron, and it is
+  //      where every rock face on earth puts one;
+  //   3. lay the apron from that apex on downhill, fanning sideways as it goes
+  //      and COARSENING toward the toe. Fines lodge in the first few metres, a
+  //      block that survives the fall keeps its momentum to the bottom — that
+  //      gradient is the most recognisable thing about a scree slope after its
+  //      angle, and it is why the toe of a real apron is a line of boulders.
+  //
+  // The clast SIZE is set by the range, not by taste: 1 px at 600 m is 0.41 m
+  // of world, so an apron built from 0.3 m chips at that range is sub-pixel
+  // fizz and an apron built from 1-3.5 m blocks is a legible band of debris.
+  // The family therefore carries its own band table out to 900 m.
   {
-    let placed = 0;
-    for (let i = 0; i < 11000 && placed < 2900; i++) {
+    let aprons = 0;
+    // Bound on SUCCESSES, not attempts. The first version counted attempts, and
+    // since the seat rule rejects a third of everything offered on a scree
+    // slope, the pass quietly stopped at 1,091 blocks having spent its whole
+    // 2,400 budget on rejections.
+    for (let i = 0; i < 88000 && aprons < 520 && spent.talus < CAPS.talus; i++) {
       const a = rng() * Math.PI * 2;
-      const r = radius(46, 340, 1.25);
-      const cx = Math.cos(a) * r;
-      const cz = Math.sin(a) * r;
-      const slope = 1 - terrain.normalAt(cx, cz).y;
-      const rel = reliefAt(terrain, cx, cz, 26);
-      if (slope > 0.42) continue;
-      const s = surfaceAt(cx, cz);
-      const talus = hasSurface ? s.scree : (rel.up > 0.42 ? 0.7 : 0.0);
-      if (talus < 0.30) continue;
-      if (rng() > talus * 0.85 * (0.35 + 0.65 * patch(cx, cz, 0.012))) continue;
-      downhill(cx, cz, 6);
+      const r = radius(76, 1500, 1.15);
+      let x = Math.cos(a) * r;
+      let z = Math.sin(a) * r;
+
+      // --- 1. is there a face here? ---------------------------------------
+      let g = downhill(x, z, 7);
+      if (g < REPOSE) continue;                       // not a face; nothing sheds
+      const s0 = surfaceAt(x, z);
+      // Bedrock sheds; a slope already buried under its own alluvium does not.
+      if (hasSurface && rng() > 0.18 + s0.rock * 1.15) continue;
+      const faceY = terrain.heightAt(x, z);
+
+      // --- 2. walk down to the break of slope ------------------------------
+      let steps = 0;
+      for (; steps < 46; steps++) {
+        g = downhill(x, z, 7);
+        if (g < REPOSE) break;                        // through the repose angle
+        x += grad.x * 5.5;
+        z += grad.y * 5.5;
+      }
+      if (steps === 0 || steps >= 46) continue;       // never left / never landed
+      const drop = faceY - terrain.heightAt(x, z);
+      if (drop < 9) continue;                         // too small a face to shed an apron
+      if (Math.hypot(x, z) < CLEAR.stone) continue;
+
+      // Fall-line frame at the apex. The apron is elongated along it and
+      // symmetric across it; a round blob of debris is the tell this replaces.
+      downhill(x, z, 9);
       const fx = grad.x;
       const fz = grad.y;
-      const run = 6 + rng() * 26;
-      const n = 8 + ((rng() * 18) | 0);
-      for (let k = 0; k < n && placed < 2900; k++) {
-        const t = Math.pow(rng(), 0.7);              // biased toward the toe
-        const lat = (rng() - 0.5) * run * 0.42 * (0.25 + t);
-        const x = cx + fx * run * t - fz * lat;
-        const z = cz + fz * run * t + fx * lat;
-        if (1 - terrain.normalAt(x, z).y > 0.5) continue;
-        // Talus coarsens downslope: the big blocks carry their momentum to the toe.
-        place(pick(shapes.chips), x, z, (0.15 + Math.pow(rng(), 1.5) * 0.46) * (0.7 + t * 0.85), {
-          align: 1.0, sink: 0.56, tilt: 0.13, bands: BANDS.chips, foot: 0.5,
-          family: 'chips',
-        });
-        placed++;
+      const dep = hasSurface ? Math.max(s0.scree, surfaceAt(x, z).deposit ?? 0) : 0.6;
+      if (hasSurface && dep < 0.10) continue;
+
+      // Apron size scales with the face that fed it, which is what stops every
+      // apron in the valley being the same apron.
+      const run = Math.min(120, 16 + drop * 1.35) * (0.7 + rng() * 0.6);
+      let n = 10 + ((rng() * 22) | 0) + ((drop * 0.35) | 0);
+      // Coarsest clast at the toe, in metres. A 60 m face throws 3 m blocks.
+      let coarse = Math.min(3.4, 0.85 + drop * 0.045) * (0.75 + rng() * 0.5);
+
+      // --- range-graded grain size -----------------------------------------
+      // The first version of this pass put real aprons at the right sites and
+      // still failed the critic's crop. Measured: 39-81 rock instances inside
+      // 70 m of the ground point under vista.png (1017, 387), and 1.14% of that
+      // crop's pixels changed when the whole rock group was hidden. The reason
+      // is arithmetic, not placement — that point is 856 m from the camera, the
+      // vista is a 42 degree field over 720 lines, so one pixel is 0.92 m of
+      // world there and the median talus block was 0.69 m. An apron built from
+      // sub-pixel clasts is not an apron, it is dither.
+      //
+      // So the far aprons are built from FEWER, BIGGER blocks: the same volume
+      // of debris, aggregated to the scale the frame can actually resolve. That
+      // is the same argument as an LOD, applied to the scatter instead of to
+      // the mesh, and it is also true of the real thing — the blocks you can
+      // pick out at a kilometre are the house-sized ones at the toe.
+      const far = THREE.MathUtils.clamp((Math.hypot(x, z) - 200) / 680, 0, 1);
+      const grain = 1 + far * 2.3;
+      coarse *= grain;
+      n = Math.max(6, Math.round(n * (1 - far * 0.42)));
+      aprons++;
+      for (let k = 0; k < n && spent.talus < CAPS.talus; k++) {
+        // t biased toward the head: an apron is densest where it is fed.
+        const t = Math.pow(rng(), 1.35);
+        // The fan widens downslope and the lateral profile is a cosine lobe,
+        // so the apron has a soft edge instead of a rectangular footprint.
+        const lat = (rng() + rng() - 1) * run * (0.20 + 0.42 * t);
+        const px = x + fx * run * t - fz * lat;
+        const pz = z + fz * run * t + fx * lat;
+        // Refuse to climb back up the face: the apron banks against it, it does
+        // not creep onto it.
+        if (downhill(px, pz, 6) > REPOSE * 1.25) continue;
+        // Grain-size gradient. `t^1.6` keeps the fines banked in the top third
+        // and puts the blocks on the toe.
+        const size = (0.28 + coarse * Math.pow(t, 1.6) * (0.45 + rng() * 1.1)) * (0.55 + 0.45 * grain);
+        const small = size < 0.72 && Math.hypot(px, pz) < 150;
+        place(pick(small ? shapes.chips : shapes.boulders), px, pz, size,
+          FAM('talus', {
+            // Scree lies where it lands: aligned to the slope, deeply keyed in,
+            // and with almost no free lean — a block that could lean would have
+            // kept rolling.
+            align: 0.92, sink: 0.40, tilt: 0.16, foot: 0.46,
+            collar: small ? null : 'boulders',
+            maxHeight: 3.2 + far * 5.0,
+          }));
       }
     }
   }
@@ -720,22 +1024,32 @@ export function buildRockField(world, lib, material) {
       if (slope > 0.45) continue;
       const s = surfaceAt(cx, cz);
       const rel = reliefAt(terrain, cx, cz, 20);
+      // Round 5 moved the drainage term from `flow` to `accum`. `flow` is the
+      // MASK the ground shader paints wadis with — blurred over an 8 m kernel
+      // and clamped — so keying a scatter to it spreads cobbles evenly over the
+      // whole painted wash. `accum` is the raw D8 contributing area, i.e. the
+      // dendritic network itself, and a cobble bar belongs in the channel, not
+      // across the width of the paint. This is most of MAJOR 4: the field looked
+      // uniform because it was being driven by a deliberately smoothed field.
+      const chan = hasSurface ? Math.max(0, (s.accum ?? s.flow) - 0.34) / 0.66 : 0;
       const supply = hasSurface
-        ? s.flow * 1.25 + s.scree * 0.75 + s.rock * 0.35
+        ? chan * chan * 1.55 + s.scree * 0.60 + s.rock * 0.30
         : Math.min(1, rel.up * 2.0);
-      if (rng() > (0.04 + supply * 0.8) * patch(cx, cz, 0.0075)) continue;
-      const spread = 3 + rng() * 12;
-      const n = 2 + ((rng() * 6) | 0);
+      if (rng() > (0.025 + supply * 0.85) * patch(cx, cz, 0.0075)) continue;
+      // Bars, not dust: a channel deposit is a tight lens of cobbles strung
+      // along the flow, so the cluster is elongated down the fall line.
+      downhill(cx, cz, 8);
+      const along = 4 + rng() * 16;
+      const across = 1.2 + rng() * 4.0;
+      const n = 3 + ((rng() * 8) | 0);
       for (let k = 0; k < n && placed < 2300; k++) {
-        const ang = rng() * Math.PI * 2;
-        const rad = Math.pow(rng(), 0.6) * spread;
-        const x = cx + Math.cos(ang) * rad;
-        const z = cz + Math.sin(ang) * rad;
+        const u = (rng() + rng() - 1) * along;
+        const w = (rng() + rng() - 1) * across;
+        const x = cx + grad.x * u - grad.y * w;
+        const z = cz + grad.y * u + grad.x * w;
         if (Math.hypot(x, z) < CLEAR.stone) continue;
-        place(pick(shapes.stones), x, z, 0.32 + Math.pow(rng(), 1.6) * 1.15, {
-          align: 0.7, sink: COLLARS.stones.sink, tilt: 0.2, bands: BANDS.stones,
-          collar: 'stones',
-        });
+        place(pick(shapes.stones), x, z, 0.34 + Math.pow(rng(), 1.6) * 1.20,
+          FAM('stones', { align: 0.7, sink: COLLARS.stones.sink, tilt: 0.2, collar: 'stones' }));
         placed++;
       }
     }
@@ -757,9 +1071,11 @@ export function buildRockField(world, lib, material) {
       const s = surfaceAt(x, z);
       const g0 = downhill(x, z, 9);
       if (hasSurface) {
-        if (s.flow < 0.35 && s.scree < 0.45) continue;
+        // Seed on the raw drainage network, not on the painted mask: a train of
+        // blocks came down a real gully, and `accum > 0.5` IS the gully.
+        if ((s.accum ?? s.flow) < 0.50 && s.scree < 0.45) continue;
       } else if (g0 < 0.12) continue;
-      if (rng() > 0.35 + 0.65 * patch(x, z, 0.006)) continue;
+      if (rng() > 0.25 + 0.75 * patch(x, z, 0.006)) continue;
 
       let big = 1.5 + Math.pow(rng(), 1.25) * 4.0;
       const steps = 4 + ((rng() * 9) | 0);
@@ -777,10 +1093,10 @@ export function buildRockField(world, lib, material) {
           const ang = rng() * Math.PI * 2;
           const rad = big * (0.6 + rng() * 1.8);
           place(pick(shapes.boulders), x + Math.cos(ang) * rad, z + Math.sin(ang) * rad,
-            big * (0.35 + rng() * 0.75), {
-              align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.16, bands: BANDS.boulders,
-              collar: 'boulders',
-            });
+            big * (0.35 + rng() * 0.75),
+            FAM('boulders', {
+              align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.16, collar: 'boulders',
+            }));
         }
         big *= 0.78 + rng() * 0.14;                 // trains fine downstream
       }
@@ -793,7 +1109,7 @@ export function buildRockField(world, lib, material) {
   // bedrock, with a strong size gradient away from the parent.
   {
     let clusters = 0;
-    for (let i = 0; i < 14000 && clusters < 190; i++) {
+    for (let i = 0; i < 20000 && clusters < 190; i++) {
       const a = rng() * Math.PI * 2;
       const r = radius(CLEAR.boulder, 1400, 1.7);
       const cx = Math.cos(a) * r;
@@ -815,13 +1131,10 @@ export function buildRockField(world, lib, material) {
         const z = cz + Math.sin(ang) * rad + grad.y * spread * t * 0.9;
         if (Math.hypot(x, z) < CLEAR.boulder) continue;
         if (1 - terrain.normalAt(x, z).y > 0.44) continue;   // it would have rolled
-        place(pick(shapes.boulders), x, z, big * (1 - t * 0.6) * (0.7 + rng() * 0.6), {
-          align: 0.5,
-          sink: COLLARS.boulders.sink,
-          tilt: 0.18,
-          bands: BANDS.boulders,
-          collar: 'boulders',
-        });
+        place(pick(shapes.boulders), x, z, big * (1 - t * 0.6) * (0.7 + rng() * 0.6),
+          FAM('boulders', {
+            align: 0.5, sink: COLLARS.boulders.sink, tilt: 0.18, collar: 'boulders',
+          }));
       }
       clusters++;
     }
@@ -834,7 +1147,7 @@ export function buildRockField(world, lib, material) {
   // valley floor feel like geology instead of set dressing.
   {
     let reefs = 0;
-    for (let i = 0; i < 26000 && reefs < 110; i++) {
+    for (let i = 0; i < 60000 && reefs < 200; i++) {
       const a = rng() * Math.PI * 2;
       const r = radius(CLEAR.formation, 1600, 1.45);
       const cx = Math.cos(a) * r;
@@ -873,19 +1186,19 @@ export function buildRockField(world, lib, material) {
         if (Math.hypot(x, z) < CLEAR.formation) continue;
         if (1 - terrain.normalAt(x, z).y > 0.66) continue;
         const size = lead * (1 - t * 0.55) * (0.7 + rng() * 0.6);
-        place(pick(shapes.formations), x, z, size, {
+        place(pick(shapes.formations), x, z, size, FAM('formations', {
           align: 0.3,
           sink: COLLARS.formations.sink,
           tilt: 0.12,
-          bands: BANDS.formations,
           foot: 0.32,
-          shadowBand: 1,
           collar: 'formations',
           // The deliberate path. This family exists to carry the skyline, so it
           // is exempt from the scatter height cap — the site has already been
-          // qualified on bedrock exposure, relief and slope above.
+          // qualified on bedrock exposure, relief and slope above. It is NOT
+          // exempt from the seat rule: round 4 shipped 86% of this family with
+          // more than half a metre of its underside in open air.
           maxHeight: Infinity,
-        });
+        }));
         // Collapse apron: blocks shed off the face, biggest nearest the base and
         // preferentially strewn downhill rather than ringing the tower evenly.
         downhill(x, z, size * 0.5 + 4);
@@ -897,10 +1210,10 @@ export function buildRockField(world, lib, material) {
           const bx = x + Math.cos(ang) * rad + grad.x * rad * 0.7;
           const bz = z + Math.sin(ang) * rad + grad.y * rad * 0.7;
           if (1 - terrain.normalAt(bx, bz).y > 0.5) continue;
-          place(pick(shapes.boulders), bx, bz, size * (0.2 - u * 0.13) * (0.6 + rng() * 0.8), {
-            align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.2, bands: BANDS.boulders,
-            collar: 'boulders',
-          });
+          place(pick(shapes.boulders), bx, bz, size * (0.2 - u * 0.13) * (0.6 + rng() * 0.8),
+            FAM('boulders', {
+              align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.2, collar: 'boulders',
+            }));
         }
       }
       reefs++;
@@ -913,7 +1226,7 @@ export function buildRockField(world, lib, material) {
   // the thing reads as bedrock rather than a prop dropped on a hill.
   {
     let placed = 0;
-    for (let i = 0; i < 26000 && placed < 240; i++) {
+    for (let i = 0; i < 72000 && placed < 520; i++) {
       const a = rng() * Math.PI * 2;
       const r = radius(CLEAR.outcrop, 1500, 1.4);
       const x = Math.cos(a) * r;
@@ -921,7 +1234,15 @@ export function buildRockField(world, lib, material) {
       const slope = 1 - terrain.normalAt(x, z).y;
       // Bedrock breaks out THROUGH a slope. On near-flat ground the same body
       // is a monument standing on a lawn, which is exactly how it reads.
-      if (slope < 0.19) continue;
+      //
+      // Round 5 lowered the floor from 0.19 to 0.115 (35.6 -> 27.7 degrees)
+      // because `place` now imposes a hard 50 degree CEILING, and the round-4
+      // family had a median seat slope of 53.5 degrees — i.e. more than half of
+      // it was above the new ceiling and the old window would have starved the
+      // skyline. A 28-50 degree window is a hillside, which is where a
+      // stratified outcrop crops out; 53-70 degrees is a cliff, which is where
+      // one falls off.
+      if (slope < 0.115) continue;
       const s = surfaceAt(x, z);
       // Bedrock crops out of bedrock. Where the solve says the slope is buried
       // under its own talus, an outcrop is a prop standing in a scree pile.
@@ -929,11 +1250,10 @@ export function buildRockField(world, lib, material) {
       // See the formations note: uniform scale means a 39 m stack is a 9 m one
       // with the detail stretched six-fold, and it reads as a grey block.
       const size = 7 + Math.pow(rng(), 1.25) * 14;
-      place(pick(shapes.outcrops), x, z, size, {
+      place(pick(shapes.outcrops), x, z, size, FAM('outcrops', {
         align: 0.68,
         sink: COLLARS.outcrops.sink,
         tilt: 0.04,
-        bands: BANDS.outcrops,
         // Round 4: 0.44 -> 0.30. `foot` is the radius over which the LOWEST
         // ground is taken, and on a hillside the minimum over 9 m of a 21 m body
         // is metres below its own centre. Combined with the family's sink that
@@ -943,7 +1263,7 @@ export function buildRockField(world, lib, material) {
         foot: 0.30,
         collar: 'outcrops',
         maxHeight: Infinity,
-      });
+      }));
       // Rubble apron shed off the face, fanning downhill and fining outward.
       downhill(x, z, size * 0.5 + 4);
       const n = 5 + ((rng() * 8) | 0);
@@ -956,10 +1276,9 @@ export function buildRockField(world, lib, material) {
           x + Math.cos(ang) * rad + grad.x * rad * 0.85,
           z + Math.sin(ang) * rad + grad.y * rad * 0.85,
           size * (0.15 - u * 0.1) * (0.6 + rng() * 0.8),
-          {
-            align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.22, bands: BANDS.boulders,
-            collar: 'boulders',
-          },
+          FAM('boulders', {
+            align: 0.55, sink: COLLARS.boulders.sink, tilt: 0.22, collar: 'boulders',
+          }),
         );
       }
       placed++;
@@ -976,5 +1295,5 @@ export function buildRockField(world, lib, material) {
   }
   const meshes = field.build(group);
   const collars = field.buildCollars(group, buildCollarLibrary());
-  return { group, meshes, collars, records: field.records };
+  return { group, meshes, collars, records: field.records, spent, rejected, wind: WIND_DIR };
 }

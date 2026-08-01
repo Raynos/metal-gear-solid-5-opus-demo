@@ -295,6 +295,16 @@ const WIND_S = Math.sin(WIND);
 // cleanly instead of beating against the pixel grid the way a 0.36 m tile did.
 const RIPPLE_N = 512;
 const RIPPLE_TILE = 1.6;
+// Ripple spacing and the peak-to-trough heights of the two ripple sets, metres.
+// The ripple INDEX (spacing / height) is the number that matters: wind ripples
+// run 14-20, megaripples 25-35. Anything flatter and the lee face cannot stand
+// at the angle of repose, which is the whole reason a ripple field shades.
+const RIPPLE_LAMBDA = 0.10;
+const RIPPLE_A1 = 0.0082;   // index 12
+const RIPPLE_A2 = 0.0115;   // 0.55 m megaripples, index 48
+// Total metric range channel B spans, so the fragment shader can convert the
+// stored height back to metres for the lee-face horizon test.
+const RIPPLE_H = 0.030;
 
 // ---------------------------------------------------------------------------
 // Heightfield simulation
@@ -1596,45 +1606,81 @@ export class Terrain {
       }
     }
 
-    const mk = (data) => {
-      const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
-      t.wrapS = t.wrapT = THREE.RepeatWrapping;
-      t.magFilter = THREE.LinearFilter;
-      t.minFilter = THREE.LinearMipmapLinearFilter;
-      t.generateMipmaps = true;
-      t.anisotropy = 16;
-      t.colorSpace = THREE.NoColorSpace;
-      t.needsUpdate = true;
-      return t;
-    };
-    this.texDetail = mk(mask);
-    this.texDetailN = mk(nrm);
+    // Mask and normal ship as the two layers of ONE array texture — see
+    // `_tileArray`. Layer 0 is the mask, layer 1 the normal.
+    this.texDetail = Terrain._tileArray([mask, nrm], N);
   }
 
   /**
-   * Wind-ripple set — sand's OWN detail layer.
+   * Pack same-sized RGBA8 tiles into a single sampler as array layers.
+   *
+   * This is a hardware-budget fix, not an aesthetic one. MAX_TEXTURE_IMAGE_UNITS
+   * is 16 on this GPU and the terrain program was measured at exactly 16 active
+   * samplers — twelve of them this material's own, the rest the shared envMap,
+   * cascade and sky-weather maps every material in the game carries. At the
+   * ceiling, one more sampler added anywhere in the engine makes THIS shader
+   * fail to link, and a terrain that fails to link renders no detail at all,
+   * which is the exact failure this round exists to fix. Measured: that is
+   * precisely what happened mid-round, and it took out the baseline as well.
+   *
+   * The mask/normal pairs are the natural thing to merge: same size, same
+   * format, same filtering, always sampled at the same uv. Two units back.
+   */
+  static _tileArray(layers, n) {
+    const data = new Uint8Array(n * n * 4 * layers.length);
+    layers.forEach((l, i) => data.set(l, i * n * n * 4));
+    const t = new THREE.DataArrayTexture(data, n, n, layers.length);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.LinearFilter;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.generateMipmaps = true;
+    t.anisotropy = 16;
+    t.colorSpace = THREE.NoColorSpace;
+    t.needsUpdate = true;
+    return t;
+  }
+
+  /**
+   * Wind-ripple set — sand's OWN relief, and the layer that gives the ground a
+   * readable DIRECTION. That direction is the strongest MGSV sand tell there
+   * is, and no isotropic clast field can produce it.
    *
    * Blown sand organises into transverse ripples: crests perpendicular to the
-   * wind, 7-14 cm apart, 4-10 mm high, and each crest is sinuous and roughly
-   * eight times longer than the crest spacing. That aspect ratio is the whole
-   * point. It is what makes a sand surface directional, and directionality is
-   * what the previous ground was missing — it had a clast normal shared with
-   * the gravel and then attenuated to 36% on sand, which left the pan measuring
-   * a third of the high-pass energy of the sandbags sitting on it.
+   * wind, ~10 cm apart, 5-8 mm high, with a long gentle stoss face and a short
+   * lee face standing near the angle of repose. The ASYMMETRY is the point.
+   * A pure sine is corrugated iron; a real ripple has one face at 8 degrees and
+   * one at 20, so when the sun drops every lee face in the field goes dark at
+   * the same moment and the whole pan reads as one grain.
    *
-   * Three superposed sets: ripples (10 cm), megaripples (53 cm, same
-   * direction), and a 2.5 cm grain. Patchy — a uniform ripple field over a
-   * kilometre reads as corduroy — so an envelope noise turns them on and off.
+   * Rounds 3 and 4 both shipped a version of this tile and both measured as
+   * absent on the shipped frames. Two independent reasons, both fixed here:
    *
-   * RG: normal xy in the WIND frame (the shader rotates it back). B: height,
-   * for the crest/trough albedo split. A: the ripple envelope.
+   *  1. AMPLITUDE. The profile was a skewed sine of 3.8 mm amplitude — peak
+   *     surface slope 0.239 — and the fragment shader then multiplied its
+   *     normal by 0.80 * sharpness * envelope * sandW, about 0.25 in the near
+   *     field. Peak shading tilt: 3.4 degrees, RMS nearer 1. A lee face stands
+   *     at 20. The layer was three stops below anything a camera could see.
+   *  2. COHERENCE. The crest phase was wandered by 2.6 CYCLES, over a
+   *     correlation length of half a tile. A ripple train displaced by two and
+   *     a half wavelengths inside its own coherence length is not a train, it
+   *     is isotropic noise — and isotropic noise has no direction to read. The
+   *     wander is now 0.40 cycles, and its anisotropy is the right way round:
+   *     the phase field varies FASTER along the crest (so crests bend and
+   *     bifurcate over ~5 wavelengths, which is what a real one does) than
+   *     across it (so the train survives as a train). Round 4 had it inverted,
+   *     pu = 2 against pv = 16, which wanders the phase eight times faster
+   *     across the crests than along them: the one arrangement that guarantees
+   *     no crest can exist at all.
+   *
+   * RG: normal xy in the WIND frame (the shader rotates it back). B: height
+   * over a FIXED RIPPLE_H metre range, so the shader can recover metres for the
+   * lee-face horizon test. A: the ripple envelope.
    */
   _buildRippleTexture() {
     const N = RIPPLE_N;
     const inv = 1 / N;
     const h = new Float32Array(N * N);
     const envF = new Float32Array(N * N);
-    const TAU = Math.PI * 2;
 
     // Anisotropic tileable fbm: independent lattice periods per axis. Both must
     // stay powers of two so they divide perlin's 256-cell period and the tile
@@ -1654,43 +1700,59 @@ export class Terrain {
       }
       return sum / norm;
     };
-    // Skewed sine: gentle stoss face, abrupt lee face. A pure sine reads as
-    // corrugated iron; the asymmetry is what says "granular".
-    const skew = (p, k) => Math.sin(p * TAU + k * Math.sin(p * TAU));
 
-    const NC = Math.round(RIPPLE_TILE / 0.10); // crests across the tile
-    let lo = Infinity;
-    let hi = -Infinity;
+    // The ripple profile itself, phase in cycles, returning +/- 0.5. Rises over
+    // the first STOSS of the cycle and falls over the rest, both halves
+    // smoothstepped so the slope is zero at crest and trough and the baked
+    // normal has no step in it to alias on. With STOSS = 0.72 the lee face is
+    // 2.6x steeper than the stoss face, which is the measured ratio.
+    const STOSS = 0.72;
+    const profile = (p) => {
+      const f = p - Math.floor(p);
+      if (f < STOSS) {
+        const t = f / STOSS;
+        return t * t * (3 - 2 * t) - 0.5;
+      }
+      const t = (f - STOSS) / (1 - STOSS);
+      return 0.5 - t * t * (3 - 2 * t);
+    };
+
+    const NC = RIPPLE_TILE / RIPPLE_LAMBDA;   // 16 crests across the tile
+    const NM = NC / 5.5;                       // megaripples at 5.5x the spacing
     for (let j = 0; j < N; j++) {
       const v = j * inv;
       for (let i = 0; i < N; i++) {
         const u = i * inv;
         const c = j * N + i;
-        // Crest wander: 8:1 stretched along the crest, so crests are long,
-        // sinuous and occasionally bifurcate rather than being ruled lines.
-        // Round 4, second pass: the phase wander was 1.35 and the crests came
-        // out as continuous ruled lines running the whole tile — rendered, that
-        // is a ploughed field, not sand. At 2.6 the crests break, bifurcate and
-        // die out over a few wavelengths, which is what a real ripple train does.
-        const wob = aniso(u + 0.11, v + 0.37, 2, 16, 3) * 2.6;
-        const wob2 = aniso(u - 0.23, v + 0.71, 1, 4, 2) * 0.75;
-        // Patchier envelope for the same reason: bare drifts between the
-        // rippled patches are most of what stops it reading as corduroy.
-        const e = clamp(aniso(u + 0.5, v + 0.5, 4, 4, 2) * 2.7 + 0.42, 0, 1);
-        const s = skew(v * NC + wob + wob2, 0.55);
-        const s2 = skew(v * (NC / 5) + aniso(u + 0.6, v - 0.2, 1, 2, 2) * 0.9, 0.4);
-        const grain = aniso(u, v, 64, 64, 2);
-        const y = s * 0.0038 * e + s2 * 0.0040 * (0.45 + 0.55 * e) + grain * 0.00045;
-        h[c] = y;
+        // Crest wander. The 4/2 term bends and terminates individual crests
+        // over ~0.4 m; the 1/1 term swings the whole train through a gentle
+        // curve across the tile, which is also what stops the tile boundary
+        // reading as a ruled line when it repeats.
+        const wob = aniso(u + 0.11, v + 0.37, 4, 2, 3) * 0.40
+                  + aniso(u - 0.23, v + 0.71, 1, 1, 2) * 0.55;
+        // Patchy: bare wind-scoured drifts between the rippled patches are most
+        // of what stops a kilometre of this reading as corduroy. Floored at
+        // 0.34 rather than 0 — the pan has to carry the direction everywhere,
+        // it is just stronger in some places than others.
+        const e = clamp(aniso(u + 0.5, v + 0.5, 4, 2, 2) * 2.1 + 0.66, 0.34, 1);
+        const s1 = profile(v * NC + wob);
+        const s2 = profile(v * NM + aniso(u + 0.6, v - 0.2, 2, 1, 2) * 0.5);
+        // Grain, deliberately small. It is ISOTROPIC, so every millimetre of it
+        // spent here is spent diluting the one property this tile exists to
+        // provide — measured, 1.2 mm of grain cut the across:along slope ratio
+        // from 4.9 to 2.4. The fine grain the near field needs comes from the
+        // shader's third tap, which reads THIS tile at a quarter scale and so
+        // turns the ripple train itself into a 2.3 cm directional grain.
+        const grain = aniso(u, v, 32, 32, 2);
+        h[c] = s1 * RIPPLE_A1 * e
+             + s2 * RIPPLE_A2 * (0.45 + 0.55 * e)
+             + grain * 0.0005;
         envF[c] = e;
-        if (y < lo) lo = y;
-        if (y > hi) hi = y;
       }
     }
 
     const cell = RIPPLE_TILE / N;
     const data = new Uint8Array(N * N * 4);
-    const invR = 1 / Math.max(1e-6, hi - lo);
     for (let j = 0; j < N; j++) {
       for (let i = 0; i < N; i++) {
         const c = j * N + i;
@@ -1703,7 +1765,10 @@ export class Terrain {
         const invL = 1 / Math.sqrt(nx * nx + ny * ny + 1);
         data[c * 4] = Math.round((nx * invL * 0.5 + 0.5) * 255);
         data[c * 4 + 1] = Math.round((ny * invL * 0.5 + 0.5) * 255);
-        data[c * 4 + 2] = Math.round(clamp((h[c] - lo) * invR, 0, 1) * 255);
+        // FIXED range, not the tile's own min/max: the shader multiplies this
+        // back up by RIPPLE_H to get metres for the horizon test, so the
+        // encoding cannot be allowed to drift with the noise.
+        data[c * 4 + 2] = Math.round(clamp(h[c] / RIPPLE_H + 0.5, 0, 1) * 255);
         data[c * 4 + 3] = Math.round(clamp(envF[c], 0, 1) * 255);
       }
     }
@@ -1834,7 +1899,12 @@ export class Terrain {
         mask[c * 4 + 2] = Math.round(tint * 255);
         mask[c * 4 + 3] = Math.round(drift * 255);
 
-        height[c] = clamp(clastH * 0.88 + grain * 0.07 + drift * 0.045, 0, 1);
+        // The clast term goes negative wherever blown sand has buried the
+        // gravel, and round 4 let that negative swamp the grain before the
+        // outer clamp — so the matrix BETWEEN the stones baked to exactly zero
+        // and its normal to exactly flat. Rendered, that is a field of pebbles
+        // sitting on glass. Floor the clasts first, then add the grain.
+        height[c] = clamp(Math.max(0, clastH) * 0.86 + grain * 0.105 + drift * 0.055, 0, 1);
       }
     }
 
@@ -1857,19 +1927,7 @@ export class Terrain {
       }
     }
 
-    const mk = (data) => {
-      const t = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
-      t.wrapS = t.wrapT = THREE.RepeatWrapping;
-      t.magFilter = THREE.LinearFilter;
-      t.minFilter = THREE.LinearMipmapLinearFilter;
-      t.generateMipmaps = true;
-      t.anisotropy = 16;
-      t.colorSpace = THREE.NoColorSpace;
-      t.needsUpdate = true;
-      return t;
-    };
-    this.texGrit = mk(mask);
-    this.texGritN = mk(nrm);
+    this.texGrit = Terrain._tileArray([mask, nrm], N);
   }
 
   // -- queries -------------------------------------------------------------
@@ -2185,9 +2243,7 @@ export class Terrain {
       uNearM: { value: this.texNearM },
       uMicro: { value: this.texMicro },
       uDetail: { value: this.texDetail },
-      uDetailN: { value: this.texDetailN },
       uGrit: { value: this.texGrit },
-      uGritN: { value: this.texGritN },
       uRipple: { value: this.texRipple },
       uFarInfo: { value: this._gridUniform(this.far) },
       uNearInfo: { value: this._gridUniform(this.near) },
@@ -2299,10 +2355,21 @@ export class Terrain {
           uniform sampler2D uNearS;
           uniform sampler2D uFarM;
           uniform sampler2D uNearM;
-          uniform sampler2D uDetail;
-          uniform sampler2D uDetailN;
-          uniform sampler2D uGrit;
-          uniform sampler2D uGritN;
+          // Layer 0 = mask, layer 1 = normal. One sampler each; see _tileArray.
+          uniform sampler2DArray uDetail;
+          uniform sampler2DArray uGrit;
+          #define TEXDETAIL(uv) texture(uDetail, vec3(uv, 0.0))
+          #define TEXGRIT(uv)   texture(uGrit,  vec3(uv, 0.0))
+          // Grit fetches inside the parallax march MUST carry explicit
+          // gradients. The marched uv is data-dependent, so two pixels of the
+          // same quad stop on different steps and dFdx(guv) is a wild number
+          // that has nothing to do with the screen footprint. Implicit LOD then
+          // selects a near-top mip and the entire clast field resolves to its
+          // own mean colour — measured: at 3.5 m the near ground rendered as
+          // smooth brown with no stone in it, which is exactly the round-2/3/4
+          // symptom this round is chartered to fix, reproduced by the fix.
+          #define GRITM(uv) textureGrad(uGrit, vec3(uv, 0.0), gdx, gdy)
+          #define GRITN(uv) textureGrad(uGrit, vec3(uv, 1.0), gdx, gdy)
           uniform sampler2D uRipple;
           uniform vec4 uFarInfo;
           uniform vec4 uNearInfo;
@@ -2385,13 +2452,30 @@ export class Terrain {
             float mn = min(length(dxu), length(dyu));
             return 1.0 - smoothstep(lim, lim * 4.2, max(mn, mx * 0.10));
           }
-          // The default limit stays tight. The clast tiles and the 64 m micro
-          // field both carry content within a couple of texels of Nyquist, and
-          // letting those through at grazing incidence is what produces the
-          // swirling wood grain across the pan that round 2 spent a pass
-          // removing. Only the ripple layer, whose features are 32 texels
-          // across, is allowed to run long.
-          float sharpness(vec2 uv) { return sharpnessK(uv, 0.50); }
+          // A limit of 0.50 for every layer but the ripples, and that one number
+          // is why three rounds of near-field detail never reached the screen.
+          // 0.50 texels per pixel means the tile has to be MAGNIFIED 2x before
+          // it counts as resolvable, which on a ground plane at eye height only
+          // happens within about two metres of the camera. Evaluated against the
+          // shipped framings it measured:
+          //
+          //   ground.png   grit tile   0.69 at 2 m, 0.00 at 4 m and beyond
+          //   vista.png    every layer 0.00-0.41 across the 100-170 m band the
+          //                critic autocorrelated
+          //
+          // So the grit layer existed only in the bottom sliver of one frame —
+          // the same sliver the depth-of-field blurs hardest — and the vista's
+          // mid-ground had literally no detail normal of any scale on it. That
+          // is both of the round-4 measurements, from one constant.
+          //
+          // The honest limit is set by the tile's own finest FEATURE, not by its
+          // texel pitch, because everything below the footprint has already been
+          // removed by the mip chain before the tap is taken. uDetail's finest
+          // content is its top fbm octave and its Worley cells, ~12-16 texels;
+          // half of that is a limit of 6, and 4.0 keeps a stop of margin. The
+          // per-layer overrides below are set the same way: the ripple tile
+          // carries 32-texel crests and the grit tile 6-10 texel clasts.
+          float sharpness(vec2 uv) { return sharpnessK(uv, 4.0); }
           ${MICRO_GLSL}
           `,
         )
@@ -2440,7 +2524,15 @@ export class Terrain {
             vec2 baseUV = mix(flatUV, wallUV, wallW);
 
             float nearW = 1.0 - smoothstep(6.0, 42.0, dist);
-            float midW  = 1.0 - smoothstep(45.0, 260.0, dist);
+            // Round 5: 45-260 m. The 26 m tile this gates carries 0.8 m Worley
+            // cells and 0.65-2.6 m fbm — which is 6 px of structure at 130 m,
+            // exactly the scale a real hillside shows at that range, and the
+            // only tile in the set whose features are big enough to survive
+            // there at all. It was being faded out at 45 m, so the whole
+            // 100-500 m band of every landscape shot ran on the baked landform
+            // normal and nothing else. Ends before the far ranges, which are
+            // aerial-perspective haze and must stay that way.
+            float midW  = 1.0 - smoothstep(150.0, 800.0, dist);
             // Each scale is read through its own rotation. Sampling one texture
             // at three scales off the *same* axes superposes a field on scaled
             // copies of itself; the copies stay correlated and beat into large
@@ -2452,11 +2544,11 @@ export class Terrain {
             float sA = sharpness(uvA);
             float sC = sharpness(uvC);
             float sB = sharpness(uvB);
-            vec4 dA = texture2D(uDetail,  uvA);
-            vec4 dB = texture2D(uDetail,  uvB);
-            vec4 dC = texture2D(uDetail,  uvC);
-            vec4 nA = texture2D(uDetailN, uvA);
-            vec4 nB = texture2D(uDetailN, uvB);
+            vec4 dA = TEXDETAIL(uvA);
+            vec4 dB = TEXDETAIL(uvB);
+            vec4 dC = TEXDETAIL(uvC);
+            vec4 nA = texture(uDetail, vec3(uvA, 1.0));
+            vec4 nB = texture(uDetail, vec3(uvB, 1.0));
             // Detail albedo also collapses to its own mean once it stops being
             // resolvable, or the same beat shows up in colour instead of relief.
             vec4 D  = mix(dB, mix(dC, dA, 0.55 * sA), (0.34 + 0.55 * nearW) * max(sC, sA * 0.5));
@@ -2544,40 +2636,103 @@ export class Terrain {
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
-            float gritW = (1.0 - smoothstep(4.0, 34.0, dist)) * sharpness(baseUV * (1.0 / GRIT_TILE));
+            // The tile is 0.9 m of ground over 512 texels and its clasts are
+            // 6-10 texels across, so 6.0 is the footprint at which they stop
+            // being resolvable. Under the old half-texel limit this whole layer
+            // measured 0.00 past 3 m — see the sharpness note above.
+            vec2 guv0 = baseUV * (1.0 / GRIT_TILE);
+            vec2 gdx = dFdx(guv0);
+            vec2 gdy = dFdy(guv0);
+            float gritW = (1.0 - smoothstep(13.0, 46.0, dist)) * sharpnessK(guv0, 6.0);
             gMicroShadow = 1.0;
+            float gritAO = 1.0;
             vec2 gpert = vec2(0.0);
             if (gritW > 0.004) {
-              vec2 guv = baseUV * (1.0 / GRIT_TILE);
-              // One parallax step, in the projection's own frame. The clasts
-              // shift against the sand between them, which is what gives them a
-              // silhouette rather than a decal.
+              vec2 guv = guv0;
+              // View direction in the projection's own frame, and the tangent
+              // sweep the full clast relief subtends from here.
               vec3 vdir = normalize(cameraPosition - vWPos);
-              vec3 vT = vdir - wn * dot(vdir, wn);
-              vec2 vuv = mix(vT.xz, vec2(dot(vT.xz, tanH), vT.y), wallW);
-              float h0 = texture2D(uGritN, guv).a;
-              guv += vuv * ((h0 - 0.45) * (GRIT_H / GRIT_TILE) * 2.0);
+              float vn = max(0.14, dot(vdir, wn));
+              vec3 vT = vdir - wn * vn;
+              vec2 vuv = mix(vT.xz, vec2(dot(vT.xz, tanH), vT.y), wallW) * (1.0 / GRIT_TILE);
+              vec2 sweep = -vuv * (GRIT_H / vn);
 
-              vec4 GM = texture2D(uGrit,  guv);
-              vec4 GN = texture2D(uGritN, guv);
+              // Parallax OCCLUSION, not the single offset step round 4 used. A
+              // stone has to HIDE the sand behind it, or it is a print of a
+              // stone: the offset step slides the whole tile sideways and every
+              // clast keeps its painted-on outline. Six steps down the view ray
+              // plus one linear refine, near field only.
+              //
+              // The loop deliberately has no break. Control flow has to stay
+              // uniform across the quad or the implicit derivatives behind these
+              // fetches are undefined, and an undefined LOD on a clast tile at
+              // grazing incidence is the wood-grain moire this file has spent
+              // three rounds removing.
+              float pomW = (1.0 - smoothstep(5.0, 13.0, dist)) * gritW;
+              if (pomW > 0.02) {
+                const int PSTEPS = 6;
+                float layer = 1.0 / float(PSTEPS);
+                vec2 duv = sweep * layer * pomW;
+                float rayH = 1.0;
+                float hc = GRITN(guv).a;
+                for (int i = 0; i < PSTEPS; i++) {
+                  float go = step(hc, rayH);   // 1 while the ray is still airborne
+                  guv += duv * go;
+                  rayH -= layer * go;
+                  hc = mix(hc, GRITN(guv).a, go);
+                }
+                vec2 prev = guv - duv;
+                float hp = GRITN(prev).a;
+                float aH = hc - rayH;
+                float bH = hp - (rayH + layer);
+                guv = mix(guv, prev, clamp(aH / max(1e-4, aH - bH), 0.0, 1.0));
+              } else {
+                float h0 = GRITN(guv).a;
+                guv += sweep * (h0 - 0.45);
+              }
+
+              vec4 GM = GRITM(guv);
+              vec4 GN = GRITN(guv);
               // One coarse read of the same tile, rotated and 3.4x bigger. It
               // modulates stone density and tone rather than adding a second
               // clast field, so it hides the 0.36 m repeat without halving the
               // contrast that makes the stones legible in the first place.
-              vec4 GB = texture2D(uGrit, (baseUV * mat2(0.80, -0.60, 0.60, 0.80)) * (1.0 / (GRIT_TILE * 3.4)) + 17.3);
+              vec4 GB = TEXGRIT((baseUV * mat2(0.80, -0.60, 0.60, 0.80)) * (1.0 / (GRIT_TILE * 3.4)) + 17.3);
 
               // Sun horizon test through the clast height field: each stone
               // shadows the sand behind it, and the shadow lengthens as the sun
-              // drops. One tap, and it is the single thing that makes gravel
-              // read as gravel instead of a bump map.
+              // drops. Two taps rather than round 4's one, because a single
+              // 3 cm probe only ever finds the stone immediately adjacent and
+              // misses the long shadow a low sun actually throws.
+              //
+              // This is a DIRECT-light term. It is the half of the near-field
+              // detail that has to respond to the light direction — the round-4
+              // measurement that killed this layer was that its contrast did not
+              // change between sunlit sand and sand inside a building's shadow,
+              // which is the signature of detail that only ever reached albedo.
               vec2 sxz = uSunDir.xz;
               float sl = length(sxz);
               if (sl > 1e-3) {
-                const float STEP_M = 0.030;
-                float hs = texture2D(uGritN, guv + (sxz / sl) * (STEP_M / GRIT_TILE)).a;
-                float rise = (hs - GN.a) * GRIT_H - STEP_M * (uSunDir.y / sl);
-                gMicroShadow = 1.0 - smoothstep(0.0, 0.020, rise) * 0.55 * gritW;
+                vec2 sdir = sxz / sl;
+                float tanE = uSunDir.y / sl;
+                // Probe distances matter more than the number of taps. Round 4
+                // used a single 3 cm step, and a 4.5 cm stone under the noon sun
+                // (68 deg) throws a shadow 1.8 cm long — so the probe landed
+                // PAST every shadow it was looking for and the noon frame got
+                // none at all. 1.0 cm catches the contact shadow at high sun,
+                // 2.4 cm catches the longer one as the sun drops.
+                float occ = 0.0;
+                for (int i = 0; i < 2; i++) {
+                  float sd = i == 0 ? 0.010 : 0.024;
+                  float hs = GRITN(guv + sdir * (sd / GRIT_TILE)).a;
+                  occ = max(occ, smoothstep(0.0, 0.008, (hs - GN.a) * GRIT_H - sd * tanE));
+                }
+                gMicroShadow = 1.0 - occ * 0.85 * gritW;
               }
+              // Contact darkening in the interstices. The sand banked between
+              // stones sees less of the sky than the stones standing over it,
+              // and that cavity term is most of what a close-up of gravel is.
+              gritAO = mix(1.0, 0.52 + GN.a * 0.80, gritW);
 
               float clast = GM.g * smoothstep(0.10, 0.62, 0.42 + GB.a * 0.85);
               float grain = GM.r;
@@ -2592,12 +2747,12 @@ export class Terrain {
               clastC = mix(clastC, uRockRed * 0.94, smoothstep(0.30, 0.72, GM.b) * 0.40);
 
               vec3 fines = mix(uSandMid, uSandLight, clamp(grain * 0.75 + drift * 0.45 - 0.10, 0.0, 1.0));
-              vec3 gritC = mix(fines, clastC, clast * 0.80);
+              vec3 gritC = mix(fines, clastC, clast * 0.92);
               // Drifts: paler where blown sand has banked up between stones.
               gritC *= (0.94 + drift * 0.14) * (0.93 + GB.r * 0.15);
 
-              albedo = mix(albedo, mix(gritC, albedo * 1.06, 0.30), gritW * (1.0 - rockW * 0.55));
-              gpert = (GN.rg * 2.0 - 1.0) * (0.70 * gritW);
+              albedo = mix(albedo, mix(gritC, albedo * 1.06, 0.10), gritW * (1.0 - rockW * 0.55));
+              gpert = (GN.rg * 2.0 - 1.0) * (1.25 * gritW);
             }
 
             // --- wind ripples --------------------------------------------------
@@ -2612,33 +2767,72 @@ export class Terrain {
               vec2 rw = rot(vWPos.xz, WIND_SC);
               vec2 ruv = rw * (1.0 / RIPPLE_TILE);
               vec2 cuv = rot(rw, vec2(0.83, 0.5578)) * (1.0 / (RIPPLE_TILE * 3.7)) + vec2(0.31, 0.67);
-              float sR = sharpnessK(ruv, 1.6);
-              float sRC = sharpnessK(cuv, 1.6);
+              // Third tap: the same tile at 0.37 m, read for its grain octaves
+              // only. This is the layer that carries the last centimetre of
+              // relief in the metre or two the player is actually standing on.
+              vec2 fuv = rot(rw, vec2(0.34, -0.94)) * (1.0 / (RIPPLE_TILE * 0.23)) + vec2(0.58, 0.14);
+              // 32 texels per crest, so a 9-texel footprint still resolves the
+              // train three times over. Round 4 used 1.6 here, which faded the
+              // ripples out from 12 m and had them at 36% by 15 m.
+              float sR  = sharpnessK(ruv, 9.0);
+              float sRC = sharpnessK(cuv, 9.0);
+              float sRG = sharpnessK(fuv, 5.0);
               // Ripples only form on loose fines: bedrock has none, the coarse
               // lag patches interrupt them, and a wall never carries them.
-              float sandW = (1.0 - rockW) * (1.0 - screeW * 0.55) * (1.0 - wallW);
-              float rippleW = sandW * (1.0 - smoothstep(26.0, 80.0, dist));
-              if (rippleW > 0.004 && max(sR, sRC) > 0.004) {
+              float sandW = (1.0 - rockW) * (1.0 - screeW * 0.45) * (1.0 - wallW);
+              float rippleW = sandW * (1.0 - smoothstep(38.0, 110.0, dist));
+              if (rippleW > 0.004 && max(sR, max(sRC, sRG)) > 0.004) {
                 vec4 RP = texture2D(uRipple, ruv);
                 vec4 RC = texture2D(uRipple, cuv);
-                rpert = (unrot(RP.rg * 2.0 - 1.0, WIND_SC) * (0.80 * sR * mix(0.30, 1.0, RP.a))
-                       + unrot(RC.rg * 2.0 - 1.0, WIND_SC) * (0.22 * sRC)) * rippleW;
-                // Crests are winnowed to coarse grains and read a touch darker
-                // and warmer; the troughs bank pale fines. Small, but it is what
-                // keeps the ripples legible once the sun is high enough that the
-                // normal alone stops shading them.
-                float crest = (RP.b - 0.5) * mix(0.30, 1.0, RP.a) * sR + (RC.b - 0.5) * 0.55 * sRC;
-                albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.35, 0.35, crest)),
-                             rippleW * 0.11);
+                float env = mix(0.45, 1.0, RP.a);
+                rpert = unrot(RP.rg * 2.0 - 1.0, WIND_SC) * (1.30 * sR * env)
+                      + unrot(RC.rg * 2.0 - 1.0, WIND_SC) * (0.20 * sRC);
+                if (sRG > 0.01) {
+                  vec4 RG = texture2D(uRipple, fuv);
+                  rpert += unrot(RG.rg * 2.0 - 1.0, WIND_SC) * (0.55 * sRG);
+                }
+                rpert *= rippleW;
+
+                // Lee-face self-shadow. One horizon step along the sun's ground
+                // track, in metres, through the tile's own height channel: as
+                // the sun drops, the short steep lee faces stop seeing it and
+                // the entire pan darkens in ONE direction at once. That is the
+                // sand tell, and it only exists because the relief is real
+                // geometry in a height field rather than a painted gradient —
+                // at noon the test correctly finds no shadow at all, because a
+                // 7 mm ripple cannot shade 4.5 cm of ground under a 68 deg sun.
+                vec2 sxz = uSunDir.xz;
+                float sl = length(sxz);
+                if (sl > 1e-3) {
+                  const float RSTEP = 0.045;
+                  vec2 sdir = rot(sxz / sl, WIND_SC);
+                  float hs = texture2D(uRipple, ruv + sdir * (RSTEP / RIPPLE_TILE)).b;
+                  float rise = (hs - RP.b) * ${RIPPLE_H.toFixed(4)} - RSTEP * (uSunDir.y / sl);
+                  gMicroShadow *= 1.0 - smoothstep(0.0, 0.004, rise) * 0.72 * sR * env * rippleW;
+                }
+
+                // Crests are winnowed to coarse grains and read a touch darker;
+                // the troughs bank pale fines. Small, and deliberately so: this
+                // is the only part of the ripple that survives into shadow, and
+                // the round-4 failure was a detail layer that was ALL albedo.
+                float crest = (RP.b - 0.5) * env * sR + (RC.b - 0.5) * 0.55 * sRC;
+                albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.26, 0.26, crest)),
+                             rippleW * 0.13);
               }
             }
 
             diffuseColor.rgb *= albedo * 0.80;
 
             // --- normal --------------------------------------------------------
-            vec4 nC = texture2D(uDetailN, uvC);
-            float midNear = 1.0 - smoothstep(18.0, 105.0, dist);
-            vec2 pert = unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.40 * midW * sB)
+            vec4 nC = texture(uDetail, vec3(uvC, 1.0));
+            // Round 5: 18-105 m. The vista's own measured band is 100-170 m of
+            // valley floor and every normal layer was gated out of it — sC by
+            // this fade, sB by the footprint limit — which is why the critic's
+            // autocorrelation on that band found a pure low-frequency gradient
+            // with no structure at any lag. The 4.6 m tile's features are 14 cm,
+            // still a pixel at 200 m, so it has no business ending at 105.
+            float midNear = 1.0 - smoothstep(45.0, 260.0, dist);
+            vec2 pert = unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.55 * midW * sB)
                       + unrot(nC.rg * 2.0 - 1.0, ROT_C) * (0.60 * midNear * sC)
                       + (nA.rg * 2.0 - 1.0) * (0.85 * nearW * sA);
             // The mid detail height field is mostly clasts. Wind-packed sand has
@@ -2667,7 +2861,7 @@ export class Terrain {
             gN = normalize(wn + pv);
 
             float cav = mix(nB.a, mix(nC.a, nA.a, nearW), midNear);
-            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.25, 1.0));
+            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.25, 1.0)) * gritAO;
             gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05, 0.55, 1.0);
           }`,
         )

@@ -45,6 +45,21 @@ import * as VolNoise from './volumetrics/noise.js';
  * construction — round 1 shipped a white sky casting navy shadows because the
  * two numbers lived in different files.
  *
+ * The probe is *unoccluded* by construction, so on its own it lights the inside
+ * of a crevice exactly as brightly as the open ground next to it. Two terms fix
+ * that, both applied to the ambient and to nothing else:
+ *
+ *  - a half-resolution GTAO pass (`_renderAO`) whose result multiplies
+ *    `irradiance` in `lights_fragment_maps`. It reads last frame's depth
+ *    attachment out of the post stack, so it costs one extra fullscreen pass
+ *    and no extra scene draw.
+ *  - a sun-gated ground-bounce lobe. The lower half of the probe is the ground
+ *    a surface sees *when that surface is in shadow* — which is its own
+ *    footing, in its own shade. The extra bounce a surface standing in the sun
+ *    gets is added back per fragment, weighted by the cascade shadow term, so
+ *    a barrel in the open has a hot warm underside and the same barrel in a
+ *    building's shade does not.
+ *
  * NOTE for other authors: any *additional* shadow-casting DirectionalLight added
  * to the scene would be absorbed into this cascade scheme and misbehave. Use
  * SpotLight/PointLight for local shadowed lights; they are untouched.
@@ -54,11 +69,27 @@ import * as VolNoise from './volumetrics/noise.js';
 // Shader chunk overrides (installed once, before any material compiles)
 // ---------------------------------------------------------------------------
 
-const CSM_SHADOW_FN = /* glsl */ `
-#ifdef USE_SHADOWMAP
-
-  // Shared plain-object uniforms owned by Lighting.js; a shader that never
-  // receives them leaves them at zero, and uSkyCloudPan.w = 0 disables clouds.
+/**
+ * Cloud shadow at a world point.
+ *
+ * The receiver is projected up the sun ray onto the cloud deck and the deck is
+ * sampled there, so the patches skew correctly under a low sun, stay locked to
+ * the world as the camera moves, and keep working far beyond the last shadow
+ * cascade (which is where they matter most).
+ *
+ * Round 3 sampled a private value-noise field at a private frequency, so the
+ * shade on the ground was uncorrelated with the cloud you could see — a grading
+ * error with a wind speed. This is the volumetric pass's own weather map, read
+ * with the volumetric pass's own wrap scale, wind clock, streak squash and
+ * coverage remap, so a shadow belongs to a cloud.
+ *
+ * ROUND 4: this is now evaluated ONCE per screen pixel in the AO pass and read
+ * back out of that buffer's alpha, instead of four weather fetches in every lit
+ * material. It is the same function on the same field — but it costs the
+ * material one sampler fewer, and `terrain-L0` was sitting on exactly the 16
+ * the driver allows, so the AO map had nowhere to go until this moved.
+ */
+const CLOUD_SHADOW_FN = /* glsl */ `
   //   uSkyCloudPan  : xy = weather-map uv pan, z = coverage, w = strength
   //   uSkyCloudDeck : x = deck base altitude (m), y = weather uv scale (1/m),
   //                   z = terminator softening width (in N.L),
@@ -68,20 +99,6 @@ const CSM_SHADOW_FN = /* glsl */ `
   uniform vec4 uSkyCloudDeck;
   uniform sampler2D uSkyCloudWeather;
 
-  /**
-   * Cloud shadow at a world point.
-   *
-   * The receiver is projected up the sun ray onto the cloud deck and the deck
-   * is sampled there, so the patches skew correctly under a low sun, stay
-   * locked to the world as the camera moves, and keep working far beyond the
-   * last shadow cascade (which is where they matter most).
-   *
-   * Round 3 sampled a private value-noise field at a private frequency, so the
-   * shade on the ground was uncorrelated with the cloud you could see — a
-   * grading error with a wind speed. This is now the volumetric pass's own
-   * weather map, read with the volumetric pass's own wrap scale, wind clock,
-   * streak squash and coverage remap, so a shadow belongs to a cloud.
-   */
   float csmCloudShadow( vec3 wp, vec3 L ) {
     if ( uSkyCloudPan.w <= 0.001 ) return 1.0;
     float t = ( uSkyCloudDeck.x - wp.y ) / max( L.y, 0.12 );
@@ -95,10 +112,10 @@ const CSM_SHADOW_FN = /* glsl */ `
     // are under, not which cloud is over you, and a valley three kilometres
     // across sits inside a single weather cell. The volumetric pass breaks the
     // front into cumulus with a 3D shape volume at 2.6 km and 900 m; a
-    // sampler3D is not available to a MeshStandardMaterial in ESSL 1, so this
-    // takes finer octaves of the SAME weather field at the shape volume's own
-    // two periods. The patch scale on the ground is then the patch scale in the
-    // sky, moving on the same wind, thickening under the same front.
+    // sampler3D is not available here, so this takes finer octaves of the SAME
+    // weather field at the shape volume's own two periods. The patch scale on
+    // the ground is then the patch scale in the sky, moving on the same wind,
+    // thickening under the same front.
     float cell = texture2D( uSkyCloudWeather, w * 17.7 + 0.13 ).g * 0.62
                + texture2D( uSkyCloudWeather, w * 51.1 - 0.37 ).a * 0.38;
     float d = ( 0.45 + 0.55 * front ) * cell * uSkyCloudPan.z * 3.0;
@@ -107,6 +124,10 @@ const CSM_SHADOW_FN = /* glsl */ `
     float shade = smoothstep( uSkyCloudDeck.w, uSkyCloudDeck.w + 0.42, d );
     return 1.0 - uSkyCloudPan.w * shade;
   }
+`;
+
+const CSM_SHADOW_FN = /* glsl */ `
+#ifdef USE_SHADOWMAP
 
   /**
    * PCSS with a Vogel-disc filter. penumbraK is smuggled in through the
@@ -204,6 +225,87 @@ const CSM_SHADOW_FN = /* glsl */ `
 #endif
 `;
 
+/**
+ * Declarations for the two ambient terms that are not in the light probe:
+ * screen-space occlusion and the sun-gated ground bounce. Appended to
+ * `lights_pars_begin`, which every lit built-in shader includes.
+ *
+ * A shader that never received these uniforms leaves them at the GLSL default
+ * of zero, and `uAmbAO.x < 0.5` is the "off" path — the sampler is then never
+ * read, which is the only safe thing to do with an unbound sampler.
+ */
+const AMB_PARS = /* glsl */ `
+uniform sampler2D uAmbAOMap;
+uniform vec4 uAmbAO;
+uniform vec4 uAmbScreen;
+uniform vec3 uAmbBounce;
+// The cloud deck's numbers survive in the material because .z is the
+// terminator roll-in width, which the key light needs; the deck's own weather
+// sampler does not, because the cloud shade now arrives in uAmbAOMap.a.
+uniform vec4 uSkyCloudDeck;
+/** Occlusion (r) and cloud shade (a) at this fragment; 1,1 when unavailable. */
+vec2 ambScreenLookup() {
+	if ( uAmbAO.x < 0.5 ) return vec2( 1.0 );
+	vec4 t = texture2D( uAmbAOMap, gl_FragCoord.xy * uAmbScreen.xy );
+	return vec2( clamp( t.r, 0.0, 1.0 ), clamp( t.a, 0.0, 1.0 ) );
+}
+`;
+
+/**
+ * Appended to `lights_fragment_maps`, which is the one point in the standard
+ * pipeline where `irradiance` is complete and has not yet been handed to
+ * RE_IndirectDiffuse. Occlusion belongs HERE and nowhere else: the sun is a
+ * point source with a shadow map of its own and multiplying it by a hemisphere
+ * visibility term would be counting the same occluder twice.
+ */
+const AMB_APPLY = /* glsl */ `
+#if defined( RE_IndirectDiffuse )
+	{
+		// Sun visibility at this point — the shadow map's answer, deliberately
+		// NOT N.L. The ground under a wall's shaded face is in the wall's
+		// shadow whether or not that face is turned away from the sun.
+		float ambSun = 1.0;
+		#if ( NUM_DIR_LIGHTS > 0 ) && defined( RE_Direct ) && defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+			ambSun = clamp( csmSunVis, 0.0, 1.0 ) * csmCloud;
+		#endif
+
+		float ambVis = 1.0;
+		if ( uAmbAO.x > 0.5 ) {
+			ambVis = pow( ambScreenLookup().x, uAmbAO.w );
+			// Jimenez's multi-bounce fit, evaluated against this fragment's own
+			// albedo. Single-scatter visibility over-darkens a bright surface:
+			// light that leaves a crevice wall lands on the opposite wall and
+			// comes back out, and sand is bright enough for that to matter — a
+			// crevice in sand at ao 0.5 is only about a stop down, not two.
+			vec3 ambA = 2.0404 * diffuseColor.rgb - 0.3324;
+			vec3 ambB = -4.7951 * diffuseColor.rgb + 0.6417;
+			vec3 ambC = 2.7552 * diffuseColor.rgb + 0.6903;
+			vec3 ambMB = max( vec3( ambVis ), ( ( ambVis * ambA + ambB ) * ambVis + ambC ) * ambVis );
+			ambMB = clamp( mix( vec3( 1.0 ), ambMB, uAmbAO.y ), 0.0, 1.0 );
+			irradiance *= ambMB;
+			ambVis = dot( ambMB, vec3( 0.3333 ) );
+		}
+
+		// Ground bounce. A uniform lower hemisphere of radiance L lays
+		// L * pi * ((1 + cos t) / 2)^2 on a normal t off straight down, and that
+		// closed form is exact, cheap, and sharper in the vertical than the L2
+		// probe can be — which is the whole point, since it is the underside of
+		// things that has to pick up the warmth off the sand.
+		vec3 ambNW = geometryNormal * mat3( viewMatrix );
+		float ambDown = ( 1.0 - ambNW.y ) * 0.5;
+		irradiance += uAmbBounce * ( ambDown * ambDown ) * ambSun * ambVis;
+
+		#if defined( RE_IndirectSpecular ) && defined( USE_ENVMAP ) && defined( STANDARD )
+			// Horizon occlusion on the specular lobe. A rough surface's lobe is
+			// wide enough to be blocked by the same geometry the diffuse one is,
+			// but a mirror looking straight out of a pit still sees the sky, so
+			// this is scaled well under the diffuse term.
+			radiance *= mix( 1.0, ambVis, uAmbAO.z * material.roughness );
+		#endif
+	}
+#endif
+`;
+
 const CSM_DIR_BLOCK = /* glsl */ `
 		{
 			vec4 csmC4 = vDirectionalShadowCoord[ i ];
@@ -250,6 +352,10 @@ const CSM_DIR_BLOCK = /* glsl */ `
 			// the weights are 1, so applying it in every iteration scales the
 			// total exactly once.
 			directLight.color *= csmS * csmW * csmCloud * csmTerm;
+			// Carried out of the loop for the ambient's ground-bounce term: the
+			// cascade weights sum to 1, so this ends up as the plain shadow
+			// visibility, free of the terminator roll-in and of N.L.
+			csmSunVis += csmS * csmW;
 		}
 `;
 
@@ -267,15 +373,105 @@ export const SHARED_UNIFORMS = {
     z: LIGHT_TRANSPORT.terminatorWidth,
     w: LIGHT_TRANSPORT.cloudShadowBias,
   },
+  /**
+   * x = 1 once the AO buffer holds a frame (0 both before that and, crucially,
+   *     in any shader that never received these uniforms — a raw ShaderMaterial
+   *     including <lights_pars_begin> reads them as zero and takes the no-AO
+   *     path rather than sampling an unbound sampler);
+   * y = how far AO is allowed to close down the ambient;
+   * z = the same for the specular IBL lobe;
+   * w = exponent on the raw visibility.
+   */
+  uAmbAO: { x: 0, y: 1.0, z: 0.8, w: 1.25 },
+  /** xy = 1 / main render-target size, so gl_FragCoord maps to the AO buffer. */
+  uAmbScreen: { x: 1 / 1920, y: 1 / 1080, z: 0, w: 0 },
+  /**
+   * pi * (radiance of sunlit ground - radiance of the ground in its own shade).
+   * The lobe this drives is the difference between the two, so a fragment the
+   * shadow map says is lit gets the whole warm kick and one in shade gets none.
+   */
+  uAmbBounce: { x: 0, y: 0, z: 0 },
+};
+
+/**
+ * Screen-space ambient occlusion buffer, shared by every lit material.
+ *
+ * It has to be a `FramebufferTexture` and not the render target's own texture:
+ * `cloneUniforms` — which is how a MeshStandardMaterial gets its copy of the
+ * ShaderLib uniforms — refuses to clone a render-target texture and substitutes
+ * null. A FramebufferTexture clones like any other texture, and clones share
+ * one `Source` and therefore one GL object, so `copyFramebufferToTexture` into
+ * this one propagates to every material at once with no per-frame scene walk.
+ *
+ * Fixed size on purpose. The Source can never be replaced once materials hold
+ * clones of it, so it cannot track a resize; it is a fullscreen buffer sampled
+ * in normalised coordinates, so a viewport of any aspect still lands on it.
+ */
+const AO_W = 960;
+const AO_H = 540;
+const AO_TEXTURE = new THREE.FramebufferTexture(AO_W, AO_H);
+AO_TEXTURE.minFilter = THREE.LinearFilter;
+AO_TEXTURE.magFilter = THREE.LinearFilter;
+AO_TEXTURE.generateMipmaps = false;
+
+/**
+ * Ambient transport constants owned by this file.
+ *
+ * They are not in ArtDirection.js because that file is being edited by several
+ * authors at once and this is a round-4 experiment surface, not settled art
+ * direction. `LIGHT_TRANSPORT` wins if a value is ever promoted over there.
+ * Exposed on the instance as `lighting.ambientModel` so tools can sweep them.
+ */
+const AMBIENT = {
+  /**
+   * Fraction of the ground DIRECTLY UNDER a surface that is taking the key.
+   *
+   * This is the number that decides whether anything out of the sun has form.
+   * Round 3 had one lit fraction for the whole ground hemisphere — the
+   * landscape average, 0.82 at noon — so the probe said a downward-facing
+   * normal receives 1.74 and an upward-facing one 1.08, i.e. the ambient got
+   * BRIGHTER toward the ground and a shaded curved surface came out flat.
+   *
+   * A surface standing on the ground shadows its own footing. What the belly of
+   * a sandbag can see is the sand between and beneath the bags, and that sand
+   * is in the sandbag wall's shadow, lit by the sky at the fill level — not by
+   * the sun. The remainder is the light that leaks into that pocket off the
+   * sunlit sand a metre away, which is what this small number is.
+   */
+  litNear: 0.03,
+  /** The same fraction for a surface the shadow map says is standing in the sun. */
+  litSun: 0.86,
+  /**
+   * How far down you have to look before the ground you see stops being your
+   * own footing, as -normal.y.
+   *
+   * Round 3 put the crossover at 0.62, i.e. half the lower hemisphere was
+   * treated as distant landscape. Geometry says otherwise: a surface a metre
+   * off the ground looking down at 15 degrees of depression is looking at sand
+   * five metres away, still well inside its own contact shade. Only the last
+   * few degrees above the ground horizon are genuinely far.
+   */
+  nearBand: [0.010, 0.18],
+  /**
+   * How much of the isotropic interreflection pedestal survives on the DOWNWARD
+   * directions. The pedestal stands in for the sunlit environment a shaded
+   * point can see — neighbouring dunes, walls, vehicles — and all of that
+   * sticks UP out of the ground. Applying it in full below the horizon put a
+   * quarter of a downward normal's fill back and cost most of the contrast this
+   * function exists to create.
+   */
+  pedestalDown: 0.10,
+  /** GTAO world-space radius, metres. */
+  aoRadius: 1.2,
+  /** Thin-occluder heuristic: how much a receding sample re-opens the horizon. */
+  aoThickness: 0.12,
 };
 
 /**
  * The volumetric pass's weather map, rebuilt here. It is a pure function of a
  * seed, so this is the same field byte for byte — the cloud casting the shadow
- * is the cloud you can see. `cloneUniforms` deep-copies textures, so it has to
- * be bound into ShaderLib *before* the first material compiles; late-binding a
- * texture into a shared uniform object does not propagate. Textures cloned
- * from one Source share a single GPU upload, so the copies are free.
+ * is the cloud you can see. Since round 4 it is read by exactly one material,
+ * the AO pass's, so nothing depends on when it is created any more.
  */
 let _weatherTex;
 function weatherTexture() {
@@ -297,16 +493,25 @@ function installCSMChunks() {
   _chunksPatched = true;
 
   THREE.ShaderChunk.shadowmap_pars_fragment = THREE.ShaderChunk.shadowmap_pars_fragment + CSM_SHADOW_FN;
+  THREE.ShaderChunk.lights_pars_begin = THREE.ShaderChunk.lights_pars_begin + AMB_PARS;
 
-  // Every lit built-in shader gets the shared cloud uniforms. Materials that
+  // Every lit built-in shader gets the shared ambient uniforms. Materials that
   // predate this (or raw ShaderMaterials) simply leave them at their GLSL
-  // default of zero, which the shader reads as "clouds off".
+  // default of zero, and uAmbAO.x = 0 is the "no screen-space terms" path —
+  // which matters, because that is the only safe thing to do with a sampler
+  // nobody bound.
+  //
+  // Exactly ONE sampler is added here, and the cloud weather map that used to
+  // be a second one is gone: `terrain-L0` compiles with 16 active texture units
+  // against a driver limit of 16, so a net addition would have failed to link.
   for (const id of ['physical', 'standard', 'lambert', 'phong', 'toon']) {
     const lib = THREE.ShaderLib[id];
     if (!lib) continue;
-    lib.uniforms.uSkyCloudPan = { value: SHARED_UNIFORMS.uSkyCloudPan };
     lib.uniforms.uSkyCloudDeck = { value: SHARED_UNIFORMS.uSkyCloudDeck };
-    lib.uniforms.uSkyCloudWeather = { value: weatherTexture() };
+    lib.uniforms.uAmbAOMap = { value: AO_TEXTURE };
+    lib.uniforms.uAmbAO = { value: SHARED_UNIFORMS.uAmbAO };
+    lib.uniforms.uAmbScreen = { value: SHARED_UNIFORMS.uAmbScreen };
+    lib.uniforms.uAmbBounce = { value: SHARED_UNIFORMS.uAmbBounce };
   }
 
   // Diffuse irradiance now comes from the sky SH light probe. Leaving the
@@ -322,7 +527,6 @@ function installCSMChunks() {
   } else {
     console.warn('Lighting: lights_fragment_maps shape changed; diffuse IBL not suppressed.');
   }
-
   const src = THREE.ShaderChunk.lights_fragment_begin;
 
   // Declare the cascade accumulator + a per-pixel rotation for the Vogel disc.
@@ -337,14 +541,12 @@ function installCSMChunks() {
   const declNew = `	DirectionalLight directionalLight;
 	float csmRemain = 1.0;
 	float csmRot = fract( 52.9829189 * fract( dot( gl_FragCoord.xy, vec2( 0.06711056, 0.00583715 ) ) ) ) * 6.2831853;
-	float csmCloud = 1.0;
-	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
-	{
-		vec3 csmWorldPos = cameraPosition + geometryPosition * mat3( viewMatrix );
-		vec3 csmSunW = normalize( directionalLights[ 0 ].direction * mat3( viewMatrix ) );
-		csmCloud = csmCloudShadow( csmWorldPos, csmSunW );
-	}
-	#endif`;
+	// Cloud shade is evaluated once per screen pixel in the AO pass (Lighting's
+	// _renderAO) and read back here, rather than four weather-map fetches in
+	// every lit material. It is a kilometre-scale, deliberately soft signal, so
+	// a half-resolution screen-space carrier costs it nothing.
+	float csmCloud = ambScreenLookup().y;
+	float csmSunVis = 0.0;`;
 
   const oldShadowLine =
     'directLight.color *= ( directLight.visible && receiveShadow ) ? getShadow( directionalShadowMap[ i ], directionalLightShadow.shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadow.shadowBias, directionalLightShadow.shadowRadius, vDirectionalShadowCoord[ i ] ) : 1.0;';
@@ -356,6 +558,12 @@ function installCSMChunks() {
   THREE.ShaderChunk.lights_fragment_begin = src
     .replace(decl, declNew)
     .replace(oldShadowLine, CSM_DIR_BLOCK);
+
+  // Only now: occlusion and the ground bounce close out the indirect term, and
+  // the bounce reads `csmSunVis`, which the block above is what declares. If the
+  // CSM override ever bails, this must bail with it rather than emit a shader
+  // that will not compile.
+  THREE.ShaderChunk.lights_fragment_maps = THREE.ShaderChunk.lights_fragment_maps + AMB_APPLY;
 }
 
 installCSMChunks();
@@ -626,6 +834,10 @@ export class Lighting {
       eye: new THREE.Vector3(),
     };
 
+    /** Sweepable ambient-transport knobs; see the AMBIENT block up top. */
+    this.ambientModel = { ...AMBIENT, nearBand: AMBIENT.nearBand.slice() };
+    this._ao = null;
+
     this.setTimeOfDay('afternoon');
   }
 
@@ -808,20 +1020,38 @@ export class Lighting {
     // shade face that reads as dim sunlight and one that reads as sky.
     const litFrac = THREE.MathUtils.clamp(LT.terrainLitBase + LT.terrainLitSlope * cosKey, 0.18, 0.95);
     const alb = LT.groundAlbedo;
-    // Ground at your feet: warm, and the source of the underside kick.
-    const groundNear = [0, 0, 0];
-    // Ground toward the horizon: kilometres of dust between here and there, so
-    // it has washed most of the way to the sky's own colour. A vertical surface
-    // sees mostly THIS, which is why a wall in shade goes cool.
+    const AM = this.ambientModel;
+    /** Radiance of ground taking a given fraction of the key. */
+    const groundAt = (lit) => {
+      const out = [0, 0, 0];
+      for (let k = 0; k < 3; k++) {
+        out[k] = ((alb[k] * (eKey[k] * cloudMean * lit + eSky[k])) / Math.PI) * LT.bounceStrength;
+      }
+      return out;
+    };
+    // The ground a surface sees DIRECTLY BENEATH IT. A surface standing on the
+    // ground shadows its own footing, so this is sand at the fill level, not at
+    // the key level — dim, and only as warm as the light leaking in off the
+    // sunlit sand beside it. This is what an underside is filled by, and making
+    // it the whole landscape average is what flattened everything out of the sun.
+    const groundNear = groundAt(AM.litNear);
+    // The open landscape: a real mix of lit facets and self-shadowed ones.
+    const groundOpen = groundAt(litFrac);
+    // ...seen through kilometres of the same dust that turns a distant ridge
+    // pale blue-grey, so it has washed most of the way to the sky's own colour.
     const groundFar = [0, 0, 0];
     for (let k = 0; k < 3; k++) {
       const skyMean = eSky[k] / Math.PI;
-      groundNear[k] =
-        ((alb[k] * (eKey[k] * cloudMean * litFrac + eSky[k])) / Math.PI) * LT.bounceStrength;
-      groundFar[k] = groundNear[k] + (skyMean - groundNear[k]) * LT.groundHaze;
+      groundFar[k] = groundOpen[k] + (skyMean - groundOpen[k]) * LT.groundHaze;
     }
-    const groundL = groundNear;
-    const pedestal = groundNear.map((v) => v * LT.groundCoupling);
+    const groundL = groundOpen;
+    // The interreflection pedestal keeps the shade warm and its level was
+    // measured and signed off in round 3, so it stays on the sky directions
+    // exactly as it was. Below the horizon it is mostly wrong: the things that
+    // throw warm light at you — dunes, walls, vehicles — stick UP out of the
+    // ground, so very little of that pedestal is visible looking down.
+    const pedestal = groundOpen.map((v) => v * LT.groundCoupling);
+    const pedestalDown = pedestal.map((v) => v * AM.pedestalDown);
     const sinRidge = Math.sin(THREE.MathUtils.degToRad(LT.ridgeElevation));
 
     // --- pass 2: full-sphere radiance -> SH, and the up-facing irradiance ----
@@ -840,11 +1070,14 @@ export class Lighting {
         for (let k = 0; k < 3; k++) L[k] = groundFar[k] + (s[k] - groundFar[k]) * t + pedestal[k];
         for (let k = 0; k < 3; k++) eUp[k] += L[k] * d.y * dOmega;
       } else {
-        // Straight down is the sand under your boots; grazing-down is the plain
-        // two kilometres out. Only the former is fully warm.
-        const nearW = THREE.MathUtils.smoothstep(-d.y, 0.04, 0.62);
+        // Straight down is the sand under your boots, in your own shade;
+        // grazing-down is the plain two kilometres out. The crossover is much
+        // closer to the horizon than it looks: a surface a metre up, looking
+        // down at 15 degrees, is looking at sand five metres away — still its
+        // own contact shade, not the landscape.
+        const nearW = THREE.MathUtils.smoothstep(-d.y, AM.nearBand[0], AM.nearBand[1]);
         for (let k = 0; k < 3; k++) {
-          L[k] = groundFar[k] + (groundNear[k] - groundFar[k]) * nearW + pedestal[k];
+          L[k] = groundFar[k] + (groundNear[k] - groundFar[k]) * nearW + pedestalDown[k];
         }
       }
       THREE.SphericalHarmonics3.getBasisAt(d, SH_BASIS);
@@ -882,6 +1115,24 @@ export class Lighting {
 
     this.probe.intensity = 1.0;
 
+    // --- the sun-gated half of the ground bounce -----------------------------
+    // The probe's lower hemisphere is the ground a surface sees when that
+    // surface is in shade. A surface the shadow map says is standing in the sun
+    // is standing on sunlit sand instead, and the difference between the two is
+    // a large, warm, strongly downward-facing lobe. Handing it to the shader as
+    // a lobe rather than folding it into the probe is what keeps the two cases
+    // apart: the same barrel reads hot underneath in the open and dead
+    // underneath in a building's shade, which is the whole tell.
+    const groundSun = groundAt(AM.litSun);
+    const ub = SHARED_UNIFORMS.uAmbBounce;
+    const bounce = [0, 0, 0];
+    for (let k = 0; k < 3; k++) {
+      bounce[k] = Math.max(0, groundSun[k] - groundNear[k]) * Math.PI * scale;
+    }
+    ub.x = bounce[0];
+    ub.y = bounce[1];
+    ub.z = bounce[2];
+
     /**
      * Published so the post stack, the AO tint and the harness all read the same
      * ambient the geometry is lit by. `irradianceUp` is what a flat unoccluded
@@ -892,6 +1143,10 @@ export class Lighting {
       radiance: eUp.map((v) => v / Math.PI),
       keyIrradiance: eKey,
       groundRadiance: groundL,
+      /** Radiance of the ground an underside in shade sees, post-calibration. */
+      groundShadeRadiance: groundNear.map((v) => v * scale),
+      /** The extra irradiance a straight-down normal in full sun picks up. */
+      bounceIrradiance: bounce,
       ratio,
       scale,
       blueOverRed: eUp[2] / Math.max(eUp[0], 1e-6),
@@ -967,6 +1222,345 @@ export class Lighting {
       night: this.night,
     };
     if (pipeline && pipeline.setAtmosphere) pipeline.setAtmosphere(this.atmosphere);
+  }
+
+  // -------------------------------------------------------------------------
+  // Ambient occlusion
+  // -------------------------------------------------------------------------
+
+  /**
+   * Build the GTAO pass. Two half-res targets, a horizon-search material and a
+   * separable depth-aware blur, plus the one fullscreen triangle they share.
+   *
+   * It reads the depth attachment the post stack already renders, so it costs
+   * no extra scene draw — only two fullscreen passes on 0.5 MP. The depth it
+   * gets is last frame's, which is exact for a static camera and one frame
+   * stale for a moving one; a hemisphere visibility term is the last thing in
+   * the frame that a 16 ms lag shows up in.
+   */
+  _buildAO() {
+    const renderer = this.engine.renderer;
+    const rt = () =>
+      new THREE.WebGLRenderTarget(AO_W, AO_H, {
+        type: THREE.UnsignedByteType,
+        format: THREE.RGBAFormat,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        depthBuffer: false,
+        colorSpace: THREE.NoColorSpace,
+      });
+
+    const VERT = /* glsl */ `
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4( position.xy, 0.0, 1.0 ); }
+    `;
+    // Depth reconstruction and a 16-bit pack, shared by both passes. The pack
+    // is there because the blur has to reject neighbours across a silhouette,
+    // and 8 bits of view depth cannot tell a barrel from the sand behind it.
+    const COMMON = /* glsl */ `
+      uniform sampler2D tDepth;
+      uniform mat4 uProjInv;
+      uniform float uFar;
+      vec3 viewAt( vec2 uv, float d ) {
+        vec4 c = uProjInv * vec4( uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0 );
+        return c.xyz / c.w;
+      }
+      vec3 worldAt( vec2 uv, float d, mat4 invVP ) {
+        vec4 c = invVP * vec4( uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0 );
+        return c.xyz / c.w;
+      }
+      vec2 packZ( float z ) {
+        float v = clamp( z / uFar, 0.0, 1.0 );
+        vec2 e = vec2( v, fract( v * 255.0 ) );
+        return vec2( e.x - e.y / 255.0, e.y );
+      }
+      float unpackZ( vec2 e ) { return ( e.x + e.y / 255.0 ) * uFar; }
+    `;
+
+    const aoMat = new THREE.ShaderMaterial({
+      vertexShader: VERT,
+      depthTest: false,
+      depthWrite: false,
+      uniforms: {
+        tDepth: { value: null },
+        uProjInv: { value: new THREE.Matrix4() },
+        uFar: { value: 2048 },
+        uDepthTexel: { value: new THREE.Vector2(1 / 1920, 1 / 1080) },
+        uProjScaleY: { value: 1 },
+        uRadius: { value: AMBIENT.aoRadius },
+        uThickness: { value: AMBIENT.aoThickness },
+        uFrame: { value: 0 },
+        uInvViewProj: { value: new THREE.Matrix4() },
+        uSunW: { value: new THREE.Vector3(0, 1, 0) },
+        uSkyCloudPan: { value: SHARED_UNIFORMS.uSkyCloudPan },
+        uSkyCloudDeck: { value: SHARED_UNIFORMS.uSkyCloudDeck },
+        uSkyCloudWeather: { value: weatherTexture() },
+      },
+      fragmentShader: /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      ${COMMON}
+      ${CLOUD_SHADOW_FN}
+      uniform vec2 uDepthTexel;
+      uniform float uProjScaleY;
+      uniform float uRadius;
+      uniform float uThickness;
+      uniform float uFrame;
+      uniform mat4 uInvViewProj;
+      uniform vec3 uSunW;
+
+      const float PI_ = 3.14159265359;
+      const float HALF_PI = 1.57079632679;
+      const float SKY_D = 0.9999995;
+
+      float ign( vec2 p ) {
+        return fract( 52.9829189 * fract( dot( p, vec2( 0.06711056, 0.00583715 ) ) ) );
+      }
+
+      void main() {
+        float d = texture2D( tDepth, vUv ).x;
+        // The sky writes 1,0,0,1: full visibility, zero depth (which the blur
+        // reads as "no sample here"), and a cloud term of 1 that nothing sees.
+        if ( d >= SKY_D ) { gl_FragColor = vec4( 1.0, 0.0, 0.0, 1.0 ); return; }
+        vec3 P = viewAt( vUv, d );
+        float cloud = csmCloudShadow( worldAt( vUv, d, uInvViewProj ), uSunW );
+
+        // Geometric normal from the DEPTH buffer, not from the shading normal:
+        // occlusion is a property of the geometry, and a normal map that tilts
+        // a flat wall must not tilt the hemisphere the wall is occluded over.
+        // Pick the closer neighbour of each pair so a silhouette does not smear
+        // a false normal across the depth step.
+        vec2 tx = vec2( uDepthTexel.x, 0.0 );
+        vec2 ty = vec2( 0.0, uDepthTexel.y );
+        vec3 pr = viewAt( vUv + tx, texture2D( tDepth, vUv + tx ).x );
+        vec3 pl = viewAt( vUv - tx, texture2D( tDepth, vUv - tx ).x );
+        vec3 pu = viewAt( vUv + ty, texture2D( tDepth, vUv + ty ).x );
+        vec3 pd = viewAt( vUv - ty, texture2D( tDepth, vUv - ty ).x );
+        vec3 ddx = abs( pr.z - P.z ) < abs( P.z - pl.z ) ? ( pr - P ) : ( P - pl );
+        vec3 ddy = abs( pu.z - P.z ) < abs( P.z - pd.z ) ? ( pu - P ) : ( P - pd );
+        vec3 N = normalize( cross( ddx, ddy ) );
+        vec3 V = normalize( -P );
+        if ( dot( N, V ) < 0.0 ) N = -N;
+
+        // World radius -> pixels. Clamped at the bottom so a distant surface
+        // still searches a couple of texels (otherwise the whole far field
+        // reports "unoccluded" and the horizon line pops), and at the top so a
+        // surface at arm's length does not turn the search into a measurement
+        // of how open the room is.
+        float pixR = uRadius * uProjScaleY * 0.5 * ${AO_H}.0 / max( -P.z, 0.05 );
+        pixR = clamp( pixR, 2.0, 48.0 );
+        vec2 aoTexel = vec2( 1.0 / ${AO_W}.0, 1.0 / ${AO_H}.0 );
+
+        float rot = ign( gl_FragCoord.xy + uFrame * 7.13 );
+        float noff = fract( ign( gl_FragCoord.yx * 1.61 ) + uFrame * 0.618 );
+
+        float vis = 0.0;
+        for ( int s = 0; s < 4; s ++ ) {
+          float phi = ( float( s ) + rot ) * PI_ * 0.25;
+          vec2 omega = vec2( cos( phi ), sin( phi ) );
+          // The slice plane: it contains the view vector and the search
+          // direction, and the visibility integral inside it is 1-D.
+          vec3 sliceN = cross( vec3( omega, 0.0 ), V );
+          float sl = length( sliceN );
+          if ( sl < 1e-5 ) continue;
+          sliceN /= sl;
+          vec3 projN = N - sliceN * dot( N, sliceN );
+          float pn = length( projN );
+          if ( pn < 1e-4 ) continue;
+          vec3 tangent = cross( V, sliceN );
+          float n = sign( dot( projN, tangent ) ) * acos( clamp( dot( projN, V ) / pn, -1.0, 1.0 ) );
+
+          float hA = -1.0;
+          float hB = -1.0;
+          for ( int k = 0; k < 5; k ++ ) {
+            float t = ( float( k ) + noff ) / 5.0;
+            // Quadratic step spacing: contact darkening lives in the first
+            // few texels and a linear walk spends four of its five taps
+            // measuring the room instead of the crease.
+            vec2 off = omega * max( t * t * pixR, 1.0 ) * aoTexel;
+            for ( int side = 0; side < 2; side ++ ) {
+              vec2 suv = side == 0 ? vUv + off : vUv - off;
+              float sd = texture2D( tDepth, suv ).x;
+              if ( sd >= SKY_D ) continue;
+              vec3 D = viewAt( suv, sd ) - P;
+              float l2 = dot( D, D );
+              if ( l2 < 1e-8 ) continue;
+              float l = sqrt( l2 );
+              float cosH = dot( D, V ) / l;
+              // Range falloff plus a thickness heuristic, so a fence wire does
+              // not shadow the whole hillside behind it.
+              float w = clamp( 1.0 - ( l - uRadius * 0.6 ) / ( uRadius * 0.4 ), 0.0, 1.0 );
+              if ( side == 0 ) hB = cosH > hB ? mix( hB, cosH, w ) : mix( hB, cosH, uThickness );
+              else hA = cosH > hA ? mix( hA, cosH, w ) : mix( hA, cosH, uThickness );
+            }
+          }
+
+          // Jimenez et al's closed-form cosine-weighted visibility between the
+          // two horizons. Taking max(sin(horizon)) instead — the HBAO
+          // approximation — under-reads creases, because the integral is
+          // dominated by the ARC between the horizons and not by the deepest one.
+          float h1 = n + max( -acos( clamp( hA, -1.0, 1.0 ) ) - n, -HALF_PI );
+          float h2 = n + min(  acos( clamp( hB, -1.0, 1.0 ) ) - n,  HALF_PI );
+          float sn = sin( n );
+          vis += pn * 0.25 * (
+            ( h1 * 2.0 * sn - cos( 2.0 * h1 - n ) ) +
+            ( h2 * 2.0 * sn - cos( 2.0 * h2 - n ) ) + 2.0 * cos( n ) );
+        }
+
+        gl_FragColor = vec4( clamp( vis * 0.25, 0.0, 1.0 ), packZ( -P.z ), cloud );
+      }
+      `,
+    });
+
+    const blurMat = new THREE.ShaderMaterial({
+      vertexShader: VERT,
+      depthTest: false,
+      depthWrite: false,
+      uniforms: {
+        tDepth: { value: null },
+        uProjInv: { value: new THREE.Matrix4() },
+        uFar: { value: 2048 },
+        tAO: { value: null },
+        uDir: { value: new THREE.Vector2() },
+      },
+      fragmentShader: /* glsl */ `
+      precision highp float;
+      varying vec2 vUv;
+      ${COMMON}
+      uniform sampler2D tAO;
+      uniform vec2 uDir;
+      void main() {
+        vec4 c = texture2D( tAO, vUv );
+        float z = unpackZ( c.gb );
+        // Sky. Its cloud term is meaningless but its AO must stay at 1, or the
+        // blur would drag a dark halo down every silhouette against the sky.
+        if ( z <= 0.0 ) { gl_FragColor = c; return; }
+        // Local depth slope, so the plane the surface is on is not itself read
+        // as a discontinuity. Without this every ground plane seen at a grazing
+        // angle — which is most of a first-person desert — rejects its own
+        // neighbours and the blur does nothing where it is needed most.
+        float zp = unpackZ( texture2D( tAO, vUv + uDir ).gb );
+        float zm = unpackZ( texture2D( tAO, vUv - uDir ).gb );
+        float slope = ( zp > 0.0 && zm > 0.0 ) ? ( zp - zm ) * 0.5 : 0.0;
+        float sum = c.r;
+        float wsum = 1.0;
+        for ( int i = 1; i <= 5; i ++ ) {
+          float fi = float( i );
+          float gw = exp( -fi * fi * 0.11 );
+          for ( int s = 0; s < 2; s ++ ) {
+            float sg = s == 0 ? 1.0 : -1.0;
+            vec4 t = texture2D( tAO, vUv + uDir * fi * sg );
+            float tz = unpackZ( t.gb );
+            if ( tz <= 0.0 ) continue;
+            float dw = exp( -abs( tz - ( z + slope * fi * sg ) ) / ( z * 0.02 + 0.05 ) );
+            float w = gw * dw;
+            sum += t.r * w;
+            wsum += w;
+          }
+        }
+        gl_FragColor = vec4( sum / wsum, c.gb, c.a );
+      }
+      `,
+    });
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3),
+    );
+    geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([0, 0, 2, 0, 0, 2]), 2));
+    const quad = new THREE.Mesh(geo, aoMat);
+    quad.frustumCulled = false;
+    const scene = new THREE.Scene();
+    scene.add(quad);
+
+    this._ao = {
+      a: rt(),
+      b: rt(),
+      aoMat,
+      blurMat,
+      quad,
+      scene,
+      cam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+      renderer,
+      ready: false,
+    };
+  }
+
+  /**
+   * Run the GTAO pass and publish the result to every lit material.
+   *
+   * `copyFramebufferToTexture` into the shared FramebufferTexture is what makes
+   * this one write instead of a scene walk: every material's cloned uniform
+   * points at the same GL object (see AO_TEXTURE).
+   */
+  _renderAO(engine) {
+    const pipeline = engine.pipeline;
+    const depth = pipeline && pipeline.hdr && pipeline.hdr.depthTexture;
+    // Nothing to read until a frame has actually been drawn — systems run
+    // before the render, so the depth attachment is empty on the first update.
+    // Leaving uAmbAO.x at 0 keeps every material on the unoccluded path rather
+    // than multiplying the ambient by garbage. Counted here rather than off the
+    // pipeline's own frame number so a rename over there degrades to nothing.
+    if (!depth || (this._frame ?? 0) < 2) return;
+    if (!this._ao) this._buildAO();
+    const ao = this._ao;
+    const renderer = engine.renderer;
+    const cam = engine.camera;
+
+    const size = renderer.getDrawingBufferSize(this._tmp.v2 || (this._tmp.v2 = new THREE.Vector2()));
+    const us = SHARED_UNIFORMS.uAmbScreen;
+    us.x = 1 / Math.max(size.x, 1);
+    us.y = 1 / Math.max(size.y, 1);
+
+    const au = ao.aoMat.uniforms;
+    au.tDepth.value = depth;
+    au.uProjInv.value.copy(cam.projectionMatrixInverse);
+    au.uDepthTexel.value.set(us.x, us.y);
+    au.uProjScaleY.value = cam.projectionMatrix.elements[5];
+    au.uFar.value = cam.far;
+    au.uRadius.value = this.ambientModel.aoRadius;
+    au.uThickness.value = this.ambientModel.aoThickness;
+    au.uFrame.value = (this._frame ?? 0) % 64;
+    // Cloud shade rides in the alpha channel; it needs world positions and the
+    // world sun, both of which this pass already has to hand.
+    cam.updateMatrixWorld();
+    au.uInvViewProj.value
+      .multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse)
+      .invert();
+    au.uSunW.value.copy(this.keyDirection);
+
+    const bu = ao.blurMat.uniforms;
+    bu.tDepth.value = depth;
+    bu.uProjInv.value.copy(cam.projectionMatrixInverse);
+    bu.uFar.value = cam.far;
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+
+    ao.quad.material = ao.aoMat;
+    renderer.setRenderTarget(ao.a);
+    renderer.render(ao.scene, ao.cam);
+
+    ao.quad.material = ao.blurMat;
+    bu.tAO.value = ao.a.texture;
+    bu.uDir.value.set(1 / AO_W, 0);
+    renderer.setRenderTarget(ao.b);
+    renderer.render(ao.scene, ao.cam);
+
+    bu.tAO.value = ao.b.texture;
+    bu.uDir.value.set(0, 1 / AO_H);
+    renderer.setRenderTarget(ao.a);
+    renderer.render(ao.scene, ao.cam);
+
+    // ao.a is still the bound framebuffer, which is what this reads from.
+    renderer.copyFramebufferToTexture(AO_TEXTURE);
+
+    renderer.setRenderTarget(prevTarget);
+    renderer.autoClear = prevAutoClear;
+    SHARED_UNIFORMS.uAmbAO.x = 1;
+    ao.ready = true;
   }
 
   _rebuildEnv() {
@@ -1143,6 +1737,12 @@ export class Lighting {
 
     this._fitCascades(engine.camera);
 
+    // Systems run before the frame is drawn, so the depth attachment this reads
+    // is the one the post stack left behind last frame — and the camera has not
+    // moved yet this frame either (the fly camera is order 1000), so the two
+    // agree exactly rather than approximately.
+    this._renderAO(engine);
+
     this._updateCloudShadow(engine.elapsed);
 
     if (this.engine.pipeline && this.atmosphere) {
@@ -1176,6 +1776,6 @@ export class Lighting {
     u.z = atm?.cloudCoverage ?? LT.cloudCoverage;
     // No sun below the horizon means no cloud shadows to cast; the moon's are
     // far too weak to read and would only mottle the night grade.
-    u.w = this.night > 0.5 || !_weatherTex ? 0.0 : LT.cloudShadowStrength * (1 - this.night);
+    u.w = this.night > 0.5 || !weatherTexture() ? 0.0 : LT.cloudShadowStrength * (1 - this.night);
   }
 }

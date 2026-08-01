@@ -35,7 +35,7 @@ export function mulberry32(seed) {
   };
 }
 
-const ZERO_SURFACE = { flow: 0, rock: 0, scree: 0, ao: 1 };
+const ZERO_SURFACE = { flow: 0, rock: 0, scree: 0, ao: 1, accum: 0, deposit: 0 };
 
 const FALLBACK_N = 1024;
 const FALLBACK_CELL = 2.5;
@@ -54,11 +54,23 @@ const PAD_CELL = 1.75;
  * equivalent by sampling its public queries. Terrain is another author's file
  * and has already been restructured once mid-project; grass silently vanishing
  * because a field was renamed is not an acceptable failure mode.
+ *
+ * Round 4 adds `accum`, the raw D8 upstream contributing area Terrain started
+ * publishing this round. `flow` is the *mask* the terrain shader paints wadis
+ * with, and it is thresholded: measured over the 640x800 m of valley floor the
+ * vista frames, `flow` is identically zero on every sample, so every previous
+ * round's "grass follows water" term did nothing at all on the one piece of
+ * ground the critics were looking at. `accum` is the network before the
+ * threshold, so it still has structure on a pan.
  */
 function resolveGrid(terrain) {
   const g = terrain.near;
   if (g && g.h && g.flow && g.rock && g.scree && Number.isFinite(g.n)) {
-    return { n: g.n, cell: g.cell, origin: g.origin, h: g.h, flow: g.flow, rock: g.rock, scree: g.scree, ao: g.ao };
+    return {
+      n: g.n, cell: g.cell, origin: g.origin, h: g.h,
+      flow: g.flow, rock: g.rock, scree: g.scree, ao: g.ao,
+      accum: g.accum ?? null, deposit: g.deposit ?? null,
+    };
   }
   const n = FALLBACK_N;
   const cell = FALLBACK_CELL;
@@ -69,6 +81,8 @@ function resolveGrid(terrain) {
     flow: new Float32Array(n * n),
     rock: new Float32Array(n * n),
     scree: new Float32Array(n * n),
+    accum: new Float32Array(n * n),
+    deposit: new Float32Array(n * n),
     ao: null,
   };
   const hasSurface = typeof terrain.surfaceAt === 'function';
@@ -83,10 +97,24 @@ function resolveGrid(terrain) {
         out.flow[c] = s.flow ?? 0;
         out.rock[c] = s.rock ?? 0;
         out.scree[c] = s.scree ?? 0;
+        out.accum[c] = s.accum ?? s.flow ?? 0;
+        out.deposit[c] = s.deposit ?? 0;
       }
     }
   }
   return out;
+}
+
+/**
+ * The wetness a plant actually responds to, from Terrain's two drainage
+ * channels. `flow` is a hard-thresholded trunk-wash mask (zero over the whole
+ * valley floor); `accum` is the dendritic network it was cut from and still
+ * separates a divide from a rill on flat ground. Taking the max means the
+ * painted wadis stay the wettest thing on the map while the pan gets the
+ * structure it was previously missing.
+ */
+export function wetnessOf(flow, accum) {
+  return Math.max(flow, smooth01(accum, 0.18, 0.62));
 }
 
 export class VegField {
@@ -108,14 +136,16 @@ export class VegField {
     this.heightTex.generateMipmaps = false;
     this.heightTex.needsUpdate = true;
 
-    // R drainage, G bedrock, B scree, A sky occlusion. Byte precision is plenty
-    // for a placement mask and keeps this to a quarter of the height texture.
+    // R drainage mask, G bedrock, B scree, A flow ACCUMULATION. Byte precision
+    // is plenty for a placement mask and keeps this to a quarter of the height
+    // texture. Alpha used to carry sky occlusion, which nothing sampled; the
+    // drainage network is the signal the scatter has been missing.
     const surf = new Uint8Array(n * n * 4);
     for (let i = 0; i < n * n; i++) {
       surf[i * 4] = Math.round(Math.min(1, Math.max(0, g.flow[i])) * 255);
       surf[i * 4 + 1] = Math.round(Math.min(1, Math.max(0, g.rock[i])) * 255);
       surf[i * 4 + 2] = Math.round(Math.min(1, Math.max(0, g.scree[i])) * 255);
-      surf[i * 4 + 3] = g.ao ? Math.round(Math.min(1, Math.max(0, g.ao[i])) * 255) : 255;
+      surf[i * 4 + 3] = g.accum ? Math.round(Math.min(1, Math.max(0, g.accum[i])) * 255) : 0;
     }
     this.surfTex = new THREE.DataTexture(surf, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
     this.surfTex.minFilter = THREE.LinearFilter;
@@ -420,9 +450,21 @@ export class VegField {
    * water, thins on the graded platform, and collects in the lee of anything
    * that breaks the wind.
    *
-   * Round 3 added the slope cut-off at 30 degrees, the curvature term and the
-   * 40 m stand field, and tripled the drainage weight. See the comment on
-   * vegDensity in shaderLib.js for why each of those exists.
+   * Round 4 rebuilt two things the critics read straight off the frame as "a
+   * uniform field of near-identical specks at uniform density":
+   *
+   *  - the WOODY mask had a hard floor. `(0.14 + base * 0.86)` never went below
+   *    0.14 * standGate, so on wild ground it evaluated to ~0.08 everywhere, and
+   *    every accept() test in Scrub.js turned that into a 9% chance of a bush on
+   *    literally any square metre of the map. Measured over the valley floor:
+   *    only 37% of it was at zero woody density and the mean was 0.158, i.e. the
+   *    field was a uniform pepper with a mild modulation on top. The floor is
+   *    gone; the two masks now share one fertility term and differ only in their
+   *    slope and rock tolerances and in which 40 m stand field gates them.
+   *  - the drainage term was multiplying `flow`, which is Terrain's thresholded
+   *    wadi-painting MASK and measures identically zero over the whole valley
+   *    floor. It now runs off `accum`, the D8 accumulation the channels were cut
+   *    from, so "grass follows water" finally does something on the pan.
    */
   density(wx, wz) {
     const s = this.terrain.surfaceAt ? this.terrain.surfaceAt(wx, wz) : ZERO_SURFACE;
@@ -434,21 +476,32 @@ export class VegField {
     const meso = fbm2(wx * 0.052 - 12, wz * 0.052 - 12, 2);
     const clump = fbm2(wx * 0.42 + 7, wz * 0.42 + 7, 2);
     const stand = fbm2(wx * 0.025 + 17, wz * 0.025 + 17, 2);
-    const raw = 0.24 + s.flow * 1.85 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
+    // A second 40 m field on its own lattice: grass stands and scrub stands are
+    // both patchy at ~40 m and they are not patchy in the SAME places, which is
+    // what stops the two layers reading as one stencil used twice.
+    const standW = fbm2(wx * 0.023 - 63, wz * 0.023 - 63, 2);
+    const wet = wetnessOf(s.flow ?? 0, s.accum ?? 0);
+    const raw = 0.10 + wet * 2.55 + (macro - 0.5) * 1.5 + (meso - 0.5) * 1.7;
     const rocky = Math.max(s.rock, s.scree * 0.6);
     const collect = Math.min(1.85, Math.max(0.16, 0.72 + curv * 5.5));
-    // `stand` and `collect` are shared with the woody mask; only the slope and
-    // rock tolerances differ, because a thorn bush roots in a crack in bedrock
-    // and holds a talus slope no tussock could sit on. Rejecting scrub with the
-    // grass mask is what left every hillside in the vista bare.
-    let base = smooth01(raw, 0.0, 0.62) * smooth01(stand, 0.455, 0.630) * collect;
-    base *= 1 - smooth01(rocky, 0.18, 0.68);
-    let d = base * smooth01(clump, 0.24, 0.58);
+    const fert = smooth01(raw, 0.0, 0.62);
+    // `collect` is shared; only the slope and rock tolerances differ, because a
+    // thorn bush roots in a crack in bedrock and holds a talus slope no tussock
+    // could sit on. Rejecting scrub with the grass mask is what left every
+    // hillside in the vista bare.
+    let d = fert * collect * (1 - smooth01(rocky, 0.18, 0.68));
+    // A wadi carries grass whatever the 40 m stand field says about the range
+    // condition around it — the water beats the grazing. Sliding the stand
+    // threshold down with wetness is what turns a 2.5x drainage contrast into
+    // the 3-4x the drainage lines are supposed to have.
+    const standCut = 0.448 - wet * 0.200;
+    d *= smooth01(stand, standCut, standCut + 0.185) * smooth01(clump, 0.24, 0.58);
     d *= 1 - smooth01(slope, 0.075, 0.140);
     d = applyDevelopment(wx, wz, d, p.dev, p.shelter, slope);
-    let w = (0.14 + base * 0.86) * smooth01(stand, 0.400, 0.600) * Math.min(1.5, collect);
+    let w = fert * Math.min(1.5, collect) * (1 - smooth01(rocky, 0.52, 0.98)) * 1.95;
+    const standCutW = 0.452 - wet * 0.185;
+    w *= smooth01(standW, standCutW, standCutW + 0.235);
     w *= 1 - smooth01(slope, 0.14, 0.34);
-    w *= 1 - smooth01(rocky, 0.52, 0.98);
     w = applyDevelopment(wx, wz, w, p.dev, p.shelter, slope);
     return {
       density: Math.min(1, Math.max(0, d)),
@@ -456,8 +509,11 @@ export class VegField {
       slope,
       curv,
       stand,
+      standW,
+      wet,
       height: this.surfaceY(wx, wz),
       flow: s.flow,
+      accum: s.accum ?? 0,
       rock: s.rock,
       scree: s.scree,
       dev: p.dev,
@@ -502,7 +558,7 @@ function applyDevelopment(x, z, d, dev, shelter, slope) {
   return out;
 }
 
-function smooth01(x, a, b) {
+export function smooth01(x, a, b) {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
   return t * t * (3 - 2 * t);
 }

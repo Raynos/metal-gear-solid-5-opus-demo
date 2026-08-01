@@ -356,7 +356,18 @@ export function displacedSphere(fn, segU = 28, segV = 20, zone = 0, uvScale = 0.
   for (let j = 0; j < segV; j++) {
     for (let i = 0; i < segU; i++) {
       const a = j * ring + i;
-      s.quad(a, a + ring, a + ring + 1, a + 1);
+      // ROUND 5 — this winding was reversed, and it had been since round 1.
+      // Measured: build a unit sphere with this function, weld its normals with
+      // `computeNormals`, and the mean of dot(normal, radial) is -1.000; the
+      // same test on `loft` gives +0.990. Every displacedSphere in the character
+      // — the SKULL, the eyeballs, the hair shell, the eyepatch — was therefore
+      // wound clockwise-from-outside, i.e. rendered as back faces with inverted
+      // normals. What the camera actually saw was the INSIDE of the far half of
+      // the head: that is why the face read as a dished bowl with two spheres
+      // floating in it, why the nose appeared as a dent, and why three rounds of
+      // critics called the head "an asymmetric blob". The skull sculpt was never
+      // the problem; it was being drawn inside out.
+      s.quad(a, a + 1, a + ring + 1, a + ring);
     }
   }
   return s;

@@ -30,6 +30,16 @@ export function buildTorso(o = {}) {
   const lats = (th) =>
     grooves(th) * (1 + 0.05 * (gauss(th, 0.4) + gauss(th - Math.PI, 0.4) + gauss(th - Math.PI * 2, 0.4)));
 
+  // Trapezius: the muscle that fills the corner between the neck and the point
+  // of the shoulder. Round 4's torso went from rx 0.204 at y 1.435 to 0.098 at
+  // 1.512 — a 10 cm collapse over 7.7 cm of height, i.e. a 52-degree cliff, and
+  // that cliff read from the gameplay camera as the "90-degree box corner"
+  // under the head. A real trapezius is a CONVEX ramp: widest at the base of
+  // the neck, sloping out and down to the acromion. `traps` biases the section
+  // toward the character's sides at the top of the loft so the ramp is a
+  // shoulder rather than a cone.
+  const traps = (th) => 1 + 0.13 * (gauss(th, 0.55) + gauss(th - Math.PI, 0.55) + gauss(th - Math.PI * 2, 0.55));
+
   const keys = [
     { p: V(0, 0.888, -0.004), rx: 0.152 * bulk, rz: 0.11 * bulk, n: 2.7, zone: Z.JACKET, mod: grooves },
     { p: V(0, 0.935, -0.006), rx: 0.151 * bulk, rz: 0.109 * bulk, n: 2.6, zone: Z.JACKET, mod: grooves },
@@ -37,12 +47,18 @@ export function buildTorso(o = {}) {
     { p: V(0, 1.095, -0.012), rx: 0.152 * bulk, rz: 0.109 * bulk, n: 2.6, zone: Z.JACKET, mod: lats },
     { p: V(0, 1.19, -0.014), rx: 0.172 * bulk, rz: 0.117 * bulk, n: 2.8, zone: Z.JACKET, mod: lats },
     { p: V(0, 1.285, -0.014), rx: 0.19 * bulk, rz: 0.124 * bulk, n: 3.0, zone: Z.JACKET, mod: lats },
-    { p: V(0, 1.365, -0.012), rx: 0.206 * bulk, rz: 0.12 * bulk, n: 3.2, zone: Z.JACKET, mod: grooves },
-    { p: V(0, 1.435, -0.008), rx: 0.204 * bulk, rz: 0.108 * bulk, n: 3.1, zone: Z.JACKET, mod: grooves },
-    { p: V(0, 1.482, -0.004), rx: 0.155, rz: 0.093, n: 2.7, zone: Z.JACKET },
-    { p: V(0, 1.512, 0.0), rx: 0.098, rz: 0.08, n: 2.4, zone: Z.COLLAR },
+    { p: V(0, 1.352, -0.012), rx: 0.204 * bulk, rz: 0.121 * bulk, n: 3.2, zone: Z.JACKET, mod: lats },
+    // Point of the shoulder. Above this the section keeps its WIDTH and loses
+    // its depth, which is what turns the top of the torso into a yoke.
+    { p: V(0, 1.402, -0.010), rx: 0.201 * bulk, rz: 0.113 * bulk, n: 3.0, zone: Z.JACKET, mod: traps },
+    { p: V(0, 1.441, -0.007), rx: 0.176 * bulk, rz: 0.102 * bulk, n: 2.8, zone: Z.JACKET, mod: traps },
+    { p: V(0, 1.468, -0.005), rx: 0.140 * bulk, rz: 0.094, n: 2.7, zone: Z.JACKET, mod: traps },
+    // The jacket's neck opening. It has to close ABOVE the collar's fold and
+    // BELOW the point where the neck itself becomes visible, or there is no
+    // neck in the silhouette at all.
+    { p: V(0, 1.487, -0.003), rx: 0.104, rz: 0.084, n: 2.5, zone: Z.COLLAR },
   ];
-  return loftKeys(keys, 26, { radial: 26, capStart: true, capEnd: true });
+  return loftKeys(keys, 28, { radial: 26, capStart: true, capEnd: true });
 }
 
 /** Hips and seat — the jacket hem overlaps this, so only the lower half shows. */
@@ -72,27 +88,82 @@ export function buildHips(o = {}) {
  */
 export function buildCollar(o = {}) {
   const bulk = o.bulk ?? 1;
-  return loftKeys(
-    [
-      { p: V(0, 1.452, -0.006), rx: 0.128 * bulk, rz: 0.098 * bulk, n: 2.9, back: 1.04, zone: Z.COLLAR },
-      { p: V(0, 1.478, -0.004), rx: 0.106, rz: 0.088, n: 2.7, back: 1.06, zone: Z.COLLAR },
-      { p: V(0, 1.508, -0.002), rx: 0.086, rz: 0.079, n: 2.5, back: 1.1, zone: Z.COLLAR },
-      // The stand flares back out at the top the way a turned-up collar does.
-      { p: V(0, 1.542, 0.002), rx: 0.081, rz: 0.077, n: 2.5, back: 1.14, zone: Z.COLLAR },
-    ],
-    10,
-    { radial: 20, capStart: true },
-  );
+  const parts = [];
+  // Round 5. The round-4 collar was a 9 cm stand that closed at y = 1.542 with
+  // rx 0.081 — wider than the neck at every height it covered, so it swallowed
+  // the whole neck and the head sat straight on it. Measured on the shipped
+  // frame there were 6 px of skin between the jaw and the collar. A BDU collar
+  // is a 30 mm band that is FOLDED DOWN over the shoulders: the stand itself is
+  // short, and what you see is the fold lying flat with a cut edge, a notch at
+  // the front and a shadow underneath. That is three value steps in the same
+  // place the old one gave zero, and it leaves 10 cm of neck above it.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.452, -0.006), rx: 0.114 * bulk, rz: 0.094 * bulk, n: 2.8, back: 1.04, zone: Z.COLLAR },
+        { p: V(0, 1.478, -0.005), rx: 0.096, rz: 0.084, n: 2.6, back: 1.06, zone: Z.COLLAR },
+        { p: V(0, 1.501, -0.004), rx: 0.083, rz: 0.077, n: 2.5, back: 1.09, zone: Z.COLLAR },
+      ],
+      8,
+      { radial: 22, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // The fold: a second skin turning back DOWN and OUT from the top of the
+  // stand, so its cut edge is a horizontal line across the base of the neck and
+  // its underside is in contact shadow. `back` grows through the fold because a
+  // BDU collar is deepest at the nape and notches away at the throat.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.500, -0.004), rx: 0.085, rz: 0.079, n: 2.5, back: 1.10, zone: Z.COLLAR },
+        { p: V(0, 1.492, -0.004), rx: 0.107, rz: 0.090, n: 2.7, back: 1.16, zone: Z.COLLAR },
+        { p: V(0, 1.474, -0.005), rx: 0.128, rz: 0.100, n: 2.9, back: 1.22, zone: Z.COLLAR },
+        { p: V(0, 1.456, -0.006), rx: 0.136, rz: 0.104, n: 3.0, back: 1.24, zone: Z.COLLAR },
+      ],
+      10,
+      { radial: 22, capStart: false, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  return parts;
 }
 
+/**
+ * The neck.
+ *
+ * Round 4's was a 4-key cylinder from y 1.40 to 1.585 that never left the
+ * collar. This is an anatomical neck and it is the single biggest silhouette
+ * fix in this round: it flares hard into the trapezius at the base (so the neck
+ * and the shoulders are one continuous form rather than a shaft plugged into a
+ * box), carries the two sternocleidomastoid cords down the front-sides, tucks
+ * in at the throat, and rises to 1.612 where the occiput overhangs it by 26 mm.
+ * Visible above the folded collar: y 1.500 -> 1.600, which at the gameplay
+ * camera's 470 px/m is a 47 px column of skin between the jaw and the jacket.
+ */
 export function buildNeck() {
+  // Sternocleidomastoid: the two cords from behind the ear to the sternum. They
+  // sit at ~55 degrees either side of the front, and they are what stops a neck
+  // reading as a dowel.
+  const cords = (th) =>
+    1 + 0.075 * (gauss(th - 1.02, 0.36) + gauss(th - (Math.PI - 1.02), 0.36));
+  // Trapezius ridge at the back-sides, where the neck merges into the shoulder.
+  const yoke = (th) =>
+    1 + 0.17 * (gauss(th - 0.35, 0.5) + gauss(th - (Math.PI - 0.35), 0.5)) + 0.10 * gauss(th - Math.PI * 1.5, 0.6);
+
   const keys = [
-    { p: V(0, 1.4, -0.004), rx: 0.072, rz: 0.076, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.46, -0.006), rx: 0.062, rz: 0.066, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.53, -0.01), rx: 0.056, rz: 0.06, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.585, -0.014), rx: 0.058, rz: 0.064, n: 2.4, zone: SZ.NECK },
+    { p: V(0, 1.352, -0.004), rx: 0.118, rz: 0.104, n: 2.5, mod: yoke, zone: SZ.NECK },
+    { p: V(0, 1.412, -0.005), rx: 0.092, rz: 0.090, n: 2.4, mod: yoke, zone: SZ.NECK },
+    { p: V(0, 1.462, -0.007), rx: 0.072, rz: 0.077, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.508, -0.010), rx: 0.062, rz: 0.069, n: 2.4, mod: cords, zone: SZ.NECK },
+    { p: V(0, 1.552, -0.013), rx: 0.057, rz: 0.064, n: 2.4, mod: cords, zone: SZ.NECK },
+    // Up under the jaw. The last station widens again: the mastoid process and
+    // the base of the skull are wider than the middle of the neck, and without
+    // that the head looks pinned on.
+    { p: V(0, 1.592, -0.015), rx: 0.059, rz: 0.067, n: 2.4, zone: SZ.NECK },
+    { p: V(0, 1.618, -0.016), rx: 0.064, rz: 0.072, n: 2.5, zone: SZ.NECK },
   ];
-  return loftKeys(keys, 8, { radial: 16, capStart: true, capEnd: false });
+  return loftKeys(keys, 14, { radial: 20, capStart: true, capEnd: false });
 }
 
 // -------------------------------------------------------------------------
@@ -176,9 +247,11 @@ export function headSurface(dir, out, o = {}) {
       const jawEdge = gauss((Math.abs(x) - 0.045 + jt * 0.02) / 0.016, 1) * gauss((y + 0.062) / 0.018, 1);
       x += 0.006 * jawEdge * Math.sign(x || 1);
 
-      // Ears.
+      // The bulge where the ear is ATTACHED. Round 5 halved it: the ear itself
+      // is now real geometry (`buildEar`), and a 13 mm swelling under a 20 mm
+      // shell reads as a swollen skull rather than as an ear root.
       const ear = gauss((y + 0.004) / 0.024, 1) * gauss((z - 0.022) / 0.02, 1);
-      x += 0.013 * ear * Math.sign(x || 1) * THREE.MathUtils.smoothstep(Math.abs(dir.x), 0.55, 0.9);
+      x += 0.0065 * ear * Math.sign(x || 1) * THREE.MathUtils.smoothstep(Math.abs(dir.x), 0.55, 0.9);
 
       out.set(cx + x, cy + y, cz + z);
     }
@@ -216,6 +289,45 @@ export function buildEyes(o = {}) {
   return s;
 }
 
+/**
+ * An ear.
+ *
+ * `headSurface` grows a 13 mm bump where the ear belongs, which at the gameplay
+ * camera's 470 px/m is a 6 px swelling on a dark mass — i.e. nothing. A real ear
+ * is 60 mm tall and stands 12 mm off the skull with a rolled helix around it, so
+ * it is a 28 px silhouette break with a bright rim and a shadow behind it,
+ * exactly where the eye goes to find the profile of a head seen from behind.
+ */
+export function buildEar(sgn = 1) {
+  // The skull surface at the ear latitude sits at |x| ~ 0.088 (0.0825 base
+  // half-width plus the attachment swelling in `headSurface`), so the shell is
+  // centred at 0.0925: its inner face is buried 6 mm inside the skull and its
+  // outer face stands 14 mm proud.
+  const cx = sgn * 0.0925;
+  const cy = 1.6765;
+  const cz = 0.0205;
+  return displacedSphere(
+    (dir, out) => {
+      const v = dir.y; // up the ear
+      const w = dir.z; // fore (-) / aft (+)
+      const r = Math.hypot(v, w);
+      // Concha: the bowl scooped out of the middle. The helix keeps its full
+      // thickness, so the RIM of the ear catches light and the middle does not
+      // — which is the only part of an ear that is legible at 28 px.
+      const bowl = Math.exp(-((r / 0.46) ** 2));
+      const thick = 0.0100 * (1 - 0.55 * bowl);
+      // 60 mm tall, 33 mm fore-aft, tapering into the lobe and raked back at
+      // the top the way a real ear sits against the skull.
+      const lobe = 1 - 0.28 * Math.max(0, -v);
+      out.set(cx + dir.x * thick, cy + v * 0.0300, cz + w * 0.0165 * lobe + v * 0.0055);
+    },
+    14,
+    10,
+    SZ.FACE,
+    0.1,
+  );
+}
+
 /** Short cropped hair as a thin shell over the skull — only where a hat isn't. */
 export function buildHair(o = {}) {
   const back = o.backOnly ?? false;
@@ -241,11 +353,16 @@ export function buildHair(o = {}) {
       const clump = 1 + 0.26 * Math.sin(dir.x * 34) * Math.sin(dir.z * 29) * cover;
       // Offset ALONG the skull's own radius: negative where there is no hair, so
       // the shell is buried inside the head and the crossover is the hairline.
-      // 30 mm of burial, not 9: the skull has a 36 mm nose and a 14 mm brow
-      // displaced onto it, and a shell that only clears the *average* radius
-      // still surfaces across the cheeks and the jaw. The 24 mm crown is a
-      // regulation 13 mm crop, not the 20 mm helmet round 3 grew.
-      const t = -0.030 + cover * (0.0128 + 0.0022 * clump);
+      //
+      // ROUND 5. Round 4 set this to `-0.030 + cover * (0.0128 + 0.0022*clump)`,
+      // whose MAXIMUM is -0.0150 — the shell never once reached the skull
+      // surface, so the character has been completely bald since round 4 and the
+      // dark mass every critic read as "hair" was the inside-out skull (see
+      // geometry.js). Burial where there is no hair is 24 mm, which clears the
+      // 14 mm brow; the nose does not matter because `cover` is zero across the
+      // whole face. At full cover the shell stands 12 mm proud, a regulation
+      // crop.
+      const t = -0.024 + cover * (0.0345 + 0.0035 * clump);
       out.copy(tmp).sub(c);
       const len = out.length() || 1;
       out.multiplyScalar(1 + t / len).add(c);
@@ -289,9 +406,13 @@ export function buildArm(o = {}) {
     // Root buried inside the torso so the shoulder never shows a seam.
     { p: V(0.085, 1.478, -0.014), rx: 0.086, rz: 0.09, n: 2.6, zone: Z.SLEEVE },
     { p: V(0.135, 1.475, -0.014), rx: 0.081 * bulk, rz: 0.085 * bulk, n: 2.5, zone: Z.SLEEVE },
-    // Deltoid cap: widest point of the arm, biased forward and up.
-    { p: armPoint(0.06), rx: 0.075 * bulk, rz: 0.08 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
-    { p: armPoint(0.2), rx: 0.065 * bulk, rz: 0.069 * bulk, n: 2.3, zone: Z.SLEEVE },
+    // Deltoid: three heads over a ball joint, so it is the one place on a limb
+    // where the profile BULGES before it tapers. Round 4 ran a single cap
+    // straight into the taper and the shoulder read as the corner of the plate
+    // carrier rather than as an arm.
+    { p: armPoint(0.05), rx: 0.081 * bulk, rz: 0.086 * bulk, n: 2.5, front: 1.1, zone: Z.SLEEVE },
+    { p: armPoint(0.13), rx: 0.077 * bulk, rz: 0.081 * bulk, n: 2.4, front: 1.08, zone: Z.SLEEVE },
+    { p: armPoint(0.22), rx: 0.064 * bulk, rz: 0.068 * bulk, n: 2.3, zone: Z.SLEEVE },
     { p: armPoint(0.34), rx: 0.06 * bulk, rz: 0.064 * bulk, n: 2.3, zone: Z.SLEEVE },
     { p: armPoint(0.46), rx: 0.052 * bulk, rz: 0.056, n: 2.3, zone: Z.SLEEVE },
     { p: armPoint(0.52), rx: 0.051, rz: 0.057, n: 2.3, zone: Z.SLEEVE },

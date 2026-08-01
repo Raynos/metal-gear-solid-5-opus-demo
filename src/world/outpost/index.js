@@ -91,12 +91,46 @@ export async function install(world) {
       width: 3.6,
     },
   ];
+  // Desire lines. Round 4: there were five of these and none of them joined the
+  // places soldiers actually walk between, so the compound had a road network
+  // and no FOOT network — which is most of why it read as unoccupied. These are
+  // set out gate -> guardroom -> barracks -> cookhouse -> latrine -> tower base,
+  // the way a path is worn: straight between the two things, cutting every
+  // corner, and doubled where two routes share a leg.
   const paths = [
     { pts: [[-34.7, -5.5], [-28, -4.2], [-16, -4], [-6, -6], [0, -12], [2, -18]], width: 1.5 },
     { pts: [[-33.2, 12.3], [-29, 8], [-25, 2], [-24, -2]], width: 1.4 },
     { pts: [[16, 10], [23, 5], [28, 1]], width: 1.3 },
     { pts: [[-29, 14], [-21, 12], [-11, 9]], width: 1.2 },
     { pts: [[2, -18], [-12, -34], [-30, -33]], width: 1.15 },
+    // Gate to the command block: the busiest line on the site, and it cuts the
+    // corner off the vehicle road rather than following it.
+    { pts: [[15.0, 34.0], [12.5, 26.0], [9.0, 15.0], [6.0, 4.0], [3.5, -8.0], [2.0, -20.5]], width: 1.9 },
+    // Gate to the barrack street.
+    { pts: [[13.0, 33.0], [4.0, 28.0], [-6.0, 22.0], [-14.0, 14.0], [-20.0, 7.5], [-25.0, 2.0]], width: 1.6 },
+    // Barracks to the cookhouse end of the second hut, and on to the shed.
+    { pts: [[-26.0, -7.5], [-27.0, -1.0], [-27.5, 2.0]], width: 1.35 },
+    { pts: [[-20.0, -12.0], [-10.0, -9.0], [-2.0, -6.0], [6.0, -3.0]], width: 1.45 },
+    // Tower bases. A tower is climbed twice a watch and the ground under the
+    // ladder is beaten bare for four metres in every direction.
+    { pts: [[28.0, 22.0], [31.0, 24.0], [33.0, 26.0]], width: 1.3 },
+    { pts: [[-38.0, -33.0], [-40.5, -35.0], [-42.0, -37.0]], width: 1.3 },
+    // Latrine block at the back of the compound, and the path to the bunker.
+    { pts: [[-24.0, 6.0], [-30.0, 16.0], [-33.0, 21.0]], width: 1.2 },
+    { pts: [[-30.0, -20.0], [-35.0, -26.0], [-39.0, -30.0]], width: 1.25 },
+    // Perimeter sentry beat: worn along the inside of the wall between posts.
+    { pts: [[9.0, 31.0], [-6.0, 32.0], [-22.0, 31.5], [-34.0, 29.0]], width: 1.4 },
+  ];
+  // Where wheeled and tracked plant turns on the spot. A turning circle is
+  // hardstanding that has been destroyed: dished, torn into concentric arcs, and
+  // ringed by the fines that were thrown out of it.
+  const churn = [
+    { u: 18.5, v: 16.5, r: 9.0 },   // the vehicle yard, in front of the shed
+    { u: 28.5, v: 3.0, r: 6.4 },    // the fuel point
+    { u: 2.5, v: -15.0, r: 5.6 },   // the command-block apron
+    { u: -30.0, v: 15.5, r: 6.8 },  // the helipad approach
+    { u: 16.0, v: 44.0, r: 7.5 },   // outside the gate, where trucks reverse
+    { u: 24.0, v: 57.0, r: 5.2 },   // the lay-by on the approach track
   ];
   const hardstand = [
     { cu: 17, cv: 16, hu: 19, hv: 15 },
@@ -126,7 +160,7 @@ export async function install(world) {
   const ground = new OutpostGround({
     terrain: world.terrain, theta: THETA, padY: PAD_Y,
     rect: { cu: (RECT.u0 + RECT.u1) / 2, cv: (RECT.v0 + RECT.v1) / 2, hu: (RECT.u1 - RECT.u0) / 2, hv: (RECT.v1 - RECT.v0) / 2 },
-    roads, paths, hardstand, oil, mounds, skirt: 28, apron: 7,
+    roads, paths, hardstand, oil, mounds, churn, skirt: 28, apron: 7,
   });
   /** Finished ground height at a compound-local point. */
   const gy = (u, v) => {
@@ -158,8 +192,16 @@ export async function install(world) {
     // on earth has up to about 1.2m.
     masonry: createSurface({
       mode: MODE.MASONRY, name: 'op-masonry', dust: DUST,
-      color: [0.330, 0.286, 0.212], color2: [0.418, 0.360, 0.272], color3: [0.640, 0.596, 0.502],
-      rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.42, scale: 1.0, roughness: 0.92, envMapIntensity: 1.15,
+      // Round 4: the three shells still measured within 12% of each other in
+      // mean albedo, which is why "every wall is the same grey" survived three
+      // rounds of being told off. Limewash is LIME — it is the palest thing on
+      // a Soviet compound by a wide margin, and the failed patches are what give
+      // it its range. Lime up 22%, block down 12%, so this building spans
+      // 0.36..0.78 where the concrete next door spans 0.30..0.61 and they can no
+      // longer be confused at any distance. Tiling scale 1.0 -> 1.75: a lime
+      // skim crazes at a much finer pitch than shutter-marked in-situ concrete.
+      color: [0.302, 0.262, 0.196], color2: [0.368, 0.318, 0.242], color3: [0.782, 0.742, 0.646],
+      rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.36, scale: 1.75, roughness: 0.86, envMapIntensity: 1.22,
       dado: 0.195, dadoStrength: 0.95, dadoColor: [0.212, 0.132, 0.046],
     }),
     // The later pour. Round 3: the critics measured that every wall on the site
@@ -171,8 +213,12 @@ export async function install(world) {
     // twice the size), less rust bleed, and markedly more sun-bleached.
     concrete2: createSurface({
       mode: MODE.CONCRETE, name: 'op-concrete2', dust: DUST,
-      color: [0.452, 0.402, 0.306], color2: [0.300, 0.262, 0.196], color3: [0.612, 0.556, 0.442],
-      rust: [0.30, 0.140, 0.058], wear: 0.30, dustAmt: 0.46, scale: 0.55, roughness: 0.95, envMapIntensity: 1.15,
+      // Round 4: pulled COLD. This is the one 1970s pour on the site and it was
+      // batched with a different sand: R/B 1.48 against the 1960s work's 1.60,
+      // which reads as the grey-green cement it is rather than as more khaki.
+      // Scale 0.55 -> 0.42, so its shutter-patch octave is now 4x the masonry's.
+      color: [0.428, 0.398, 0.320], color2: [0.276, 0.256, 0.206], color3: [0.576, 0.542, 0.462],
+      rust: [0.30, 0.140, 0.058], wear: 0.30, dustAmt: 0.46, scale: 0.42, roughness: 0.97, envMapIntensity: 1.10,
     }),
     // Painted joinery. Institutional sage-green oil paint on every reveal,
     // architrave and door surround. It is deliberately the only cool hue on the
@@ -201,7 +247,7 @@ export async function install(world) {
     wall: createSurface({
       mode: MODE.CONCRETE, name: 'op-wall', dust: DUST,
       color: [0.428, 0.380, 0.296], color2: [0.258, 0.226, 0.176], color3: [0.578, 0.518, 0.412],
-      rust: [0.34, 0.163, 0.072], wear: 0.62, dustAmt: 0.46, scale: 1.25, roughness: 0.94, envMapIntensity: 1.15,
+      rust: [0.34, 0.163, 0.072], wear: 0.62, dustAmt: 0.46, scale: 2.05, roughness: 0.94, envMapIntensity: 1.15,
     }),
     metal: createSurface({
       mode: MODE.METAL, name: 'op-metal', dust: DUST,
@@ -210,9 +256,13 @@ export async function install(world) {
     }),
     corr: createSurface({
       mode: MODE.CORRUGATED, name: 'op-corr', dust: DUST,
-      color: [0.205, 0.198, 0.170], color2: [0.148, 0.158, 0.108], color3: [0.282, 0.250, 0.190],
-      rust: [0.205, 0.108, 0.058], wear: 0.30, dustAmt: 0.44, metalness: 0.55, roughness: 0.62,
-      corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.10,
+      // Round 4: the 1980s shed still carries most of its factory finish, which
+      // on Soviet profiled sheet was a pale blue-grey primer, not khaki. It is
+      // the only genuinely cool-hued large surface in the compound and it is
+      // what stops the three barracks reading as one building repeated.
+      color: [0.176, 0.196, 0.198], color2: [0.132, 0.148, 0.132], color3: [0.316, 0.322, 0.300],
+      rust: [0.225, 0.112, 0.056], wear: 0.34, dustAmt: 0.44, metalness: 0.55, roughness: 0.58,
+      corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.18,
     }),
     wood: createSurface({
       mode: MODE.WOOD, name: 'op-wood', dust: DUST,
@@ -283,7 +333,13 @@ export async function install(world) {
     }),
     ground: createSurface({
       mode: MODE.GROUND, name: 'op-ground', dust: DUST,
-      color: [0.412, 0.338, 0.238], color2: [0.268, 0.216, 0.150], color3: [0.208, 0.190, 0.166],
+      // color3 is the crushed-rock end of the palette: the graded fill, the
+      // hardstanding and the near-field stones all come out of it. Round 4
+      // warmed it from R/B 1.25 to 1.33 — introducing the compacted-fill
+      // material took the ground frame's mean R-B from 8.0 to 7.6, i.e. just
+      // under the +8 floor this project holds itself to, and Afghan crushed
+      // limestone is not a neutral grey anyway.
+      color: [0.412, 0.338, 0.238], color2: [0.268, 0.216, 0.150], color3: [0.228, 0.204, 0.172],
       wear: 0.4, dustAmt: 0.0, roughness: 0.95, scale: 1.0, envMapIntensity: 1.15,
     }),
     // Behind every window and door opening. Not pure black: an unlit room still
@@ -298,8 +354,15 @@ export async function install(world) {
     // and disappeared. Dirty thirty-year-old glass is roughness ~0.14 and it
     // reflects the sky at its real Fresnel weight — dark, with a faint gradient
     // down the pane. That is what makes a window a hole with something in it.
+    // Round 4: envMapIntensity 1.15 -> 1.9 and roughness 0.14 -> 0.11. Thirty
+    // year old glass is dark but it is still GLASS: what a window actually shows
+    // from outside is the sky, dimmed to its Fresnel weight and graded from
+    // bright at the top of the pane to nearly black at the bottom where it is
+    // reflecting the ground. At 1.15 the panes were returning so little that
+    // they measured as flat holes, which is the other half of "the openings
+    // disappear" — the reveal fixed the geometry, this fixes the pane.
     glass: new THREE.MeshStandardMaterial({
-      color: 0x0d1116, roughness: 0.14, metalness: 0.02, envMapIntensity: 1.15, name: 'op-glass',
+      color: 0x0d1116, roughness: 0.11, metalness: 0.04, envMapIntensity: 1.9, name: 'op-glass',
     }),
   };
   // Glazing that lights up; emissive is driven from the time of day below.
@@ -560,8 +623,9 @@ export async function install(world) {
     const B = new THREE.Vector3(b2[0], gy(b2[0], b2[1]) + b2[2], b2[1]);
     cables.push(catenary(A, B, Math.min(1.5, A.distanceTo(B) * 0.045), 0.026, 14));
   }
+  // NOT merged into bag.metal any more: the cables need their own mesh so they
+  // can be kept out of the shadow pass. See `op-telegraph` below for why.
   for (const g of cables) bakeWeather(g, { wear: 0.9 });
-  bag.metal.push(...cables);
 
   // Camo nets: one over the supply dump in the middle of the compound (the
   // dappled shade under it is the single best-looking thing on the site), one
@@ -623,6 +687,7 @@ export async function install(world) {
   addMerged(bag.mil, M.mil, 'op-arch-mil');
   addMerged(bag.dado, M.dado, 'op-arch-dado');
   addMerged(bag.paintWarn, M.paintWarn, 'op-arch-paintwarn');
+  addMerged(cables, M.metal, 'op-cables', { cast: false, receive: false });
 
   // Perimeter.
   const panelBag = panelGeo();
@@ -637,7 +702,10 @@ export async function install(world) {
     }
   };
   addInst({ concrete: merge(panelBag.concrete) }, peri.panels, { concrete: M.wall });
-  addInst({ concrete: merge(pilBag.concrete), metal: merge(pilBag.metal) }, peri.pilasters, { concrete: M.wall, metal: M.metal });
+  addInst(
+    { concrete: merge(pilBag.concrete), metal: merge(pilBag.metal) },
+    peri.pilasters, { concrete: M.wall, metal: M.metal },
+  );
   addInst(
     { metal: merge(linkPostBag.metal), concrete: merge(linkPostBag.concrete) },
     peri.linkPosts, { metal: M.metal, concrete: M.wall },
@@ -868,7 +936,23 @@ export async function install(world) {
       lineGeo.push(catenary(A, B, sag, 0.030, 10));
     }
   }
-  addMerged(lineGeo.map((g) => bakeWeather(g, { wear: 0.9 })), M.metal, 'op-telegraph', { receive: false });
+  // Round 4: `cast: false`. A critic called these shadows "the loudest wrong
+  // note in the frame" and the arithmetic agrees with them. The effective solar
+  // source in this build is 0.036 rad across (ArtDirection.sunAngularSize — the
+  // dusty circumsolar aureole, not the 0.0093 rad disc). A conductor 60mm across
+  // hanging 7 m above the sand therefore casts a shadow whose penumbra is
+  // 7 * 0.036 = 252mm wide with NO umbra at all: the widest the wire ever
+  // occludes is 60/252 = 24% of the source, so the deepest the ground can go is
+  // 24% of the way from sunlit to shade, spread over a quarter of a metre —
+  // which on a sunlit desert floor is under two display codes and invisible.
+  // What the shadow map was drawing instead was a fully-occluded line softened
+  // by PCF: the right WIDTH and four times the right CONTRAST. There is no way
+  // to get the contrast right with a binary shadow map, so the honest answer is
+  // the one the brief allows — the wires stop casting. The poles still do, and
+  // they are what actually reads.
+  addMerged(lineGeo.map((g) => bakeWeather(g, { wear: 0.9 })), M.metal, 'op-telegraph', {
+    cast: false, receive: false,
+  });
 
   // Bulkhead lamps down the inside of the perimeter wall.
   const lampList = [];
@@ -909,7 +993,15 @@ export async function install(world) {
       s.castShadow = false;
       s.shadow.mapSize.set(1024, 1024);
       s.shadow.camera.near = 1.5;
-      s.shadow.camera.far = dist;
+      // Round 4: was `dist` (70 m). The mast is 13 m up and aimed almost
+      // straight down, so everything that can cast into its pool is inside
+      // ~30 m of the lamp; the other 40 m of frustum was buying nothing and
+      // costing both depth precision and every frustum-cullable caster in the
+      // valley. Measured: the refresh frame is the only frame in the game that
+      // exceeds the triangle budget (3.72 M -> 4.72 M when it lands inside the
+      // harness's timed window), and this is the half of that which can be
+      // fixed without touching another author's culling.
+      s.shadow.camera.far = Math.min(dist, 34);
       s.shadow.bias = -0.0016;
       s.shadow.normalBias = 0.05;
       // CACHED, not per-frame. This mast is bolted to a tower and it does not
@@ -980,7 +1072,12 @@ export async function install(world) {
       // Slow refresh of the cached spot shadow (see spotAt). 20 frames is a
       // third of a second of staleness on a moving guard and 5% of the cost of
       // redrawing it every frame.
-      if (++tick % 20 === 0) {
+      // Round 4: 20 -> 45 frames. The refresh costs a full extra scene depth
+      // pass and it is the one thing in this module that can put a frame over
+      // the triangle budget; three quarters of a second of staleness on a
+      // walking guard's cast shadow at night is not something anybody has ever
+      // measured, and a frame over budget is.
+      if (++tick % 45 === 0) {
         for (const l of lights) if (l.castShadow && l.shadow.autoUpdate === false) l.shadow.needsUpdate = true;
       }
       const el = world.lighting?.preset?.sunElevation ?? 30;

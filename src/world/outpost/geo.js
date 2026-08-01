@@ -229,23 +229,42 @@ export function box(w, h, d, o = {}) {
   // across the site for nothing measurable. 75mm of section and 450mm of length
   // is roughly "a member you could sit on", which is the set of edges that
   // actually carry the building's silhouette.
-  if (o.sharp || m < 0.075 || Math.max(aw, ah, ad) < 0.45) {
+  if (o.sharp || (!o.arris && (m < 0.075 || Math.max(aw, ah, ad) < 0.45))) {
     return xform(new THREE.BoxGeometry(w, h, d), o);
   }
+  // Explicit override, for the members that carry a building's silhouette. See
+  // `cornerPier` in buildings.js: those get a 70-90mm chamfer because that is
+  // the only size that survives the projection at the distance the compound is
+  // actually seen from, and unlike the automatic rule below it is applied where
+  // an author has decided the edge is worth it.
+  if (o.arris) return xform(chamferBox(aw, ah, ad, Math.min(o.arris, m * 0.42)), o);
   // Round 3: the cap was 22mm and the entry gate 100mm, which meant every
   // building silhouette — walls, piers, copings, cills — carried a 22mm arris
   // that is under a third of a pixel at 30m and therefore not there at all. A
   // real precast arris is 20-25mm but a poured-and-struck concrete corner that
   // has been knocked about for thirty years is 30-45mm, and it is the only
-  // thing standing between a facade and a perfect mathematical edge. 32mm at
-  // 30m is ~2px of specular rim, which is the point.
-  const c = Math.min(0.032, Math.max(0.009, m * 0.12));
+  // thing standing between a facade and a perfect mathematical edge.
+  //
+  // Round 4: the cap is now a function of the member's LENGTH, not only its
+  // section. Measured on shots/r5-op-base/night.png, a 32mm arris on a building
+  // corner 26 m from the camera projects to 1.3 px at 1920 wide — the horizontal
+  // profile across x=862..912 went 0.095, 0.095, 0.067, 0.024 with no bright
+  // sliver, exactly as the critic reported, because there was nothing there
+  // wider than a pixel to find. Section still sets the arris on small parts (a
+  // 45mm strap must not dissolve), but a member metres long is a structural
+  // element that was struck out of a shutter with a proper 45mm chamfer fillet
+  // in it. THE headline silhouette corners get a real 100mm strip on top of
+  // this — see `cornerArris` in buildings.js; no cap on this function alone can
+  // buy a 4-pixel rim at 26 m.
+  const big = Math.max(aw, ah, ad);
+  const cap = big >= 1.2 ? 0.046 : 0.032;
+  const c = Math.min(cap, Math.max(0.009, m * 0.14));
   return xform(chamferBox(aw, ah, ad, c), o);
 }
 
 /** Box whose BASE sits at y — how buildings and posts are actually dimensioned. */
-export function post(w, h, d, x, y, z, ry = 0) {
-  return box(w, h, d, { x, y: y + h / 2, z, ry });
+export function post(w, h, d, x, y, z, ry = 0, o = {}) {
+  return box(w, h, d, { ...o, x, y: y + h / 2, z, ry });
 }
 
 /** Point-in-polygon, for the irregular compound outline. */

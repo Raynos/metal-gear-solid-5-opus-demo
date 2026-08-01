@@ -73,6 +73,8 @@ function polyDist(u, v, pts, cum) {
   let best = Infinity;
   let bestS = 0;
   let bestSide = 1;
+  let bestNx = 1;
+  let bestNv = 0;
   for (let i = 0; i < pts.length - 1; i++) {
     const ax = pts[i][0];
     const ay = pts[i][1];
@@ -86,9 +88,12 @@ function polyDist(u, v, pts, cum) {
       bestS = cum[i] + t * Math.sqrt(len2);
       // Signed side, so the wheel ruts sit either side of the centreline.
       bestSide = ex * (v - ay) - ey * (u - ax) < 0 ? -1 : 1;
+      const len = Math.sqrt(len2);
+      bestNx = -ey / len;
+      bestNv = ex / len;
     }
   }
-  return { d: best, s: bestS, side: bestSide };
+  return { d: best, s: bestS, side: bestSide, nx: bestNx, nv: bestNv };
 }
 
 function cumulative(pts) {
@@ -139,11 +144,19 @@ export class OutpostGround {
     return [x * this.cos - z * this.sin, x * this.sin + z * this.cos];
   }
 
-  /** Track influence at a local point: mask 0..1, signed lateral offset, arc length. */
+  /**
+   * Track influence at a local point: mask 0..1, signed lateral offset, arc
+   * length, and the unit vector pointing ACROSS the track in local axes. The
+   * last of those is what lets the shader roll the shading normal into and out
+   * of a wheel rut: the rut is defined in `lat`, so its relief points along the
+   * lat gradient, and that direction cannot be recovered per-fragment.
+   */
   trackAt(u, v) {
     let mask = 0;
     let lat = 0;
     let s = 0;
+    let ax = 1;
+    let av = 0;
     for (let i = 0; i < this.roads.length; i++) {
       const r = this.roads[i];
       const q = polyDist(u, v, r.pts, this.roadCum[i]);
@@ -152,9 +165,11 @@ export class OutpostGround {
         mask = m;
         lat = q.d * q.side;
         s = q.s;
+        ax = q.nx;
+        av = q.nv;
       }
     }
-    return { mask, lat, s };
+    return { mask, lat, s, ax, av };
   }
 
   pathAt(u, v) {
@@ -220,6 +235,47 @@ export class OutpostGround {
     return h;
   }
 
+  /**
+   * Spoil windrow round the toe of the fill.
+   *
+   * A cut-and-fill platform generates more material than it consumes and the
+   * surplus does not evaporate: the dozer pushes it to the edge of the works and
+   * leaves it there, so every graded pad on earth is ringed by a broken ridge of
+   * spoil a metre or so high, and so is every graded track — which is what makes
+   * an installation read as BUILT rather than placed. It follows the pad outline
+   * for free by keying off `padK` rather than the rectangle, so it inherits the
+   * wobble, and it dies out along the road corridor where the plant was working
+   * (`k` is near 1 across the running surface, so the ridge sits on the shoulder
+   * of the track exactly as it should).
+   */
+  bermAt(u, v, k) {
+    if (k < 0.015 || k > 0.55) return 0;
+    // Broken along its length. A continuous ridge is an earth bank; a ridge that
+    // comes and goes in 15-30 m lengths is where a dozer turned round.
+    const lump = fbm2(u * 0.055 + 11.3, v * 0.055 - 7.1, 3);
+    const fine = fbm2(u * 0.30 - 2.0, v * 0.30 + 5.5, 2);
+    const t = (k - 0.155) / 0.105;
+    const ridge = Math.exp(-t * t);
+    return 1.15 * ridge * (0.10 + 1.15 * lump * lump) * (0.72 + 0.56 * fine);
+  }
+
+  /**
+   * Churn: where tracked and wheeled plant has turned on the spot.
+   *
+   * A turning circle is not hardstanding — it is hardstanding that has been
+   * destroyed. The fines are ground out, the stone is turned over, and the whole
+   * disc is dished by 100mm or so with a scuffed lip. `churn` drives both the
+   * dish here and the arc-shaped rut set in the shader.
+   */
+  churnAt(u, v) {
+    let m = 0;
+    for (const c of this.churn ?? []) {
+      const wob = (fbm2(u * 0.55, v * 0.55, 2) - 0.5) * c.r * 0.45;
+      m = Math.max(m, smoothstep(c.r + wob, c.r * 0.35 + wob, Math.hypot(u - c.u, v - c.v)));
+    }
+    return m;
+  }
+
   /** Finished ground height, in world space. This is the authority for placement. */
   heightAt(x, z) {
     const [u, v] = this.toLocal(x, z);
@@ -229,13 +285,22 @@ export class OutpostGround {
   heightAtLocal(u, v, x, z, kIn = null) {
     const k = kIn ?? this.padK(u, v);
     const nat = this.terrain.heightAt(x, z);
-    const track = this.trackAt(u, v).mask;
+    const t = this.trackAt(u, v);
     // Below the terrain everywhere except the graded pad and the track itself.
-    const base = nat - 0.44 + track * 0.52;
+    const base = nat - 0.44 + t.mask * 0.52;
     const crown = -0.10 * Math.min(1, (Math.hypot(u - this.rect.cu, v - this.rect.cv) / 60) ** 2);
     const micro = (fbm2(u * 0.09, v * 0.09, 3) - 0.5) * 0.13;
     const pad = this.padY + crown + micro;
-    return THREE.MathUtils.lerp(base, pad, k) + this.moundAt(u, v);
+    // The running surface is dished: thirty years of traffic has taken 90mm out
+    // of the middle of the track and pushed it onto the shoulders, which is what
+    // makes a desert road read as WORN rather than drawn.
+    const lat = Math.abs(t.lat);
+    const dish = t.mask * (-0.090 * Math.exp(-((lat / 2.5) ** 2)) + 0.055 * Math.exp(-(((lat - 4.2) / 1.7) ** 2)));
+    // Plant turning on the spot dishes the whole disc and throws a lip.
+    const ch = this.churnAt(u, v);
+    const churn = ch * (-0.085 + 0.030 * (fbm2(u * 0.45, v * 0.45, 2) - 0.5));
+    return THREE.MathUtils.lerp(base, pad, k) + this.moundAt(u, v)
+      + this.bermAt(u, v, k) + dish + churn;
   }
 
   /**
@@ -251,6 +316,7 @@ export class OutpostGround {
     const weather = new Float32Array(vertCount * 3);
     const uv = new Float32Array(vertCount * 2);
     const vars = new Float32Array(vertCount * 3);
+    const gnd = new Float32Array(vertCount * 3);
 
     for (let j = 0; j <= nv; j++) {
       for (let i = 0; i <= nu; i++) {
@@ -268,9 +334,19 @@ export class OutpostGround {
         track[idx * 4 + 1] = t.lat;
         track[idx * 4 + 2] = t.s;
         track[idx * 4 + 3] = k > 0.02 ? this.hardAt(u, v) * k : 0;
-        weather[idx * 3] = 0.55;
+        // aWeather.x is "height within the object" for architecture; on the
+        // ground it was a constant 0.55 that nothing read, so it carries the
+        // GRADED-GROUND mask instead. That is the single most useful thing the
+        // ground shader was missing: without it, the engineered platform and the
+        // undisturbed desert around it were drawn by exactly the same code with
+        // exactly the same statistics, which is why the compound measured as
+        // "placed on the sand" rather than cut into it.
+        weather[idx * 3] = k;
         weather[idx * 3 + 1] = k > 0.02 ? this.oilAt(u, v) : 0;
         weather[idx * 3 + 2] = k > 0.02 ? this.pathAt(u, v) * k : 0;
+        gnd[idx * 3] = this.churnAt(u, v);
+        gnd[idx * 3 + 1] = t.ax;
+        gnd[idx * 3 + 2] = t.av;
         uv[idx * 2] = u * 0.1;
         uv[idx * 2 + 1] = v * 0.1;
         vars[idx * 3 + 2] = 0.5;
@@ -295,6 +371,7 @@ export class OutpostGround {
     geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
     geo.setAttribute('aTrack', new THREE.BufferAttribute(track, 4));
     geo.setAttribute('aWeather', new THREE.BufferAttribute(weather, 3));
+    geo.setAttribute('aGround', new THREE.BufferAttribute(gnd, 3));
     geo.setAttribute('aVar', new THREE.BufferAttribute(vars, 3));
     geo.setIndex(new THREE.BufferAttribute(index, 1));
     geo.computeVertexNormals();

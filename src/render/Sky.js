@@ -133,10 +133,88 @@ const DUST_SPIKE_G = 0.96;
 const BETA_M_S_EFF = BETA_M_S.map((v) => v * (1 - DUST_TRUNC));
 const BETA_M_E_EFF = BETA_M_S_EFF.map((v, i) => v + BETA_M_A[i]);
 // Ozone (Chappuis), 1/km at the layer peak. Tent profile, 10 km -> 25 km -> 40 km.
-const BETA_O = [0.000650, 0.001881, 0.000085];
+//
+// Round 5: 0.000650/0.001881/0.000085 -> 0.000955/0.002765/0.000125, a uniform
+// 1.47x. The tent integrates to 15 km of unit density, so the old triple was a
+// vertical optical depth of 0.028 at 600 nm; 300 DU of ozone against the
+// Chappuis cross section (~5.0e-21 cm^2) is 0.040, and Afghan-latitude spring
+// column is 320-350 DU. The old numbers were a ~210 DU atmosphere — thinner
+// than anywhere on Earth outside the polar hole.
+//
+// This is the single biggest lever on the low-sun sky and it was set 30-40%
+// low. Ozone is the ONLY term that gets stronger with path length while
+// absorbing orange rather than blue, so it is what stops a long horizontal path
+// at dusk from turning the whole dome sepia. Measured on the dome, dusk at 15
+// degrees of elevation, linear B/G:
+//
+//   ozone x1.00 (shipped r4)   solar 1.03   90 deg 1.20   anti-solar 1.09
+//   ozone x1.47 (this)         solar 1.20   90 deg 1.42   anti-solar 1.30
+//
+// and the dusk zenith goes 1.69 -> 1.99. Noon is almost untouched (zenith
+// 1.96 -> 1.99) because a high sun's path never crosses much ozone.
+//
+// The red channel is then raised again on its own, 0.000955 -> 0.001380, i.e.
+// from 0.35 of the green coefficient to 0.50. Sampling the Chappuis band at
+// three monochromatic wavelengths (680/550/440) badly under-weights it in RED,
+// because the band's MAXIMUM is at 602 nm — inside the sRGB red primary's
+// response, not the green's. Band-averaged over the primaries the honest ratio
+// is nearer 1.0; 0.50 is a deliberately conservative half-step toward it. It is
+// the term that decides whether a twilight sky reads blue or magenta, because
+// it is the only one that takes red out of a long slant path: measured on the
+// dusk dome 90 degrees off the sun at 20 degrees of elevation, linear R/G goes
+// 1.11 -> 1.02, and at the zenith 1.01 -> 0.93. Below 1.0 the sky is blue;
+// above it, it is violet, and three rounds of critics have called that magenta.
+const BETA_O = [0.001380, 0.002765, 0.000125];
 // Desert sand, linear albedo. Feeds the multi-scatter integral and the
 // below-horizon dome, i.e. the warm half of the IBL.
 const GROUND_ALBEDO = [0.34, 0.29, 0.21];
+
+// ---------------------------------------------------------------------------
+// Angular colour structure of the multiply-scattered field (round 5).
+//
+// Hillaire's Psi table is indexed by (altitude, sun angle) only: the multiply
+// scattered radiance is assumed ISOTROPIC in the view direction. At a high sun
+// that is a good approximation, because multiple scattering is then a small
+// fraction of the signal. At a low sun it is the single reason this dome had no
+// warm/cool split at all. Measured on the shipped build, the dusk dome at 15
+// degrees of elevation read linear B/G 1.03 toward the sun and 1.09 opposite
+// it — a 6% difference across an entire sky. It is 6% because below ~20 degrees
+// of elevation at a 2 degree sun the multi-scatter term IS the sky, and it
+// carries no azimuth.
+//
+// The field is not isotropic in colour, for a reason that needs no fudge:
+// radiance arriving from close to the sun has scattered the fewest times and is
+// still close to the direct beam, which at a low sun is deeply reddened;
+// radiance arriving from the anti-solar half only got there by scattering
+// again, and every additional event is Rayleigh, i.e. lambda^-4 weighted. So
+// the multiply-scattered field gets monotonically bluer with angle from the
+// sun. That is what paints a real sunset: orange behind you, and blue-violet
+// over your shoulder, in the same sky, at the same time.
+//
+// Applied as a chroma-only tilt. Both endpoints are normalised to Rec.709
+// luminance 1.0 and the interpolation is linear, so the mix is luminance 1.0
+// everywhere: this moves no energy, it only redistributes it across the
+// primaries. It is faded out as the sun rises, because the premise (multiple
+// scattering dominating a long slant path) stops being true.
+const MS_TINT_SOLAR = [1.190, 0.975, 0.700];
+const MS_TINT_ANTI = [0.810, 1.010, 1.450];
+/**
+ * Where the warm half ends and the cool half begins, as cos(angle from the
+ * light): 15 degrees and 72 degrees. NOT a linear ramp in cos — a linear ramp
+ * put the halfway point at 90 degrees off the sun, which means every framing
+ * that keeps the sun anywhere in shot (five of the seven canonical ones do)
+ * sees only the warm half of the transition. The low-order, still-reddened part
+ * of the multiply-scattered field is concentrated in the aureole and the first
+ * few tens of degrees around it, because that is the width of what the aerosol
+ * phase function convolved with itself puts there; beyond ~70 degrees a photon
+ * has had to turn too far for anything but repeated Rayleigh events to have
+ * done it. So the warm zone is tight and the sky beyond it is blue, which is
+ * what a sunset actually looks like.
+ */
+const MS_WARM_MU = 0.966; // cos 15 deg
+const MS_COOL_MU = 0.309; // cos 72 deg
+/** Strength at a horizon sun; ramped to zero by ~38 degrees of elevation. */
+const MS_ANISO = 0.85;
 
 const TRANS_W = 256;
 const TRANS_H = 64;
@@ -225,6 +303,22 @@ float phaseDust(float mu, float g) {
   float gb = clamp((g - ${DUST_TRUNC.toFixed(3)}) / ${(1 - DUST_TRUNC).toFixed(3)}, 0.05, 0.80);
   return ${DUST_SPIKE_W.toFixed(3)} * hg(mu, ${DUST_SPIKE_G.toFixed(3)}) +
          ${(1 - DUST_SPIKE_W).toFixed(3)} * hg(mu, gb);
+}
+
+/**
+ * Luminance-preserving chroma tilt on the multi-scatter term (see MS_TINT_*).
+ * mu is the cosine between the view ray and the light; s is the strength, which
+ * the caller ramps off as the light climbs.
+ */
+vec3 msAnisotropy(float mu, float s) {
+  vec3 t = mix(vec3(${MS_TINT_SOLAR.join(', ')}), vec3(${MS_TINT_ANTI.join(', ')}),
+               1.0 - smoothstep(${MS_COOL_MU.toFixed(3)}, ${MS_WARM_MU.toFixed(3)}, mu));
+  return mix(vec3(1.0), t, s);
+}
+
+/** MS anisotropy strength for a light at elevation sine muY. */
+float msAnisotropyStrength(float muY) {
+  return ${MS_ANISO.toFixed(3)} * (1.0 - smoothstep(0.06, 0.62, muY));
 }
 
 /** Nearest positive intersection with a sphere centred at the origin; -1 if none. */
@@ -391,6 +485,10 @@ March marchSky(vec3 ro, vec3 rd, vec3 sunDir, vec3 sunE, vec3 moonDir, vec3 moon
   float pRm = phaseRayleigh(muMoon);
   float pMm = phaseDust(muMoon, mieG);
   bool doMoon = uNight > 0.001;
+  // Constant along the ray: the multi-scatter chroma only depends on the angle
+  // between the view direction and the light, so it is hoisted out of the loop.
+  vec3 msTintS = msAnisotropy(muSun, msAnisotropyStrength(sunDir.y));
+  vec3 msTintM = msAnisotropy(muMoon, msAnisotropyStrength(moonDir.y));
 
   const int STEPS = 20;
   for (int i = 0; i < STEPS; i++) {
@@ -415,13 +513,13 @@ March marchSky(vec3 ro, vec3 rd, vec3 sunDir, vec3 sunE, vec3 moonDir, vec3 moon
     vec3 up = p / r;
     float muS = dot(up, sunDir);
     vec3 tSun = lightTransmittance(r, muS);
-    vec3 psiS = texture2D(uMsLUT, msUv(r, muS)).rgb;
+    vec3 psiS = texture2D(uMsLUT, msUv(r, muS)).rgb * msTintS;
     vec3 S = ((bR * dR * pRs + bMs * dM * pMs) * tSun + sS * psiS) * sunE;
 
     if (doMoon) {
       float muM = dot(up, moonDir);
       vec3 tMoon = lightTransmittance(r, muM);
-      vec3 psiM = texture2D(uMsLUT, msUv(r, muM)).rgb;
+      vec3 psiM = texture2D(uMsLUT, msUv(r, muM)).rgb * msTintM;
       S += ((bR * dR * pRm + bMs * dM * pMm) * tMoon + sS * psiM) * moonE;
     }
 
@@ -1204,6 +1302,8 @@ export class Sky {
     const muMoon = n[0] * moon.x + n[1] * moon.y + n[2] * moon.z;
     const pRm = (3 / (16 * Math.PI)) * (1 + muMoon * muMoon);
     const pMm = dustPhase(muMoon, mieG);
+    const msTintS = msAnisotropy(muSun, msAnisotropyStrength(sun.y));
+    const msTintM = msAnisotropy(muMoon, msAnisotropyStrength(moon.y));
 
     const Tv = [1, 1, 1];
     const tl = [0, 0, 0];
@@ -1236,7 +1336,7 @@ export class Sky {
       for (let c = 0; c < 3; c++) {
         const sr = T.bR[c] * dR;
         const sm = T.bMs[c] * dM;
-        S[c] = ((sr * pRs + sm * pMs) * tl[c] + (sr + sm) * psi[c]) * E;
+        S[c] = ((sr * pRs + sm * pMs) * tl[c] + (sr + sm) * psi[c] * msTintS[c]) * E;
       }
       if (doMoon) {
         const muM = ux * moon.x + uy * moon.y + uz * moon.z;
@@ -1245,7 +1345,7 @@ export class Sky {
         for (let c = 0; c < 3; c++) {
           const sr = T.bR[c] * dR;
           const sm = T.bMs[c] * dM;
-          S[c] += ((sr * pRm + sm * pMm) * tl[c] + (sr + sm) * psi[c]) * Em[c];
+          S[c] += ((sr * pRm + sm * pMm) * tl[c] + (sr + sm) * psi[c] * msTintM[c]) * Em[c];
         }
       }
       for (let c = 0; c < 3; c++) {
@@ -1309,6 +1409,23 @@ function hgPhase(mu, g) {
 function dustPhase(mu, g) {
   const gb = Math.min(0.80, Math.max(0.05, (g - DUST_TRUNC) / (1 - DUST_TRUNC)));
   return DUST_SPIKE_W * hgPhase(mu, DUST_SPIKE_G) + (1 - DUST_SPIKE_W) * hgPhase(mu, gb);
+}
+
+/** CPU mirrors of the shader's `msAnisotropy` / `msAnisotropyStrength`. */
+function msAnisotropy(mu, s) {
+  const x = Math.min(1, Math.max(0, (mu - MS_COOL_MU) / (MS_WARM_MU - MS_COOL_MU)));
+  const t = 1 - x * x * (3 - 2 * x);
+  const out = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    const tint = MS_TINT_SOLAR[c] + (MS_TINT_ANTI[c] - MS_TINT_SOLAR[c]) * t;
+    out[c] = 1 + (tint - 1) * s;
+  }
+  return out;
+}
+
+function msAnisotropyStrength(muY) {
+  const x = Math.min(1, Math.max(0, (muY - 0.06) / 0.56));
+  return MS_ANISO * (1 - x * x * (3 - 2 * x));
 }
 
 function normalize3(v) {

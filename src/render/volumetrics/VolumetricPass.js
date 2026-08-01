@@ -117,6 +117,13 @@ function quad(material) {
 const _v3 = new THREE.Vector3();
 const HORIZON = [0, 0, 0];
 
+/**
+ * Fraction of the air that reddens the beam which sits BELOW the cloud base —
+ * i.e. how much of the camera-level solar reddening a cumulus at ~1.8 km
+ * actually sees. See `_keyLight`.
+ */
+const DECK_AIRMASS = 0.5;
+
 export class VolumetricPass {
   constructor(world, fields) {
     this.world = world;
@@ -184,6 +191,7 @@ export class VolumetricPass {
         uKeyColor: { value: new THREE.Vector3(5, 4.4, 3.5) },
         uSkyZenith: { value: new THREE.Vector3(0.06, 0.09, 0.16) },
         uSkyHorizon: { value: new THREE.Vector3(0.16, 0.16, 0.18) },
+        uSkyAmb: { value: new THREE.Vector3(0.12, 0.14, 0.20) },
         uGroundBounce: { value: new THREE.Vector3(0.05, 0.04, 0.025) },
         uResolution: { value: new THREE.Vector2() },
         uTime: { value: 0 },
@@ -206,6 +214,7 @@ export class VolumetricPass {
         uDustHeight: { value: 900 },
         uApGain: { value: 0.93 },
         uApDesat: { value: 0.14 },
+        uSkyMean: { value: new THREE.Vector3(1, 1, 1) },
         uSkyLutValid: { value: 0 },
         uApG: { value: 0.66 },
         uCloudCoverage: { value: 0.38 },
@@ -314,6 +323,22 @@ export class VolumetricPass {
    * night — but only as a unit-luminance tint, clamped. Taking its level too
    * would over-attenuate the deck: that irradiance is evaluated at the camera,
    * and a cloud at 2 km sits above most of the air that reddens it.
+   *
+   * ## Round 5: the reddening was being applied twice
+   *
+   * `atm.sunRadiance` is `preset.sunColor * sunIntensity` — it already carries
+   * the beam's chroma. Multiplying that by `keyIrradiance`'s chroma on top of it
+   * applied the atmospheric reddening a second time: measured at afternoon, the
+   * preset beam is R/B 1.258, the camera-level irradiance is R/B 1.56, and the
+   * product handed to the cloud shader was R/B 1.98 — a light no sun at 27
+   * degrees of elevation emits. Every lit cumulus in the build inherited it, and
+   * since the deck fills the sky in a low camera, so did the sky.
+   *
+   * The fix takes the LEVEL from `atm.sunRadiance` as before but normalises its
+   * chroma out first, so the tint is applied exactly once. It is then applied at
+   * `DECK_AIRMASS` strength, because that irradiance is measured at the camera
+   * and a cloud base at 1.8 km sits above roughly half the dust that does the
+   * reddening — the very argument the paragraph above makes about the level.
    */
   _keyLight(out) {
     const L = this.world.lighting;
@@ -323,8 +348,10 @@ export class VolumetricPass {
     let r;
     let g;
     let b;
+    let preTinted = false;
     if (atm?.sunRadiance && atm.sunRadiance.every(Number.isFinite)) {
       [r, g, b] = atm.sunRadiance;
+      preTinted = true;
     } else {
       const c = L.sun.color;
       const i = L.sun.intensity;
@@ -339,7 +366,20 @@ export class VolumetricPass {
 
     const tint = this._skyChroma();
     out.dir = dir;
-    out.rgb = _v3.set(r * tint.x, g * tint.y, b * tint.z);
+    if (preTinted) {
+      // Strip the chroma the level already carries, then re-apply the sky's,
+      // partially: a cloud base sees a shorter path through the reddening air
+      // than the camera on the valley floor does.
+      const lum = Math.max(1e-6, 0.2126 * r + 0.7152 * g + 0.0722 * b);
+      const k = DECK_AIRMASS;
+      out.rgb = _v3.set(
+        lum * (1 + k * (tint.x - 1) + (1 - k) * (r / lum - 1)),
+        lum * (1 + k * (tint.y - 1) + (1 - k) * (g / lum - 1)),
+        lum * (1 + k * (tint.z - 1) + (1 - k) * (b / lum - 1)),
+      );
+    } else {
+      out.rgb = _v3.set(r * tint.x, g * tint.y, b * tint.z);
+    }
     return out;
   }
 
@@ -435,6 +475,15 @@ export class VolumetricPass {
       }
       u.uSkyHorizon.value.set(HORIZON[0], HORIZON[1], HORIZON[2]);
     }
+    // What a cloud TOP is filled by: the whole upper hemisphere, not the one
+    // direction that happens to be dimmest. The LUT's mean is that integral
+    // already; without it, fall back to the midpoint of the two endpoints.
+    if (this.skyLut.valid) {
+      const m = this.skyLut.mean;
+      u.uSkyAmb.value.set(m[0], m[1], m[2]);
+    } else {
+      u.uSkyAmb.value.copy(u.uSkyZenith.value).lerp(u.uSkyHorizon.value, 0.45);
+    }
     // Radiance of the sunlit desert floor: albedo/PI x irradiance. This lights
     // both the underside of the cloud deck and the suspended dust, and it is
     // the term that keeps them khaki instead of sky-blue.
@@ -478,6 +527,12 @@ export class VolumetricPass {
     u.uDustHeight.value = p.dustHeight;
     u.uApGain.value = p.apGain ?? 0.93;
     u.uApDesat.value = p.apDesat ?? 0.14;
+    // Where multiple scattering relaxes the haze chroma TO. Round 4 relaxed it
+    // toward grey, which is a desaturation of the sky, not a redistribution of
+    // it: a haze flattened toward grey is warmer than the sky it sits under, and
+    // that is measurable on any far ridge. The physical target is the sky's own
+    // hemispheric mean, as a unit-luminance chroma so it can only move hue.
+    this._unitChroma(u.uSkyMean.value, this.skyLut.valid ? this.skyLut.mean : null);
     // Chroma of the dust in-scatter, as a UNIT-LUMINANCE tilt away from the
     // sky's own colour and toward the sunlit ground under it. Unit luminance is
     // the whole point: it means the dust can only ever change the haze's hue,
@@ -512,6 +567,14 @@ export class VolumetricPass {
     );
     const l = 0.2126 * out.x + 0.7152 * out.y + 0.0722 * out.z;
     return l > 1e-6 ? out.multiplyScalar(1 / l) : out.set(1, 1, 1);
+  }
+
+  /** Write `rgb` renormalised to luminance 1 into `out`; white if unusable. */
+  _unitChroma(out, rgb) {
+    if (!rgb) return out.set(1, 1, 1);
+    const l = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    if (!(l > 1e-9)) return out.set(1, 1, 1);
+    return out.set(rgb[0] / l, rgb[1] / l, rgb[2] / l).clampScalar(0.35, 2.8);
   }
 
   update(dt, engine) {

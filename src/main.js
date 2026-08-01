@@ -102,10 +102,34 @@ window.__GAME = {
   applyShot,
   setTimeOfDay: (n) => lighting.setTimeOfDay(n),
   setFreeFly: (v) => (freeFly = v),
-  /** Advance the simulation deterministically then render one frame. */
+  /**
+   * Advance the simulation deterministically then render one frame.
+   *
+   * The pipeline's frame counter is rewound first, and that is not cosmetic:
+   * it drives the TAA jitter phase (`JITTER[frame % 16]`), the AO's temporal
+   * rotation (`frame % 64`) and the grain's time seed. It is a free-running
+   * counter over the life of the page, so the phase a shot landed on depended
+   * on how many frames the warm world happened to have drawn before it — a
+   * different number in every run, and a different number for the same shot
+   * depending on its position in the batch.
+   *
+   * Measured before this line existed: two runs of the SAME source, same shot,
+   * differed by RMS 0.0106 in linear luminance on near sand — 5.6% of the
+   * surface's own mean, and TWICE the size of the entire near-field grit
+   * signal an A/B was trying to measure (0.0055). Every ablation this round,
+   * mine and the nine authors', was being read through a noise floor larger
+   * than most of the effects. Resetting it makes a shot a pure function of the
+   * source, which is what a screenshot harness has to be.
+   */
   settle(frames = 6, dt = 1 / 60) {
     engine.deterministic = true;
     engine.stop();
+    if (engine.pipeline) engine.pipeline.frame = 0;
+    // Same argument for the clock: wind sway, the cloud pan and the cloud
+    // shadow all read `engine.elapsed`, which is cumulative over the life of
+    // the warm world, so shot N of a batch was drawn at a different moment in
+    // the weather than shot N of the previous batch.
+    engine.elapsed = 0;
     for (let i = 0; i < frames; i++) {
       engine.step(dt);
       engine.render();

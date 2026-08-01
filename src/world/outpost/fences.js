@@ -24,7 +24,11 @@ export function panelGeo() {
   const h = PANEL_H;
   b.concrete.push(box(w, h, t * 0.55, { y: h / 2 }));
   b.concrete.push(box(w, 0.26, t, { y: 0.13 }));
-  b.concrete.push(box(w, 0.26, t, { y: h - 0.13 }));
+  // The head of the panel is the compound's skyline in every approach frame —
+  // a couple of hundred metres of it, and it was stepping from concrete to sky
+  // in one pixel. 45mm off a 150mm-thick precast head is a heavy arris but it
+  // is what the mould actually had in it, and it is 64mm of lit rim.
+  b.concrete.push(box(w, 0.26, t, { y: h - 0.13, arris: 0.045 }));
   for (const sx of [-1, 1]) b.concrete.push(box(0.24, h, t, { x: sx * (w / 2 - 0.12), y: h / 2 }));
   // Rhombus relief: four bars at 45 degrees. Sharp — the panel is instanced ~130
   // times and this relief is never seen closer than the wall face it sits on,
@@ -45,7 +49,13 @@ export function panelGeo() {
 export function pilasterGeo() {
   const b = newBag();
   const h = PANEL_H + 0.22;
-  b.concrete.push(post(0.33, h, 0.36, 0, 0));
+  // The pilaster is the only vertical the perimeter has, it is repeated ~130
+  // times along the skyline of every frame that looks at this compound, and its
+  // corners were doing what the buildings' were: stepping from wall value
+  // straight to background in one antialiasing pixel. The precast ПО-2
+  // pilaster is moulded with a chamfer on all four arrises — 60mm of it, which
+  // is 85mm of chamfer face and still only 18% of the 330mm section.
+  b.concrete.push(post(0.33, h, 0.36, 0, 0, 0, 0, { arris: 0.06 }));
   b.concrete.push(box(0.42, 0.13, 0.44, { y: h + 0.06 }));
   b.metal.push(xform(cyl(0.028, 0.62, 5), { rz: -0.5, y: h + 0.35, z: 0.12 }));
   b.metal.push(xform(cyl(0.028, 0.62, 5), { rz: 0.5, y: h + 0.35, z: -0.12 }));

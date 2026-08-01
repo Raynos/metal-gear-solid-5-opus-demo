@@ -29,6 +29,55 @@ const GEO_KEYS = [
 ];
 
 /**
+ * Chamfered corner pier. The thing rounds 2 and 3 both asked for and neither
+ * got, and which round 4's first attempt still got wrong.
+ *
+ * `box()` knocks a 32-46mm arris off every edge in the compound and it is not
+ * enough, for a reason that is arithmetic rather than taste. Measured on the
+ * shipped frames: the corner of the concrete hut is 18.4 m from the night
+ * camera; at this field of view that is 24.1 px per degree, so a 46mm chamfer —
+ * which projects to 46*cos45 = 33mm at the silhouette — is 1.6 px. The
+ * horizontal profile across it ran 0.095, 0.095, 0.069, 0.026: one antialiasing
+ * pixel, no rim. Nothing that small can ever measure.
+ *
+ * The first fix attempted here was a 45-degree fillet prism let into the corner,
+ * and it failed for a reason worth recording so nobody tries it again: added
+ * geometry cannot REMOVE a corner. The wall's own 90-degree arris still stood
+ * 65mm proud of the fillet along the diagonal and hid it completely. A chamfer
+ * has to be cut, not stuck on.
+ *
+ * So: the four silhouette corners get a real pier — 340mm square, standing 40mm
+ * proud of both faces, which is how these buildings were actually detailed —
+ * and the pier is struck with a 75mm chamfer on all four of ITS arrises. That
+ * gives a chamfer facet 106mm wide, projecting 75mm at the silhouette, which is
+ * 5.6 px at 18.4 m. Because it is cut out of the pier there is nothing in front
+ * of it, and because `chamferBox` marks those facets in `aWeather.z` the
+ * material treats them as exposed aggregate — paler than the face and far
+ * smoother, so they take a specular rim off the sun as well as a diffuse one.
+ *
+ * @param {object} b        geometry bag
+ * @param {number} o.w      distance across the two face planes being met
+ * @param {number} o.d      ditto, the other way
+ * @param {number} o.sec    pier section
+ * @param {number} o.out    how far the pier stands proud of each face
+ * @param {number} o.arris  chamfer struck off the pier's own edges
+ * @param {Array}  o.corners which of the four to place, as [sx, sz] signs
+ */
+export function cornerPier(b, {
+  w, d, cx = 0, cz = 0, y0 = 0, y1, sec = 0.34, out = 0.04, arris = 0.075,
+  key = 'concrete', corners = null,
+}) {
+  const h = y1 - y0;
+  if (h <= 0.25) return;
+  const k = sec / 2 - out;
+  for (const [sx, sz] of corners ?? [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+    b[key].push(box(sec, h, sec, {
+      arris, x: cx + sx * (w / 2 - k), y: (y0 + y1) / 2, z: cz + sz * (d / 2 - k),
+    }));
+  }
+}
+
+/**
  * The painted socle, as geometry.
  *
  * Applied as a 30mm-proud skin rather than a shader band so it reads at any
@@ -60,14 +109,14 @@ export function dadoSkin(b, { w, d, h = 1.35, out = 0.03, y = 0 }) {
  * course, and a splayed weathering above it so water runs off rather than
  * sitting on the top of the plinth.
  */
-export function plinth(b, { w, d, h = 0.62, out = 0.13, y = 0, key = 'concrete' }) {
-  b[key].push(box(w + out * 2, h, d + out * 2, { y: y + h / 2 }));
+export function plinth(b, { w, d, h = 0.62, out = 0.13, y = 0, cx = 0, key = 'concrete' }) {
+  b[key].push(box(w + out * 2, h, d + out * 2, { x: cx, y: y + h / 2 }));
   // Splayed weathering: a shallow chamfered cap so the plinth sheds water and
   // presents a lit top edge above its own shadow.
-  b[key].push(box(w + out * 2 + 0.06, 0.075, d + out * 2 + 0.06, { y: y + h + 0.03 }));
-  b[key].push(box(w + out * 0.9, 0.11, d + out * 0.9, { y: y + h + 0.12 }));
+  b[key].push(box(w + out * 2 + 0.06, 0.075, d + out * 2 + 0.06, { x: cx, y: y + h + 0.03 }));
+  b[key].push(box(w + out * 0.9, 0.11, d + out * 0.9, { x: cx, y: y + h + 0.12 }));
   // The footing itself, mostly buried; what shows is a hard dark line at grade.
-  b[key].push(box(w + out * 2 + 0.14, 0.26, d + out * 2 + 0.14, { y: y - 0.10 }));
+  b[key].push(box(w + out * 2 + 0.14, 0.26, d + out * 2 + 0.14, { x: cx, y: y - 0.10 }));
 }
 
 /**
@@ -366,6 +415,11 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) b.concrete.push(post(0.74, H, 0.74, sx * (w / 2 - 0.02), 0.4, sz * (d / 2 - 0.02)));
   }
+  // The chamfer fillet on the four corner pilasters — the building's silhouette
+  // edges. The pilaster's outer face sits at (w/2 - 0.02) + 0.37, so that is
+  // where the strip goes; the cornice above it overhangs by 460mm and stops it,
+  // and the plinth weathering below it starts it.
+  cornerPier(b, { w: w + 0.70, d: d + 0.70, y0: 0.55, y1: H, sec: 0.42, out: 0.05, arris: 0.09 });
   // Bay pilasters go BETWEEN the windows. Round 3 found them landing exactly on
   // top of them: the old expression put pilaster 3 of 5 at x = 1.50 and window 3
   // of 5 at x = 1.50, so a 560mm pier stood across a 1350mm opening on both
@@ -536,6 +590,10 @@ export function barracks({
     }
   }
   b.concrete.push(box(w + 0.32, 0.18, d + 0.32, { y: H + 0.09 }));
+  // Chamfer fillets on the four corners, stopped under the eaves band. On a
+  // limewashed block wall the arris is where the render has come off first, so
+  // this strip is the one place on the elevation showing bare aggregate.
+  cornerPier(b, { w, d, y0: 0.50, y1: H, sec: 0.34, out: 0.04, arris: 0.075, key: shell });
   // Bay piers, set out from the ACTUAL window centres rather than from an
   // independent even division of the wall. With a paired rhythm the two
   // divisions drift apart and piers end up standing across openings, which is
@@ -675,6 +733,10 @@ function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCe
       b[shell].push(post(0.46, H + 0.30, 0.20, x, 0, sz * (d / 2 + 0.09)));
     }
   }
+  // Chamfer fillet down the four corner columns. The column's outer face is at
+  // (w/2 + 0.23, d/2 + 0.19), so that — not the wall behind it — is the edge
+  // that carries this building's silhouette.
+  cornerPier(b, { w: w + 0.46, d: d + 0.38, y0: 0, y1: H + 0.30, sec: 0.36, out: 0.045, arris: 0.08, key: shell });
   for (const sz of [-1, 1]) b[shell].push(box(w + 0.30, 0.40, 0.24, { y: H - 0.20, z: sz * (d / 2 + 0.11) }));
   b[shell].push(box(w + 0.34, 0.20, d + 0.34, { y: H + 0.10 }));
   parapet(b, { w: w + 0.34, d: d + 0.34, y: H + 0.20, h: 0.52, t: 0.15, key: shell });
@@ -769,6 +831,14 @@ function steelShed({ w = 20, d = 11, rng, litFrac = 0.3, signCell = 1 } = {}) {
   for (const sz of [-1, 1]) {
     b.metal.push(box(w + 0.7, 0.16, 0.10, { y: eave + 0.30, z: sz * (halfD + 0.55) }));
   }
+  // Folded corner flashing. A clad shed's corner is not a mitre — it is a
+  // pressed angle lapped over both sheets, and it is the only part of the
+  // cladding that is still galvanised rather than painted, so it reads brighter
+  // than either face at every sun angle.
+  cornerPier(b, {
+    w: w + 0.02, d: d + 0.10, y0: 0.50, y1: eave + 0.36, sec: 0.20, out: 0.03, arris: 0.055,
+    key: 'metal',
+  });
 
   // Roller shutter at the gable end, on its own steel goalpost.
   const sw = 4.2;
@@ -835,6 +905,13 @@ export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
     b.concrete.push(post(0.44, Hf, 0.44, -w / 2 + (i * w) / bays, 0, d / 2 - 0.22));
   }
   b.concrete.push(box(w + 0.5, 0.65, 0.52, { y: Hf + 0.33, z: d / 2 - 0.22 }));
+  // Back corners are the wall's own; front corners belong to the end columns of
+  // the portal, which stand 220mm proud of the flank wall.
+  cornerPier(b, { w, d, y0: 0.30, y1: Hb, sec: 0.36, out: 0.045, arris: 0.08, corners: [[-1, -1], [1, -1]] });
+  cornerPier(b, {
+    w: w + 0.44, d, y0: 0.30, y1: Hf, sec: 0.36, out: 0.045, arris: 0.08,
+    corners: [[-1, 1], [1, 1]],
+  });
 
   b.corr.push(xform(box(w + 0.95, 0.06, Math.hypot(d + 1.2, drop)), { rx: -slope, y: (Hf + Hb) / 2 + 0.66, z: 0 }));
   const nP = 6;
@@ -858,8 +935,15 @@ export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
 export function bunker({ w = 12, d = 8 } = {}) {
   const b = newBag();
   const H = 3.0;
+  // Round 4: the bunker was the one structure on the site with neither a plinth
+  // nor a parapet — a plain extruded box with a slab on it, which is the read
+  // the critics kept naming. It gets the same three-part base as every other
+  // building and a proper upstand above the cap so the roof deck is hidden.
+  plinth(b, { w, d, h: 0.46, out: 0.20 });
   b.concrete.push(box(w, H, d, { y: H / 2 }));
   b.concrete.push(box(w + 0.95, 0.48, d + 0.95, { y: H + 0.24 }));
+  cornerPier(b, { w, d, y0: 0.62, y1: H, sec: 0.44, out: 0.06, arris: 0.10 });
+  parapet(b, { w: w + 0.62, d: d + 0.62, y: H + 0.48, h: 0.40, t: 0.19 });
   b.concrete.push(box(3.2, 2.8, 1.3, { y: 1.4, z: d / 2 + 0.65 }));
   b.metal.push(box(2.25, 2.15, 0.10, { y: 1.08, z: d / 2 + 1.2 }));
   for (const sx of [-0.55, 0.55]) b.metal.push(cyl(0.03, 1.65, 5, { x: sx, y: 1.08, z: d / 2 + 1.27 }));
@@ -869,7 +953,7 @@ export function bunker({ w = 12, d = 8 } = {}) {
     b.metal.push(cyl(0.2, 0.07, 8, { x, y: H + 1.58, z: -d / 4 }));
   }
   b.interest.push({ pos: new THREE.Vector3(0, 0, d / 2 + 2.8), kind: 'door' });
-  return bakeBag(b, H + 0.35, 0.25);
+  return bakeBag(b, H + 0.50, 0.25);
 }
 
 // ------------------------------------------------------------- watchtower ---
@@ -949,6 +1033,10 @@ export function gateway({ gap = 9 } = {}) {
     b.concrete.push(post(pw, pierH, pw, x, 0));
     b.concrete.push(box(pw + 0.32, 0.24, pw + 0.32, { x, y: pierH + 0.12 }));
     b.concrete.push(box(pw + 0.5, 0.52, pw + 0.5, { x, y: 0.26 }));
+    // The gate piers are the closest architecture to the approach camera and
+    // the first thing a player walks up to, so they get the fillet at its full
+    // 120mm — struck out of a shutter with the chamfer board still in it.
+    cornerPier(b, { w: pw, d: pw, cx: x, y0: 0.54, y1: pierH, sec: 0.40, out: 0.05, arris: 0.10 });
   }
   b.concrete.push(box(gap + pw * 2 + 0.5, 0.8, 0.78, { y: pierH + 0.62 }));
 
@@ -1001,6 +1089,8 @@ export function gateway({ gap = 9 } = {}) {
   for (const g of wallRun(hd - 0.4, hh, 0.2, [{ x: 0, w: 1.0, y0: 0, h: 2.05 }])) {
     b.concrete.push(xform(g, { ry: -Math.PI / 2, x: hx - hw / 2 + 0.1 }));
   }
+  plinth(b, { w: hw, d: hd, h: 0.30, out: 0.11, cx: hx });
+  cornerPier(b, { w: hw, d: hd, cx: hx, y0: 0.42, y1: hh, sec: 0.30, out: 0.035, arris: 0.065 });
   b.concrete.push(box(hw + 0.75, 0.19, hd + 0.75, { x: hx, y: hh + 0.095 }));
   b.glow.push(box(1.6, 0.98, 0.05, { x: hx, y: 1.57, z: hd / 2 - 0.04 }));
   b.lights.push({ pos: new THREE.Vector3(hx, hh + 0.32, hd / 2 + 0.1), kind: 'wall' });

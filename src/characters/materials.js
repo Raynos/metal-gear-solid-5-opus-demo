@@ -101,6 +101,31 @@ mat3 ch_frame(vec3 N, vec3 p, vec2 uvv) {
   float im = inversesqrt(max(dot(T, T), dot(B, B)) + 1e-12);
   return mat3(T * im, B * im, N);
 }
+/**
+ * Bound a stack of tangent-space height gradients to a real surface slope.
+ *
+ * ROUND 5, and this is the whole of the "the pack out-reflects sunlit sand"
+ * defect. The gradients below were summed raw into vec3(sum, 1.0): the fold,
+ * drape, quilt and sag terms each peak near 1.0, so their sum reached 4-6 and
+ * the shading normal ended up 76-81 degrees off the surface it belongs to.
+ * That is not a normal map, it is a random direction generator — and on a
+ * BACKLIT character it meant a large fraction of fragments on the pack had a
+ * normal pointing at the sun, so a 0.20-albedo fabric standing in its own shade
+ * was taking the full 8.5-unit key. Measured on shots/r4/gameplay.png the 400
+ * brightest pixels of the pack came back at (220,206,187), linear luminance
+ * 0.629, against fully sunlit sand at 0.304 — the pack was 2.07x BRIGHTER than
+ * sand with three times the albedo, and the white blotches all over the
+ * silhouette were fold-noise catching the key.
+ *
+ * k is tan(max slope). Worn cotton twill wrinkles are a few millimetres deep
+ * over a centimetre or two; 0.60 is 31 degrees, which is already generous. The
+ * soft normalise keeps everything well below k linear (so the weave, ripstop
+ * and stitching are untouched) and asymptotes to k instead of clipping, so
+ * there is no visible ridge where the clamp engages.
+ */
+vec3 ch_tangentNormal(vec2 g, float k) {
+  return normalize(vec3(g * (k * inversesqrt(k * k + dot(g, g))), 1.0));
+}
 `;
 
 const VARYINGS = /* glsl */ `
@@ -194,29 +219,45 @@ const CHAR_BOUNCE = /* glsl */ `
   vec3 chBTint = mix(vec3(1.0), chTint, clamp(uWarmMix * 1.6, 0.0, 1.0));
   vec3 chInd = irradiance + iblIrradiance;
   float chUp = geometryNormal.y * 0.5 + 0.5;
-  irradiance += dot(chInd, CH_LUMA) * chBTint * uBounceAmt * mix(1.15, 0.28, chUp) * mix(0.55, 1.0, gAO) * mix(0.5, 1.0, chDay);
+  // Round 5 flattened the up/down profile from mix(1.15, 0.28) to
+  // mix(0.75, 0.30) and halved the amount. Measured on the round-5 gameplay
+  // frame BEFORE this change: the pack's sky-facing top curve rendered at
+  // linear 0.0223, its vertical flank at 0.0128 and its GROUND-FACING bottom
+  // roll at 0.0158 — the underside was brighter than the side, i.e. this term
+  // was inverting the sky ramp. It has to be small, because the scene's diffuse
+  // ambient is an SH projection of the sky dome that already carries the ground
+  // bounce (its own -Y irradiance measures 0.388 of its +Y, a 1.37-stop ramp),
+  // so anything added here is a SECOND copy of light that is already in the
+  // probe and it lands hardest exactly where the probe is darkest.
+  irradiance += dot(chInd, CH_LUMA) * chBTint * uBounceAmt * mix(0.75, 0.30, chUp) * mix(0.55, 1.0, gAO) * mix(0.5, 1.0, chDay);
 }
 `;
 
 const CHAR_RIM = /* glsl */ `
 {
-  // Round 4 tightened both lobes by two powers and cut the sun term by more
-  // than half. The direct-sun rim runs at the key's own intensity (8.5 in
-  // physical units at afternoon), so even a fresnel of 0.05 was landing at
-  // twice the diffuse of a 0.13-albedo garment — measured on the round-4
-  // frames it drew a uniform cream ring around the ENTIRE head, 15% of the
-  // head's radius wide, which swallowed the hairline, the bandana and the ear.
-  // A rim is meant to describe an edge, not to replace the form behind it.
-  float chF = 1.0 - saturate(dot(geometryNormal, geometryViewDir));
+  // Round 5 changed two things that together were most of the energy defect.
+  //
+  //  - The fresnel is taken off nonPerturbedNormal, the INTERPOLATED vertex
+  //    normal, not off the bump-mapped one. A rim describes the edge of a
+  //    FORM; keying it to a per-fragment wrinkle normal meant every crease in
+  //    the middle of a flat panel fired a full-strength rim, which is why the
+  //    round-4 pack was covered in cream blotches rather than outlined by one.
+  //  - Both lobes are now normalised by 1/PI, i.e. expressed as a reflectance
+  //    against the same irradiance the Lambert lobe sees. Before, the sky lobe
+  //    ran at 0.35 * 0.40 = 0.14 * irradiance at grazing while the fabric's own
+  //    diffuse is albedo/PI = 0.065 * irradiance — the "rim" was 2.2x the
+  //    surface it was supposed to trim. A cloth sheen edge is 0.15-0.30
+  //    reflectance, i.e. AT MOST comparable to the diffuse, never double it.
+  float chF = 1.0 - saturate(dot(nonPerturbedNormal, geometryViewDir));
   float chF2 = chF * chF;
   float chRim = chF2 * chF2;
   reflectedLight.indirectSpecular +=
-    chRim * uRimAmt * uRimColor * (irradiance * 0.35 + iblIrradiance * 0.65) * gAO;
+    chRim * uRimAmt * RECIPROCAL_PI * uRimColor * (irradiance + iblIrradiance) * gAO;
   #if NUM_DIR_LIGHTS > 0
     // Backlit edge: only where the key is genuinely behind the subject.
     float chBack = saturate(-dot(directionalLights[0].direction, geometryViewDir));
-    reflectedLight.indirectSpecular +=
-      chRim * chF2 * chBack * chBack * chBack * uSunRim * directionalLights[0].color * gAO;
+    reflectedLight.indirectSpecular += chRim * chF2 * chBack * chBack * chBack *
+      uSunRim * RECIPROCAL_PI * directionalLights[0].color * gAO;
   #endif
 }
 `;
@@ -236,11 +277,20 @@ const CHAR_RIM = /* glsl */ `
 function lightUniforms(o = {}) {
   return {
     uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.83, 0.63])) },
-    uBounceAmt: { value: o.bounce ?? 0.40 },
+    // Round 5: 0.40 -> 0.18. The scene's diffuse ambient is a spherical-harmonic
+    // projection of the sky dome that ALREADY carries the ground bounce
+    // (Lighting.js `_computeSkySH`), so this term was adding a second copy of it
+    // — up to +46% of the total indirect on a downward-facing panel. A real
+    // secondary bounce off sand onto a vertical surface is on the order of 15%.
+    uBounceAmt: { value: o.bounce ?? 0.11 },
     uWarmMix: { value: o.warmMix ?? 0.10 },
     uRimColor: { value: new THREE.Vector3(...(o.rimColor ?? [1.0, 0.94, 0.86])) },
-    uRimAmt: { value: o.rim ?? 0.40 },
-    uSunRim: { value: o.sunRim ?? 0.075 },
+    // Now a REFLECTANCE (the lobe is 1/PI-normalised in CHAR_RIM), so 0.30 means
+    // a grazing sheen of 0.30 against a fabric whose diffuse albedo is 0.20:
+    // a rim that is a stop brighter than the panel at the extreme silhouette
+    // and invisible two degrees inboard of it.
+    uRimAmt: { value: o.rim ?? 0.22 },
+    uSunRim: { value: o.sunRim ?? 0.05 },
   };
 }
 
@@ -300,11 +350,20 @@ function defaultClothPalette() {
   // character. Round 4 pulled it toward oxide: at R/G 5.6 it was the single
   // most saturated thing in a frame whose whole grade is built on being
   // desaturated, and the tails read as a ribbon rather than as dyed cotton.
-  c[Z.BANDANA] = new THREE.Vector3(0.132, 0.038, 0.029);
-  // Dark brown, not black. A crop in Afghan sun carries a strong sheen off the
-  // crown; at 0.048 the whole back of the head rendered as one silhouette and
-  // took the bandana and the ear down with it.
-  c[Z.HAIR] = new THREE.Vector3(0.104, 0.079, 0.056);
+  // Round 5: lifted again. Measured on the shipped gameplay frame the whole
+  // head — hair, bandana, ear, jaw — came back as ONE mass at sRGB 34-46 with a
+  // 12-count spread across 110 px. The bandana at 0.132/0.038 was the same
+  // LUMINANCE as the hair beside it, so the one internal value step on the head
+  // was invisible; a faded oxide cotton is lighter than dark hair, not equal.
+  c[Z.BANDANA] = new THREE.Vector3(0.163, 0.072, 0.056);
+  // Dark brown. Round 5 put it BACK down: the round-1..4 argument for lifting
+  // hair was that "the whole back of the head rendered as one silhouette", but
+  // that was the inside-out skull (geometry.js), not the hair — which was
+  // buried inside the skull and never drawn at all. Now that a real hair shell
+  // stands 12 mm proud of a correctly-wound head, it has to be hair-coloured:
+  // dark brown keratin is 0.05-0.09 diffuse reflectance, and against a 0.152
+  // plate carrier that value step is the whole read of the head.
+  c[Z.HAIR] = new THREE.Vector3(0.083, 0.062, 0.043);
   c[Z.BOOT] = new THREE.Vector3(0.147, 0.105, 0.065);
   return c;
 }
@@ -596,7 +655,10 @@ export function makeClothMaterial(opts = {}) {
            gRough = clamp(rough + (meso - 0.5) * 0.09 - seam * 0.06, 0.25, 1.0);
            // Sheen is a *whisper*. Cranked up it lights the whole garment from
            // the environment and fatigues turn into pale nylon.
-           gSheenCol = mix(vec3(0.020, 0.018, 0.015), vec3(0.078, 0.072, 0.062), ao) * gSheen;
+           // Round 5: halved. Sheen is an ADDITIVE lobe that three adds on top
+           // of the whole BRDF, so on a backlit subject a 0.078 sheen against a
+           // 8.5-unit key was worth 30% of the surface's own sunlit diffuse.
+           gSheenCol = mix(vec3(0.012, 0.011, 0.009), vec3(0.040, 0.037, 0.032), ao) * gSheen;
          }`,
       )
       .replace(
@@ -666,7 +728,14 @@ export function makeClothMaterial(opts = {}) {
            float seam = ch_seams(vBind, vEdge.x, zi);
            float stitchN = gStitch * 0.55 - seam * 0.35;
 
-           vec3 tn = normalize(vec3(nRip + nWeave + nFold + nDrape + nQuilt + nSag + vec2(stitchN), 1.0));
+           // Bounded. See ch_tangentNormal: the raw sum of these six terms
+           // reaches 4-6, which tilts the shading normal 76-81 degrees off the
+           // panel and lets a backlit 0.20-albedo pack catch the full key.
+           vec2 nSum = nRip + nWeave + nFold + nDrape + nQuilt + nSag + vec2(stitchN);
+           // Load-bearing kit is a stiff laminated panel and gets the tighter
+           // bound; a sleeve or a trouser leg genuinely gathers harder.
+           // tan(19 deg) / tan(24 deg).
+           vec3 tn = ch_tangentNormal(nSum, kit ? 0.34 : 0.45);
            normal = normalize(tbn * tn);
          }`,
       )
@@ -708,7 +777,7 @@ export function makeSkinMaterial(opts = {}) {
     uBrow: { value: opts.brow ?? 1.0 },
     // Skin wants a warmer, weaker rim than cloth: a cold sky rim on a face
     // reads as a chrome edge.
-    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.34, sunRim: 0.085, bounce: 0.30, warmMix: 0.14, ...opts }),
+    ...lightUniforms({ rimColor: [1.0, 0.86, 0.74], rim: 0.26, sunRim: 0.06, bounce: 0.09, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -856,7 +925,9 @@ export function makeSkinMaterial(opts = {}) {
            vec3 cp = vBind * 55.0;
            float c0 = ch_ridge(cp, 2);
            vec2 gc = vec2(c0 - ch_ridge(cp + vec3(0.2, 0.0, 0.0), 2), c0 - ch_ridge(cp + vec3(0.0, 0.2, 0.0), 2));
-           normal = normalize(tbn * normalize(vec3(g * 1.8 * fine + gc * 1.1, 1.0)));
+           // tan(19 deg). Pores and skin creases are shallow; anything steeper
+           // is the same unbounded-gradient bug the cloth had.
+           normal = normalize(tbn * ch_tangentNormal(g * 1.8 * fine + gc * 1.1, 0.34));
          }`,
       )
       // Subsurface: wrapped diffuse with a blood-red tint in the terminator.
@@ -913,7 +984,7 @@ export function makeMetalMaterial(opts = {}) {
   const uniforms = {
     uMetalColor: { value: colors },
     uSeed: { value: opts.seed ?? 0 },
-    ...lightUniforms({ rim: 0.40, sunRim: 0.07, bounce: 0.24, warmMix: 0.14, ...opts }),
+    ...lightUniforms({ rim: 0.30, sunRim: 0.05, bounce: 0.07, warmMix: 0.14, ...opts }),
   };
   mat.userData.uniforms = uniforms;
 
@@ -989,7 +1060,10 @@ export function makeMetalMaterial(opts = {}) {
            float e = 0.5;
            float h0 = ch_fbm(pp, 2);
            vec2 g = vec2(h0 - ch_fbm(pp + vec3(e, 0.0, 0.0), 2), h0 - ch_fbm(pp + vec3(0.0, e, 0.0), 2));
-           normal = normalize(tbn * normalize(vec3(g * 1.1, 1.0)));
+           // Machined metal is FLAT: tan(11 deg) is already generous for a
+           // phosphate finish, and an over-tilted normal on a metalness-1
+           // surface samples a random mip of the sky and glitters.
+           normal = normalize(tbn * ch_tangentNormal(g * 1.1, 0.20));
          }`,
       );
 
@@ -1007,7 +1081,7 @@ export function makeRubberMaterial(opts = {}) {
     envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
-  const uniforms = lightUniforms({ rim: 0.38, sunRim: 0.05, bounce: 0.34, warmMix: 0.14, ...opts });
+  const uniforms = lightUniforms({ rim: 0.28, sunRim: 0.035, bounce: 0.10, warmMix: 0.14, ...opts });
   mat.userData.uniforms = uniforms;
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
@@ -1048,7 +1122,9 @@ export function makeRubberMaterial(opts = {}) {
            vec3 pp = vBind * 220.0;
            float h0 = ch_fbm(pp, 2);
            vec2 g = vec2(h0 - ch_fbm(pp + vec3(0.6, 0.0, 0.0), 2), h0 - ch_fbm(pp + vec3(0.0, 0.6, 0.0), 2));
-           normal = normalize(tbn * normalize(vec3(g * 2.0 + nLug, 1.0)));
+           // A lug block has near-vertical walls but they are two pixels wide at
+           // any distance this is seen from; tan(35 deg) is the honest average.
+           normal = normalize(tbn * ch_tangentNormal(g * 2.0 + nLug, 0.70));
          }`,
       );
   };

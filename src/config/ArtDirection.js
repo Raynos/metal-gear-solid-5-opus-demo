@@ -29,6 +29,22 @@ export const TAU = Math.PI * 2;
  * Raising the sun instead of only cutting the fill also pulls the sky out of the
  * blown-white it sat in: the scene brightens, auto-exposure stops down, and the
  * dome comes back into the shoulder where its cloud modelling is readable.
+ *
+ * ROUND 5 — `exposure` CHANGED MEANING. It is no longer the absolute exposure;
+ * it is a dimensionless TRIM around an exposure the pipeline now derives from
+ * this preset's own sun and sky irradiance (see RenderPipeline's
+ * `_updateExposure` and GRADE.exposureKey / exposureAdapt). That is what makes
+ * two shots at the same time of day expose identically instead of the
+ * histogram deciding: round 4 printed flat sunlit sand 0.52 stops apart between
+ * the gameplay and outpost framings, and printed the afternoon 0.58 stops
+ * BRIGHTER than noon, which no sun elevation can produce.
+ *
+ * So these five numbers are now the only place the print says how each hour
+ * should read relative to the others. Measured on the shipped frames, sunlit
+ * sand lands at display Y 0.53 at noon and 0.44-0.51 in the afternoon — under
+ * noon, as a 27 degree sun should be — and the night frame sits 1.6 stops under
+ * the day. Raising one of these raises EVERY shot at that hour by exactly the
+ * same amount, which is the whole point.
  */
 export const TIME_OF_DAY = {
   dawn: {
@@ -45,7 +61,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 0.9,
     fogColor: [0.66, 0.62, 0.62],
     fogDensity: 0.000105,
-    exposure: 1.00,
+    exposure: 0.68,
   },
   noon: {
     sunElevation: 68.0,
@@ -71,7 +87,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 1.15,
     fogColor: [0.70, 0.735, 0.80],
     fogDensity: 0.000082,
-    exposure: 0.74,
+    exposure: 1.12,
   },
   afternoon: {
     sunElevation: 27.0,
@@ -91,7 +107,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 1.0,
     fogColor: [0.72, 0.70, 0.71],
     fogDensity: 0.000095,
-    exposure: 0.95,
+    exposure: 0.78,
   },
   dusk: {
     sunElevation: 2.0,
@@ -112,7 +128,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 1.05,
     fogColor: [0.60, 0.52, 0.52],
     fogDensity: 0.000118,
-    exposure: 1.00,
+    exposure: 0.55,
   },
   night: {
     sunElevation: -14.0,
@@ -134,7 +150,7 @@ export const TIME_OF_DAY = {
     ambientIntensity: 0.28,
     fogColor: [0.13, 0.16, 0.24],
     fogDensity: 0.00013,
-    exposure: 0.72,
+    exposure: 0.175,
   },
 };
 
@@ -166,7 +182,17 @@ export const GRADE = {
   // is already sitting inside the +8..+18 target. The print was adding +14 on
   // top of it. Trimming the two warm terms is therefore the only honest fix;
   // cooling the ground further would have made the scene itself wrong.
-  midTint: [1.022, 1.000, 0.982],
+  // Round 5 integration: 1.022/0.982 -> 1.030/0.974. The scene got COOLER this
+  // round on purpose — the sky dome is genuinely blue, the SH probe's gradient
+  // was un-inverted so shaded faces now take sky rather than ground, and the
+  // shadow band is filled with that sky. All three are correct and all three
+  // cost red: the shipped daylight frames measured mean R-B ground +4.9,
+  // gameplay +3.1, vista +7.2 against a +8..+18 target, i.e. three of four
+  // below the floor. The mid band is where a desert frame lives, so the
+  // recovery goes here and in `warmth`, not into the shadow tint (which is the
+  // sky, and must stay cool) or the highlights (which are the sun, and must
+  // stay near-white).
+  midTint: [1.030, 1.000, 0.974],
   highlightTint: [1.015, 1.0, 0.975],
   // Round 3: saturation 0.90 -> 0.86 and lift 0.034 -> 0.050. The warmth fix
   // landed (every daylight frame now measures red above blue) but it landed
@@ -177,6 +203,25 @@ export const GRADE = {
   saturation: 0.86,
   contrast: 1.12,
   lift: 0.050,
+  /**
+   * Shadow FILL, distinct from `lift`.
+   *
+   * `lift` moves the black point: it is a constant added everywhere and it is
+   * what puts the darkest pixel in the frame at code 11-15 instead of 0. It
+   * cannot fix the round-5 dusk problem, because the dusk frame has no blacks
+   * to lift — measured on ridge.png, nothing at all sits below code 26 and
+   * 11.2% of the frame sits in codes 26-31, right under the L=0.12 line. What
+   * that needs is a bump in the LOW SHADOWS that leaves the black point where
+   * it is, so this is gated off below code ~13 and tapered out by code ~107:
+   * the toe keeps its measured black, the deep-shadow band comes up ~5 counts,
+   * and midtone and highlight contrast are untouched.
+   *
+   * Simulated over all seven shipped frames before it was written: ridge
+   * 11.21% -> 0.56% of frame below L=0.12, vista 0.34 -> 0.09, outpost
+   * 1.56 -> 0.54, gameplay 20.12 -> 10.15, with min/p0.1% unchanged to a tenth
+   * of a code on every one of them.
+   */
+  shadowFill: 0.020,
   // Bloom
   bloomStrength: 0.28,
   bloomRadius: 0.62,
@@ -196,9 +241,18 @@ export const GRADE = {
   // gameplay and became a product photograph. f/4.5 keeps the separation and
   // leaves the scene readable; the landscape shots focus past 100 m and are
   // unaffected either way.
-  fStop: 4.5,            // aperture for the depth-of-field solve
+  // Round 5: f/4.5 -> f/16. At f/4.5 and a 2.1 m subject, a 29 mm lens puts
+  // EVERYTHING beyond the hero under a 4 px circle of confusion — the whole
+  // playable mid-ground of the gameplay shot, measured at 5.1 px of effective
+  // edge width on the building roofline against the sky. Seven engineers'
+  // geometry was being blurred away before it reached the screen. At f/16 the
+  // hyperfocal distance of the same lens is 1.6 m, so a shot focused on a
+  // subject at arm's length is sharp from a metre to infinity, and the only
+  // defocus left in the frame is the ~1 px of far-field separation MGSV
+  // actually uses. Shallow depth of field is a cutscene tool, not a gameplay one.
+  fStop: 16,             // aperture for the depth-of-field solve
   sensorHeight: 0.024,   // metres; 35mm-format sensor, sets CoC -> pixels
-  focusEdgeSoftness: 1.2, // extra CoC in the corners (field curvature), pixels
+  focusEdgeSoftness: 0.25, // extra CoC in the corners (field curvature), pixels
   // Tonemap (appended round 2). `whitePoint` is the linear value that maps to
   // display 1.0; nothing can exceed it, because everything above
   // whitePoint*shoulder is folded into the remaining headroom by a rational
@@ -223,7 +277,46 @@ export const GRADE = {
   // genuinely blue and the sun is no longer a 3300 K filter — so the print no
   // longer has to carry the warmth on its own, and at the old value it was
   // adding ~9 counts of R-B to a mid-grey before the split tone had run.
-  warmth: [1.034, 1.0, 0.950],
+  // Round 5 integration: 1.034/0.950 (an 8.8% R-over-B tilt) -> 1.052/0.934
+  // (12.6%). See `midTint` — the scene-side white balance moved cool this round
+  // and the print has to take some of it back. Held well short of the round-3
+  // value (16.9%) that produced the orange cast this file rules out.
+  warmth: [1.052, 1.0, 0.934],
+  /**
+   * Depth-of-field ceilings, in pixels at 1080p (they scale with resolution).
+   * These are the seatbelt behind `fStop`: whatever the autofocus locks onto,
+   * the background can never smear more than `maxCoCFar` and the foreground
+   * never more than `maxCoCNear`. `cocFloor` is the point below which defocus
+   * is not defocus — anything under it skips the bokeh gather entirely, so a
+   * sharp frame costs nothing and cannot be softened by accident.
+   */
+  maxCoCFar: 2.4,
+  maxCoCNear: 1.2,
+  cocFloor: 0.9,
+  /**
+   * Exposure. `exposureKey` is the linear, post-exposure value that SUNLIT
+   * SAND is placed at; the pipeline derives the stop from the sun and sky
+   * irradiance so that every shot at a given time of day is exposed
+   * identically, and `TIME_OF_DAY[x].exposure` is the per-hour trim around it.
+   *
+   * `autoExposureStops` is all the authority the histogram has left, in stops
+   * either side of that physical value. Round 4 gave it -1.00 to +0.77 and it
+   * spent that budget putting two frames of the same afternoon 0.52 stops
+   * apart on the same sand. It is a seatbelt now, not a grade.
+   */
+  exposureKey: 0.763,
+  exposureRefRadiance: 1.652,
+  exposureAdapt: 0.62,
+  meterBias: 0.62,
+  autoExposureStops: 0.02,
+  /**
+   * Where display white sits on the shoulder, as a fraction of `whitePoint`.
+   * Below 1.0 the top of the curve is a finite, reachable value instead of an
+   * asymptote — see `_refreshWhitePoint`. This is the difference between a
+   * frame with the sun in it having some genuinely white pixels and a frame
+   * whose brightest channel anywhere is 252.
+   */
+  whiteReach: 0.95,
 };
 
 /** Terrain / material palette (linear-space albedo). */
@@ -344,7 +437,19 @@ export const LIGHT_TRANSPORT = {
    * at noon and delivered a frame with no dynamic range at all.
    */
   keyFillHigh: 8.6,
-  keyFillLow: 2.8,
+  // Round 5: 2.8 -> 1.6, and this is the fix for the crushed dusk/dawn frames
+  // rather than anything in the print. The ramp above bottoms out at this value
+  // for any sun below ~2.3 degrees, i.e. exactly the dusk and dawn presets, and
+  // at 2.8 it was asserting that a 2 degree sun still delivers 64% of the
+  // horizontal illuminance. It does not: the comment above sizes the horizon
+  // case at five air masses, which is a 12 degree sun; at 2 degrees the beam
+  // crosses more than thirty and the sky is unambiguously the dominant source.
+  // Measured on ridge.png with 2.8, the shaded near hill — 15% of the dusk hero
+  // frame — sat at mean display Y 0.090 with a standard deviation of 0.002: one
+  // flat black value across every piece of geometry in the nearest quarter of
+  // the picture, and 26% of the frame under L=0.12. This is a fill problem, and
+  // lifting it with exposure instead would only have blown the sun side.
+  keyFillLow: 1.6,
   keyFillNight: 3.6,
   /**
    * Width, in N.L, of the shading-normal terminator roll-in on the key light.

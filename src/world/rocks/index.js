@@ -22,7 +22,7 @@ export async function install(world) {
   const t0 = performance.now();
   const lib = buildShapeLibrary();
   const material = createRockMaterial();
-  const { group, meshes, collars, records } = buildRockField(world, lib, material);
+  const { group, meshes, collars, records, spent, rejected, wind } = buildRockField(world, lib, material);
   world.scene.add(group);
 
   let instances = 0;
@@ -57,9 +57,19 @@ export async function install(world) {
   const tmp = new THREE.Matrix4();
   const zero = new THREE.Vector3(0, 0, 0);
 
+  console.log(
+    `[rocks] placed ${JSON.stringify(spent)} | rejected ${JSON.stringify(rejected)}` +
+      ` | wind ${wind.map((v) => v.toFixed(3)).join(',')}`,
+  );
+
   return {
     group,
     meshes,
+    /** Per-family instance counts and the seat/cull rejection tally. */
+    spent,
+    rejected,
+    /** World-space wind vector, shared with the terrain's ripple field. */
+    windDir: wind,
     /** Fines aprons. Separate bodies, placed in world space — see Scatter.addCollar. */
     collars,
     material,

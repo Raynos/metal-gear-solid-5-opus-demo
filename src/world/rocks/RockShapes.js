@@ -356,8 +356,15 @@ export function buildShapeLibrary() {
   // aspect floor, edge weathering and fines apron are what make it read.
   const stones = STONES.map((a, i) =>
     bodyVariant(2000 + i, [0, 1, 2], a, { grooves: 3, grooveDepth: 0.055 }, 0.44));
+  // No `hero` on boulders either, as of round 5. `hero` buys a SECOND
+  // subdivision — 2,240 triangles a body against 560 — and the audit found
+  // exactly zero instances eligible for it: `CLEAR.boulder` refuses a boulder
+  // inside 112 m of the play centre and the band-0 ring started at 126 m, so
+  // the mesh was generated, normalised and kept resident for a tier nothing has
+  // ever been in. At 112 m a 2 m boulder is 25 px tall; the once-subdivided hull
+  // has more outline segments than that.
   const boulders = BOULDERS.map((a, i) =>
-    bodyVariant(3000 + i, [0, 1, 2], a, { hero: 1 }, 0.46));
+    bodyVariant(3000 + i, [0, 1, 2], a, {}, 0.46));
   // 0.52 on the finished hull for the skyline families. These are the bodies a
   // critic can see from a kilometre away, and the only defence against the
   // "placeholder monolith" read at that range is that the thing has three real

@@ -278,7 +278,10 @@ const GRASS_VERT_BODY = /* glsl */ `
     // Capped at 1.0 — the old curve peaked at 1.23, which is a material that
     // reflects more light than lands on it, and it was doing that on the very
     // pixels (blade tips against distant ground) that read as confetti.
-    vVegAO = mix(0.80, 1.00, smoothstep(0.0, 0.24, t)) * mix(0.90, 1.00, tint);
+    // Round 4: floor 0.80 -> 0.87. The occlusion inside a 20 cm tussock is real
+    // but it is not a fifth of the hemisphere, and it was the third of three
+    // places round 3 subtracted for the same effect.
+    vVegAO = mix(0.87, 1.00, smoothstep(0.0, 0.24, t)) * mix(0.93, 1.00, tint);
     vVegT = t;
     vVegN = n;
   } else {
@@ -328,7 +331,12 @@ export function createGrassRing(field, uniforms, opts) {
     // inside a tussock, so it sees rather less than a full hemisphere of sky.
     // At 1.15 it saw *more* than a flat open surface does, which is one of the
     // reasons every critic measured grass brighter than the ground under it.
-    envMapIntensity: 0.78,
+    // Round 4: 0.78 -> 0.94. Round 3 subtracted for self-occlusion here AND in
+    // the albedo AND in the AO ramp, three times for one effect, and the result
+    // measured 0.06-0.08 display luminance below the sand it stands in. A tuft
+    // in the open really does see most of the sky; the canopy it hides from is
+    // its own, and that is what the AO ramp below is for.
+    envMapIntensity: 0.94,
     dithering: true,
   });
 
@@ -378,6 +386,24 @@ export function createGrassRing(field, uniforms, opts) {
          varying float vVegAO;
          varying vec3 vVegN;
          ${GLSL_DRY_SHADING}`,
+      )
+      // THE reason round 3's grass read as black wire, and it has nothing to do
+      // with albedo. `normal_fragment_begin` flips the shading normal on back
+      // faces of a DOUBLE_SIDED material, which is right for a solid and wrong
+      // for a blade of grass: `uTuft.w` has already dragged this normal 78-88%
+      // of the way toward the GROUND normal, so flipping it points it at the
+      // floor. Under a 68-degree sun that is N.L = 0, and since roughly half the
+      // blades in a tuft present their back face, half of every tuft rendered as
+      // an unlit silhouette. Cancel the flip: both faces of a blade are shaded
+      // with the same canopy normal, which is what every foliage shader does and
+      // what the translucency term below is there to complete.
+      .replace(
+        '#include <normal_fragment_begin>',
+        `#include <normal_fragment_begin>
+         #ifdef DOUBLE_SIDED
+           normal *= faceDirection;
+           nonPerturbedNormal = normal;
+         #endif`,
       )
       // getShadowMask() is not part of the physical material, but everything it
       // needs (vDirectionalShadowCoord, getShadow) is — meshphysical already
@@ -494,13 +520,23 @@ function buildCoverPatch(seed, rim = 7) {
   return geo;
 }
 
+// The lattice half-width is `cellSize * grid / 2` and `fadeOut[1]` must not
+// exceed it, or the layer simply stops at the edge of its own grid with a hard
+// circular boundary and the fade never runs. 20 x 124 / 2 = 1240 m, which is
+// exactly where the fade ends. Patch radii scale with the cell for the same
+// reason they always did: coverage per unit area has to stay constant.
 const COVER = {
-  cellSize: 15.0,
-  grid: 108,
-  patchMin: 10.0,
-  patchMax: 19.0,
+  cellSize: 20.0,
+  grid: 124,
+  patchMin: 13.5,
+  patchMax: 25.5,
   fadeIn: [34, 96],   // hands over from the instanced rings as they thin out
-  fadeOut: [760, 930],
+  // Round 4 pushed the far edge out from 930 m to 1240 m. The woody tiers used
+  // to run to 1050 m and this layer stopped before they did; now that they stop
+  // at 560 m, this is the ONLY thing carrying coverage over the far half of the
+  // valley floor, and it has to reach past where the aerial perspective has
+  // washed the ground out anyway.
+  fadeOut: [1030, 1240],
   // Coverage is a fraction of ground, not an opacity: a stand that the density
   // field calls 0.25 hides most of the soil under it once you are far enough
   // away to see it edge-on. The gain converts one into the other, and it is
@@ -515,8 +551,16 @@ const COVER = {
   maxAlpha: 0.62,
 };
 
-/** Linear albedo of the covered ground. Between bare sand and a grass blade. */
-const COVER_COLOR = new THREE.Vector3(0.196, 0.166, 0.104);
+/**
+ * Linear albedo of the covered ground. Between bare sand and a grass blade, and
+ * it has to be, because this layer IS the grass at distance: if it is darker
+ * than the blades it replaces then the field changes value at the LOD boundary,
+ * which is the one thing this layer exists to prevent. Luminance 0.259 against
+ * the blade mean of 0.294 and sandLight's 0.551 — a stand of dry grass seen from
+ * 400 m is mostly grass with some soil showing through, so it lands just under
+ * the blade and well under the sand.
+ */
+const COVER_COLOR = new THREE.Vector3(0.330, 0.262, 0.150);
 
 const COVER_VERT = /* glsl */ `
   vec2 cellIdx = uFieldCell + aCell - uRing.y;
@@ -785,25 +829,34 @@ export function createGrass(field, uniforms) {
 
 /**
  * Round 2 argued dry grass is "sand with more yellow in it" and set the bleached
- * tip at 0.660 linear — one count under PALETTE.sandLight. That is wrong, and it
- * is wrong by a factor of two and a half. Sand is a mineral surface with an
- * albedo of 0.35-0.45; dead grass is a translucent organic one at 0.15-0.25.
- * Standing next to each other under the same sun, dry scrub is ALWAYS the darker
- * of the two — which is the whole reason it is legible at all. The old values
- * made grass the brightest thing on the valley floor and turned the distant
- * field into frost.
+ * tip at 0.660 linear — one count under PALETTE.sandLight. Round 3 corrected
+ * that and OVERSHOT, to 0.303/0.149 (mean luminance 0.226 against sand at
+ * 0.38-0.55). Measured by ablation — the same frame rendered with and without
+ * vegetation, post-effects frozen so the diff is not grain — the tufts came back
+ * at display luminance 0.550 against the 0.625 of the sand they replace in the
+ * `ground` shot, and 0.384 against 0.440 in `gameplay`. That is 0.06-0.08 of
+ * display luminance below their own background, which is exactly the magnitude
+ * round 2 sat ABOVE it. Black confetti instead of white confetti.
  *
- * The target is a blade averaging 0.20 linear. These are the two ends of that
- * average, not a ceiling: bleached tip at luminance 0.303, stained root at
- * 0.149, mean 0.226 — against PALETTE.sandLight at 0.53 and sandDark at 0.38,
- * so a tuft is a little over half the value of the sand it stands in. A first
- * pass at this put the pair at 0.223/0.128 and the near-field tufts came back
- * as black wire against the yard: correct as a ratio to the *distant* ground,
- * far too dark against ground the player is standing on. Still comfortably warm
- * — red well over blue — because Afghan daylight has no cold grass in it, and
- * grass is one of the few surfaces with enough screen area to argue that.
+ * The target is not "dark", it is "in the same light as the ground it grows
+ * from". Two physical anchors, both of which round 3 got wrong:
+ *
+ *  - broadband albedo of dry steppe grass is 0.22-0.28, not 0.15-0.20; and
+ *    Afghan sand is 0.30-0.40, not the 0.45-0.55 of a lab swatch. The honest
+ *    ratio is ~0.7, not the ~0.45 round 3 used.
+ *  - a tuft is a vertical structure. Self-shadowing, the AO ramp and an
+ *    envMapIntensity under 1 all subtract on top of the albedo, so the RENDERED
+ *    ratio is always well below the albedo ratio. Round 3 budgeted for the
+ *    albedo difference twice.
+ *
+ * Bleached tip at luminance 0.387, stained root at 0.201, mean 0.294 — 0.63 of
+ * the sand's mean, which after the geometric losses lands a tuft a couple of
+ * hundredths under the sand beside it instead of a tenth. R/B is 2.0 (sand is
+ * 1.28), so the tuft stays unambiguously the warmer of the two: warm khaki
+ * against pale grey-khaki, which is the relationship reference photography of
+ * dry Afghan scrub actually shows.
  */
 export const GRASS_COLORS = {
-  light: new THREE.Vector3(0.360, 0.300, 0.166),
-  dark: new THREE.Vector3(0.180, 0.148, 0.078),
+  light: new THREE.Vector3(0.520, 0.406, 0.208),
+  dark: new THREE.Vector3(0.286, 0.212, 0.104),
 };

@@ -70,6 +70,15 @@ function halton(index, base) {
 }
 const JITTER = Array.from({ length: 16 }, (_, i) => [halton(i + 1, 2) - 0.5, halton(i + 1, 3) - 0.5]);
 
+/**
+ * Luminance of the surface the exposure is metered against: PALETTE.sandLight,
+ * which is what most of an Afghan valley actually is. Exposure is derived from
+ * how much light is FALLING on that surface, never from what happens to be in
+ * frame — see `_updateExposure`.
+ */
+const EXPOSURE_REF_ALBEDO = 0.55;
+const lum3 = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
 function makeQuad(material) {
   const geo = new THREE.BufferGeometry();
   // Full-screen triangle: fewer fragments than a quad, no diagonal seam.
@@ -186,6 +195,21 @@ function buildGradeLUT(grade) {
         r = r * (1 - lift) + lift * 0.86;
         g = g * (1 - lift) + lift * 0.965;
         b = b * (1 - lift) + lift * 1.18;
+
+        // --- deep-shadow fill, gated off the black point ---
+        // See GRADE.shadowFill. The gate's lower edge sits just above where the
+        // toe above lands display black (0.043-0.059 depending on channel), so
+        // the darkest pixel in a frame is not moved at all; the taper is gone
+        // by 0.42, which is the contrast pivot, so nothing at or above middle
+        // grey changes. Applied per channel, after the toe, so the toe's cool
+        // cast survives into the band this fills.
+        const sf = grade.shadowFill ?? 0;
+        if (sf > 0) {
+          const fill = (v) => v + sf * smoothstep(0.055, 0.105, v) * (1 - smoothstep(0.13, 0.42, v));
+          r = fill(r);
+          g = fill(g);
+          b = fill(b);
+        }
 
         // --- gentle highlight rolloff toward a warm neutral ---
         const roll = (v, warm) => {
@@ -360,7 +384,17 @@ export class RenderPipeline {
       motionBlur: true,
       autoExposure: true,
     };
-    this.exposure = 0.88;
+    /**
+     * Per-time-of-day exposure TRIM, set by `Lighting` from
+     * `TIME_OF_DAY[x].exposure`. It is dimensionless and lives near 1.0: the
+     * absolute stop is derived from the sun and sky irradiance in
+     * `_updateExposure`, and this is the artistic offset on top of it.
+     */
+    this.exposure = 1.0;
+    this._physExposure = 1;
+    this._finalExposure = 1;
+    /** Last solved exposure, published for the harness and the critics. */
+    this.exposureInfo = null;
     this.grade = { ...GRADE };
     /**
      * Where autofocus reads depth, in UV (0,0 = bottom-left). Shots that put a
@@ -458,6 +492,27 @@ export class RenderPipeline {
     const w = Math.max(2, Math.floor(width * dpr));
     const h = Math.max(2, Math.floor(height * dpr));
     if (w === this.width && h === this.height) return;
+    // three's RenderTarget.setSize resizes `textures` — the COLOUR attachments —
+    // and nothing else. An explicitly attached `depthTexture` keeps its original
+    // image dimensions, so after any resize the HDR target is assembled from a
+    // colour buffer at the new size and a depth buffer at the old one. That is
+    // an incomplete framebuffer: every scene draw is dropped with
+    // INVALID_FRAMEBUFFER_OPERATION and the frame comes out as the grade's
+    // black point (11,12,15) plus grain, silently, with no page error and a
+    // zero exit code.
+    //
+    // This is why every 1920x1080 screenshot this project has ever taken was
+    // black — the harness renders 1280x720 first, so the budget resolution the
+    // whole thing is judged at was ALWAYS the second size the pipeline saw. It
+    // is not resolution-specific: any resize breaks it, and it stays broken
+    // until the page is reloaded. Verified against git HEAD, so it predates
+    // round 5.
+    const dt = this.hdr.depthTexture;
+    if (dt && (dt.image.width !== w || dt.image.height !== h)) {
+      dt.image.width = w;
+      dt.image.height = h;
+      dt.dispose();
+    }
     this.hdr.setSize(w, h);
     this.prepRT.setSize(w, h);
     this.taaA.setSize(w, h);
@@ -488,6 +543,60 @@ export class RenderPipeline {
     this.atmosphere = a;
   }
 
+  /**
+   * Solve the exposure from the ILLUMINANT, not from the frame.
+   *
+   * Round 4 exposed every shot off a centre-weighted histogram of whatever was
+   * on screen, with an authority of -1 to +0.77 stops. Measured on the shipped
+   * frames, flat sunlit sand under the same declared afternoon sun landed at
+   * display Y 0.646 in the gameplay framing and 0.450 in the outpost framing —
+   * 0.52 stops apart on the SAME material under the SAME light — and the
+   * afternoon sand came out 0.58 stops BRIGHTER than the noon sand, which no
+   * sun elevation can produce. An auto-exposure with that much authority is not
+   * a camera, it is a per-shot grade nobody wrote down.
+   *
+   * A real camera on a locked-off exterior is metered once, off an incident
+   * reading. That is exactly this: the horizontal irradiance is the sun's
+   * radiance projected onto the ground plus the sky's, both published by
+   * `Lighting` from the same atmosphere the sky dome is drawn with, and a
+   * reference sand albedo turns it into the radiance the ground sends back.
+   * Two shots at the same time of day therefore get a bit-identical exposure
+   * whatever is in front of the lens, and if the sun's intensity is ever
+   * re-tuned the exposure tracks it instead of silently cancelling it.
+   *
+   * `grade.exposureAdapt` is how much of a change in illuminance the camera
+   * compensates for. At 1.0 every hour of the day prints identically, which is
+   * as wrong as no lock at all — noon carries a stop more light than a 27
+   * degree afternoon and the print should say so. At `adapt` the rendered
+   * brightness moves by (1 - adapt) of the scene's own change, so afternoon
+   * lands measurably under noon and night lands far under both WITHOUT any of
+   * it depending on framing. `TIME_OF_DAY[x].exposure` is the per-hour trim on
+   * top, and it stays near 1.0 because the law above already did the work.
+   */
+  _updateExposure() {
+    const a = this.atmosphere;
+    const cosSun = Math.max(a.sunDirection.y, 0);
+    // Irradiance on a horizontal surface, in the scene's own light units.
+    const keyE = lum3(a.sunRadiance) * cosSun;
+    const skyE = lum3(a.skyRadiance) * Math.PI;
+    const sceneL = Math.max((EXPOSURE_REF_ALBEDO / Math.PI) * (keyE + skyE), 1e-5);
+    const refL = this.grade.exposureRefRadiance ?? 1.65;
+    const adapt = this.grade.exposureAdapt ?? 0.72;
+    this._physExposure =
+      ((this.grade.exposureKey ?? 0.60) / refL) * Math.pow(refL / sceneL, adapt);
+    this._finalExposure = this.exposure * this._physExposure;
+    this.exposureInfo = {
+      keyE,
+      skyE,
+      sceneL,
+      phys: this._physExposure,
+      trim: this.exposure,
+      final: this._finalExposure,
+      ev: Math.log2(Math.max(this._finalExposure, 1e-9)),
+    };
+    return sceneL;
+  }
+
   /** Rebuild the baked grade after changing `this.grade`. */
   refreshGrade() {
     if (this.lut) this.lut.dispose();
@@ -504,11 +613,30 @@ export class RenderPipeline {
   _refreshWhitePoint() {
     const W = this.grade.whitePoint ?? 2.6;
     const shoulder = this.grade.shoulder ?? 0.3;
+    const reach = this.grade.whiteReach ?? 0.86;
     const fit = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081);
     const u = this.compositeMat.uniforms;
     u.uWhitePoint.value = W;
     u.uShoulder.value = shoulder;
-    u.uWhiteScale.value = 1 / Math.max(fit(W), 1e-4);
+    /**
+     * `whiteReach` is what fixes "nothing in the game is ever white".
+     *
+     * Round 2 replaced a hard clip with a rational fold that only reaches the
+     * white point ASYMPTOTICALLY, and round 3 then normalised the tonemap by
+     * the fit at exactly that white point. The two together are a proof that
+     * display 1.0 requires infinite input: measured across 14.5 M shipped
+     * round-4 pixels the maximum 8-bit channel value was 252, and the vista and
+     * ground frames topped out at 241 — including frames with the solar disc
+     * directly in shot. A photograph of the sun that contains no white pixel is
+     * not a restrained highlight rolloff, it is a broken one.
+     *
+     * Normalising at `whitePoint * reach` instead puts display 1.0 at a FINITE
+     * folded value, so the top of the shoulder is a real destination that a
+     * specular or a solar disc can actually arrive at, while broad surfaces —
+     * which live an order of magnitude below it — still roll off on exactly the
+     * same curve they did before.
+     */
+    u.uWhiteScale.value = 1 / Math.max(fit(W * reach), 1e-4);
   }
 
   // -------------------------------------------------------------------------
@@ -988,14 +1116,15 @@ export class RenderPipeline {
       void main() {
         vec3 c = texture2D(tColor, vUv).rgb;
         float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-        // Centre-weighted metering. A flat average lets a big patch of sky
-        // decide the exposure, which is exactly why the same time of day read
-        // two stops apart between a vista and an over-the-shoulder framing.
+        // Centre-weighted metering. Since round 5 this drives only the +/-0.02
+        // stop trim around the illuminant-derived exposure solved on the CPU.
+        // The frame no longer gets to decide its own stop, which is what had
+        // the same afternoon reading half a stop apart between the gameplay
+        // and outpost framings.
         vec2 d = vUv - 0.5;
         float w = 1.0 - 0.62 * smoothstep(0.02, 0.26, dot(d, d));
         // Clamp the metering range so the sun disc and the blown sky cannot
-        // drag the average. Round 1 let them, which is why the same time of day
-        // exposed a stop apart between the vista and the outpost.
+        // drag the average even inside that tiny authority.
         float lg = clamp(log(max(l, 1e-4)), -5.5, 1.4);
         gl_FragColor = vec4(lg * w, w, 0.0, 1.0);
       }
@@ -1155,11 +1284,19 @@ export class RenderPipeline {
       uniform float uAttenuation;
       void main() {
         vec3 sum = vec3(0.0);
-        float wsum = 0.0;
+        float wsum = 1e-5;
         for (int i = -8; i <= 8; i++) {
           float fi = float(i);
           float w = pow(uAttenuation, abs(fi));
-          sum += texture2D(tDiffuse, vUv + vec2(fi * uStep, 0.0)).rgb * w;
+          float u = vUv.x + fi * uStep;
+          // Fade samples out as they leave the frame instead of letting the
+          // clamp-to-edge sampler replicate the border column. On the dusk
+          // ridge, whose sun sits hard against the left border, that replicated
+          // column was being smeared back across the picture as a slab of
+          // glare with a visible vertical edge. A streak is light that arrived
+          // from somewhere; off the edge of the sensor there is nowhere.
+          w *= clamp(min(u, 1.0 - u) * 26.0, 0.0, 1.0);
+          sum += texture2D(tDiffuse, vec2(clamp(u, 0.0, 1.0), vUv.y)).rgb * w;
           wsum += w;
         }
         gl_FragColor = vec4(sum / wsum, 1.0);
@@ -1184,7 +1321,9 @@ export class RenderPipeline {
       uniform float uFocal;      // focal length, metres (derived from the FOV)
       uniform float uAperture;   // aperture diameter, metres
       uniform float uSensorPx;   // pixels per metre of sensor height
-      uniform float uMaxCoC;
+      uniform float uMaxCoCFar;  // hard ceiling on background defocus, pixels
+      uniform float uMaxCoCNear; // hard ceiling on foreground defocus, pixels
+      uniform float uCoCFloor;   // CoC below this costs nothing and is dropped
       uniform float uEdgeSoftness;
       uniform float uMotionScale;
       uniform float uFrame;
@@ -1197,14 +1336,26 @@ export class RenderPipeline {
       }
 
       /**
-       * Honest thin-lens circle of confusion, in pixels. Doing this properly
-       * rather than with an ad-hoc depth ramp is what makes a landscape stay
-       * sharp front to back while an over-the-shoulder framing throws the
-       * background out — the same lens, two subject distances.
+       * Honest thin-lens circle of confusion, in pixels.
+       *
+       * Round 5: the ceiling is now ASYMMETRIC and both halves of it are about
+       * a pixel, not thirteen. A game is not a photograph. Round 4 ran the same
+       * +/-13 px clamp on both sides of focus, so an over-the-shoulder framing
+       * focused at 2.1 m put the entire playable mid-ground — building,
+       * barrels, fence — under a 4 px circle of confusion, and a ground-level
+       * shot metering its focus on the mid-distance put the sand at the
+       * camera's feet under the same. Measured on the round-4 gameplay frame,
+       * the building roofline against the sky resolved over 5.1 px.
+       *
+       * MGSV uses defocus as a whisper: a little far-field separation behind a
+       * near subject, a gentle near-field falloff, and a playable mid-ground
+       * that is always sharp. That is what a small aperture buys, and the
+       * clamps here are the seatbelt that guarantees it even if the autofocus
+       * locks somewhere absurd.
        */
       float cocAt(float z, float focus) {
         float c = uAperture * uFocal * (z - focus) / (max(z, 0.02) * max(focus - uFocal, 1e-4));
-        return clamp(c * uSensorPx, -uMaxCoC, uMaxCoC);
+        return clamp(c * uSensorPx, -uMaxCoCNear, uMaxCoCFar);
       }
 
       void main() {
@@ -1217,7 +1368,11 @@ export class RenderPipeline {
         float coc = abs(cocAt(z, focus));
 
         // Field curvature: real lenses lose the corners. A perfectly sharp
-        // frame edge is one of the strongest "this is CG" cues.
+        // frame edge is one of the strongest "this is CG" cues. Round 5 cut it
+        // from 1.2 px to a quarter of a pixel: at 1.2 px this term ALONE was
+        // above the pass's own skip threshold, so every pixel outside the
+        // middle sixth of the frame went through the 24-tap bokeh gather
+        // whatever its depth. That is a full-frame blur wearing a lens's name.
         vec2 cen = vUv - 0.5;
         float r2 = dot(cen, cen);
         coc += uEdgeSoftness * smoothstep(0.06, 0.28, r2);
@@ -1234,7 +1389,10 @@ export class RenderPipeline {
         }
         float velPix = length(vel / uTexel);
 
-        if (coc < 0.7 && velPix < 0.8) { gl_FragColor = vec4(centre, 1.0); return; }
+        // Sub-pixel defocus is not defocus, it is a soft filter over a sharp
+        // image. Anything under the floor passes through untouched.
+        if (coc < uCoCFloor && velPix < 0.8) { gl_FragColor = vec4(centre, 1.0); return; }
+        coc = max(coc - uCoCFloor * 0.5, 0.0);
 
         float rot = ign(gl_FragCoord.xy + uFrame * 3.7) * 6.2831853;
         float cr = cos(rot), sr = sin(rot);
@@ -1259,7 +1417,7 @@ export class RenderPipeline {
           vec2 suv = vUv + off;
           vec3 sc = texture2D(tColor, suv).rgb;
           float sz = viewZ(texture2D(tDepth, suv).x);
-          float scoc = abs(cocAt(sz, focus)) + uEdgeSoftness * smoothstep(0.06, 0.28, r2);
+          float scoc = max(abs(cocAt(sz, focus)) + uEdgeSoftness * smoothstep(0.06, 0.28, r2) - uCoCFloor * 0.5, 0.0);
           // Only accept a sample if its own blur circle reaches this pixel,
           // otherwise sharp foreground bleeds outward.
           float reach = length(disk) * coc;
@@ -1286,8 +1444,10 @@ export class RenderPipeline {
         uFocal: { value: 0.031 },
         uAperture: { value: 0.013 },
         uSensorPx: { value: 30000 },
-        uMaxCoC: { value: 13.0 },
-        uEdgeSoftness: { value: 1.2 },
+        uMaxCoCFar: { value: 2.4 },
+        uMaxCoCNear: { value: 1.2 },
+        uCoCFloor: { value: 0.9 },
+        uEdgeSoftness: { value: 0.25 },
         uMotionScale: { value: 0.55 },
         uFrame: { value: 0 },
         uEnabled: { value: 1 },
@@ -1448,12 +1608,17 @@ export class RenderPipeline {
           color = mix(color, vec3(dot(color, vec3(0.2126, 0.7152, 0.0722))), t);
         }
 
-        color = acesFitted(color);
-
-        // Vignette is a lens light-falloff, so it belongs in linear light,
-        // before the display encode.
+        // Vignette is the lens's own light falloff: it happens at the aperture,
+        // so it belongs in SCENE-linear light ahead of the tonemap, not on the
+        // display-referred result. Round 4 applied it afterwards, which meant a
+        // sun sitting off-centre — as it does in the ridge and dawn framings —
+        // had 26% subtracted from an already-tonemapped value and could not
+        // reach white however hot it was. Ahead of the curve it just moves the
+        // corner a little way down the shoulder instead.
         float vig = 1.0 - uVignette * smoothstep(0.12, 0.92, dr2 * 2.0);
         color *= vig;
+
+        color = acesFitted(color);
 
         // --- display encode, THEN grade ---
         // The LUT is authored in display-referred code values: its contrast
@@ -1497,8 +1662,10 @@ export class RenderPipeline {
         uCA: { value: GRADE.chromaticAberration },
         uDistortion: { value: 0.035 },
         uAutoExposure: { value: 1 },
+        // Both are overwritten every frame from the illuminant solve; these are
+        // only the values a pipeline sees before its first render().
         uKeyValue: { value: 0.203 },
-        uExposureClamp: { value: new THREE.Vector2(0.50, 1.70) },
+        uExposureClamp: { value: new THREE.Vector2(0.986, 1.014) },
         uLutStrength: { value: 1.0 },
         uWhitePoint: { value: GRADE.whitePoint ?? 5.2 },
         uShoulder: { value: GRADE.shoulder ?? 0.3 },
@@ -1723,11 +1890,16 @@ export class RenderPipeline {
     }
     const adaptTex = this.adaptB.texture;
 
+    // ---- 5b. exposure solve (illuminant-derived, not frame-derived) ----
+    const sceneL = this._updateExposure();
+
     // ---- 6. bloom ----
     if (this.enabled.bloom) {
       this.brightMat.uniforms.tDiffuse.value = resolved.texture;
       this.brightMat.uniforms.uThreshold.value = this.grade.bloomThreshold;
-      this.brightMat.uniforms.uExposure.value = this.exposure;
+      // The bright pass has to see the SAME exposure the composite will apply,
+      // or the bloom threshold means a different scene radiance in every shot.
+      this.brightMat.uniforms.uExposure.value = this._finalExposure;
       this._blit(this.brightMat, this.bloomRTs[0].a);
       for (let i = 0; i < this.bloomRTs.length; i++) {
         const rt = this.bloomRTs[i];
@@ -1754,15 +1926,24 @@ export class RenderPipeline {
       }
 
       // Anamorphic streak from the second mip (already bright-passed).
+      //
+      // Steps were 1 / 9 / 81 quarter-res texels. Two things were wrong with
+      // that. The 17-tap kernel of one pass spans +/-8 steps, so a factor of 9
+      // leaves GAPS between passes: each outer tap of the last pass landed as a
+      // discrete ghost of the image a quarter of a frame away, visible in the
+      // round-4 dusk sky as a duplicated horizon. And the total reach came to
+      // 2.3x the frame width, so most taps were off the sensor entirely.
+      // 1 / 4 / 16 overlaps cleanly and reaches ~0.5 of the frame, which is
+      // what a long anamorphic flare actually looks like.
       this.streakMat.uniforms.tDiffuse.value = this.bloomRTs[1].a.texture;
       this.streakMat.uniforms.uStep.value = 1.0 / this.streakA.width;
       this.streakMat.uniforms.uAttenuation.value = 0.88;
       this._blit(this.streakMat, this.streakA);
       this.streakMat.uniforms.tDiffuse.value = this.streakA.texture;
-      this.streakMat.uniforms.uStep.value = 9.0 / this.streakA.width;
+      this.streakMat.uniforms.uStep.value = 4.0 / this.streakA.width;
       this._blit(this.streakMat, this.streakB);
       this.streakMat.uniforms.tDiffuse.value = this.streakB.texture;
-      this.streakMat.uniforms.uStep.value = 81.0 / this.streakA.width;
+      this.streakMat.uniforms.uStep.value = 16.0 / this.streakA.width;
       this._blit(this.streakMat, this.streakA);
     }
 
@@ -1783,7 +1964,13 @@ export class RenderPipeline {
     du.uFocal.value = focal;
     du.uAperture.value = focal / (this.grade.fStop ?? 2.4);
     du.uSensorPx.value = h / sensorH;
-    du.uEdgeSoftness.value = this.grade.focusEdgeSoftness ?? 1.2;
+    // Every CoC term scales with resolution so the defocus is the same fraction
+    // of the image at 720p and at 4K rather than the same pixel count.
+    const cocScale = h / 1080;
+    du.uEdgeSoftness.value = (this.grade.focusEdgeSoftness ?? 0.25) * cocScale;
+    du.uMaxCoCFar.value = (this.grade.maxCoCFar ?? 2.4) * cocScale;
+    du.uMaxCoCNear.value = (this.grade.maxCoCNear ?? 1.2) * cocScale;
+    du.uCoCFloor.value = (this.grade.cocFloor ?? 0.9) * cocScale;
     du.uFrame.value = this.frame % 64;
     du.uMotionScale.value = this.enabled.motionBlur ? 0.55 : 0.0;
     du.uEnabled.value = this.enabled.dof || this.enabled.motionBlur ? 1 : 0;
@@ -1798,8 +1985,15 @@ export class RenderPipeline {
     u.uBloomStrength.value = this.enabled.bloom ? this.grade.bloomStrength : 0;
     u.uStreakStrength.value = this.enabled.bloom ? (this.grade.anamorphic ?? 0.16) : 0;
     u.uDirtStrength.value = this.enabled.bloom ? (this.grade.lensDirt ?? 0.5) : 0;
-    u.uExposure.value = this.exposure;
+    u.uExposure.value = this._finalExposure;
     u.uAutoExposure.value = this.enabled.autoExposure ? 1 : 0;
+    // What the metered log-average SHOULD be if the frame is a fair sample of
+    // the illuminant. Centring the auto term on the physical prediction means
+    // its (deliberately tiny) authority is spent correcting genuine content
+    // deviation rather than re-deriving the exposure from the histogram.
+    u.uKeyValue.value = sceneL * (this.grade.meterBias ?? 0.62);
+    const auth = this.grade.autoExposureStops ?? 0.02;
+    u.uExposureClamp.value.set(Math.pow(2, -auth), Math.pow(2, auth));
     u.uResolution.value.set(w, h);
     u.uGrain.value = this.grade.grainAmount;
     u.uVignette.value = this.grade.vignette;

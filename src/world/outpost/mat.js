@@ -73,6 +73,7 @@ varying vec3 vOPW;
 varying vec3 vOPV;
 #if OP_MODE == 5
 varying vec4 vOPT;
+varying vec3 vOPC;
 #endif
 `;
 
@@ -216,14 +217,51 @@ const BODY = {
     // — not merely a slightly differently-lit sliver of the same one. It is
     // broken along its length (the m3 term) because a continuous chip is a
     // moulding, and it bleeds rust wherever the cover was thin.
+    //
+    // Round 4: two changes, both measured. The albedo lift went from 0.62 to
+    // 0.80 of the way to the aggregate colour, and the ROUGHNESS now goes DOWN
+    // rather than up — 0.44 against the face's 0.90. That sign was simply
+    // wrong: an arris is the one part of a concrete elevation that is
+    // continuously burnished, by shoulders, kit, doorframes and truck mirrors,
+    // and a rough edge on a rough face cannot produce the specular rim the
+    // brief asks for. It is worth doing now because the chamfer facets on the
+    // silhouette corners are 106mm wide instead of 46mm (see cornerPier), i.e.
+    // 5-6 px instead of 1.6, so the response finally has somewhere to land.
     float chipE = arris * (0.35 + 0.65 * smoothstep(0.30, 0.78, m3 * 0.7 + m2 * 0.5));
-    c = mix(c, uBase3 * 1.34 + vec3(0.030, 0.027, 0.021), clamp(chipE * 0.62, 0.0, 0.7));
+    c = mix(c, uBase3 * 1.42 + vec3(0.034, 0.030, 0.023), clamp(chipE * 0.80, 0.0, 0.84));
     c = mix(c, uRust * 0.85, clamp(chipE * (streak * 1.1 + 0.18 * wear), 0.0, 0.32));
-    gRough = mix(gRough, 0.99, chipE * 0.55);
+    gRough = mix(gRough, 0.44, chipE * 0.62);
     ${DADO}
     // Relief so a shaded facade still catches a gradient from the sky.
     nrm = normalize(wn + vec3(m3 - 0.5, m2 - 0.5, m2 - 0.5) * 0.22 * (0.4 + chip)
                        - vec3(0.0, seam * side * 0.12, 0.0));
+    // Round 5 integration: near-field fracture relief.
+    //
+    // The line above offsets the normal by a noise VALUE, which tilts a whole
+    // facet uniformly instead of breaking it up. That is fine on a wall seen
+    // from 20 m and it is not fine on rubble: the op-debris material puts a 0.7 m broken
+    // slab 4.3 m from the gameplay camera, where it occupies 90x55 px as ten
+    // dead-flat faces meeting at hard arrises — measured per-facet standard
+    // deviation under 2 code values. It is the one piece of geometry in the
+    // hero shot that reads as an untextured placeholder.
+    //
+    // A GRADIENT-driven 30 mm aggregate field fixes it, because a gradient
+    // varies across a face where a value offset does not. Faded out entirely by
+    // 12 m so it costs nothing on the ~130 pilasters and the perimeter, which
+    // are never that close to the camera.
+    float dcamK = length(vOPP - cameraPosition);
+    float kFade = 1.0 - smoothstep(4.0, 12.0, dcamK);
+    if (kFade > 0.004) {
+      float ks = 34.0;
+      float ke = 0.006;
+      float q0 = optri(vOPP, wn, ks, 2);
+      float qx = optri(vOPP + vec3(ke, 0.0, 0.0), wn, ks, 2);
+      float qy = optri(vOPP + vec3(0.0, ke, 0.0), wn, ks, 2);
+      float qz = optri(vOPP + vec3(0.0, 0.0, ke), wn, ks, 2);
+      vec3 grd = (vec3(qx, qy, qz) - q0) / ke;
+      grd -= wn * dot(grd, wn);
+      nrm = normalize(nrm - grd * (0.16 / ks) * kFade);
+    }
   `,
   [MODE.MASONRY]: /* glsl */ `
     // Rendered/whitewashed blockwork: 390x190 blocks under a lime skim that has
@@ -259,10 +297,15 @@ const BODY = {
     // block below is showing, which on a whitewashed building is the DARKER
     // material — the opposite sign to bare concrete, and the reason the two
     // shells stop looking like the same wall in two tints.
+    // Round 4: the block showing through is the darker material, but the
+    // knocked edge itself is polished, so the value goes DOWN and the gloss goes
+    // UP. Dark, shiny, narrow: on a whitewashed wall in low sun that reads as a
+    // rim just as strongly as a pale one does on bare concrete, and with the
+    // opposite sign, which is what stops the two shells looking alike.
     float chipE = arris * (0.30 + 0.70 * smoothstep(0.28, 0.75, m3 * 0.7 + m2 * 0.5));
-    c = mix(c, uBase2 * 0.86, clamp(chipE * 0.70, 0.0, 0.78));
+    c = mix(c, uBase2 * 0.80, clamp(chipE * 0.82, 0.0, 0.86));
     gRough = clamp(0.88 + (m2 - 0.5) * 0.16 + joint * 0.08, 0.5, 1.0);
-    gRough = mix(gRough, 0.99, chipE * 0.5);
+    gRough = mix(gRough, 0.46, chipE * 0.58);
     gMetal = 0.0;
     ${DADO}
     nrm = normalize(wn
@@ -430,9 +473,15 @@ const BODY = {
     float hard = clamp(vOPT.w, 0.0, 1.0);
     float oil = clamp(vOPW.y, 0.0, 1.0);
     float path = clamp(vOPW.z, 0.0, 1.0);
+    // Graded ground vs undisturbed desert. Everything below keys off this, and
+    // until round 4 it did not exist: the platform and the plain were drawn by
+    // the same code with the same statistics, so the compound read as PLACED on
+    // the sand rather than cut into it.
+    float grade = clamp(vOPW.x, 0.0, 1.0);
+    float churn = clamp(vOPC.x, 0.0, 1.0);
 
     float dcam = length(vOPP - cameraPosition);
-    float near = 1.0 - smoothstep(5.0, 46.0, dcam);
+    float near = 1.0 - smoothstep(6.0, 78.0, dcam);
     float n0 = opfbm(vOPP.xz * 0.011, 3);
     float n1 = opfbm(vOPP.xz * 0.055, 4);
     float n2 = opfbm(vOPP.xz * 0.42, 3);
@@ -441,8 +490,27 @@ const BODY = {
 
     vec3 sand = mix(uBase2, uBase, clamp(n0 * 0.5 + n1 * 0.8 + n2 * 0.45 - 0.15, 0.0, 1.0));
     sand *= 0.88 + 0.26 * n3;
+    // Undisturbed desert carries the same wind ripple as the terrain outside.
+    // Putting it ONLY on the ungraded fraction is half of what makes the pad
+    // read as engineered: a graded surface has had its ripple bladed off.
+    vec2 wdG = vec2(${Math.cos(0.38).toFixed(5)}, ${Math.sin(0.38).toFixed(5)});
+    float ripG = sin(dot(vOPP.xz, wdG) * 24.0 + opfbm(vOPP.xz * 0.9, 2) * 9.0) * 0.5 + 0.5;
+    float wild = (1.0 - grade) * (1.0 - road);
+    sand *= 1.0 + 0.085 * (ripG - 0.5) * wild;
     // Drifted fines catch on the lee of every bump — big, soft, low-contrast.
     sand = mix(sand, uBase * 1.12, smoothstep(0.55, 0.9, n1) * 0.35);
+
+    // COMPACTED FILL: the whole graded platform, not just the hardstanding.
+    // Imported borrow material, bladed and rolled — so it is a different rock
+    // from the wind-sorted sand around it: greyer, flatter, higher in fines,
+    // with the odd bit of stone rolled proud. This is the "apron" the critics
+    // said the site did not have, and it has to be a MATERIAL break rather than
+    // a shading one or it stops existing at low sun.
+    vec3 fill = mix(uBase2 * 0.94, uBase3 * 1.06, 0.45 + 0.45 * n2);
+    fill = mix(fill, uBase3 * 1.45, smoothstep(0.70, 0.94, n4) * 0.30);
+    fill *= 0.93 + 0.15 * n3;
+    float gradeN = clamp(grade * 1.35 - 0.30 + (n1 - 0.5) * 0.50, 0.0, 1.0);
+    vec3 c = mix(sand, fill, gradeN * 0.78);
 
     // Graded gravel hardstanding: cooler, coarser, crushed rock through the fines.
     vec3 gravel = mix(uBase * 0.58, uBase3, 0.5 + 0.4 * n2);
@@ -450,7 +518,7 @@ const BODY = {
     gravel = mix(gravel, uBase * 0.82, smoothstep(0.62, 0.30, n3) * 0.4);
     gravel *= 0.90 + 0.20 * n4;
     float hardN = clamp(hard * 1.25 - 0.25 + (n1 - 0.5) * 0.55, 0.0, 1.0);
-    vec3 c = mix(sand, gravel, hardN);
+    c = mix(c, gravel, hardN);
     // Big, slow tonal drift across the platform: fill from different borrow pits.
     c *= 0.80 + 0.42 * n0;
 
@@ -461,26 +529,77 @@ const BODY = {
     float shoulder = smoothstep(0.35, 1.0, abs(lat) * 0.28);
     c = mix(c, mix(dirt, sand * 1.10, shoulder), road);
     gRough = mix(gRough, 0.80, road * (1.0 - shoulder) * 0.6);
-    float rut = exp(-pow((abs(lat) - 0.92) * 2.2, 2.0)) + exp(-pow((abs(lat) - 2.6) * 2.8, 2.0)) * 0.5;
+    // Two wheel ruts each side of the crown, wandering the way a truck does.
+    // Round 4: the rut set was symmetric, fixed-width and albedo-only, which is
+    // a stripe rather than a rut. It now wanders (the sway term, a slow
+    // function of arc length, so both ruts move together as one vehicle line),
+    // it is narrower and deeper, and it carries a NORMAL so the groove picks up
+    // a shadow on one flank and a highlight on the other at low sun — which is
+    // the only reason a 60mm depression is visible on sand at all.
+    float sway = (opfbm(vec2(along * 0.045, 3.7), 2) - 0.5) * 1.30;
+    float r1 = (abs(lat) - (1.02 + sway)) * 3.4;
+    float r2 = (abs(lat) - (2.62 + sway)) * 3.0;
+    float rut = exp(-r1 * r1) + exp(-r2 * r2) * 0.62;
     float rutN = 0.45 + 0.9 * opfbm(vec2(along * 0.55, lat * 4.0), 2);
-    c *= 1.0 - 0.34 * clamp(rut, 0.0, 1.0) * road * rutN;
+    rut = clamp(rut, 0.0, 1.0) * road * rutN;
+    c *= 1.0 - 0.40 * rut;
+    gRough = mix(gRough, 0.72, rut * 0.5);
     // Loose spoil pushed to the shoulder catches the light and outlines the track.
     float shoulderBand = smoothstep(0.45, 0.05, abs(abs(lat) * 0.30 - 1.05));
     c = mix(c, sand * 1.16, shoulderBand * road * 0.45);
 
-    // Close-range grit and loose stones. At high sun the micro-normal does almost
-    // nothing, so the near-field surface has to be carried by albedo.
+    // Turning circle: plant pivoting on the spot tears the surface into
+    // concentric arcs and throws the fines out to a scuffed lip. The arcs are a
+    // ring function of the radius from the disc centre — reconstructed here from
+    // the vertex mask's own gradient rather than passed in, which costs nothing
+    // and keeps the disc centres out of the shader.
+    if (churn > 0.004) {
+      float arc = sin(churn * 46.0) * 0.5 + 0.5;
+      float torn = churn * (0.45 + 0.55 * arc) * (0.5 + 0.7 * n3);
+      c = mix(c, dirt * 0.86, clamp(torn * 0.85, 0.0, 0.80));
+      c = mix(c, uBase3 * 1.30, smoothstep(0.55, 0.92, n4) * churn * 0.30);
+      gRough = mix(gRough, 0.86, churn * 0.5);
+    }
+
+    // Close-range grit and loose stones.
+    // Round 4: the near band reached 46 m and the stone contrast was under a
+    // tenth of a stop, so a graded fill surface — which in reality is 30% loose
+    // stone by area — measured sd 0.061 over the whole gameplay yard and read
+    // as a poured slab. Three octaves now instead of two, the band reaches
+    // 78 m, and the picked-out stones are a real value break in BOTH directions
+    // (pale quartz up, dark basalt down) rather than a wash.
+    //
+    // Round 5 integration: round 4 put ALL of that contrast in the albedo,
+    // on the argument that a micro-normal does nothing under a high sun. That
+    // is measurable, and it measures wrong. High-pass texture energy on near
+    // sand, grain-subtracted, came out at 3.6% in open sun and 4.3-5.8% inside
+    // a cast shadow at the SAME depth (ground.png y508-524, outpost.png
+    // y592-624) — relative contrast RISING as the key is removed, which is the
+    // signature of paint, not of relief. The two pure-noise albedo terms are
+    // halved and the difference is spent on a grit-scale height field below;
+    // the picked-out quartz and basalt stay in the albedo because a quartz
+    // pebble really is a different colour, not just a different angle.
     if (near > 0.01) {
       float grit = opfbm(vOPP.xz * 22.0, 2);
       float mid = opfbm(vOPP.xz * 6.0, 2);
-      c *= 1.0 - 0.34 * (grit - 0.5) * near;
-      c *= 1.0 - 0.20 * (mid - 0.5) * near;
-      c = mix(c, uBase3 * 1.7, smoothstep(0.74, 0.93, grit) * near * (0.25 + 0.5 * hardN));
-      c = mix(c, uBase2 * 0.75, smoothstep(0.76, 0.95, 1.0 - grit) * near * 0.35);
+      float fines = opfbm(vOPP.xz * 62.0, 2);
+      c *= 1.0 - 0.17 * (grit - 0.5) * near;
+      c *= 1.0 - 0.11 * (mid - 0.5) * near;
+      c *= 1.0 - 0.10 * (fines - 0.5) * near * near;
+      c = mix(c, uBase3 * 2.1, smoothstep(0.72, 0.92, grit) * near * (0.30 + 0.55 * hardN));
+      c = mix(c, uBase2 * 0.58, smoothstep(0.74, 0.94, 1.0 - grit) * near * 0.48);
+      // Stones sit ON the surface, so they roughen it and tilt their own normal.
+      gRough = clamp(gRough - 0.10 * smoothstep(0.72, 0.92, grit) * near, 0.14, 1.0);
     }
 
     // Worn footpaths: boot traffic polishes the fines and kills the gravel.
-    c = mix(c, dirt * 1.05, path * (0.6 + 0.4 * n3));
+    // Round 4: a beaten path is not just darker, it has a CROWN of scuffed
+    // lighter material either side of a polished core, and boot prints churn the
+    // edges. Without the edge break it reads as a painted line.
+    c = mix(c, dirt * 1.02, path * (0.6 + 0.4 * n3));
+    float pathEdge = smoothstep(0.20, 0.62, path) * smoothstep(0.98, 0.66, path);
+    c = mix(c, sand * 1.14, pathEdge * 0.42);
+    gRough = mix(gRough, 0.78, path * 0.45);
 
     // Oil and diesel: dark, low-roughness, slightly iridescent at the edge.
     float oilN = smoothstep(0.25, 0.75, oil * (0.55 + 0.9 * n3));
@@ -499,6 +618,35 @@ const BODY = {
       float hx = opfbm((vOPP.xz + vec2(e, 0.0)) * 3.0, 2) + opfbm((vOPP.xz + vec2(e, 0.0)) * 11.0, 2) * 0.16;
       float hz = opfbm((vOPP.xz + vec2(0.0, e)) * 3.0, 2) + opfbm((vOPP.xz + vec2(0.0, e)) * 11.0, 2) * 0.16;
       nrm = normalize(wn + vec3((h0 - hx) * amp / e, 0.0, (h0 - hz) * amp / e) * fade);
+
+      // Grit-scale relief, at the SAME two frequencies the grit albedo above
+      // uses. Heights are in metres: a 2.2 mm pebble field at a 45 mm
+      // wavelength is a peak slope of 2*pi*A/lambda = 0.30, which is a 17 deg
+      // wobble — small enough that it cannot read as a lava field, large enough
+      // that removing the key removes the detail with it. The finite-difference
+      // step is 8 mm so the 62-cycle octave is actually resolved rather than
+      // aliased. Faded by the near-band term, so it only exists where a pebble
+      // subtends more than a pixel.
+      float gN = near * fade * (1.0 - oilN);
+      if (gN > 0.004) {
+        float e2 = 0.008;
+        float gA = 0.0028 * (0.6 + 0.7 * hard);
+        float gB = 0.0009 * (0.6 + 0.7 * hard);
+        float k0 = opfbm(vOPP.xz * 22.0, 2) * gA + opfbm(vOPP.xz * 62.0, 2) * gB;
+        float kx = opfbm((vOPP.xz + vec2(e2, 0.0)) * 22.0, 2) * gA
+                 + opfbm((vOPP.xz + vec2(e2, 0.0)) * 62.0, 2) * gB;
+        float kz = opfbm((vOPP.xz + vec2(0.0, e2)) * 22.0, 2) * gA
+                 + opfbm((vOPP.xz + vec2(0.0, e2)) * 62.0, 2) * gB;
+        nrm = normalize(nrm + vec3((k0 - kx) / e2, 0.0, (k0 - kz) / e2) * gN);
+      }
+      // The rut groove itself. lat runs across the track, so its gradient in
+      // world space is the track's own normal direction; d(rut)/d(lat) rolls the
+      // shading normal into and out of the groove, which is what puts a 60mm
+      // depression on the screen at all. Analytic rather than sampled, because
+      // the rut is defined by lat and there is nothing to sample.
+      float dr = -2.0 * (r1 * 3.4 * exp(-r1 * r1) + r2 * 3.0 * exp(-r2 * r2) * 0.62);
+      vec3 across = normalize(vec3(vOPC.y, 0.0, vOPC.z) + vec3(1e-5, 0.0, 0.0));
+      nrm = normalize(nrm + across * dr * road * rutN * 0.085 * sign(lat) * fade);
     }
   `,
 };
@@ -594,6 +742,7 @@ export function createSurface(opts = {}) {
          attribute vec3 aVar;
          #if OP_MODE == 5
          attribute vec4 aTrack;
+         attribute vec3 aGround;
          #endif`,
       )
       .replace(
@@ -620,6 +769,7 @@ export function createSurface(opts = {}) {
          vOPV = aVar;
          #if OP_MODE == 5
          vOPT = aTrack;
+         vOPC = vec3(aGround.x, normalize(mat3(modelMatrix) * vec3(aGround.y, 0.0, aGround.z)).xz);
          #endif
          #include <project_vertex>`,
       );

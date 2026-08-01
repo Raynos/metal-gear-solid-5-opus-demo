@@ -46,6 +46,87 @@ function buckle(p, opts = {}) {
 }
 
 /**
+ * A Cordura pouch: body, overhanging lid, bound edge, pull tab.
+ *
+ * ROUND 5 (three rounds of "pouch edges have no depth"). A `roundedBox` with a
+ * 12 mm fillet is a soap bar — it has no CUT EDGE anywhere, and a cut edge is
+ * the only thing that makes a fabric box read as sewn. Every real pouch is a
+ * bag with a lid that OVERHANGS it by 4-6 mm on three sides, and every panel of
+ * both is finished with a folded binding tape that stands ~2 mm proud. That
+ * gives, from top to bottom in about 30 px: lid binding (lit), lid face,
+ * lid binding again (lit), the reveal under the overhang (black), the body
+ * binding (lit), the body face. Six value steps where round 4 had one.
+ *
+ * `at` is the placement matrix; the pouch is authored around its own origin
+ * with -Z outboard, matching the rest of this file.
+ */
+function pouch(w, h, d, at, o = {}) {
+  const zone = o.zone ?? Z.POUCH;
+  const tapeZone = o.tapeZone ?? Z.WEBBING;
+  const out = [];
+  const push = (s) => out.push({ surface: s.transform(at), mat: 'cloth' });
+  const lidH = o.lidH ?? Math.min(0.030, h * 0.30);
+  const bodyH = h - lidH - 0.006;
+  const bodyY = -h / 2 + bodyH / 2;
+  const lidY = h / 2 - lidH / 2;
+
+  // Body. A loaded pouch bellies outward at its middle and pinches at the seams.
+  push(
+    loftKeys(
+      [
+        { p: V(0, bodyY - bodyH / 2, 0), rx: w * 0.46, rz: d * 0.42, n: 5.2, zone },
+        { p: V(0, bodyY - bodyH * 0.18, -0.002), rx: w / 2, rz: d / 2, n: 4.6, zone },
+        { p: V(0, bodyY + bodyH * 0.18, -0.002), rx: w / 2, rz: d / 2, n: 4.6, zone },
+        { p: V(0, bodyY + bodyH / 2, 0), rx: w * 0.48, rz: d * 0.46, n: 5.2, zone },
+      ],
+      9,
+      { radial: o.radial ?? 14, capStart: true, capEnd: true },
+    ),
+  );
+  // Lid, 5 mm proud of the body on every side so it throws a hard shadow line
+  // across the front of the pouch.
+  push(
+    loftKeys(
+      [
+        { p: V(0, lidY - lidH / 2, -0.001), rx: w / 2 + 0.005, rz: d / 2 + 0.005, n: 5.0, zone },
+        { p: V(0, lidY + lidH * 0.1, -0.002), rx: w / 2 + 0.005, rz: d / 2 + 0.005, n: 5.0, zone },
+        { p: V(0, lidY + lidH / 2, 0.002), rx: w * 0.47, rz: d * 0.46, n: 5.2, zone },
+      ],
+      7,
+      { radial: o.radial ?? 14, capStart: true, capEnd: true },
+    ),
+  );
+  // Binding tape around the lid's cut edge and the body's mouth.
+  const loop = (y, rx, rz) => {
+    const pts = [];
+    for (let i = 0; i <= 16; i++) {
+      const a = (i / 16) * Math.PI * 2;
+      const s = Math.sin(a);
+      const c = Math.cos(a);
+      const k = Math.pow(Math.pow(Math.abs(s / rx), 5.0) + Math.pow(Math.abs(c / rz), 5.0), -1 / 5.0);
+      pts.push(V(s * k, y, c * k));
+    }
+    return strap(pts, 0.008, 0.0035, tapeZone, { stations: 13 });
+  };
+  push(loop(lidY - lidH / 2 - 0.001, w / 2 + 0.006, d / 2 + 0.006));
+  // Pull tab hanging off the bottom of the lid.
+  push(
+    strap(
+      [
+        V(0, lidY - lidH / 2, -d / 2 - 0.004),
+        V(0, lidY - lidH / 2 - 0.012, -d / 2 - 0.010),
+        V(0, lidY - lidH / 2 - 0.024, -d / 2 - 0.008),
+      ],
+      0.014,
+      0.004,
+      tapeZone,
+      { stations: 6 },
+    ),
+  );
+  return out;
+}
+
+/**
  * A ladder of MOLLE webbing. Rows of 25 mm tape stitched across a panel is what
  * every modern load-bearing surface actually looks like, and the horizontal
  * banding survives to any distance where the character is more than a few
@@ -87,34 +168,30 @@ export function buildChestRig(o = {}) {
         { p: V(0, 1.22, -0.016), rx: 0.184 * bulk, rz: 0.139 * bulk, n: 3.8, zone: Z.VEST },
         { p: V(0, 1.31, -0.016), rx: 0.199 * bulk, rz: 0.143 * bulk, n: 3.8, zone: Z.VEST },
         { p: V(0, 1.38, -0.012), rx: 0.204 * bulk, rz: 0.134 * bulk, n: 3.6, zone: Z.VEST },
-        { p: V(0, 1.42, -0.008), rx: 0.185 * bulk, rz: 0.116 * bulk, n: 3.2, zone: Z.VEST },
+        { p: V(0, 1.42, -0.008), rx: 0.190 * bulk, rz: 0.120 * bulk, n: 3.2, zone: Z.VEST },
+        // Round 5: the carrier used to stop dead here with a flat cap, which is
+        // the 90-degree corner the critics read as "box shoulders". Two more
+        // stations run it up over the trapezius and close it at the neck, so
+        // the top of the rig is a yoke that follows the body under it.
+        { p: V(0, 1.448, -0.005), rx: 0.163 * bulk, rz: 0.108 * bulk, n: 2.9, zone: Z.VEST },
+        { p: V(0, 1.468, -0.003), rx: 0.121 * bulk, rz: 0.094 * bulk, n: 2.6, zone: Z.VEST },
       ],
-      14,
+      16,
       { radial: 24, capStart: true, capEnd: true },
     ),
     mat: 'cloth',
   });
 
-  // Front magazine pouches. Three across, angled outward, with flaps.
+  // Front magazine pouches. Three across, angled outward, with real lids.
   const magY = 1.185;
   for (let i = -1; i <= 1; i++) {
     const m = new THREE.Matrix4()
       .makeRotationY(-i * 0.34)
       .setPosition(i * 0.062, magY, -0.152 + Math.abs(i) * 0.012);
-    parts.push({
-      surface: roundedBox(0.062, 0.125, 0.05, 0.014, { zone: Z.POUCH, radial: 12 }).transform(m),
-      mat: 'cloth',
-    });
-    // Flap + retention strap over the top of each pouch.
-    parts.push({
-      surface: roundedBox(0.064, 0.026, 0.056, 0.01, { zone: Z.POUCH, radial: 10 }).transform(
-        new THREE.Matrix4().makeRotationY(-i * 0.34).setPosition(i * 0.062, magY + 0.062, -0.153 + Math.abs(i) * 0.012),
-      ),
-      mat: 'cloth',
-    });
+    parts.push(...pouch(0.062, 0.148, 0.05, m, { radial: 12 }));
     parts.push({
       surface: strap(
-        [V(i * 0.062, magY + 0.075, -0.14), V(i * 0.062, magY + 0.06, -0.183), V(i * 0.062, magY - 0.01, -0.181)],
+        [V(i * 0.062, magY + 0.082, -0.14), V(i * 0.062, magY + 0.066, -0.183), V(i * 0.062, magY - 0.01, -0.181)],
         0.014,
         0.005,
         Z.WEBBING,
@@ -125,24 +202,23 @@ export function buildChestRig(o = {}) {
   }
 
   // Utility / radio pouch high on the left chest, with a stub antenna.
-  parts.push({
-    surface: roundedBox(0.07, 0.085, 0.048, 0.012, { zone: Z.POUCH, radial: 12 }).transform(
-      new THREE.Matrix4().makeRotationY(0.3).setPosition(-0.105, 1.305, -0.13),
-    ),
-    mat: 'cloth',
-  });
+  parts.push(
+    ...pouch(0.07, 0.085, 0.048, new THREE.Matrix4().makeRotationY(0.3).setPosition(-0.105, 1.305, -0.13), {
+      radial: 12,
+    }),
+  );
   parts.push({
     surface: tube(V(-0.118, 1.345, -0.13), V(-0.135, 1.47, -0.1), 0.0035, 0.002, 6, MZ.DARKPOLY),
     mat: 'metal',
   });
 
   // Right chest admin pouch + a grenade.
-  parts.push({
-    surface: roundedBox(0.075, 0.06, 0.04, 0.01, { zone: Z.POUCH, radial: 12 }).transform(
-      new THREE.Matrix4().makeRotationY(-0.3).setPosition(0.105, 1.315, -0.128),
-    ),
-    mat: 'cloth',
-  });
+  parts.push(
+    ...pouch(0.075, 0.062, 0.04, new THREE.Matrix4().makeRotationY(-0.3).setPosition(0.105, 1.315, -0.128), {
+      radial: 12,
+      lidH: 0.020,
+    }),
+  );
   if (heavy) {
     parts.push({
       surface: loftKeys(
@@ -250,12 +326,17 @@ export function buildChestRig(o = {}) {
       mat: 'cloth',
     });
   }
-  parts.push({
-    surface: roundedBox(0.128, 0.086, 0.048, 0.014, { zone: Z.POUCH, radial: 12 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.104, 0.162),
+  // Rear utility pouch. This is the single closest piece of kit to the gameplay
+  // lens, so it is the one that has to carry a real lid and a bound edge.
+  parts.push(
+    ...pouch(
+      0.128,
+      0.098,
+      0.048,
+      new THREE.Matrix4().makeRotationY(Math.PI).setPosition(0, 1.112, 0.162),
+      { radial: 14, lidH: 0.028 },
     ),
-    mat: 'cloth',
-  });
+  );
   parts.push({
     surface: strap(
       [V(-0.056, 1.146, 0.156), V(-0.028, 1.152, 0.184), V(0.028, 1.152, 0.184), V(0.056, 1.146, 0.156)],
@@ -317,25 +398,19 @@ export function buildBelt(o = {}) {
     mat: 'metal',
   });
   // Rear belt pouches — reads well from behind, which is the gameplay camera.
+  // These are the closest pieces of kit to the gameplay lens (they sit at the
+  // small of the back, dead centre of frame), so they get the full pouch build.
   for (const x of o.pouches ?? [-0.11, 0.11]) {
     const rotY = x > 0 ? -0.5 : 0.5;
+    const m = new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 0.978, 0.1);
+    // The pouch is authored with -Z outboard; these sit on the BACK of the
+    // belt, so it is turned to face rearward.
+    m.multiply(new THREE.Matrix4().makeRotationY(Math.PI));
+    parts.push(...pouch(0.085, 0.095, 0.055, m, { radial: 12, lidH: 0.026 }));
     parts.push({
-      surface: roundedBox(0.085, 0.075, 0.055, 0.012, { zone: Z.POUCH, radial: 12 }).transform(
-        new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 0.965, 0.1),
-      ),
-      mat: 'cloth',
-    });
-    // Flap and retention tab: a pouch with no lid is a block.
-    parts.push({
-      surface: roundedBox(0.088, 0.02, 0.06, 0.008, { zone: Z.POUCH, radial: 10 }).transform(
-        new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 1.005, 0.1),
-      ),
-      mat: 'cloth',
-    });
-    parts.push({
-      surface: strap([V(0, 0.028, -0.03), V(0, 0.016, 0.032), V(0, -0.03, 0.03)], 0.014, 0.005, Z.WEBBING, {
+      surface: strap([V(0, 0.038, 0.03), V(0, 0.022, -0.032), V(0, -0.03, -0.03)], 0.014, 0.005, Z.WEBBING, {
         stations: 8,
-      }).transform(new THREE.Matrix4().makeRotationY(rotY).setPosition(x * 1.1, 0.985, 0.1)),
+      }).transform(m),
       mat: 'cloth',
     });
   }
@@ -469,6 +544,33 @@ export function buildBackpack(o = {}) {
       ),
       mat: 'cloth',
     });
+    // Daisy chain down the flank. The pack's SIDE is what the over-the-shoulder
+    // camera actually sees — the MOLLE on the rear panel faces away from it —
+    // and in round 4 that side was 90 px of one unbroken value. A vertical tape
+    // tacked down every 38 mm puts a rung across it at the one frequency that
+    // survives to gameplay range.
+    parts.push({
+      surface: strap(
+        [V(sgn * 0.101, 1.155, back - 0.004), V(sgn * 0.122, 1.21, back + 0.012), V(sgn * 0.129, 1.29, back + 0.014), V(sgn * 0.11, 1.36, back - 0.006)],
+        0.017,
+        0.005,
+        Z.WEBBING,
+        { stations: 12 },
+      ),
+      mat: 'cloth',
+    });
+    for (const yy of [1.196, 1.234, 1.272, 1.31]) {
+      parts.push({
+        surface: strap(
+          [V(sgn * 0.106, yy, back + 0.002), V(sgn * 0.132, yy, back + 0.016), V(sgn * 0.128, yy, back + 0.038)],
+          0.007,
+          0.004,
+          Z.WEBBING,
+          { stations: 6 },
+        ),
+        mat: 'cloth',
+      });
+    }
   }
 
   // MOLLE ladders across the back panel. Five rows at 34 mm rather than four at
@@ -564,42 +666,177 @@ export function buildBackpack(o = {}) {
 // Headgear
 // -------------------------------------------------------------------------
 
+/**
+ * A modern combat helmet (ACH/MICH pattern).
+ *
+ * Round 4's was a capped loft with a flat circular bottom edge and no brim, no
+ * chin cup and no nape strap — a dome, which is exactly the "asymmetric blob"
+ * note. What makes a helmet read as a helmet at any distance is three things and
+ * none of them is resolution:
+ *   1. A SCALLOPED edge — cut low over the brow and the nape, swept up over the
+ *      ears. That single curve is the difference between a helmet and a bowl.
+ *   2. A rolled BRIM standing 5 mm proud all the way round, so the edge carries
+ *      a lit top and a shadowed underside instead of ending in nothing.
+ *   3. A CHINSTRAP that is a closed system: two Y-yokes off the side rails, a
+ *      chin cup under the jaw, and a nape pad behind. Without it a helmet floats.
+ * The shell is swept as a quarter-ellipse from the crown down to that scalloped
+ * edge rather than lofted along a straight spine, because a loft cross-section
+ * cannot vary in height and the scallop is the whole point.
+ */
 export function buildHelmet() {
   const parts = [];
+  const CY = 1.812; // crown, 30 mm above the skull's own 1.782
+  const CX = -0.0; // centre in x
+  const CZ = -0.008; // centre in z (skull is set back)
+
+  // Edge height as a function of the angle around the helmet. a = 0 is the
+  // FRONT (-Z), a = PI/2 the character's right (+X). Anchored to real landmarks
+  // on this skull: the brow ridge is at y 1.710 and the top of the ear at 1.706,
+  // so the front edge sits a few mm above the brow, the sides clear the ear, and
+  // the back drops 45 mm to cover the nape. Round 4's edge was FLAT at 1.598 —
+  // below the chin at 1.574 — so the helmet swallowed the entire face.
+  const edgeY = (a) => 1.700 - 0.004 * Math.max(0, Math.cos(a)) - 0.045 * Math.max(0, -Math.cos(a));
+  const edgeR = (a) => {
+    const s = Math.sin(a);
+    const c = Math.cos(a);
+    // Superelliptic: a helmet is wider than it is deep at the ears and pushes
+    // forward over the brow.
+    const rx = 0.1125;
+    const rz = c > 0 ? 0.1215 : 0.1265; // front (cos>0) / back
+    const k = Math.pow(Math.pow(Math.abs(s / rx), 2.7) + Math.pow(Math.abs(c / rz), 2.7), -1 / 2.7);
+    return k;
+  };
+
+  const shell = new Surface();
+  const RINGS = 11;
+  const SEG = 26;
+  for (let j = 0; j <= RINGS; j++) {
+    const t = j / RINGS;
+    // Quarter-ellipse from crown (t=0) to edge (t=1).
+    const rf = Math.sin((t * Math.PI) / 2);
+    const yf = 1 - Math.cos((t * Math.PI) / 2);
+    for (let i = 0; i <= SEG; i++) {
+      const a = (i / SEG) * Math.PI * 2;
+      const R = edgeR(a);
+      const yE = edgeY(a);
+      shell.vert(
+        CX + Math.sin(a) * R * rf,
+        CY - (CY - yE) * yf,
+        CZ - Math.cos(a) * R * rf,
+        (i / SEG) * 0.5,
+        t * 0.16,
+        Z.HELMCOVER,
+        i / SEG,
+        // rim: metres to the cut edge, so the stitched-border term draws the
+        // cover's edge binding and nothing else.
+        Math.min(0.25, (1 - t) * 0.22),
+      );
+    }
+  }
+  for (let j = 0; j < RINGS; j++) {
+    for (let i = 0; i < SEG; i++) {
+      const p = j * (SEG + 1) + i;
+      shell.quad(p, p + 1, p + SEG + 2, p + SEG + 1);
+    }
+  }
+  parts.push({ surface: shell, mat: 'cloth' });
+
+  // Rolled brim: a closed loop of 22 mm tape following the same scalloped edge,
+  // standing 5 mm proud. Lit on top, shadowed underneath — the horizontal that
+  // separates the helmet from the head at any distance.
+  const brim = [];
+  for (let i = 0; i <= 24; i++) {
+    const a = (i / 24) * Math.PI * 2;
+    const R = edgeR(a) * 1.035;
+    brim.push(V(CX + Math.sin(a) * R, edgeY(a) + 0.004, CZ - Math.cos(a) * R));
+  }
+  parts.push({ surface: strap(brim, 0.019, 0.012, Z.HELMCOVER, { stations: 30 }), mat: 'cloth' });
+
+  // Cover seam: the four-panel seam over the crown, and the cat-eye retro band
+  // around the back. Two more horizontals on an otherwise blank dome.
+  // Two full meridian seams from edge, over the crown, to the opposite edge:
+  // the four-panel cover every helmet cover is cut from.
+  for (const a0 of [0.66, 2.24]) {
+    const seam = [];
+    for (let i = 0; i <= 18; i++) {
+      const u = (i / 18) * 2 - 1; // -1 edge(a0) .. 0 crown .. +1 edge(a0+PI)
+      const a = u < 0 ? a0 : a0 + Math.PI;
+      const k = Math.abs(u);
+      const rf = Math.sin((k * Math.PI) / 2);
+      const yf = 1 - Math.cos((k * Math.PI) / 2);
+      const R = edgeR(a) * rf;
+      seam.push(V(CX + Math.sin(a) * R, CY - (CY - edgeY(a)) * yf + 0.0028, CZ - Math.cos(a) * R));
+    }
+    parts.push({ surface: strap(seam, 0.009, 0.004, Z.HELMCOVER, { stations: 22 }), mat: 'cloth' });
+  }
+  const band = [];
+  for (let i = 0; i <= 20; i++) {
+    const a = (i / 20) * Math.PI * 2;
+    const t = 0.72;
+    const rf = Math.sin((t * Math.PI) / 2);
+    const yf = 1 - Math.cos((t * Math.PI) / 2);
+    const R = edgeR(a) * rf * 1.02;
+    band.push(V(CX + Math.sin(a) * R, CY - (CY - edgeY(a)) * yf, CZ - Math.cos(a) * R));
+  }
+  parts.push({ surface: strap(band, 0.016, 0.005, Z.WEBBING, { stations: 26 }), mat: 'cloth' });
+
+  // NVG shroud on the brow, and the side rails the chinstrap yokes hang off.
   parts.push({
-    surface: loftKeys(
-      [
-        { p: V(0, 1.598, -0.004), rx: 0.107, rz: 0.118, n: 2.7, zone: Z.HELMCOVER },
-        { p: V(0, 1.615, -0.006), rx: 0.111, rz: 0.121, n: 2.7, zone: Z.HELMCOVER },
-        { p: V(0, 1.66, -0.008), rx: 0.108, rz: 0.117, n: 2.7, zone: Z.HELMCOVER },
-        { p: V(0, 1.715, -0.008), rx: 0.096, rz: 0.104, n: 2.6, zone: Z.HELMCOVER },
-        { p: V(0, 1.768, -0.008), rx: 0.068, rz: 0.074, n: 2.5, zone: Z.HELMCOVER },
-        { p: V(0, 1.802, -0.008), rx: 0.026, rz: 0.028, n: 2.4, zone: Z.HELMCOVER },
-      ],
-      13,
-      { radial: 22, capEnd: true },
-    ),
-    mat: 'cloth',
-  });
-  // Ear/side rails and a front NVG shroud — the shapes that make a modern helmet
-  // silhouette readable at 30 m.
-  parts.push({
-    surface: roundedBox(0.05, 0.032, 0.028, 0.008, { zone: MZ.DARKPOLY, radial: 10 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.652, -0.114),
+    surface: roundedBox(0.05, 0.028, 0.024, 0.007, { zone: MZ.DARKPOLY, radial: 10 }).transform(
+      new THREE.Matrix4().makeRotationX(0.30).setPosition(0, 1.720, -0.122),
     ),
     mat: 'metal',
   });
   for (const sgn of [-1, 1]) {
     parts.push({
-      surface: strap([V(sgn * 0.1, 1.63, -0.06), V(sgn * 0.112, 1.628, 0.0), V(sgn * 0.1, 1.63, 0.06)], 0.02, 0.012, MZ.DARKPOLY, { stations: 8 }),
+      surface: strap(
+        [V(sgn * 0.099, 1.716, -0.055), V(sgn * 0.110, 1.710, 0.0), V(sgn * 0.100, 1.706, 0.055)],
+        0.016,
+        0.009,
+        MZ.DARKPOLY,
+        { stations: 8 },
+      ),
       mat: 'metal',
     });
-    // Chin strap.
+    // Chinstrap Y-yoke off the side rail: a forward leg down in front of the
+    // ear to the jaw hinge, a rear leg behind it to the nape pad. Both are
+    // 11 mm tape, i.e. two pixels at gameplay range — their job is to close the
+    // shape between the helmet and the jaw, not to be read individually.
     parts.push({
-      surface: strap([V(sgn * 0.098, 1.62, -0.03), V(sgn * 0.072, 1.575, -0.02), V(sgn * 0.03, 1.548, -0.035), V(0, 1.545, -0.04)], 0.014, 0.006, Z.WEBBING, { stations: 10 }),
+      surface: strap(
+        [V(sgn * 0.093, 1.700, -0.038), V(sgn * 0.083, 1.640, -0.048), V(sgn * 0.055, 1.590, -0.058)],
+        0.011,
+        0.004,
+        Z.WEBBING,
+        { stations: 9 },
+      ),
       mat: 'cloth',
     });
+    parts.push({
+      surface: strap(
+        [V(sgn * 0.095, 1.700, 0.026), V(sgn * 0.086, 1.646, 0.036), V(sgn * 0.058, 1.602, 0.02)],
+        0.011,
+        0.004,
+        Z.WEBBING,
+        { stations: 9 },
+      ),
+      mat: 'cloth',
+    });
+    parts.push(...buckle(V(sgn * 0.062, 1.606, -0.03), { w: 0.017, h: 0.013, rotY: sgn * 0.5 }));
   }
+  // Chin cup under the jaw, and the nape pad behind.
+  parts.push({
+    surface: roundedBox(0.058, 0.02, 0.028, 0.007, { zone: Z.WEBBING, radial: 10 }).transform(
+      new THREE.Matrix4().makeRotationX(-0.3).setPosition(0, 1.578, -0.056),
+    ),
+    mat: 'cloth',
+  });
+  parts.push({
+    surface: roundedBox(0.082, 0.026, 0.02, 0.007, { zone: Z.WEBBING, radial: 10 }).transform(
+      new THREE.Matrix4().setPosition(0, 1.614, 0.056),
+    ),
+    mat: 'cloth',
+  });
   return parts;
 }
 
@@ -714,7 +951,9 @@ export function buildBandana() {
   for (let j = 0; j < rows.length - 1; j++) {
     for (let i = 0; i < R; i++) {
       const a = j * (R + 1) + i;
-      band.quad(a, a + 1, a + R + 2, a + R + 1);
+      // Rows run UP the skull, so this is the opposite winding to
+      // displacedSphere (whose rows run down). See geometry.js.
+      band.quad(a, a + R + 1, a + R + 2, a + 1);
     }
   }
   parts.push({ surface: band, mat: 'cloth' });
@@ -723,20 +962,32 @@ export function buildBandana() {
   // the only saturated colour in the frame, so from the gameplay camera the
   // read was "red ribbon", not "soldier". A tied bandana tail is a 14 mm
   // pennant.
+  //
+  // Round 5 moved the knot DOWN to the nape and laid the tails flat against the
+  // skull. At y 1.712 with the tails hanging off the back of the crown they
+  // stood clear of the silhouette on both sides of the head and read, at
+  // gameplay range, as two antennae — the "asymmetric blob" note. A bandana is
+  // tied at the occiput, below the widest point of the skull, and its tails lie
+  // ON the hair.
   parts.push({
-    surface: roundedBox(0.034, 0.028, 0.028, 0.007, { zone: Z.BANDANA, radial: 8 }).transform(
-      new THREE.Matrix4().setPosition(0, 1.712, 0.108),
+    surface: roundedBox(0.036, 0.024, 0.022, 0.006, { zone: Z.BANDANA, radial: 8 }).transform(
+      new THREE.Matrix4().makeRotationX(0.35).setPosition(0, 1.664, 0.098),
     ),
     mat: 'cloth',
   });
   for (const sgn of [-1, 1]) {
     parts.push({
       surface: strap(
-        [V(sgn * 0.012, 1.706, 0.112), V(sgn * 0.026, 1.672, 0.118), V(sgn * 0.038, 1.638, 0.114), V(sgn * 0.044, 1.608, 0.1)],
-        0.015,
+        [
+          V(sgn * 0.014, 1.658, 0.1),
+          V(sgn * 0.03, 1.634, 0.096),
+          V(sgn * 0.042, 1.608, 0.084),
+          V(sgn * 0.046, 1.586, 0.066),
+        ],
+        0.017,
         0.004,
         Z.BANDANA,
-        { stations: 10, taper: 0.45 },
+        { stations: 10, taper: 0.5 },
       ),
       mat: 'cloth',
     });
@@ -782,7 +1033,8 @@ function skullBand(opts = {}) {
   for (let j = 0; j < rows.length - 1; j++) {
     for (let i = 0; i < R; i++) {
       const a = j * (R + 1) + i;
-      s.quad(a, a + 1, a + R + 2, a + R + 1);
+      // Rows run up the skull; opposite winding to displacedSphere.
+      s.quad(a, a + R + 1, a + R + 2, a + 1);
     }
   }
   return s;
@@ -1049,12 +1301,15 @@ export function buildPockets(o = {}) {
     });
   }
   // Hip dump pouch.
-  parts.push({
-    surface: roundedBox(0.1, 0.11, 0.06, 0.016, { zone: Z.POUCH, radial: 12 }).transform(
-      new THREE.Matrix4().makeRotationY(0.5).setPosition(-0.16, 0.9, 0.055),
+  parts.push(
+    ...pouch(
+      0.1,
+      0.12,
+      0.06,
+      new THREE.Matrix4().makeRotationY(0.5 + Math.PI).setPosition(-0.16, 0.9, 0.055),
+      { radial: 12, lidH: 0.030 },
     ),
-    mat: 'cloth',
-  });
+  );
   return parts;
 }
 

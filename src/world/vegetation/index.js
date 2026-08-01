@@ -58,7 +58,17 @@ export async function install(world) {
     // 0.26 is roughly the transmittance of a dry straw blade. 0.06 is what is
     // left of the wrapped-sky term once the IBL (envMapIntensity, also pulled
     // down) is allowed to do the ambient work it is there to do.
-    uTranslucency: { value: new THREE.Vector2(0.26, 0.06) },
+    // Round 4: 0.26 -> 0.30, and the distance taper in vegDryShading pulled in
+    // hard (45-150 m instead of 90-300 m) at the same time. Dry straw really
+    // does transmit about a third of what lands on it, and the lobe now carries
+    // its own amber tint (VEG_TRANSMIT in shaderLib) rather than merely scaling
+    // the reflected colour, so a back-lit blade goes amber instead of just
+    // bright. Raising the gain without pulling the range in put a bright speck
+    // on every distant bush in the dawn frame's shaded hillside — round 2's
+    // white confetti by a different route. The sky half is untouched at 0.06;
+    // that one is ungated and it is what made a dead branch measure luminance 80
+    // in a NIGHT frame.
+    uTranslucency: { value: new THREE.Vector2(0.30, 0.06) },
     uHeightMap: { value: field.heightTex },
     uSurfMap: { value: field.surfTex },
     uPadMap: { value: field.padTex },

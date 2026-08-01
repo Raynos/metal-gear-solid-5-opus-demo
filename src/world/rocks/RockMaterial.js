@@ -25,16 +25,25 @@ import { PALETTE } from '../../config/ArtDirection.js';
 /**
  * World-space wind, matched to the terrain's blown-sand relief.
  *
- * Terrain.js bakes its ripple set as `sin((u*27 + v*10) * 2pi)` over a 64 m
- * wrapping field, so the phase gradient — and therefore the wind that built it,
- * because a ripple's crests lie across the flow — is along (27, 10) in world
- * XZ. Deriving it from those two integers rather than writing down an azimuth
- * means the rocks cannot drift out of agreement with the sand if the terrain
- * author retunes the field: a stone with its drift banked against the wrong
- * face is a louder error than a stone with no drift at all.
+ * ROUND 5: THIS WAS 48 DEGREES OUT AND HAD BEEN SINCE IT WAS WRITTEN.
+ *
+ * The old derivation came from a ripple field Terrain.js no longer has — it read
+ * `sin((u*27 + v*10)*2pi)` off a 64 m wrapping tile and concluded the wind ran
+ * along (27, 10), i.e. 20.3 degrees measured from +X. Terrain now bakes its
+ * ripples into a 1.6 m tile that the ground shader samples in a rotated frame:
+ * `rw = rot(vWPos.xz, WIND_SC)` with `WIND_SC = (cos W, sin W)`, `W = 0.38 rad`,
+ * and the ripple phase advances along `rw.y`. Crests lie ACROSS the flow, so the
+ * wind runs along the ripple wave vector, which in world XZ is
+ * `(sin W, cos W)` — 68.2 degrees from +X, not 20.3.
+ *
+ * Measured against the shipped ground: the two vectors have a dot product of
+ * 0.67, so every drift in the game was banked 48 degrees off the sand ripple it
+ * was supposed to agree with, which is worse than having no drift at all. These
+ * two lines are now derived from Terrain's own `WIND` constant and its own
+ * rotation convention, so a retune there moves the rocks with it.
  */
-const WIND_AZIMUTH = Math.atan2(10, 27);
-export const WIND_DIR = [Math.cos(WIND_AZIMUTH), Math.sin(WIND_AZIMUTH)];
+const TERRAIN_WIND = 0.38;   // rad; Terrain.js `const WIND`
+export const WIND_DIR = [Math.sin(TERRAIN_WIND), Math.cos(TERRAIN_WIND)];
 
 export function createRockMaterial() {
   const mat = new THREE.MeshStandardMaterial({
@@ -45,7 +54,10 @@ export function createRockMaterial() {
     // shaded side, and measured against the terrain the shaded flank was landing
     // at 0.47 of the sand's shadow value — a crushed silhouette, which is the
     // opposite of the reference. MGSV shadows are lifted and full of sky.
-    envMapIntensity: 1.20,
+    // Round 5: 1.20 -> 1.34. The shade side of a clast is lit by the indirect
+    // term and nothing else, and measured against the ground it covers, a third
+    // of every rock pixel was landing under 0.40 of its own sand.
+    envMapIntensity: 1.34,
     dithering: true,
   });
 
@@ -77,20 +89,74 @@ export function createRockMaterial() {
   // in the valley the reddest object in the frame. Values are the old ones with
   // the blue channel raised; luminance is unchanged to within half a percent,
   // so none of the lit/shade calibration above moves.
+  // Round 5 re-derived the whole ramp against a MEASUREMENT of the shipped
+  // frame rather than against the palette. The rule in this file has always been
+  // "never cooler in R/B than the sand", and it was being checked against
+  // PALETTE.sandLight's albedo (R/B 1.28). But the number a critic reads off a
+  // PNG is not albedo, it is albedo times illuminant times grade, and measured
+  // with an ID mask over 6,000 paired pixels the sand comes back at image R/B
+  // 1.79 while the rock came back at 1.65 — 69% of rock pixels COOLER than the
+  // exact ground they covered. Two causes, both fixed: the ground-bounce tint
+  // below was never applied (see uBounce), and the ramp itself was only ~1.45,
+  // which after a shaded facet's sky-dominated fill lands under the sand.
+  // Blue is 7% of luminance, so a 12% blue cut is a 0.8% value change and a
+  // 15% hue change; that is the whole trade and it is why it is done in blue.
+  //
+  // uRockDeep is also lifted 23% in luminance. It is the target of the cavity
+  // mix, and with the round-5 varnish on top of it a third of every clast pixel
+  // was landing under 0.40 of its own ground — charcoal, not limestone.
   mat.userData.uniforms = {
-    uRockLight: { value: new THREE.Vector3(0.518, 0.440, 0.362) },  // 1.43 buff
-    uRockDark: { value: new THREE.Vector3(0.356, 0.291, 0.234) },   // 1.52 tan
-    uRockDeep: { value: new THREE.Vector3(0.232, 0.179, 0.142) },   // 1.63 stain
-    uRockRed: { value: new THREE.Vector3(0.47, 0.302, 0.222) },     // 2.12 iron
+    uRockLight: { value: new THREE.Vector3(0.534, 0.440, 0.299) },  // 1.79 buff
+    uRockDark: { value: new THREE.Vector3(0.370, 0.291, 0.192) },   // 1.93 tan
+    uRockDeep: { value: new THREE.Vector3(0.280, 0.208, 0.128) },   // 2.19 stain
+    uRockRed: { value: new THREE.Vector3(0.48, 0.302, 0.198) },     // 2.42 iron
     uSand: { value: new THREE.Vector3(...PALETTE.sandLight) },
     // Wind dust is *lighter and warmer* than the sand it came from: the fine
     // fraction is what stays airborne, and fines are pale.
-    uDust: { value: new THREE.Vector3(0.571, 0.487, 0.404) },       // 1.41
+    uDust: { value: new THREE.Vector3(0.588, 0.487, 0.336) },       // 1.75
     uLichen: { value: new THREE.Vector3(0.245, 0.228, 0.156) },     // 1.57 khaki
+    /**
+     * Desert varnish. Round 5: the single term that makes a small clast read as
+     * an object rather than a stain on the sand.
+     *
+     * Measured on r4/outpost.png with a paired mask (render the frame, render it
+     * with the rock group hidden, difference the two), the rock pixels averaged
+     * display luminance 0.2518 against 0.2562 for the exact sand pixels they
+     * covered — a ratio of 0.983, and 77% of every rock pixel in the frame sat
+     * within +/-12% of the ground behind it. A field of objects that measures
+     * within 2% of its own background is a decal.
+     *
+     * The physical answer is on the ground already: Terrain.js paints its own
+     * near-field lag as varnished clasts on unvarnished sand, with the comment
+     * "desert pavement is mostly DARKER than the matrix it sits on". Manganese
+     * and iron oxide build on stable clast faces over millennia; the sand
+     * between them is turned over constantly and never darkens. This is that
+     * stain. Terrain's own uVarnish is R/B 1.32; this is 2.21, and it has to be,
+     * because the rule is "never cooler than the sand" and the sand MEASURES
+     * R/B 1.91 in the ground shot once the afternoon beam is on it. A stain
+     * that is only as warm as the rock it darkens cannot raise the rock's hue,
+     * and 39% of the clasts came back cooler than their own ground at 1.67.
+     * Manganese-iron desert varnish is genuinely a red-brown-black.
+     */
+    uVarnish: { value: new THREE.Vector3(0.175, 0.120, 0.076) },    // 2.30
     uDetail: { value: 1.0 },
-    // Warm ground-bounce multiplier applied to the indirect term on faces that
-    // look away from the sky. Derived from LIGHT_TRANSPORT.groundAlbedo's hue
-    // (0.54, 0.44, 0.345) normalised so the green channel carries the lift.
+    /**
+     * Warm ground-bounce TINT applied to the indirect term on faces that look
+     * away from the sky.
+     *
+     * ROUND 5: THIS UNIFORM WAS DECLARED, DOCUMENTED AND NEVER USED. It was in
+     * the uniform block and in the fragment shader's declaration list, and the
+     * string "uBounce" appeared nowhere else in the file, so the warm bounce
+     * every comment in here assumes has never once been applied. That is the
+     * mechanical reason a rock's shaded flank goes blue: the ONLY thing lighting
+     * it was the sky IBL, and the sky is blue. Measured on the round-5 field
+     * before this was wired up, 70% of rock pixels were cooler in R/B than the
+     * exact ground pixels they covered.
+     *
+     * It is a TINT, not a gain: normalised by its own green channel so it moves
+     * hue without moving the brightness the AO calibration above was set
+     * against. The values still track LIGHT_TRANSPORT.groundAlbedo's hue.
+     */
     uBounce: { value: new THREE.Vector3(2.35, 1.80, 1.32) },
     uWind: { value: new THREE.Vector2(WIND_DIR[0], WIND_DIR[1]) },
   };
@@ -103,12 +169,14 @@ export function createRockMaterial() {
         '#include <common>',
         `#include <common>
          attribute vec4 aRock;    // cavity, ao, heightFrac, skirt
-         attribute vec2 aTint;    // per-instance: value shift, strata phase
+         // per-instance: value shift, strata phase, clast weight.
+         // .z is 1 for a pebble and 0 for a butte — see Scatter's CLAST table.
+         attribute vec3 aTint;
          varying vec3 vWPos;
          varying vec3 vWNrm;
          varying vec3 vLPos;
          varying vec4 vRock;
-         varying vec2 vTint;
+         varying vec3 vTint;
          varying vec3 vBedUp;   // world-space direction of the body's bedding axis
          varying vec3 vOrg;     // world-space origin of this instance
          uniform vec2 uWind;`,
@@ -142,8 +210,14 @@ export function createRockMaterial() {
                  // Local +Y is the ground normal and local XZ is the ground
                  // plane, both by construction of the collar's transform, so
                  // this is a world-space displacement written in local units.
-                 transformed.y += (bank * 0.16 - scour * 0.085) * rim;
-                 transformed.xz *= 1.0 + (bank * 0.26 - scour * 0.17) * rim;
+                 // Round 5 roughly doubled the asymmetry. With the wind vector
+                 // itself 48 degrees wrong there was no point measuring the
+                 // amplitude, and at the old values the crescent moved the rim
+                 // by 16% of a drift that is itself ~30% of the stone's
+                 // footprint radius — under a pixel at any range the stone is
+                 // legible from. A real lee scour is a visible hollow.
+                 transformed.y += (bank * 0.26 - scour * 0.15) * rim;
+                 transformed.xz *= 1.0 + (bank * 0.42 - scour * 0.30) * rim;
                }
              }
            #endif
@@ -178,10 +252,11 @@ export function createRockMaterial() {
          varying vec3 vWNrm;
          varying vec3 vLPos;
          varying vec4 vRock;
-         varying vec2 vTint;
+         varying vec3 vTint;
          varying vec3 vBedUp;   // world-space direction of the body's bedding axis
          varying vec3 vOrg;     // world-space origin of this instance
          uniform vec2 uWind;
+         uniform vec3 uVarnish;
          uniform vec3 uRockLight;
          uniform vec3 uRockDark;
          uniform vec3 uRockDeep;
@@ -289,7 +364,7 @@ export function createRockMaterial() {
            // Warm: a cool-grey vein on a buff rock is a grey stripe, and grey
            // stripes are what made the family read cold next to the sand.
            float vein = smoothstep(0.9, 0.99, rfbm(vLPos.xy * 3.4 + vTint.y * 9.0, 3));
-           albedo = mix(albedo, vec3(0.545, 0.505, 0.435), vein * 0.45);
+           albedo = mix(albedo, vec3(0.560, 0.505, 0.392), vein * 0.45);
 
            // mineral grain, close range only (it would alias into fizz further out)
            float gritFade = 1.0 - smoothstep(3.0, 26.0, dist);
@@ -358,8 +433,37 @@ export function createRockMaterial() {
            // Capped below saturation. Fully dusted the rock takes the dust colour
            // outright and a field of them reads as a scatter of white sugar cubes
            // against the ground rather than as stone with dust on it.
-           dust = clamp(dust, 0.0, 0.60);
+           //
+           // Round 5: the cap is now a function of clast size, and that is the
+           // whole reason the small families were invisible. A chip lies on a LAG
+           // pavement — a surface that exists precisely because the wind has
+           // taken every fine grain off it — so the one body in the scene that
+           // was being given the most dust (flat, sky-facing, hFrac near zero, so
+           // all three terms saturate) is the body that in reality carries the
+           // least. At 0.60 the pebble was 60% uDust, whose luminance is within
+           // 4% of the sand's, which is why it measured a ratio of 0.98 against
+           // the ground it sat on.
+           float clast = clamp(vTint.z, 0.0, 1.0);
+           dust = clamp(dust, 0.0, mix(0.60, 0.31, clast));
            albedo = mix(albedo, uDust, dust);
+
+           // --- desert varnish on the clast families -------------------------
+           // Not a value trim: a real mineral coat, applied where it forms.
+           // Manganese-iron varnish builds on the stable, sky-facing, unscoured
+           // faces of a clast that has not moved in centuries, so it tracks the
+           // up-facing normal and the absence of a crevice, and it is absent on
+           // the buried underside. "pale" leaves a fifth of the population
+           // unvarnished quartzite: a field where every stone is the same value
+           // reads as a pattern, which is the failure the terrain's own grit
+           // shader calls out.
+           if (clast > 0.003) {
+             float pale = smoothstep(0.62, 0.88, vTint.x);            // quartzy minority
+             float coat = clast * (1.0 - pale * 0.85)
+                        * (0.42 + 0.58 * pow(up, 0.7))
+                        * (0.55 + 0.45 * smoothstep(0.15, 0.75, hFrac))
+                        * (0.70 + 0.60 * smoothstep(0.30, 0.85, rfbm(vWPos.xz * 1.7 + 5.1, 3)));
+             albedo = mix(albedo, uVarnish, clamp(coat, 0.0, 1.0) * 0.38);
+           }
 
            // --- the fines apron banked against the base ---
            // Past the collar's inner lip this is not rock at all: it is drifted
@@ -386,8 +490,8 @@ export function createRockMaterial() {
              float wd = wl > 1e-4 ? dot(woff / wl, uWind) : 0.0;
              float bank = smoothstep(0.15, -1.0, wd);
              float scour = smoothstep(-0.15, 1.0, wd);
-             fines *= 1.0 + bank * 0.12 - scour * 0.13;
-             fines = mix(fines, uDust * 1.02, bank * 0.34);
+             fines *= 1.0 + bank * 0.19 - scour * 0.18;
+             fines = mix(fines, uDust * 1.04, bank * 0.50);
              // coarse grains standing proud in the drift, close range only
              fines *= 1.0 + (triF(vWPos, wn, 9.0, 2) - 0.5) * 0.22 * fade;
              albedo = mix(albedo, fines, sk);
@@ -488,6 +592,29 @@ export function createRockMaterial() {
              grad -= wn * dot(grad, wn);
              nWorld = normalize(nWorld - grad * (0.075 / sc) * uDetail * fadeFine);
            }
+           // Round 5 integration: a third octave, near-field only.
+           //
+           // The finest octave above has a 24 cm cell, so a 60 cm chip lying
+           // three metres from a third-person camera has no surface variation
+           // across a whole facet. Measured on gameplay.png: the nearest rock
+           // occupies 90x55 px, is fourteen flat facets, and each facet's own
+           // standard deviation is under two code values — it reads as untextured
+           // placeholder geometry in the one shot that is supposed to read as
+           // the game. A 5 cm cell at tan 4.9 deg breaks the facet without
+           // touching the silhouette or the shape's own read, and it is gone by
+           // 16 m, which is about where a 5 cm feature stops resolving.
+           float fadeMicro = 1.0 - smoothstep(5.0, 16.0, dist);
+           if (fadeMicro > 0.003) {
+             float sc = 19.0;
+             float e = 0.014;
+             float h0 = triF(vWPos, wn, sc, 2);
+             float hx = triF(vWPos + vec3(e, 0.0, 0.0), wn, sc, 2);
+             float hy = triF(vWPos + vec3(0.0, e, 0.0), wn, sc, 2);
+             float hz = triF(vWPos + vec3(0.0, 0.0, e), wn, sc, 2);
+             vec3 grad = (vec3(hx, hy, hz) - h0) / e;
+             grad -= wn * dot(grad, wn);
+             nWorld = normalize(nWorld - grad * (0.085 / sc) * uDetail * fadeMicro);
+           }
            // Bedding relief: courses are not flush, so the contacts read as real
            // steps in the surface rather than lines painted on a smooth shell.
            vec3 bedT = vBedUp - wn * dot(vBedUp, wn);
@@ -500,8 +627,22 @@ export function createRockMaterial() {
       .replace(
         '#include <aomap_fragment>',
         `#include <aomap_fragment>
-         reflectedLight.indirectDiffuse *= gAO;
-         reflectedLight.indirectSpecular *= gAO;`,
+         {
+           // Warm ground bounce. A rock's shaded flank sees no sky worth
+           // speaking of and a great deal of sunlit sand, so the indirect
+           // arriving at it is the GROUND's colour, not the dome's. Weighted by
+           // how far the normal points below the horizon, and normalised by its
+           // own green channel so it is a hue shift and not a second light.
+           // Weighted by how little SKY the facet sees, not by how far it
+           // points down: LIGHT_TRANSPORT.ridgeElevation makes the same point
+           // about the terrain — a vertical face's cosine lobe is concentrated
+           // at low elevations, which in a valley is sunlit rock and sand, not
+           // dome. A vertical flank therefore takes the bounce at full weight.
+           float bDown = 1.0 - clamp(normalize(vWNrm).y, 0.0, 1.0);
+           vec3 bTint = mix(vec3(1.0), uBounce / max(uBounce.g, 1e-4), bDown * 0.90);
+           reflectedLight.indirectDiffuse *= gAO * bTint;
+           reflectedLight.indirectSpecular *= gAO;
+         }`,
       );
 
     mat.userData.shader = shader;
