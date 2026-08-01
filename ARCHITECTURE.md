@@ -82,8 +82,10 @@ Daemon control: `node tools/shot.mjs status` / `stop`. Its state lives in
 `.shotd/` (gitignored) and its log is `.shotd/log`. One daemon per working tree,
 enforced by an `O_EXCL` lock: if nine authors run the client at the same instant,
 nine daemons start, one wins the lock and the other eight exit before opening a
-vite server. Tune with `SHOTD_PAGES` (default 3) and `SHOTD_IDLE` (seconds,
-default 1800).
+vite server. Each daemon runs **exactly one chromium** with **one warm page** by default,
+because every working tree gets its own daemon and a page holds a whole
+generated world (~160 MB plus GPU). Raise `SHOTD_PAGES` (max 4) only if you are
+on a single tree and want the concurrency; `SHOTD_IDLE` is seconds, default 600.
 
 ## File ownership — DO NOT CROSS THESE LINES
 

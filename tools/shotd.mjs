@@ -40,8 +40,21 @@ const opt = (k, d) => {
   const i = argv.indexOf('--' + k);
   return i < 0 ? d : argv[i + 1];
 };
-const POOL_SIZE = Math.max(1, +opt('pages', 3));
-const IDLE_MS = Math.max(60, +opt('idle', 1800)) * 1000;
+// ONE warm page per daemon by default, and one chromium per daemon, full stop.
+//
+// A page holds a complete generated world: ~160 MB of typed arrays plus its GPU
+// textures and a 3.6M-triangle scene. This defaulted to 3 when the assumption
+// was one working tree. It is not — authors run a worktree each, every tree gets
+// its own daemon, and 6 trees x 3 pages meant 18 resident worlds, 47 chromium
+// processes and 7.8 GB. Load average hit 122 and the machine was unusable.
+//
+// The pool bought little anyway: 8 concurrent clients measured 4.5-11.5s at
+// pages=3, and the work is GPU-serialised regardless. Raise it deliberately with
+// SHOTD_PAGES if you are on one tree and know you want the concurrency.
+const POOL_SIZE = Math.max(1, Math.min(+opt('pages', 1), 4));
+// 10 minutes, not 30. An abandoned tree should not hold a browser through a
+// whole round.
+const IDLE_MS = Math.max(60, +opt('idle', 600)) * 1000;
 
 const log = (...a) => {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`;
