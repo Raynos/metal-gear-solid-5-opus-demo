@@ -1,0 +1,234 @@
+import * as THREE from 'three';
+
+/**
+ * The MGSV third-person camera.
+ *
+ * The rig is not invented here — it is the one solved for the canonical
+ * `gameplay` shot in src/debug/Shots.js, read back out as an offset so the
+ * playable camera and the frame this project is judged on are the same camera.
+ * Reproducing the shot's numbers exactly:
+ *
+ *   cam    = root + up*1.62 + camRight*0.45 - camForward*2.1
+ *   look   = (yaw, -0.081)
+ *
+ * with root (1.476, -0.05, 4.563) and yaw 0.4085 that evaluates to
+ * (2.723, 1.57, 6.311) against the shot's (2.723, 1.57, 6.312), and the pitch
+ * is the 4.6 degrees the shot's own comment derives geometrically: 0.17 m of
+ * drop (eye 1.62 to sternum 1.45) over the 2.1 m boom.
+ *
+ * The subject lands on the left third because the camera is 0.45 m to the RIGHT
+ * of him while looking parallel — atan(0.45/2.1) is 12.1 degrees of a 22.5
+ * degree half-FOV, so he sits at about a third of frame width with the aim
+ * space open across the other two. That single number is the shoulder swap.
+ */
+
+// Right shoulder. Every one of these is the shot's rig; do not "improve" them
+// without re-solving the shot.
+const RIG = {
+  eye: 1.62,
+  lat: 0.45,
+  dist: 2.1,
+  pitchBase: -0.0808,
+  fov: 45,
+};
+// Shouldered: closer, tighter, a touch higher, and the subject moves further
+// off-axis so the sight line is clear.
+// Round 7: dist 1.30 -> 1.44 and lat 0.36 -> 0.41, measured off the rendered
+// frame. At 1.30 the shoulder and the back of the skull took the whole left
+// third out to 38% of frame width, and the head crowded the top edge. The extra
+// 140 mm is 11% of the subject's screen height back and the extra lateral pushes
+// what remains further off-axis; the aim space is unchanged because the boom
+// still sits on the same side.
+const AIM = { eye: 1.665, lat: 0.41, dist: 1.44, pitchBase: -0.055, fov: 33 };
+
+const PITCH_MIN = -1.02;   // 58 degrees down
+const PITCH_MAX = 0.78;    // 45 degrees up
+const ORBIT = 0.75;        // how much of the pitch the boom follows
+
+export class PlayerCamera {
+  constructor(camera, { obstacles, ground }) {
+    this.camera = camera;
+    this.obstacles = obstacles;
+    this.ground = ground;
+
+    this.yaw = 0;
+    this.pitch = 0;
+    this.shoulder = 1;          // +1 right, -1 left
+    this._shoulderBlend = 1;
+    this.aimBlend = 0;
+    this.stanceDrop = 0;
+    this._kick = 0;
+    this._kickVel = 0;
+
+    this.follow = new THREE.Vector3();     // smoothed root
+    this.lead = new THREE.Vector3();
+    this._pos = new THREE.Vector3();
+    this._want = new THREE.Vector3();
+    this._e = new THREE.Euler(0, 0, 0, 'YXZ');
+    this._first = true;
+  }
+
+  /** Point the rig at a heading without a sweep — used when play mode starts. */
+  reset(position, yaw) {
+    this.yaw = yaw;
+    this.pitch = 0;
+    this.follow.copy(position);
+    this.lead.set(0, 0, 0);
+    this._first = true;
+  }
+
+  addLook(dx, dy) {
+    this.yaw += dx;
+    this.pitch = THREE.MathUtils.clamp(this.pitch + dy, PITCH_MIN, PITCH_MAX);
+  }
+
+  /** Weapon kick: a fast upward impulse that settles back over ~0.35 s. */
+  recoil(amount) {
+    this._kickVel += amount;
+  }
+
+  swapShoulder() {
+    this.shoulder = -this.shoulder;
+  }
+
+  /**
+   * @param {object} s player state
+   *   position   root position (feet)
+   *   velocity   horizontal velocity, for the lead
+   *   aiming     0..1
+   *   stance     'stand' | 'crouch' | 'prone'
+   *   sprint     boolean, widens the lens
+   */
+  update(dt, s) {
+    // --- spring-damped kick -------------------------------------------------
+    this._kickVel -= this._kick * 90 * dt;
+    this._kickVel *= Math.max(0, 1 - dt * 11);
+    this._kick += this._kickVel * dt;
+
+    // --- blends -------------------------------------------------------------
+    const ease = (cur, target, tau) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
+    this.aimBlend = ease(this.aimBlend, s.aiming ? 1 : 0, 0.085);
+    this._shoulderBlend = ease(this._shoulderBlend, this.shoulder, 0.16);
+    const dropTarget = s.stance === 'prone' ? 1.02 : s.stance === 'crouch' ? 0.36 : 0;
+    this.stanceDrop = ease(this.stanceDrop, dropTarget, 0.18);
+
+    // --- what the rig is following -----------------------------------------
+    // The camera leads the movement, but only SIDEWAYS.
+    //
+    // The first version slid the anchor along the whole velocity, and the
+    // sprint frame showed why that is wrong: the boom is measured from the
+    // anchor, so leading forward walks the camera 0.56 m closer to the body it
+    // is following and the character grows to fill the frame at exactly the
+    // moment you need to see where you are going. Only the component across the
+    // heading survives, which is what makes the frame swing wide through a turn
+    // — and the distance term below does the job the forward lead was reaching
+    // for, by pulling BACK with speed instead of in.
+    const lead = this._want.set(s.velocity.x * 0.13, 0, s.velocity.z * 0.13);
+    const along = lead.x * -Math.sin(this.yaw) + lead.z * -Math.cos(this.yaw);
+    lead.x += Math.sin(this.yaw) * along;
+    lead.z += Math.cos(this.yaw) * along;
+    if (lead.lengthSq() > 0.1225) lead.setLength(0.35);
+    this.lead.lerp(lead, 1 - Math.exp(-dt / 0.22));
+
+    if (this._first) {
+      this.follow.copy(s.position);
+      this._first = false;
+    } else {
+      // Tight, but not welded: 45 ms of give absorbs the step-up snap without
+      // reading as lag on the stick.
+      this.follow.lerp(s.position, 1 - Math.exp(-dt / 0.045));
+    }
+
+    // --- solve the boom -----------------------------------------------------
+    const a = this.aimBlend;
+    const eye = THREE.MathUtils.lerp(RIG.eye, AIM.eye, a) - this.stanceDrop;
+    const lat = THREE.MathUtils.lerp(RIG.lat, AIM.lat, a) * this._shoulderBlend;
+    // Speed pulls the camera back. Half a metre over the sprint range is barely
+    // conscious and it is the whole reason a sprint reads as urgent rather than
+    // as the same shot playing faster.
+    const speed = Math.hypot(s.velocity.x, s.velocity.z);
+    const dist = THREE.MathUtils.lerp(RIG.dist, AIM.dist, a) + (1 - a) * Math.min(0.5, speed * 0.075);
+    const pitchBase = THREE.MathUtils.lerp(RIG.pitchBase, AIM.pitchBase, a);
+
+    const yaw = this.yaw;
+    const cy = Math.cos(yaw);
+    const sy = Math.sin(yaw);
+    const fx = -sy;
+    const fz = -cy;
+    const rx = cy;
+    const rz = -sy;
+
+    const ax = this.follow.x + this.lead.x;
+    const ay = this.follow.y + eye;
+    const az = this.follow.z + this.lead.z;
+
+    const orbit = this.pitch * ORBIT;
+    const back = dist * Math.cos(orbit);
+    const rise = -dist * Math.sin(orbit);
+
+    // No lean term here on purpose. The peek moves the BODY out from behind
+    // cover (PlayerController._lean, which routes it through the collision
+    // test), and this rig follows the body — so the camera comes with it for
+    // free and stays exactly as far behind his shoulder as it was. An extra
+    // camera-space lean on top double-counted it, and because the body leans
+    // along the cover tangent while the camera leaned along its own right, the
+    // two disagreed whenever the wall was not square to the view: measured on
+    // the peek state, the subject's head projected to x = -0.104, i.e. it had
+    // left the frame entirely.
+    this._want.set(
+      ax + rx * lat - fx * back,
+      ay + rise,
+      az + rz * lat - fz * back,
+    );
+
+    // --- collision ----------------------------------------------------------
+    // March the boom from the anchor outward and stop short of anything solid.
+    // The anchor is inside the player's own chest, so it is always a valid
+    // start point even when he is standing in a doorway.
+    let t = 1;
+    if (this.obstacles?.ok) {
+      t = this.obstacles.clearFraction(ax, ay, az, this._want.x, this._want.y, this._want.z, 7, 0.22);
+      t = Math.max(0.14, t);
+    }
+    this._pos.set(
+      ax + (this._want.x - ax) * t,
+      ay + (this._want.y - ay) * t,
+      az + (this._want.z - az) * t,
+    );
+    // Never below the ground: a camera that dips under a slope behind the
+    // player fills the frame with the inside of the terrain.
+    const gy = this.ground.heightAt(this._pos.x, this._pos.z) + 0.32;
+    if (this._pos.y < gy) this._pos.y = gy;
+
+    this.camera.position.copy(this._pos);
+    this._e.set(this.pitch + pitchBase + this._kick, yaw, 0, 'YXZ');
+    this.camera.quaternion.setFromEuler(this._e);
+
+    // --- lens ---------------------------------------------------------------
+    // A few degrees of extra width at a sprint is the cheapest speed cue there
+    // is, and it goes away the moment the weapon comes up.
+    const fov = THREE.MathUtils.lerp(RIG.fov + (s.sprint ? 4.5 : 0), AIM.fov, a);
+    this._fov = ease(this._fov ?? fov, fov, 0.12);
+    if (Math.abs(this.camera.fov - this._fov) > 0.02) {
+      this.camera.fov = this._fov;
+      this.camera.updateProjectionMatrix();
+    }
+  }
+
+  /**
+   * Where the camera is looking, for the aim ray.
+   *
+   * Rebuilt from yaw/pitch rather than read off `camera.quaternion`, because
+   * the transform is applied at the END of the frame (order 1100, after the
+   * animator has seated the root) while the aim ray is needed at the start.
+   * Reading the matrix would put the reticle one frame behind the stick — 16 ms
+   * of lag on the one thing in the game that has to be exact.
+   */
+  forward(out = new THREE.Vector3()) {
+    const pitch = this.pitch + THREE.MathUtils.lerp(RIG.pitchBase, AIM.pitchBase, this.aimBlend) + this._kick;
+    const cp = Math.cos(pitch);
+    return out.set(-Math.sin(this.yaw) * cp, Math.sin(pitch), -Math.cos(this.yaw) * cp);
+  }
+}
+
+export { RIG as CAMERA_RIG };
