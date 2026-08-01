@@ -6,3 +6,4 @@ shots/
 .shotd/
 .claude/worktrees/
 node_modules/.gencache/
+bench-history.jsonl
