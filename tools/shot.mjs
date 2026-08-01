@@ -17,7 +17,13 @@
  *   node tools/shot.mjs pix crop shots/r4/ground.png 1030 810 220 160 3 out.png
  *   node tools/shot.mjs pix column shots/r4/vista.png 1690 0.02,0.12,0.25,0.40
  *
+ *   node tools/shot.mjs reload            # force a world rebuild from source
  *   node tools/shot.mjs status | stop
+ *
+ * There is exactly ONE daemon per machine, shared by every working tree: one
+ * vite server, one chromium, one warm world. Requests queue, and the queue is
+ * ordered to prefer whichever tree is already loaded so switching trees is paid
+ * once per batch rather than once per request.
  *
  * The daemon starts on demand and shuts itself down when idle. Exits non-zero
  * if the page threw — a broken build must never be silently screenshotted as
@@ -26,11 +32,14 @@
 import { spawn } from 'node:child_process';
 import { readFile, mkdir } from 'node:fs/promises';
 import { openSync, readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const RUN = path.join(ROOT, '.shotd');
+// The daemon is machine-wide, not per-tree, so its state lives outside every
+// tree. Each request carries ROOT so the daemon knows which tree to load.
+const RUN = path.join(os.homedir(), '.cache', 'shotd');
 const PORTFILE = path.join(RUN, 'port');
 const LOCKFILE = path.join(RUN, 'lock');
 const LOGFILE = path.join(RUN, 'log');
@@ -112,16 +121,12 @@ async function daemonPort({ quiet = false } = {}) {
       lastSpawn = Date.now();
     }
   }
-  throw new Error(`render daemon never came up — see ${path.relative(ROOT, LOGFILE)}`);
+  throw new Error(`render daemon never came up — see ${LOGFILE}`);
 }
 
 function daemonFlags() {
-  const f = [];
-  const pages = process.env.SHOTD_PAGES;
   const idle = process.env.SHOTD_IDLE;
-  if (pages) f.push('--pages', pages);
-  if (idle) f.push('--idle', idle);
-  return f;
+  return idle ? ['--idle', idle] : [];
 }
 
 async function call(endpoint, body, { quiet = false } = {}) {
@@ -129,7 +134,7 @@ async function call(endpoint, body, { quiet = false } = {}) {
   const r = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body ?? {}),
+    body: JSON.stringify({ ...(body ?? {}), root: ROOT }),
   });
   const json = await r.json();
   if (!r.ok) throw new Error(json.error ?? `daemon returned ${r.status}`);
@@ -150,7 +155,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (!a.startsWith('--')) positional.push(a);
 }
 
-const SUBCOMMANDS = new Set(['eval', 'pix', 'status', 'stop']);
+const SUBCOMMANDS = new Set(['eval', 'pix', 'status', 'stop', 'reload']);
 const cmd = SUBCOMMANDS.has(positional[0]) ? positional.shift() : 'shot';
 
 // --- subcommands ----------------------------------------------------------
@@ -222,6 +227,11 @@ async function runPix() {
   else console.log(JSON.stringify(res, null, 2));
 }
 
+async function runReload() {
+  await call('/reload', {});
+  console.log('world rebuilt from source');
+}
+
 async function runStatus() {
   const port = await ping();
   if (!port) {
@@ -231,8 +241,8 @@ async function runStatus() {
   const r = await fetch(`http://127.0.0.1:${port}/status`);
   const s = await r.json();
   console.log(
-    `render daemon: up  pid=${s.pid} port=${port} pages=${s.pages} idle=${s.idlePages} ` +
-      `queued=${s.queued} uptime=${s.uptimeSec}s\nrenderer: ${s.renderer}`,
+    `render daemon: up  pid=${s.pid} port=${port} queued=${s.queued} busy=${s.busy} ` +
+      `uptime=${s.uptimeSec}s\nloaded tree: ${s.loadedRoot ?? '(none yet)'}\nrenderer: ${s.renderer ?? 'not yet probed'}`,
   );
 }
 
@@ -246,7 +256,7 @@ async function runStop() {
   console.log('render daemon: stopped');
 }
 
-const RUNNERS = { shot: runShot, eval: runEval, pix: runPix, status: runStatus, stop: runStop };
+const RUNNERS = { shot: runShot, eval: runEval, pix: runPix, reload: runReload, status: runStatus, stop: runStop };
 
 RUNNERS[cmd]().catch((err) => {
   console.error(String(err?.message ?? err));

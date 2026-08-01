@@ -43,26 +43,31 @@ the table above — do not re-create the deleted file.
 
 ### How the harness works
 
-`tools/shot.mjs` renders nothing itself. It talks to **one** render daemon
-(`tools/shotd.mjs`) shared by every author on the machine: one vite server, one
-chromium, a small pool of pages each holding a fully generated world. The daemon
-starts on demand and shuts down when idle; nothing needs starting by hand.
+`tools/shot.mjs` renders nothing. It talks to **one render daemon**
+(`tools/shotd.mjs`) — exactly one per machine, shared by every working tree:
+**one vite server, one chromium, one warm world**. It starts on demand and shuts
+down when idle; nothing needs starting by hand.
 
 This matters because generating the world costs ~17 s, of which ~12 s is the
 `Terrain.js` erosion simulation. The old harness paid that on **every**
 screenshot, and eight authors doing it at once turned an 18 s run into 55 s of
-pure contention. Against the warm daemon a repeat shot is well under a second,
-and the world is rebuilt only when a source file actually changes — once for the
-whole machine, not once per author.
+pure contention.
 
-Measured on an M3 Pro, 1280×720:
+Because trees hold different source, the daemon owns which tree is loaded and
+switches on demand. Its queue is ordered to prefer the tree already loaded, so a
+switch is paid once for a whole batch rather than once per request — 8 requests
+interleaved across 2 trees complete in ~17 s, not ~112 s. A request that has
+waited 45 s jumps the queue so a busy tree cannot starve the others.
+
+Measured on an M3 Pro, 1280x720:
 
 | | old harness | daemon |
 | --- | --- | --- |
 | 4 shots, alone | 18.3 s | 25 s cold **/ 2.5 s warm** |
-| 4 shots, 8 authors at once | 39.9–67.5 s (avg 54.6) | **4.5–11.5 s** |
+| 4 shots, 8 authors at once | 39.9-67.5 s (avg 54.6) | **4.5-11.5 s** |
 | `eval` probe | ~25 s | **0.4 s** |
-| shot after an edit | 18.3 s | ~16 s (one rebuild, then warm) |
+| broken build reported in | 180 s (hang) | **2.5 s**, with file and line |
+| resident cost | 6 daemons, 47 procs, 7.8 GB | **1 daemon, 7 procs, 0.94 GB** |
 
 Consequences worth knowing:
 
@@ -72,20 +77,21 @@ Consequences worth knowing:
   invocation may cost a rebuild.
 - `eval` and `pix` run against the same warm daemon, so probing the live page or
   measuring a PNG is effectively free. Use them freely.
+- `node tools/shot.mjs reload` forces a rebuild if you ever need one explicitly.
 - **Do not write `sleep`/retry loops around the harness.** The old harness had a
   latent bug where its readiness wait used Playwright's 30 s default instead of
-  the intended 90 s, so it spuriously failed under load and everyone wrapped it
-  in `for i in $(seq 1 40); … sleep 15`. That is fixed. A broken build now fails
-  in ~2 s with the offending file and line, rather than hanging.
+  the intended 90 s, so it failed spuriously under load and everyone wrapped it
+  in `for i in $(seq 1 40); ... sleep 15`. That is fixed. A broken build now
+  fails in ~2 s naming the offending file and line, rather than hanging.
+- **Never add another script that launches a browser.** That is the entire class
+  of problem this replaced. Add a subcommand to the daemon instead.
 
-Daemon control: `node tools/shot.mjs status` / `stop`. Its state lives in
-`.shotd/` (gitignored) and its log is `.shotd/log`. One daemon per working tree,
-enforced by an `O_EXCL` lock: if nine authors run the client at the same instant,
-nine daemons start, one wins the lock and the other eight exit before opening a
-vite server. Each daemon runs **exactly one chromium** with **one warm page** by default,
-because every working tree gets its own daemon and a page holds a whole
-generated world (~160 MB plus GPU). Raise `SHOTD_PAGES` (max 4) only if you are
-on a single tree and want the concurrency; `SHOTD_IDLE` is seconds, default 600.
+Daemon control: `node tools/shot.mjs status` / `reload` / `stop`. State lives in
+`~/.cache/shotd/` (machine-wide, outside every tree) and the log is
+`~/.cache/shotd/log`. One instance is enforced by an `O_EXCL` lock: if nine
+authors run the client at the same instant, nine daemons start, one wins and the
+other eight exit before opening a vite server. `SHOTD_IDLE` sets the idle
+shutdown in seconds (default 600).
 
 ## File ownership — DO NOT CROSS THESE LINES
 
