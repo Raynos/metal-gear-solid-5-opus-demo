@@ -33,7 +33,7 @@
  *   node tools/shotd.mjs [--idle 600]
  */
 import { chromium } from 'playwright';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { createServer as createNetServer } from 'node:net';
 import { createServer } from 'node:http';
 import { mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises';
@@ -186,6 +186,28 @@ function reapStale(file, what, group = true) {
 }
 
 const reapStaleVite = () => reapStale(VITEPID, 'vite');
+
+/**
+ * PID of the chromium we just launched, so a hard-killed daemon's browser can be
+ * reaped next start. `browser.process()` is not available on every Playwright
+ * build, so fall back to our own child list — at launch time chromium is the
+ * only child, since vite starts lazily on the first request.
+ */
+function browserPid() {
+  try {
+    if (typeof browser.process === 'function') {
+      const pid = browser.process()?.pid;
+      if (pid) return pid;
+    }
+  } catch { /* not supported on this build */ }
+  try {
+    const kids = execSync(`pgrep -P ${process.pid}`, { encoding: 'utf8' })
+      .trim().split('\n').map(Number).filter(Boolean);
+    return kids.find((p) => p !== vite?.proc?.pid) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 async function startVite(root) {
   reapStaleVite();
@@ -572,7 +594,7 @@ async function main() {
   log(`booting (idle=${IDLE_MS / 1000}s) — one vite, one chromium, one world`);
   reapStale(BROWSERPID, 'chromium', false);
   browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
-  const bpid = browser.process()?.pid;
+  const bpid = browserPid();
   if (bpid) writeFileSync(BROWSERPID, String(bpid));
   await attachPage();
 
