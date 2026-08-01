@@ -13,6 +13,7 @@ import { install as installRocks } from './world/rocks/index.js';
 import { install as installVegetation } from './world/vegetation/index.js';
 import { install as installOutpost } from './world/outpost/index.js';
 import { install as installCharacters } from './characters/index.js';
+import { install as installAI } from './ai/index.js';
 import { install as installGameplay } from './gameplay/index.js';
 import { install as installUI } from './ui/index.js';
 import { install as installAudio } from './audio/index.js';
@@ -256,6 +257,7 @@ const MODULES = [
   ['vegetation', installVegetation],
   ['outpost', installOutpost],
   ['characters', installCharacters],
+  ['ai', installAI],
   ['gameplay', installGameplay],
   ['ui', installUI],
   ['audio', installAudio],

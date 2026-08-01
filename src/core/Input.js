@@ -72,6 +72,19 @@ export class Input {
 
     this._down = new Set();     // source ids currently held
     this._prev = new Set();     // snapshot at the last update()
+    /**
+     * Sources that went down since the last update() — INCLUDING ones already
+     * released again. Edge detection used to be purely `_down` vs `_prevSet`,
+     * which silently drops any press whose whole down-up cycle fell between two
+     * frames. At 50 FPS that is a 20 ms window, and a crisp tap on C or Z is
+     * comfortably inside it: measured driving the real page, crouch and prone
+     * never fired once because the keyup landed before the next update(). Every
+     * edge-triggered verb — crouch, prone, reload, cover, CQC, swap shoulder —
+     * was affected. Keydown auto-repeat is filtered upstream by `e.repeat`, so
+     * latching here cannot make a held key toggle every frame.
+     */
+    this._taps = new Set();
+    this._pendingTaps = new Set();
     this._wheel = 0;
     this._lookX = 0;
     this._lookY = 0;
@@ -130,6 +143,10 @@ export class Input {
     this.releaseLock();
     this._down.clear();
     this._prev.clear();
+    // A latched tap that survived a mode change would fire the frame play mode
+    // is re-entered — a crouch nobody pressed.
+    this._taps.clear();
+    this._pendingTaps.clear();
     this.move.x = this.move.y = 0;
     this.look.x = this.look.y = 0;
     this._lookX = this._lookY = 0;
@@ -181,6 +198,7 @@ export class Input {
   _onKeyDown(e) {
     if (e.repeat) return;
     this._down.add(e.code);
+    this._pendingTaps.add(e.code);
     // Arrows, space and the slash key scroll or open quick-find otherwise, and
     // a page that scrolls under a pointer-locked game is a bug the player sees
     // as the camera sticking.
@@ -193,6 +211,7 @@ export class Input {
 
   _onMouseDown(e) {
     this._down.add(`Mouse${e.button}`);
+    this._pendingTaps.add(`Mouse${e.button}`);
     if (!this.pointerLocked) this.requestLock();
     e.preventDefault();
   }
@@ -263,6 +282,12 @@ export class Input {
     this._prev = recycled;
     this._prev.clear();
     for (const s of this._down) this._prev.add(s);
+    // Same double-buffer trick for the tap latch: `_taps` is what pressed()
+    // reads for THIS frame, `_pendingTaps` starts collecting for the next one.
+    const swap = this._taps;
+    this._taps = this._pendingTaps;
+    this._pendingTaps = swap;
+    this._pendingTaps.clear();
 
     // Stick beats keys when it is pushed further, so a pad plugged in mid-game
     // just works without a mode switch.
@@ -301,7 +326,10 @@ export class Input {
     const srcs = this.bindings[action];
     if (!srcs) return false;
     const prev = this._prevSet;
-    for (const s of srcs) if (this._down.has(s) && !prev?.has(s)) return true;
+    for (const s of srcs) {
+      if (this._taps.has(s)) return true;               // tap that began and ended between frames
+      if (this._down.has(s) && !prev?.has(s)) return true;
+    }
     return false;
   }
 

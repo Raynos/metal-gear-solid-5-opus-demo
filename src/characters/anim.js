@@ -287,6 +287,23 @@ export class Animator {
   get phase() { return this.loco.phase; }
   get gaitCycle() { return this.loco.cycle; }
   get action() { return this.actions.action; }
+  /**
+   * INTEGRATION SEAM. `src/gameplay` writes `anim.action` every frame as one of
+   * its declared animation channels ('none'|'takedown'|'grab'|'drag'|'cover'),
+   * while this class had only a getter — and assigning to a getter-only accessor
+   * throws in a module's strict mode. It threw inside Stealth.pose(), which runs
+   * BEFORE PlayerController.update() in the same system callback, so the throw
+   * took the controller with it: 2021 exceptions in one session and a player who
+   * could aim and fire but could not walk, crouch or go prone.
+   *
+   * The two `action` namespaces are genuinely different — this one is the action
+   * LAYER's clip state ('fire', 'reload', 'hit'), gameplay's is a verb intent —
+   * so the setter records the intent and deliberately does NOT poke
+   * `actions.action`, which would corrupt a running clip. gameplay's contract
+   * says the channel is additive and nothing needs to read it back, so parking
+   * it here costs nothing and keeps the getter honest.
+   */
+  set action(v) { this.intentAction = v; }
 
   /** World-space impulse direction (pointing away from the shooter). */
   hit(dir) {
