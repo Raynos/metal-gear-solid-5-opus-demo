@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { cachedBuffer } from '../core/GenCache.js';
 import { PALETTE, QUALITY } from '../config/ArtDirection.js';
 
 /**
@@ -653,6 +654,32 @@ class Grid {
     this.mid = new Float32Array(n * n);
   }
 
+  /**
+   * The simulated state of this grid as one buffer, and back again.
+   *
+   * Everything below is the output of the thermal + droplet sims, which cost
+   * 11.6 s of a 16 s world build and are fully deterministic. Serialising the
+   * lot lets GenCache skip them entirely on every load after the first.
+   * FIELDS is order-sensitive and is part of the cache key's version.
+   */
+  static FIELDS = ['h','rock','scree','flow','accum','deposit','ao','curv','nx','nz','section','bandH','bedRef','mid'];
+
+  serialize() {
+    const per = this.n * this.n;
+    const out = new Float32Array(per * Grid.FIELDS.length);
+    Grid.FIELDS.forEach((f, i) => out.set(this[f], i * per));
+    return out;
+  }
+
+  static hydrate(n, cell, buf) {
+    const g = new Grid(n, cell);
+    const per = n * n;
+    const all = new Float32Array(buf);
+    if (all.length !== per * Grid.FIELDS.length) return null; // stale layout
+    Grid.FIELDS.forEach((f, i) => g[f].set(all.subarray(i * per, (i + 1) * per)));
+    return g;
+  }
+
   /** Continuous grid index for a world coordinate. */
   ix(w) {
     return (w - this.origin) / this.cell;
@@ -687,7 +714,8 @@ const H_RANGE = 1900;
 // ---------------------------------------------------------------------------
 
 export class Terrain {
-  constructor({ size = QUALITY.terrainSize, segments = 512 } = {}) {
+  constructor(opts = {}) {
+    const { size = QUALITY.terrainSize, segments = 512 } = opts;
     this.size = size;
     this.segments = segments;
     this.order = 10;
@@ -697,16 +725,71 @@ export class Terrain {
     this.far = new Grid(1536, 8);
     this.near = new Grid(1280, 2);
 
-    this._buildFar();
-    this._buildNear();
+    if (!opts.__deferSim) {
+      this._buildFar();
+      this._buildNear();
+    }
 
-    this._buildTextures();
-    this._buildMicroTexture();
-    this._buildDetailTextures();
-    this._buildGritTextures();
-    this._buildRippleTexture();
-    this._buildMaterial();
-    this._buildClipmap();
+    if (!opts.__deferSim) {
+      this._buildTextures();
+      this._buildMicroTexture();
+      this._buildDetailTextures();
+      this._buildGritTextures();
+      this._buildRippleTexture();
+      this._buildMaterial();
+      this._buildClipmap();
+    }
+  }
+
+  /**
+   * Build a Terrain, reusing a cached simulation when the generator has not
+   * changed. Bump SIM_VERSION whenever anything that feeds `_buildFar` or
+   * `_buildNear` changes, or you will get a stale landscape.
+   */
+  static SIM_VERSION = 'sim1';
+
+  static async create(opts = {}) {
+    const size = opts.size ?? QUALITY.terrainSize;
+    const segments = opts.segments ?? 512;
+    const t = new Terrain({ ...opts, size, segments, __deferSim: true });
+    const key = `terrain-${Terrain.SIM_VERSION}-${size}-${segments}-${t.far.n}x${t.far.cell}-${t.near.n}x${t.near.cell}`;
+
+    let hydrated = false;
+    try {
+      const buf = await cachedBuffer(key, () => {
+        t._buildFar();
+        t._buildNear();
+        const a = t.far.serialize();
+        const b = t.near.serialize();
+        const joined = new Float32Array(a.length + b.length);
+        joined.set(a, 0);
+        joined.set(b, a.length);
+        return joined;
+      });
+      if (!t.far.h.some((v) => v !== 0)) {
+        const all = new Float32Array(buf);
+        const aLen = t.far.n * t.far.n * Grid.FIELDS.length;
+        const far = Grid.hydrate(t.far.n, t.far.cell, all.subarray(0, aLen).slice().buffer);
+        const near = Grid.hydrate(t.near.n, t.near.cell, all.subarray(aLen).slice().buffer);
+        if (far && near) { t.far = far; t.near = near; hydrated = true; }
+      }
+    } catch (err) {
+      console.warn('terrain cache unavailable, simulating:', err?.message ?? err);
+    }
+    if (!hydrated && !t.far.h.some((v) => v !== 0)) {
+      t._buildFar();
+      t._buildNear();
+    }
+
+    // Everything downstream reads the finished grids, so it must run after.
+    t._buildTextures();
+    t._buildMicroTexture();
+    t._buildDetailTextures();
+    t._buildGritTextures();
+    t._buildRippleTexture();
+    t._buildMaterial();
+    t._buildClipmap();
+    return t;
   }
 
   // -- heightfield ---------------------------------------------------------

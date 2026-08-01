@@ -22,12 +22,23 @@
  */
 
 const BASE = '/__gencache/';
+// Deliberately does NOT retain large buffers. The terrain blob is 214 MB, and
+// holding it here after the caller has copied what it needs pins that much heap
+// for the life of the page — which, with several worlds resident in one browser,
+// is the difference between a comfortable and an oversubscribed machine. Small
+// results are worth memoising; big ones are cheap to re-read from disk.
+const MEMOISE_UNDER_BYTES = 8 * 1024 * 1024;
 const memory = new Map();
 
-const available =
-  typeof fetch === 'function' &&
-  typeof window !== 'undefined' &&
-  !!import.meta.env?.DEV;
+// NOT gated on import.meta.env.DEV. The render daemon serves a production
+// bundle via `vite preview`, where DEV is false — gating on it disabled the
+// cache in exactly the situation it exists for, and the first version of this
+// file silently wrote nothing.
+//
+// Instead the endpoint proves itself: a hit must come back as octet-stream. A
+// dev/preview server with no middleware mounted answers unknown paths with the
+// SPA fallback (index.html, status 200), which would otherwise be read as data.
+const available = typeof fetch === 'function' && typeof window !== 'undefined';
 
 /** Cache any ArrayBuffer-backed result. `make()` may be sync or async. */
 export async function cachedBuffer(key, make) {
@@ -36,10 +47,12 @@ export async function cachedBuffer(key, make) {
   if (available) {
     try {
       const res = await fetch(BASE + encodeURIComponent(key));
-      if (res.ok) {
+      const type = res.headers.get('content-type') || '';
+      if (res.ok && type.includes('octet-stream')) {
         const buf = await res.arrayBuffer();
         if (buf.byteLength) {
-          memory.set(key, buf);
+          stats.hits++;
+          if (buf.byteLength < MEMOISE_UNDER_BYTES) memory.set(key, buf);
           return buf;
         }
       }
@@ -48,9 +61,10 @@ export async function cachedBuffer(key, make) {
     }
   }
 
+  stats.misses++;
   const made = await make();
   const buf = made instanceof ArrayBuffer ? made : made.buffer;
-  memory.set(key, buf);
+  if (buf.byteLength < MEMOISE_UNDER_BYTES) memory.set(key, buf);
 
   if (available) {
     // Fire and forget: never make the caller wait to populate the cache.

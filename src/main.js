@@ -33,7 +33,12 @@ engine.addSystem({
   update: (dt, e) => sky.update(dt, e.camera, e.elapsed),
 });
 
-const terrain = new Terrain({ size: 4096, segments: 512 });
+// Terrain.create() consults the generation cache; the plain constructor runs the
+// 11.6 s simulation. The fallback keeps this file working in a tree whose
+// Terrain.js predates the cache, so it can be propagated anywhere safely.
+const terrain = Terrain.create
+  ? await Terrain.create({ size: 4096, segments: 512 })
+  : new Terrain({ size: 4096, segments: 512 });
 engine.scene.add(terrain.mesh);
 
 /**
