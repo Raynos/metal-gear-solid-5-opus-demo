@@ -47,6 +47,7 @@ const RUN = path.join(os.homedir(), '.cache', 'shotd');
 const LOCK = path.join(RUN, 'lock');
 const PORTFILE = path.join(RUN, 'port');
 const VITEPID = path.join(RUN, 'vite.pid');
+const BROWSERPID = path.join(RUN, 'browser.pid');
 
 const argv = process.argv.slice(2);
 const opt = (k, d) => {
@@ -83,7 +84,7 @@ function claimLock() {
 }
 
 function releaseLock() {
-  for (const f of [LOCK, PORTFILE, VITEPID]) {
+  for (const f of [LOCK, PORTFILE, VITEPID, BROWSERPID]) {
     try { unlinkSync(f); } catch {}
   }
 }
@@ -167,18 +168,24 @@ function killVite() {
   vite = null;
 }
 
-/** Kill a vite orphaned by a previously hard-killed daemon. */
-function reapStaleVite() {
+/**
+ * Kill a child orphaned by a previously hard-killed daemon. SIGKILL on the
+ * daemon leaves its chromium and vite running; without this they accumulate
+ * across a session, each holding a port and hundreds of MB.
+ */
+function reapStale(file, what, group = true) {
   let pid;
-  try { pid = +readFileSync(VITEPID, 'utf8').trim(); } catch { return; }
+  try { pid = +readFileSync(file, 'utf8').trim(); } catch { return; }
   if (pid > 0) {
     try {
-      process.kill(-pid, 'SIGKILL');
-      log(`reaped orphaned vite from a previous daemon (pid ${pid})`);
+      process.kill(group ? -pid : pid, 'SIGKILL');
+      log(`reaped orphaned ${what} from a previous daemon (pid ${pid})`);
     } catch { /* already gone */ }
   }
-  try { unlinkSync(VITEPID); } catch {}
+  try { unlinkSync(file); } catch {}
 }
+
+const reapStaleVite = () => reapStale(VITEPID, 'vite');
 
 async function startVite(root) {
   reapStaleVite();
@@ -563,7 +570,10 @@ async function main() {
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => shutdown(`signal ${sig}`));
 
   log(`booting (idle=${IDLE_MS / 1000}s) — one vite, one chromium, one world`);
+  reapStale(BROWSERPID, 'chromium', false);
   browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
+  const bpid = browser.process()?.pid;
+  if (bpid) writeFileSync(BROWSERPID, String(bpid));
   await attachPage();
 
   const server = createServer(async (req, res) => {

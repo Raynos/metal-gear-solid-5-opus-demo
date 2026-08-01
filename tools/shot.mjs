@@ -129,16 +129,35 @@ function daemonFlags() {
   return idle ? ['--idle', idle] : [];
 }
 
+/** Did this fail because the daemon went away rather than because we were wrong? */
+function isDaemonGone(err) {
+  const m = String(err?.message ?? err);
+  return /ECONNREFUSED|ECONNRESET|socket hang up|fetch failed|other side closed|browser has been closed|Target page, context or browser has been closed/.test(
+    m,
+  );
+}
+
 async function call(endpoint, body, { quiet = false } = {}) {
-  const port = await daemonPort({ quiet });
-  const r = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...(body ?? {}), root: ROOT }),
-  });
-  const json = await r.json();
-  if (!r.ok) throw new Error(json.error ?? `daemon returned ${r.status}`);
-  return json;
+  // The daemon is shared and long-lived, so it can legitimately restart under a
+  // request — an idle shutdown racing us, another author's `stop`, a crash. That
+  // is the daemon's business, not the caller's: re-acquire one and try again
+  // rather than surfacing a connection error as a failed build.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const port = await daemonPort({ quiet: quiet || attempt > 0 });
+      const r = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...(body ?? {}), root: ROOT }),
+      });
+      const json = await r.json();
+      if (!r.ok) throw new Error(json.error ?? `daemon returned ${r.status}`);
+      return json;
+    } catch (err) {
+      if (attempt >= 2 || !isDaemonGone(err)) throw err;
+      await sleep(500);
+    }
+  }
 }
 
 // --- argument parsing -----------------------------------------------------
