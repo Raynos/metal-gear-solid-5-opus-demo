@@ -17,20 +17,29 @@
  * Eight agents running it concurrently turned an 18s run into 55s of pure
  * core contention.
  *
- * The first fix was a daemon per working tree. That was still wrong: authors
- * run a worktree each, so daemons tracked worktrees — six of them, 47 chromium
+ * A daemon per working tree was the first fix and was still wrong: authors run
+ * a worktree each, so daemons tracked worktrees — six of them, 47 chromium
  * processes, 7.8 GB, load average 122, machine unusable.
  *
- * So: ONE daemon, ONE vite server, ONE chromium, ONE warm world, machine-wide.
- * Every tree talks to it. Requests queue. Because different trees hold different
- * source, the daemon owns which tree is currently loaded and switches on demand
- * — and it batches queued work by tree so a switch is amortised over every
- * request waiting for that tree rather than paid per request.
+ * So: ONE daemon, ONE chromium, machine-wide, shared by every tree.
+ *
+ * WHY MORE THAN ONE RESIDENT WORLD
+ *
+ * Collapsing to a single resident world made same-tree work superb (32 shots in
+ * 9.2s, ~0.29s each) and cross-tree work worse than what it replaced: every
+ * switch rebuilt from scratch at 13.5s, strictly serialised, with no reuse. Four
+ * agents on four trees took 59.6s — and 57.2s again on a second pass, because
+ * each switch evicted the previous world.
+ *
+ * So the daemon keeps a small LRU of resident worlds (default 3, hard cap 6).
+ * One chromium still; one page and one vite server per resident world. That is a
+ * bounded ~2 GB, nothing like the 7.8 GB that came from unbounded per-tree
+ * daemons — and revisiting a hot tree costs ~0.3s instead of 13.5s.
  *
  * Nothing starts this by hand: tools/shot.mjs spawns it on demand and it shuts
  * itself down when idle.
  *
- *   node tools/shotd.mjs [--idle 600]
+ *   node tools/shotd.mjs [--idle 600] [--worlds 3]
  */
 import { chromium } from 'playwright';
 import { spawn, execSync } from 'node:child_process';
@@ -41,13 +50,12 @@ import { openSync, writeSync, closeSync, readFileSync, writeFileSync, unlinkSync
 import os from 'node:os';
 import path from 'node:path';
 
-// Machine-wide state. Deliberately NOT inside any tree: the whole point is that
-// one daemon serves every tree, so its lock cannot live in one of them.
+// Machine-wide state. Deliberately NOT inside any tree: one daemon serves every
+// tree, so its lock cannot live in one of them.
 const RUN = path.join(os.homedir(), '.cache', 'shotd');
 const LOCK = path.join(RUN, 'lock');
 const PORTFILE = path.join(RUN, 'port');
-const VITEPID = path.join(RUN, 'vite.pid');
-const BROWSERPID = path.join(RUN, 'browser.pid');
+const CHILDREN = path.join(RUN, 'children.json'); // pids to reap after a hard kill
 
 const argv = process.argv.slice(2);
 const opt = (k, d) => {
@@ -55,6 +63,10 @@ const opt = (k, d) => {
   return i < 0 ? d : argv[i + 1];
 };
 const IDLE_MS = Math.max(60, +opt('idle', 600)) * 1000;
+// Each resident world is a page holding ~160 MB of terrain typed arrays plus GPU
+// textures, and a vite server at ~75 MB. Capped hard: unbounded residency is the
+// mistake that took the machine down.
+const MAX_WORLDS = Math.max(1, Math.min(+opt('worlds', 3), 6));
 // How long a request may wait behind another tree's batch before it jumps the
 // queue. Without this, a busy tree starves every other tree indefinitely.
 const STARVATION_MS = 45000;
@@ -84,14 +96,40 @@ function claimLock() {
 }
 
 function releaseLock() {
-  for (const f of [LOCK, PORTFILE, VITEPID, BROWSERPID]) {
+  for (const f of [LOCK, PORTFILE, CHILDREN]) {
     try { unlinkSync(f); } catch {}
   }
 }
 
+// --- child bookkeeping ----------------------------------------------------
+// SIGKILL on the daemon orphans its chromium and every vite server it started,
+// and those accumulate at ~0.8 GB and ~75 MB apiece. Record them so the next
+// daemon cleans up. NOTE: playwright launches `chrome-headless-shell`, NOT
+// `Chromium.app` — grepping for the latter silently matches nothing.
+const children = { browser: null, vites: [] };
+
+function persistChildren() {
+  try { writeFileSync(CHILDREN, JSON.stringify(children)); } catch {}
+}
+
+function reapOrphans() {
+  let prev;
+  try { prev = JSON.parse(readFileSync(CHILDREN, 'utf8')); } catch { return; }
+  const kill = (pid, group, what) => {
+    if (!pid) return;
+    try {
+      process.kill(group ? -pid : pid, 'SIGKILL');
+      log(`reaped orphaned ${what} from a previous daemon (pid ${pid})`);
+    } catch { /* already gone */ }
+  };
+  kill(prev.browser, false, 'chromium');
+  for (const p of prev.vites ?? []) kill(p, true, 'vite');
+  try { unlinkSync(CHILDREN); } catch {}
+}
+
 // --- source staleness -----------------------------------------------------
-// A loaded world only has to be thrown away when the code that generated it
-// changed, so a rebuild is paid once per edit for the whole machine.
+// A resident world only has to be thrown away when the code that generated it
+// changed, so a rebuild is paid once per edit rather than once per screenshot.
 const WATCH_FILES = ['index.html', 'vite.config.js'];
 const mtimeCache = new Map(); // root -> { at, value }
 
@@ -125,7 +163,7 @@ async function newestSourceMtime(root) {
   return newest;
 }
 
-// --- the one browser, the one vite ---------------------------------------
+// --- the one browser ------------------------------------------------------
 const BROWSER_ARGS = [
   '--use-gl=angle',
   '--use-angle=metal',
@@ -136,17 +174,15 @@ const BROWSER_ARGS = [
   '--force-device-scale-factor=1',
   '--hide-scrollbars',
   '--mute-audio',
+  // Only one page can be foreground; without these the rest get throttled and
+  // screenshots come back stale or blank.
   '--disable-background-timer-throttling',
   '--disable-backgrounding-occluded-windows',
   '--disable-renderer-backgrounding',
 ];
 
 let browser = null;
-let page = null;
-let pageErrors = [];
-let vite = null; // { proc, port, root }
-let loaded = { root: null, mtime: 0 }; // which tree's world is in the page
-let viewport = { width: 1280, height: 720 };
+let renderer = null;
 let lastActivity = Date.now();
 let stopping = false;
 
@@ -161,37 +197,15 @@ function freePort() {
   });
 }
 
-function killVite() {
-  if (!vite) return;
-  try { process.kill(-vite.proc.pid, 'SIGKILL'); } catch {}
-  try { unlinkSync(VITEPID); } catch {}
-  vite = null;
+function isPageGone(err) {
+  const m = String(err?.message ?? err);
+  return /Not attached to an active page|Target closed|Target crashed|has been closed|Page closed|crashed/.test(m);
 }
 
 /**
- * Kill a child orphaned by a previously hard-killed daemon. SIGKILL on the
- * daemon leaves its chromium and vite running; without this they accumulate
- * across a session, each holding a port and hundreds of MB.
- */
-function reapStale(file, what, group = true) {
-  let pid;
-  try { pid = +readFileSync(file, 'utf8').trim(); } catch { return; }
-  if (pid > 0) {
-    try {
-      process.kill(group ? -pid : pid, 'SIGKILL');
-      log(`reaped orphaned ${what} from a previous daemon (pid ${pid})`);
-    } catch { /* already gone */ }
-  }
-  try { unlinkSync(file); } catch {}
-}
-
-const reapStaleVite = () => reapStale(VITEPID, 'vite');
-
-/**
- * PID of the chromium we just launched, so a hard-killed daemon's browser can be
- * reaped next start. `browser.process()` is not available on every Playwright
- * build, so fall back to our own child list — at launch time chromium is the
- * only child, since vite starts lazily on the first request.
+ * PID of the chromium we launched. `browser.process()` is missing on some
+ * Playwright builds, so fall back to our own child list — at launch chromium is
+ * the only child, because vite servers start lazily per world.
  */
 function browserPid() {
   try {
@@ -203,151 +217,218 @@ function browserPid() {
   try {
     const kids = execSync(`pgrep -P ${process.pid}`, { encoding: 'utf8' })
       .trim().split('\n').map(Number).filter(Boolean);
-    return kids.find((p) => p !== vite?.proc?.pid) ?? null;
+    return kids[0] ?? null;
   } catch {
     return null;
   }
 }
 
-async function startVite(root) {
-  reapStaleVite();
-  const port = await freePort();
-  const proc = spawn(
-    process.execPath,
-    [path.join(root, 'node_modules/vite/bin/vite.js'), '--port', String(port), '--strictPort', '--host', '127.0.0.1', '--clearScreen', 'false'],
-    { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
-  );
-  let out = '';
-  proc.stdout.on('data', (d) => (out += d));
-  proc.stderr.on('data', (d) => (out += d));
-  writeFileSync(VITEPID, String(proc.pid));
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    try {
-      if ((await fetch(`http://127.0.0.1:${port}/`)).ok) return { proc, port, root };
-    } catch { /* not up yet */ }
-    await new Promise((r) => setTimeout(r, 100));
+// --- worlds ---------------------------------------------------------------
+/** One tree's generated world: its own vite server and its own warm page. */
+class World {
+  constructor(root) {
+    this.root = root;
+    this.page = null;
+    this.vite = null;
+    this.mtime = 0;
+    this.lastUsed = Date.now();
+    this.errors = [];
+    this.width = 1280;
+    this.height = 720;
   }
-  try { process.kill(-proc.pid, 'SIGKILL'); } catch {}
-  throw new Error(`vite failed to start for ${root}:\n${out}`);
-}
 
-function isPageGone(err) {
-  const m = String(err?.message ?? err);
-  return /Not attached to an active page|Target closed|Target crashed|has been closed|Page closed|crashed/.test(m);
-}
+  async startVite() {
+    const port = await freePort();
+    const proc = spawn(
+      process.execPath,
+      [path.join(this.root, 'node_modules/vite/bin/vite.js'), '--port', String(port), '--strictPort', '--host', '127.0.0.1', '--clearScreen', 'false'],
+      { cwd: this.root, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
+    );
+    let out = '';
+    proc.stdout.on('data', (d) => (out += d));
+    proc.stderr.on('data', (d) => (out += d));
+    children.vites.push(proc.pid);
+    persistChildren();
 
-async function attachPage() {
-  page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
-  loaded = { root: null, mtime: 0 };
-  page.on('console', (m) => {
-    if (m.type() === 'error') pageErrors.push(m.text());
-  });
-  page.on('pageerror', (e) => pageErrors.push(String(e)));
-  // A module that fails to transform comes back as a 500 whose body names the
-  // file and line. Without this the only symptom is a bare 500.
-  page.on('response', async (res) => {
-    if (res.status() < 400) return;
-    const body = await res.text().catch(() => '');
-    const detail = body.trim().split('\n').slice(0, 6).join('\n  ');
-    pageErrors.unshift(`${res.status()} ${res.url()}${detail ? `\n  ${detail}` : ''}`);
-  });
-  page.on('crash', () => {
-    loaded = { root: null, mtime: 0 };
-    log('page crashed; will be rebuilt on next request');
-  });
-}
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      try {
+        if ((await fetch(`http://127.0.0.1:${port}/`)).ok) {
+          this.vite = { proc, port };
+          return;
+        }
+      } catch { /* not up yet */ }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    try { process.kill(-proc.pid, 'SIGKILL'); } catch {}
+    throw new Error(`vite failed to start for ${this.root}:\n${out}`);
+  }
 
-/**
- * Wait for the world to finish generating.
- *
- * Two traps. Playwright's second positional argument is the page-function
- * ARGUMENT, not the options bag — passing `{ timeout }` there silently leaves
- * the 30s default in place, which is shorter than a cold world build under load
- * and is why the old harness spuriously timed out and everyone wrapped it in
- * retry loops. And on a cold `node_modules/.vite`, vite's dependency optimizer
- * force-reloads the page mid-boot and destroys the execution context.
- */
-async function waitReady(timeoutMs = 180000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    let state;
+  async attachPage() {
+    this.page = await browser.newPage({
+      viewport: { width: this.width, height: this.height },
+      deviceScaleFactor: 1,
+    });
+    this.mtime = 0;
+    this.page.on('console', (m) => {
+      if (m.type() === 'error') this.errors.push(m.text());
+    });
+    this.page.on('pageerror', (e) => this.errors.push(String(e)));
+    // A module that fails to transform comes back as a 500 whose body names the
+    // file and line. Without this the only symptom is a bare 500.
+    this.page.on('response', async (res) => {
+      if (res.status() < 400) return;
+      const body = await res.text().catch(() => '');
+      const detail = body.trim().split('\n').slice(0, 6).join('\n  ');
+      this.errors.unshift(`${res.status()} ${res.url()}${detail ? `\n  ${detail}` : ''}`);
+    });
+    this.page.on('crash', () => {
+      this.mtime = 0;
+      log(`page for ${path.basename(this.root)} crashed; will rebuild on next use`);
+    });
+  }
+
+  /**
+   * Wait for the world to finish generating.
+   *
+   * Two traps. Playwright's second positional argument is the page-function
+   * ARGUMENT, not the options bag — passing `{ timeout }` there silently leaves
+   * the 30s default in place, which is shorter than a cold build under load and
+   * is why the old harness spuriously timed out and everyone wrapped it in retry
+   * loops. And on a cold `node_modules/.vite`, vite's dependency optimizer
+   * force-reloads the page mid-boot and destroys the execution context.
+   */
+  async waitReady(timeoutMs = 180000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let state;
+      try {
+        state = await this.page.evaluate(() => ({
+          ready: !!(window.__GAME && window.__GAME.ready === true),
+          present: !!window.__GAME,
+          doc: document.readyState,
+        }));
+      } catch (err) {
+        if (isPageGone(err)) throw err;
+        const m = String(err?.message ?? err);
+        if (!m.includes('Execution context was destroyed') && !m.includes('navigating')) throw err;
+        await this.page.waitForLoadState('load').catch(() => {});
+        state = null;
+      }
+      if (state?.ready) return;
+
+      // A finished document that never created the harness, plus a thrown
+      // error, means the module graph did not evaluate — a syntax error, not a
+      // slow build. Say so now: during a real build the main thread is blocked
+      // and this poll could not even run.
+      if (state && !state.present && state.doc === 'complete' && this.errors.length) {
+        throw new Error(`build is broken — the page threw before the harness loaded:\n  ${this.errors[0]}`);
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `world never became ready within ${Math.round(timeoutMs / 1000)}s` +
+            (this.errors.length ? `; first page error:\n  ${this.errors[0]}` : ''),
+        );
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  async build(reason) {
+    const t0 = Date.now();
+    // Stamp before building: an edit landing mid-build must leave this world
+    // stale rather than being masked by a fresher mtime.
+    const stamp = await newestSourceMtime(this.root);
+    this.errors = [];
+    if (!this.vite) await this.startVite();
+    if (!this.page || this.page.isClosed()) await this.attachPage();
+
     try {
-      state = await page.evaluate(() => ({
-        ready: !!(window.__GAME && window.__GAME.ready === true),
-        present: !!window.__GAME,
-        doc: document.readyState,
-      }));
+      await this.page.goto(`http://127.0.0.1:${this.vite.port}/`, { waitUntil: 'load', timeout: 120000 });
+      await this.waitReady();
     } catch (err) {
-      if (isPageGone(err)) throw err;
-      const m = String(err?.message ?? err);
-      if (!m.includes('Execution context was destroyed') && !m.includes('navigating')) throw err;
-      await page.waitForLoadState('load').catch(() => {});
-      state = null;
+      if (!isPageGone(err)) {
+        this.mtime = 0;
+        throw err;
+      }
+      // Renderer died holding a 3.6M-triangle scene; start a fresh one once.
+      try { await this.page.close(); } catch {}
+      await this.attachPage();
+      this.errors = [];
+      await this.page.goto(`http://127.0.0.1:${this.vite.port}/`, { waitUntil: 'load', timeout: 120000 });
+      await this.waitReady();
     }
-    if (state?.ready) return;
+    this.mtime = stamp;
+    log(`world ready for ${this.root} (${reason}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  }
 
-    // A finished document that never created the harness, plus a thrown error,
-    // means the module graph did not evaluate — a syntax error, not a slow
-    // build. Say so now: during a real build the main thread is blocked and
-    // this poll cannot even run, so reaching here means nothing is building.
-    if (state && !state.present && state.doc === 'complete' && pageErrors.length) {
-      throw new Error(`build is broken — the page threw before the harness loaded:\n  ${pageErrors[0]}`);
+  async setViewport(width, height) {
+    if (this.width === width && this.height === height) return;
+    this.width = width;
+    this.height = height;
+    await this.page.setViewportSize({ width, height });
+  }
+
+  async dispose() {
+    try { await this.page?.close(); } catch {}
+    if (this.vite) {
+      try { process.kill(-this.vite.proc.pid, 'SIGKILL'); } catch {}
+      children.vites = children.vites.filter((p) => p !== this.vite.proc.pid);
+      persistChildren();
     }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `world never became ready within ${Math.round(timeoutMs / 1000)}s` +
-          (pageErrors.length ? `; first page error:\n  ${pageErrors[0]}` : ''),
-      );
+    this.page = null;
+    this.vite = null;
+  }
+}
+
+const worlds = new Map(); // root -> World; LRU by lastUsed
+
+async function evictIfNeeded(keepRoot) {
+  while (worlds.size >= MAX_WORLDS) {
+    let oldest = null;
+    for (const w of worlds.values()) {
+      if (w.root === keepRoot) continue;
+      if (!oldest || w.lastUsed < oldest.lastUsed) oldest = w;
     }
-    await new Promise((r) => setTimeout(r, 250));
+    if (!oldest) return; // nothing evictable
+    worlds.delete(oldest.root);
+    await oldest.dispose();
+    log(`evicted world ${oldest.root} (LRU, cap ${MAX_WORLDS})`);
   }
 }
 
 /**
- * Make the single page hold `root`'s current world, switching trees and/or
- * rebuilding only when it actually has to. This is the chokepoint everything
- * else funnels through.
+ * Get a ready world for `root`. This is the chokepoint everything funnels
+ * through: it rebuilds only when the tree's sources actually moved, and keeps
+ * recently used trees resident so revisiting one is nearly free.
  */
-async function ensureWorld(root, { force = false } = {}) {
+async function getWorld(root, { force = false } = {}) {
+  let w = worlds.get(root);
   const newest = await newestSourceMtime(root);
-  if (!force && loaded.root === root && loaded.mtime >= newest && page && !page.isClosed()) return;
 
-  const t0 = Date.now();
-  const reason = force ? 'forced reload' : loaded.root !== root ? `switch to ${path.basename(root)}` : 'sources changed';
-
-  if (!vite || vite.root !== root) {
-    killVite();
-    vite = await startVite(root);
+  if (w && !force && w.mtime >= newest && w.page && !w.page.isClosed()) {
+    w.lastUsed = Date.now();
+    return w;
   }
-  if (!page || page.isClosed()) await attachPage();
-  pageErrors = [];
 
-  try {
-    await page.goto(`http://127.0.0.1:${vite.port}/`, { waitUntil: 'load', timeout: 120000 });
-    await waitReady();
-  } catch (err) {
-    if (!isPageGone(err)) {
-      loaded = { root: null, mtime: 0 };
-      throw err;
-    }
-    // Renderer died holding a 3.6M-triangle scene; start a fresh one once.
-    try { await page.close(); } catch {}
-    await attachPage();
-    pageErrors = [];
-    await page.goto(`http://127.0.0.1:${vite.port}/`, { waitUntil: 'load', timeout: 120000 });
-    await waitReady();
+  if (!w) {
+    await evictIfNeeded(root);
+    w = new World(root);
+    worlds.set(root, w);
+    await w.build('first use');
+  } else {
+    await w.build(force ? 'forced reload' : 'sources changed');
   }
-  loaded = { root, mtime: newest };
-  log(`world ready for ${root} (${reason}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  w.lastUsed = Date.now();
+  return w;
 }
 
 // --- the queue ------------------------------------------------------------
-// One page means one job at a time. The ordering rule is what makes a shared
-// daemon cheap: prefer work for the tree already loaded, so a switch is paid
-// once for a whole batch instead of once per request. A waiter that has been
-// passed over for too long jumps the queue, so a busy tree cannot starve the
-// others.
+// Rendering is GPU-serialised and world builds are single-threaded CPU work, so
+// one job at a time is the honest model — overlapping them only adds contention.
+// The ordering rule is what makes it cheap: prefer work for a tree that is
+// already resident, so a build is amortised over a whole batch. A waiter passed
+// over for too long jumps the queue.
 const queue = [];
 let running = false;
 
@@ -362,8 +443,11 @@ function nextIndex() {
   const now = Date.now();
   const starving = queue.findIndex((q) => now - q.at > STARVATION_MS);
   if (starving >= 0) return starving;
-  const sameTree = queue.findIndex((q) => q.root === loaded.root);
-  return sameTree >= 0 ? sameTree : 0;
+  const resident = queue.findIndex((q) => {
+    const w = worlds.get(q.root);
+    return w && w.page && !w.page.isClosed();
+  });
+  return resident >= 0 ? resident : 0;
 }
 
 async function pump() {
@@ -372,8 +456,8 @@ async function pump() {
   lastActivity = Date.now();
   const item = queue.splice(nextIndex(), 1)[0];
   try {
-    await ensureWorld(item.root);
-    item.resolve(await item.job());
+    const world = await getWorld(item.root);
+    item.resolve(await item.job(world));
   } catch (err) {
     item.reject(err);
   } finally {
@@ -383,18 +467,10 @@ async function pump() {
   }
 }
 
-async function setViewport(width, height) {
-  if (viewport.width === width && viewport.height === height) return;
-  viewport = { width, height };
-  await page.setViewportSize(viewport);
-}
-
 // --- request handlers -----------------------------------------------------
-let renderer = null;
-
-async function readRenderer() {
+async function readRenderer(w) {
   if (renderer) return renderer;
-  renderer = await page
+  renderer = await w.page
     .evaluate(() => {
       const gl = window.__GAME.engine.renderer.getContext();
       const dbg = gl.getExtension('WEBGL_debug_renderer_info');
@@ -405,19 +481,19 @@ async function readRenderer() {
 }
 
 function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, frames = 6 }) {
-  return enqueue(root, async () => {
-    await setViewport(width, height);
-    pageErrors = [];
+  return enqueue(root, async (w) => {
+    await w.setViewport(width, height);
+    w.errors = [];
 
     const outDir = path.resolve(root, out);
     await mkdir(outDir, { recursive: true });
 
-    const all = await page.evaluate(() => Object.keys(window.__GAME.shots));
+    const all = await w.page.evaluate(() => Object.keys(window.__GAME.shots));
     const wanted = shots && shots.length ? shots.filter((s) => all.includes(s)) : all;
-    const report = { renderer: await readRenderer(), shots: {}, errors: [] };
+    const report = { renderer: await readRenderer(w), shots: {}, errors: [] };
 
     for (const name of wanted) {
-      const meta = await page.evaluate(
+      const meta = await w.page.evaluate(
         ({ name, frames }) => {
           const g = window.__GAME;
           const s = g.applyShot(name);
@@ -427,10 +503,10 @@ function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, fr
         { name, frames },
       );
       const file = path.join(outDir, `${name}.png`);
-      await writeFile(file, await page.screenshot({ type: 'png' }));
+      await writeFile(file, await w.page.screenshot({ type: 'png' }));
       report.shots[name] = { file: path.relative(root, file), ...meta };
     }
-    report.errors = pageErrors.slice();
+    report.errors = w.errors.slice();
     report.missing = (shots || []).filter((s) => !all.includes(s));
     report.dir = path.relative(root, outDir);
     await writeFile(path.join(outDir, 'report.json'), JSON.stringify(report, null, 2));
@@ -439,12 +515,12 @@ function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, fr
 }
 
 function handleEval({ root, code, shot, width = 1920, height = 1080, out = 'shots/diag' }) {
-  return enqueue(root, async () => {
-    await setViewport(width, height);
-    pageErrors = [];
-    if (shot) await page.evaluate((n) => window.__GAME.applyShot(n), shot);
+  return enqueue(root, async (w) => {
+    await w.setViewport(width, height);
+    w.errors = [];
+    if (shot) await w.page.evaluate((n) => window.__GAME.applyShot(n), shot);
 
-    const result = await page.evaluate(async (src) => {
+    const result = await w.page.evaluate(async (src) => {
       window.__snaps = {};
       const g = window.__GAME;
       const fn = new Function('g', 'THREE', `return (async () => {\n${src}\n})();`);
@@ -452,23 +528,23 @@ function handleEval({ root, code, shot, width = 1920, height = 1080, out = 'shot
     }, code);
 
     const outDir = path.resolve(root, out);
-    const snaps = await page.evaluate(() => Object.keys(window.__snaps || {}));
+    const snaps = await w.page.evaluate(() => Object.keys(window.__snaps || {}));
     if (snaps.length) await mkdir(outDir, { recursive: true });
     const written = [];
     for (const name of snaps) {
-      const b64 = await page.evaluate((n) => window.__snaps[n], name);
+      const b64 = await w.page.evaluate((n) => window.__snaps[n], name);
       const file = path.join(outDir, name + '.png');
       await writeFile(file, Buffer.from(b64.split(',')[1], 'base64'));
       written.push(path.relative(root, file));
     }
-    return { result, snaps: written, errors: pageErrors.slice() };
+    return { result, snaps: written, errors: w.errors.slice() };
   });
 }
 
 /** Explicit "throw the world away and rebuild it" control. */
 function handleReload({ root }) {
   return enqueue(root, async () => {
-    await ensureWorld(root, { force: true });
+    await getWorld(root, { force: true });
     return { ok: true, root, reloaded: true };
   });
 }
@@ -591,12 +667,11 @@ async function main() {
   process.on('exit', releaseLock);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => shutdown(`signal ${sig}`));
 
-  log(`booting (idle=${IDLE_MS / 1000}s) — one vite, one chromium, one world`);
-  reapStale(BROWSERPID, 'chromium', false);
+  log(`booting (idle=${IDLE_MS / 1000}s, worlds=${MAX_WORLDS}) — one chromium, ${MAX_WORLDS} resident world(s) max`);
+  reapOrphans();
   browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
-  const bpid = browserPid();
-  if (bpid) writeFileSync(BROWSERPID, String(bpid));
-  await attachPage();
+  children.browser = browserPid();
+  persistChildren();
 
   const server = createServer(async (req, res) => {
     const send = (code, obj) => {
@@ -609,8 +684,9 @@ async function main() {
       if (url.pathname === '/status') {
         return send(200, {
           ok: true, pid: process.pid, renderer,
-          loadedRoot: loaded.root, queued: queue.length, busy: running,
-          trees: [...new Set(queue.map((q) => q.root))].length,
+          maxWorlds: MAX_WORLDS,
+          resident: [...worlds.values()].map((w) => ({ root: w.root, idleSec: Math.round((Date.now() - w.lastUsed) / 1000) })),
+          queued: queue.length, busy: running,
           uptimeSec: Math.round(process.uptime()),
         });
       }
@@ -649,13 +725,12 @@ async function shutdown(reason) {
   stopping = true;
   log(`shutting down (${reason})`);
   // Release the lock LAST. Releasing it first opens a window where a successor
-  // daemon starts while this one is still holding a browser and a vite server —
-  // which is exactly how two daemons ended up alive at once. And never linger:
-  // if browser.close() hangs we still die, and the 'exit' handler clears the
-  // lock on the way out.
+  // daemon starts while this one still holds a browser and vite servers — which
+  // is how two daemons ended up alive at once. And never linger: if close()
+  // hangs we still die, and the 'exit' handler clears the lock on the way out.
   const bail = setTimeout(() => process.exit(0), 5000);
+  for (const w of worlds.values()) await w.dispose().catch(() => {});
   try { await browser?.close(); } catch {}
-  killVite();
   clearTimeout(bail);
   releaseLock();
   process.exit(0);
@@ -663,8 +738,8 @@ async function shutdown(reason) {
 
 main().catch(async (err) => {
   log(`fatal: ${err?.stack || err}`);
-  releaseLock();
   try { await browser?.close(); } catch {}
-  killVite();
+  for (const w of worlds.values()) await w.dispose().catch(() => {});
+  releaseLock();
   process.exit(1);
 });

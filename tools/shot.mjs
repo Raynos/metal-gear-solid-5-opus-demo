@@ -21,9 +21,10 @@
  *   node tools/shot.mjs status | stop
  *
  * There is exactly ONE daemon per machine, shared by every working tree: one
- * vite server, one chromium, one warm world. Requests queue, and the queue is
- * ordered to prefer whichever tree is already loaded so switching trees is paid
- * once per batch rather than once per request.
+ * chromium, and a small LRU of resident worlds (default 3) each with its own
+ * page and vite server. Requests queue, ordered to prefer a tree that is already
+ * resident. A shot against a resident tree costs ~0.3s; a tree that has to be
+ * built costs ~13.5s, so keep your hot trees under the cap (SHOTD_WORLDS).
  *
  * The daemon starts on demand and shuts itself down when idle. Exits non-zero
  * if the page threw — a broken build must never be silently screenshotted as
@@ -125,8 +126,10 @@ async function daemonPort({ quiet = false } = {}) {
 }
 
 function daemonFlags() {
-  const idle = process.env.SHOTD_IDLE;
-  return idle ? ['--idle', idle] : [];
+  const f = [];
+  if (process.env.SHOTD_IDLE) f.push('--idle', process.env.SHOTD_IDLE);
+  if (process.env.SHOTD_WORLDS) f.push('--worlds', process.env.SHOTD_WORLDS);
+  return f;
 }
 
 /** Did this fail because the daemon went away rather than because we were wrong? */
@@ -261,8 +264,10 @@ async function runStatus() {
   const s = await r.json();
   console.log(
     `render daemon: up  pid=${s.pid} port=${port} queued=${s.queued} busy=${s.busy} ` +
-      `uptime=${s.uptimeSec}s\nloaded tree: ${s.loadedRoot ?? '(none yet)'}\nrenderer: ${s.renderer ?? 'not yet probed'}`,
+      `uptime=${s.uptimeSec}s\nrenderer: ${s.renderer ?? 'not yet probed'}\n` +
+      `resident worlds: ${s.resident?.length ?? 0}/${s.maxWorlds}`,
   );
+  for (const w of s.resident ?? []) console.log(`  ${w.root}  (idle ${w.idleSec}s)`);
 }
 
 async function runStop() {
