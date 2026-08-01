@@ -36,9 +36,52 @@ engine.addSystem({
 const terrain = new Terrain({ size: 4096, segments: 512 });
 engine.scene.add(terrain.mesh);
 
+/**
+ * Game state. Three modes share one world:
+ *
+ *   'menu'    front end; the world renders behind it as a live backdrop
+ *   'godmode' free-fly camera — ALSO what the screenshot harness drives, so it
+ *             must keep working exactly as it does today or every canonical shot
+ *             and every visual regression check breaks
+ *   'play'    the actual game: player controller, AI, HUD
+ *
+ * Modules subscribe with onModeChange() and enable/disable their own systems.
+ * Owning this here keeps four modules (ui, gameplay, ai, audio) out of main.js.
+ */
+const modeListeners = new Set();
+let mode = 'menu';
+
+function setMode(next) {
+  if (next === mode) return mode;
+  const prev = mode;
+  mode = next;
+  // Free-fly is godmode's camera; the harness poses the camera itself and must
+  // never have it fighting back, so applyShot() also parks us in godmode.
+  freeFly = next === 'godmode';
+  for (const fn of modeListeners) {
+    try {
+      fn(next, prev);
+    } catch (err) {
+      console.error('mode listener failed:', err);
+    }
+  }
+  return mode;
+}
+
+const gameState = {
+  get mode() {
+    return mode;
+  },
+  setMode,
+  onModeChange(fn) {
+    modeListeners.add(fn);
+    return () => modeListeners.delete(fn);
+  },
+};
+
 /** World services other systems resolve against. */
 const registry = {};
-const world = { engine, sky, lighting, terrain, scene: engine.scene, registry };
+const world = { engine, sky, lighting, terrain, scene: engine.scene, registry, gameState };
 window.__WORLD = world;
 
 // --- free-fly camera for manual inspection -------------------------------
@@ -57,6 +100,8 @@ window.addEventListener('mousemove', (e) => {
 });
 
 let freeFly = true;
+
+
 engine.addSystem({
   order: 1000,
   update: (dt, e) => {
@@ -78,6 +123,9 @@ engine.addSystem({
 function applyShot(name) {
   const s = SHOTS[name];
   if (!s) throw new Error(`unknown shot: ${name}`);
+  // The harness poses the camera directly; make sure no play/menu camera system
+  // is still driving it, then park free-fly so nothing overwrites the pose.
+  if (mode !== 'godmode') setMode('godmode');
   freeFly = false;
   engine.camera.position.set(...s.position);
   engine.camera.lookAt(new THREE.Vector3(...s.target));
@@ -102,6 +150,8 @@ window.__GAME = {
   applyShot,
   setTimeOfDay: (n) => lighting.setTimeOfDay(n),
   setFreeFly: (v) => (freeFly = v),
+  gameState,
+  setMode,
   /**
    * Advance the simulation deterministically then render one frame.
    *
@@ -134,14 +184,28 @@ window.__GAME = {
       engine.step(dt);
       engine.render();
     }
-    // Timed pass: measure steady-state CPU-side frame cost.
+    // Timed pass: steady-state THROUGHPUT, not the latency of a few frames.
+    //
+    // This used to time five frames and divide, which reported 3.4 ms while the
+    // game actually ran at 14-24 FPS. Those frames are only enqueued: straight
+    // after a settle the GPU queue is empty, so submission returns at
+    // command-buffer write speed and you measure the driver, not the frame. The
+    // cost ramp over consecutive 20-frame blocks is [2.8, 47.4, 40.7, 40.8,
+    // 40.4, 41.5] — only the first block is cheap, and that was the window
+    // being sampled. Warm until the queue is saturated, then measure.
+    const gl = engine.renderer.getContext();
+    for (let i = 0; i < 24; i++) {
+      engine.step(dt);
+      engine.render();
+    }
+    gl.finish();
     const t0 = performance.now();
-    const N = 5;
+    const N = 30;
     for (let i = 0; i < N; i++) {
       engine.step(dt);
       engine.render();
     }
-    engine.renderer.getContext().finish();
+    gl.finish();
     return (performance.now() - t0) / N;
   },
   /**

@@ -159,14 +159,34 @@ A module that throws is caught and logged; the rest of the game still boots.
 
 ## Performance budget
 
-Measured by `tools/shot.mjs` at 1920×1080 on an M3 Pro (reported per shot):
+Measured by `node tools/shot.mjs eval tools/probes/perf.js` — **not** by the
+per-shot number alone. Targets at 1920x1080 on an M3 Pro:
 
-- **< 8 ms** CPU frame time per shot.
-- **< 600** draw calls.
-- **< 4 M** triangles.
+- **< 16.7 ms** frame time (60 FPS) with the camera MOVING, not static.
+- **< 350** draw calls.
+- **< 2.5 M** triangles.
+
+Read the header of `tools/probes/perf.js` before making any frame-time claim.
+The short version: for six rounds the budget read "2.7 ms, within budget" while
+the game ran at 14-24 FPS, because the old measurement timed five frames
+immediately after a settle. Those frames are only *enqueued* — the GPU queue is
+empty, so submission returns at command-buffer write speed. The cost ramp over
+consecutive 20-frame blocks is [2.8, 47.4, 40.7, 40.8, 40.4, 41.5]: only the
+first block is cheap, and that was exactly the window being sampled.
+
+The same mistake understated geometry, because six frames is not long enough for
+the LOD rings to finish populating — the same shot reports 380 draws / 3.4 M
+triangles at six frames and 543 / 4.7 M once warm.
+
+Three rules for any frame-time claim:
+1. Warm until the GPU queue is saturated; discard the first block.
+2. Measure throughput over many frames, not the latency of a few.
+3. **Move the camera.** A static pose skips clipmap updates, shadow-cascade
+   refits, TAA history invalidation and LOD churn — all of which a player pays
+   for every single frame. Panning currently costs 3x a static pose.
 
 Use `InstancedMesh` for anything appearing more than ~20 times. Merge static
-geometry. Budget overruns are regressions — the harness prints these every run.
+geometry. Cull per shadow cascade, not just against the main frustum.
 
 ## Visual target (the bar every change is judged against)
 
