@@ -49,10 +49,17 @@ import { mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { openSync, writeSync, closeSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { appendFileSync } from 'node:fs';
 
 // Machine-wide state. Deliberately NOT inside any tree: one daemon serves every
 // tree, so its lock cannot live in one of them.
-const RUN = path.join(os.homedir(), '.cache', 'shotd');
+// Instance isolation. One daemon per machine is right for the shared tree, but
+// optimisation work needs a daemon that cannot contend with, evict, or be
+// queued behind the one real agents are using. SHOTD_RUN gives it a private
+// lock, port file and world set.
+const RUN = process.env.SHOTD_RUN
+  ? path.resolve(process.env.SHOTD_RUN)
+  : path.join(os.homedir(), '.cache', 'shotd');
 const LOCK = path.join(RUN, 'lock');
 const PORTFILE = path.join(RUN, 'port');
 const CHILDREN = path.join(RUN, 'children.json'); // pids to reap after a hard kill
@@ -259,6 +266,7 @@ class World {
    */
   async bundle() {
     const t0 = Date.now();
+    metric('bundle_start', { root: this.root });
     const proc = spawn(
       process.execPath,
       [path.join(this.root, 'node_modules/vite/bin/vite.js'), 'build', '--logLevel', 'warn'],
@@ -271,6 +279,7 @@ class World {
     if (code !== 0) {
       throw new Error(`build is broken — vite build failed for ${this.root}:\n${out.trim().slice(0, 2000)}`);
     }
+    metric('bundle_end', { root: this.root, bundleMs: Date.now() - t0 });
     log(`bundled ${this.root} in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
 
@@ -481,6 +490,36 @@ async function getWorld(root, { force = false } = {}) {
   return w;
 }
 
+
+// --- metrics --------------------------------------------------------------
+// One JSON object per line, appended, never rotated by the daemon itself. This
+// exists because diagnosing "the agents are idle" took an afternoon of ad-hoc
+// probing that a single grep would have answered: queue depth, what each slot
+// was doing, and where the latency actually went.
+//
+//   node tools/shot.mjs metrics [n]     # tail and summarise
+//
+// Fields are stable; add, never rename.
+const METRICS = path.join(RUN, 'metrics.jsonl');
+let seq = 0;
+
+function metric(event, fields = {}) {
+  const line = JSON.stringify({
+    t: new Date().toISOString(),
+    ms: Date.now(),
+    event,
+    qdepth: queue.length,
+    building,
+    resident: worlds.size,
+    ...fields,
+  });
+  try {
+    appendFileSync(METRICS, line + '\n');
+  } catch {
+    /* metrics must never break a render */
+  }
+}
+
 // --- the queue ------------------------------------------------------------
 // RENDERING is GPU-serialised: one job at a time, always. BUILDING is not.
 //
@@ -497,9 +536,11 @@ async function getWorld(root, { force = false } = {}) {
 const queue = [];
 let running = false;
 
-function enqueue(root, job) {
+function enqueue(root, job, label = '') {
   return new Promise((resolve, reject) => {
-    queue.push({ root, job, resolve, reject, at: Date.now() });
+    const id = ++seq;
+    queue.push({ id, root, job, resolve, reject, at: Date.now(), label });
+    metric('enqueue', { id, root, label });
     // Warm this tree now rather than when it reaches the head of the queue, so
     // its build overlaps with the render already in flight.
     prebuild(root);
@@ -524,10 +565,26 @@ async function pump() {
   running = true;
   lastActivity = Date.now();
   const item = queue.splice(nextIndex(), 1)[0];
+  const waitMs = Date.now() - item.at;
+  metric('dequeue', { id: item.id, root: item.root, label: item.label, waitMs });
+  const tStart = Date.now();
+  let tAfterWorld = tStart;
   try {
     const world = await getWorld(item.root);
-    item.resolve(await item.job(world));
+    tAfterWorld = Date.now();
+    metric('world_ready', { id: item.id, root: item.root, worldMs: tAfterWorld - tStart });
+    const value = await item.job(world);
+    metric('complete', {
+      id: item.id, root: item.root, label: item.label,
+      waitMs, worldMs: tAfterWorld - tStart, jobMs: Date.now() - tAfterWorld,
+      totalMs: Date.now() - item.at,
+    });
+    item.resolve(value);
   } catch (err) {
+    metric('error', {
+      id: item.id, root: item.root, label: item.label, waitMs,
+      totalMs: Date.now() - item.at, message: String(err?.message ?? err).slice(0, 300),
+    });
     item.reject(err);
   } finally {
     running = false;
@@ -580,7 +637,7 @@ function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, fr
     report.dir = path.relative(root, outDir);
     await writeFile(path.join(outDir, 'report.json'), JSON.stringify(report, null, 2));
     return report;
-  });
+  }, `shot:${(shots && shots.length ? shots : ['<all>']).join(',')}`);
 }
 
 function handleEval({ root, code, shot, width = 1920, height = 1080, out = 'shots/diag' }) {

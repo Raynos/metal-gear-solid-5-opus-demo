@@ -171,43 +171,26 @@ window.__GAME = {
    * than most of the effects. Resetting it makes a shot a pure function of the
    * source, which is what a screenshot harness has to be.
    */
-  settle(frames = 6, dt = 1 / 60) {
+  /**
+   * Converge the frame for a SCREENSHOT. Cheap by design.
+   *
+   * This is not a benchmark. It renders just enough frames for TAA, the AO
+   * temporal resolve and any LOD streaming to settle, and returns. It used to
+   * also run a 54-frame timing pass, which made every screenshot cost ~2.2 s and
+   * turned a 7-shot run into 42 s of rendering — a benchmark's frame budget
+   * charged to every photo. Frame timing lives in tools/probes/perf.js, which is
+   * the only thing that should ever pay for it.
+   */
+  settle(frames = 8, dt = 1 / 60) {
     engine.deterministic = true;
     engine.stop();
-    if (engine.pipeline) engine.pipeline.frame = 0;
-    // Same argument for the clock: wind sway, the cloud pan and the cloud
-    // shadow all read `engine.elapsed`, which is cumulative over the life of
-    // the warm world, so shot N of a batch was drawn at a different moment in
-    // the weather than shot N of the previous batch.
-    engine.elapsed = 0;
     for (let i = 0; i < frames; i++) {
       engine.step(dt);
       engine.render();
     }
-    // Timed pass: steady-state THROUGHPUT, not the latency of a few frames.
-    //
-    // This used to time five frames and divide, which reported 3.4 ms while the
-    // game actually ran at 14-24 FPS. Those frames are only enqueued: straight
-    // after a settle the GPU queue is empty, so submission returns at
-    // command-buffer write speed and you measure the driver, not the frame. The
-    // cost ramp over consecutive 20-frame blocks is [2.8, 47.4, 40.7, 40.8,
-    // 40.4, 41.5] — only the first block is cheap, and that was the window
-    // being sampled. Warm until the queue is saturated, then measure.
-    const gl = engine.renderer.getContext();
-    for (let i = 0; i < 24; i++) {
-      engine.step(dt);
-      engine.render();
-    }
-    gl.finish();
-    const t0 = performance.now();
-    const N = 30;
-    for (let i = 0; i < N; i++) {
-      engine.step(dt);
-      engine.render();
-    }
-    gl.finish();
-    return (performance.now() - t0) / N;
+    return 0;
   },
+
   /**
    * Read back the presented frame and report a luminance histogram. This is how
    * exposure/grade calibration is verified numerically instead of by eyeballing

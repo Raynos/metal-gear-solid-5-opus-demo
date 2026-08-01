@@ -40,7 +40,13 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // The daemon is machine-wide, not per-tree, so its state lives outside every
 // tree. Each request carries ROOT so the daemon knows which tree to load.
-const RUN = path.join(os.homedir(), '.cache', 'shotd');
+// Instance isolation. One daemon per machine is right for the shared tree, but
+// optimisation work needs a daemon that cannot contend with, evict, or be
+// queued behind the one real agents are using. SHOTD_RUN gives it a private
+// lock, port file and world set.
+const RUN = process.env.SHOTD_RUN
+  ? path.resolve(process.env.SHOTD_RUN)
+  : path.join(os.homedir(), '.cache', 'shotd');
 const PORTFILE = path.join(RUN, 'port');
 const LOCKFILE = path.join(RUN, 'lock');
 const LOGFILE = path.join(RUN, 'log');
