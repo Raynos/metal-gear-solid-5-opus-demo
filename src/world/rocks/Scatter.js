@@ -311,14 +311,22 @@ class Field {
 
   add(variant, band, matrix, tint, x, z, shadowBand = 0, lodShift = 0) {
     const lod = Math.min(band + lodShift, variant.lods.length - 1);
-    // Band is part of the key as well as LOD: a far group must be able to drop
-    // out of the shadow pass even when it shares a mesh resolution with a near one.
-    const key = `${variant.id}:${lod}:${band}`;
+    // What actually has to be separate is (mesh resolution, casts shadow or not)
+    // — a far group must be able to drop out of the shadow pass even when it
+    // shares a mesh resolution with a near one. Keying on the raw band as well
+    // split groups that agreed on BOTH: a family whose LOD_SHIFT clamps bands 1
+    // and 2 onto the same LOD, with neither of them casting, was two draw calls
+    // of identical state. Twelve of the module's draws were that, and this scene
+    // is submission-bound, so they are worth more than the triangles.
+    const casts = band <= shadowBand;
+    const key = `${variant.id}:${lod}:${casts ? 'S' : 'N'}`;
     let g = this.groups.get(key);
     if (!g) {
-      g = { variant, lod, band, shadowBand, matrices: [], tints: [], xz: [] };
+      g = { variant, lod, band, casts, matrices: [], tints: [], xz: [] };
       this.groups.set(key, g);
     }
+    // The name still carries a band, so keep the lowest one that landed here.
+    if (band < g.band) g.band = band;
     g.matrices.push(matrix);
     g.tints.push(tint);
     g.xz.push(x, z);
@@ -392,7 +400,7 @@ class Field {
       mesh.instanceMatrix.needsUpdate = true;
       // The sun's shadow frustum is only ~240 m wide: submitting the far field
       // to the depth pass costs vertices and buys nothing.
-      mesh.castShadow = g.band <= g.shadowBand;
+      mesh.castShadow = g.casts;
       mesh.receiveShadow = true;
       mesh.name = `rock_${g.variant.id}_lod${g.lod}_b${g.band}`;
       mesh.computeBoundingSphere();

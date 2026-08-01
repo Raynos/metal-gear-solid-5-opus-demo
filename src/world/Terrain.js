@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { cachedBuffer } from '../core/GenCache.js';
 import { PALETTE, QUALITY } from '../config/ArtDirection.js';
 
 /**
@@ -653,6 +654,32 @@ class Grid {
     this.mid = new Float32Array(n * n);
   }
 
+  /**
+   * The simulated state of this grid as one buffer, and back again.
+   *
+   * Everything below is the output of the thermal + droplet sims, which cost
+   * 11.6 s of a 16 s world build and are fully deterministic. Serialising the
+   * lot lets GenCache skip them entirely on every load after the first.
+   * FIELDS is order-sensitive and is part of the cache key's version.
+   */
+  static FIELDS = ['h','rock','scree','flow','accum','deposit','ao','curv','nx','nz','section','bandH','bedRef','mid'];
+
+  serialize() {
+    const per = this.n * this.n;
+    const out = new Float32Array(per * Grid.FIELDS.length);
+    Grid.FIELDS.forEach((f, i) => out.set(this[f], i * per));
+    return out;
+  }
+
+  static hydrate(n, cell, buf) {
+    const g = new Grid(n, cell);
+    const per = n * n;
+    const all = new Float32Array(buf);
+    if (all.length !== per * Grid.FIELDS.length) return null; // stale layout
+    Grid.FIELDS.forEach((f, i) => g[f].set(all.subarray(i * per, (i + 1) * per)));
+    return g;
+  }
+
   /** Continuous grid index for a world coordinate. */
   ix(w) {
     return (w - this.origin) / this.cell;
@@ -687,7 +714,8 @@ const H_RANGE = 1900;
 // ---------------------------------------------------------------------------
 
 export class Terrain {
-  constructor({ size = QUALITY.terrainSize, segments = 512 } = {}) {
+  constructor(opts = {}) {
+    const { size = QUALITY.terrainSize, segments = 512 } = opts;
     this.size = size;
     this.segments = segments;
     this.order = 10;
@@ -697,16 +725,74 @@ export class Terrain {
     this.far = new Grid(1536, 8);
     this.near = new Grid(1280, 2);
 
-    this._buildFar();
-    this._buildNear();
+    if (!opts.__deferSim) {
+      this._buildFar();
+      this._buildNear();
+    }
 
-    this._buildTextures();
-    this._buildMicroTexture();
-    this._buildDetailTextures();
-    this._buildGritTextures();
-    this._buildRippleTexture();
-    this._buildMaterial();
-    this._buildClipmap();
+    if (!opts.__deferSim) {
+      this._buildTextures();
+      this._buildMicroTexture();
+      this._buildDetailTextures();
+      this._buildGritTextures();
+      this._buildRippleTexture();
+      this._buildMaterial();
+      this._buildClipmap();
+    }
+  }
+
+  /**
+   * Build a Terrain, reusing a cached simulation when the generator has not
+   * changed. Bump SIM_VERSION whenever anything that feeds `_buildFar` or
+   * `_buildNear` changes, or you will get a stale landscape.
+   */
+  // Hash of this file, injected by vite. The cache must invalidate when the
+  // generator changes — without it, a tree that edited Terrain.js would silently
+  // load a sibling tree's baked landscape from the shared cache directory.
+  static SIM_VERSION = typeof __TERRAIN_HASH__ !== 'undefined' ? __TERRAIN_HASH__ : 'dev';
+
+  static async create(opts = {}) {
+    const size = opts.size ?? QUALITY.terrainSize;
+    const segments = opts.segments ?? 512;
+    const t = new Terrain({ ...opts, size, segments, __deferSim: true });
+    const key = `terrain-${Terrain.SIM_VERSION}-${size}-${segments}-${t.far.n}x${t.far.cell}-${t.near.n}x${t.near.cell}`;
+
+    let hydrated = false;
+    try {
+      const buf = await cachedBuffer(key, () => {
+        t._buildFar();
+        t._buildNear();
+        const a = t.far.serialize();
+        const b = t.near.serialize();
+        const joined = new Float32Array(a.length + b.length);
+        joined.set(a, 0);
+        joined.set(b, a.length);
+        return joined;
+      });
+      if (!t.far.h.some((v) => v !== 0)) {
+        const all = new Float32Array(buf);
+        const aLen = t.far.n * t.far.n * Grid.FIELDS.length;
+        const far = Grid.hydrate(t.far.n, t.far.cell, all.subarray(0, aLen).slice().buffer);
+        const near = Grid.hydrate(t.near.n, t.near.cell, all.subarray(aLen).slice().buffer);
+        if (far && near) { t.far = far; t.near = near; hydrated = true; }
+      }
+    } catch (err) {
+      console.warn('terrain cache unavailable, simulating:', err?.message ?? err);
+    }
+    if (!hydrated && !t.far.h.some((v) => v !== 0)) {
+      t._buildFar();
+      t._buildNear();
+    }
+
+    // Everything downstream reads the finished grids, so it must run after.
+    t._buildTextures();
+    t._buildMicroTexture();
+    t._buildDetailTextures();
+    t._buildGritTextures();
+    t._buildRippleTexture();
+    t._buildMaterial();
+    t._buildClipmap();
+    return t;
   }
 
   // -- heightfield ---------------------------------------------------------
@@ -2187,7 +2273,6 @@ export class Terrain {
     const vmap = new Int32Array(stride * stride).fill(-1);
     const pos = [];
     const st = [];
-    const idx = [];
 
     const vid = (i, j) => {
       const key = j * stride + i;
@@ -2204,6 +2289,9 @@ export class Terrain {
       return k;
     };
 
+    // NOT split into cullable blocks, and that is a measured decision — see the
+    // note on `_buildClipmap`.
+    const idx = [];
     for (let j = 0; j < G; j++) {
       for (let i = 0; i < G; i++) {
         if (!full && i >= lo && i < hi && j >= lo && j < hi) continue;
@@ -2243,6 +2331,32 @@ export class Terrain {
     this.mesh.name = 'terrain';
     this._rings = [];
 
+    // The clipmap stays EIGHT draw calls, uncullable, and that is a measured
+    // decision rather than an oversight. Round 8 built and benchmarked the
+    // obvious fix, and it lost.
+    //
+    // The observation is real: with `frustumCulled = false` all 461 k triangles
+    // of clipmap go into the main pass and all 184 k of L0..L2 into each of the
+    // three shadow cascades — including into the 28 m cascade, which cannot
+    // contain one triangle of the 12 km level. Culling cannot help as written,
+    // because a level's bounding sphere is centred on the camera and a sphere
+    // that contains the eye is inside every frustum there is. Only a 4x4 block
+    // split makes the twelve outer blocks of a level rejectable.
+    //
+    // Built, measured on `gameplay` at 1920x1080, blocks vs this:
+    //     triangles/frame   5.03 M -> 4.45 M     (-12%)
+    //     draw calls        559    -> 659        (+18%)
+    //     frame time, static  44.4 ms -> 45.3 ms
+    //     frame time, panning 42.9 ms -> 48.3 ms
+    // Both timings are back-to-back on the same machine and the same load. The
+    // scene is submission-bound, not vertex-bound — the resolution sweep says
+    // the same thing, 640x360 costs 85% of what 1920x1080 costs — so trading
+    // 100 draw calls for 580 k triangles is the wrong direction, and the extra
+    // cost of re-fitting a hundred bounding spheres on every 8 m re-centre is
+    // what makes the panning number worse still. Cut draw calls here, not
+    // triangles. If the levels are ever split, the per-block height range has to
+    // come from a min/max pyramid baked with the heightfield, not from sampling
+    // the grid on every snap.
     for (let l = 0; l < LEVELS; l++) {
       const spacing = 0.5 * Math.pow(2, l);
       const geo = Terrain._ringGeometry(G, spacing, l === 0);
@@ -2360,11 +2474,38 @@ export class Terrain {
       // is the albedo half. Bedrock is not pale — dry Afghan limestone and
       // schist photograph at 0.20-0.28 linear reflectance, and the varnished
       // faces at half that. Round 5's 0.456 was a fresh-quarry value.
-      uRockLight: { value: C(0.318, 0.294, 0.266) },  // 1.20  (was 0.456)
-      uRockDark: { value: C(0.198, 0.178, 0.160) },   // 1.24  (was 0.236)
-      uRockRed: { value: C(0.352, 0.262, 0.222) },    // 1.59 iron stain
-      uVarnish: { value: C(0.150, 0.126, 0.116) },    // 1.29
+      // Round 6 took bedrock from 0.456 to 0.318 and the range still measured as
+      // the brightest large object in the outpost frame. 0.318 is a FRESH
+      // limestone value; what a camera sees on a weathered Afghan range is the
+      // varnished, dust-loaded outer millimetre, and that photographs at
+      // 0.14-0.20. This is 0.55x, which is the number the critique asked for and
+      // also where the measurement lands: the ridge stops out-reading the sky it
+      // is silhouetted against without the haze owner having to carry the whole
+      // correction in extinction.
+      uRockLight: { value: C(0.175, 0.162, 0.146) },  // 1.20  (was 0.318)
+      // The dark end moves less. It is already at limestone-in-shadow and taking
+      // it down by the same factor makes every gorge charcoal, which is the exact
+      // crushed-shadow failure four rounds of light transport exist to prevent.
+      uRockDark: { value: C(0.140, 0.126, 0.113) },   // 1.24  (was 0.198)
+      uRockRed: { value: C(0.238, 0.177, 0.150) },    // 1.59 iron stain
+      uVarnish: { value: C(0.098, 0.082, 0.076) },    // 1.29
+      // The scree/gravel apron on the PAN is not the same material as a cliff
+      // face and must not follow bedrock down: the pan is loose, dust-coated,
+      // freshly turned-over clasts and it is what the near-field ground is made
+      // of. It used to borrow uRockLight, so the round-7 bedrock cut would have
+      // taken 0.55x out of the valley floor as well.
+      uGravelClast: { value: C(0.318, 0.294, 0.266) },
       uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
+      /**
+       * Second ablation hook: (pavement lag layer, mid-field albedo swing,
+       * varnish coverage probe, spare). The first two are 1/0 kill switches so a
+       * round-7 claim can be proved by toggling the layer off and re-rendering
+       * rather than by diffing against a previous round, where five things moved
+       * at once. The third is a MEASUREMENT hook: set it to a threshold t in
+       * (0,1] and every bedrock fragment whose varnish weight is >= t renders
+       * black, so "varnish coverage" becomes a pixel count instead of an opinion.
+       */
+      uDbg2: { value: new THREE.Vector4(1, 1, 0, 0) },
     };
     this.uniforms = u;
 
@@ -2498,6 +2639,8 @@ export class Terrain {
           // shot.mjs eval probe — no rebuild, no second material, and so no
           // chance of the A and the B differing in anything else.
           uniform vec4 uDbg;
+          uniform vec3 uGravelClast;
+          uniform vec4 uDbg2;
 
           // The stratigraphic resistance hash, bit-identical to the CPU's in
           // _addStrata. It has to be identical: it decides which beds the
@@ -2531,6 +2674,13 @@ export class Terrain {
           vec2 unrot(vec2 p, vec2 sc) { return vec2(p.x * sc.x + p.y * sc.y, -p.x * sc.y + p.y * sc.x); }
           #define ROT_C vec2(0.6, 0.8)
           #define ROT_B vec2(-0.28, 0.96)
+          // Two more rotations for the mid-field pavement taps. They read the
+          // same tile as the near-field grit at 3.6x and 11x, and a scaled copy
+          // of a field read on the SAME axes beats against its own source into
+          // large swirling contours — the wood grain this file spent round 4
+          // removing. A rotation per scale is not optional.
+          #define ROT_P vec2(0.94, -0.34)
+          #define ROT_Q vec2(-0.52, 0.854)
 
           // Detail anti-aliasing.
           //
@@ -2679,7 +2829,20 @@ export class Terrain {
             vec4 nB = texture(uDetail, vec3(uvB, 1.0));
             // Detail albedo also collapses to its own mean once it stops being
             // resolvable, or the same beat shows up in colour instead of relief.
-            vec4 D  = mix(dB, mix(dC, dA, 0.55 * sA), (0.34 + 0.55 * nearW) * max(sC, sA * 0.5));
+            // Round 7. This blend weight was gated on nearW, which is a 6-42 m
+            // DISTANCE ramp, so past 42 m the ground albedo collapsed to 66% of
+            // the 26 m tile — a field whose finest feature is ten metres across.
+            // That is why the mid ground of every wide shot is one value: not
+            // because the detail could not be resolved (the 4.6 m tile's own
+            // footprint fade sC is still 1.0 at 200 m) but because a range check
+            // had already thrown it away. Measured on the ridge frame, rows
+            // 800-1050 at 55-95 m: 11x11 high-pass RMS 0.87 display codes on a
+            // mean of 30.6, i.e. 2.85%, over a quarter of the frame.
+            //
+            // The weight now follows the tiles' own resolvability: nearW still
+            // pushes the finest tile in close, but sC keeps the 4.6 m tile in
+            // charge for as long as a pixel can actually see it.
+            vec4 D  = mix(dB, mix(dC, dA, 0.55 * sA), (0.34 + 0.55 * max(nearW, sC * 0.86)) * max(sC, sA * 0.5));
             D = mix(vec4(0.5), D, max(sB, max(sC, sA)));
 
             // --- material weights --------------------------------------------
@@ -2717,7 +2880,7 @@ export class Terrain {
             // --- scree / gravel apron: coarser and darker than the sand, but
             // still iron-warm. Grey gravel is the fastest way to read "quarry".
             vec3 gravel = mix(uGravel, uSandDark, 0.24 + D.a * 0.38);
-            gravel = mix(gravel, uRockLight * 0.96, smoothstep(0.22, 0.85, D.g));
+            gravel = mix(gravel, uGravelClast * 0.96, smoothstep(0.22, 0.85, D.g));
             gravel *= 0.80 + D.r * 0.40;
 
             // --- bedrock: stratified, iron-stained ---------------------------
@@ -2785,12 +2948,27 @@ export class Terrain {
             // long-exposed clast surfaces: resistant beds, boulder tops, the
             // ground that is not being scoured. So it tracks bed hardness and a
             // mid-scale patch field, with occlusion left as a weak modifier.
-            float varnish = smoothstep(0.16, 0.68, mid * 0.46 + macro * 0.26
+            // Round 7: shoulder 0.16-0.68 -> 0.12-0.62 and the applied strength
+            // 0.66 -> 0.80, with uVarnish itself taken down to 0.098. Varnish on
+            // a stable Afghan range is not a minority feature — it is the default
+            // state of any face that is not actively spalling — and the patchiness
+            // should come from the (1 - flow) and rockM gates, which model where
+            // it physically cannot form, rather than from a threshold on noise.
+            //
+            // Measured with the uDbg2.z hook below (blacks out every bedrock
+            // fragment whose weight is >= t, so coverage is a pixel ratio):
+            // an earlier 0.04-0.46 shoulder saturated the layer — 100% of bedrock
+            // above t = 0.35 and 73-87% above t = 0.7 — which buys coverage by
+            // throwing the patchiness away. This shoulder keeps the spread.
+            float varnish = smoothstep(0.12, 0.62, mid * 0.46 + macro * 0.26
                                                  + bedHash(bedK) * 0.34 * sectionW
                                                  + (D.a - 0.5) * 0.22)
                           * (1.0 - flow) * smoothstep(0.06, 0.40, rockM)
-                          * mix(0.62, 1.0, smoothstep(0.86, 0.42, bake));
-            rock = mix(rock, uVarnish, varnish * 0.66 * uDbg.w);
+                          * mix(0.70, 1.0, smoothstep(0.86, 0.42, bake));
+            rock = mix(rock, uVarnish, varnish * 0.80 * uDbg.w);
+            // Measurement hook, not a look. uDbg2.z is 0 in the shipped build;
+            // a probe sets it to a threshold and counts the black pixels.
+            if (uDbg2.z > 0.0 && varnish >= uDbg2.z) rock = vec3(0.0);
 
             // --- assemble -----------------------------------------------------
             vec3 albedo = sand;
@@ -2807,11 +2985,16 @@ export class Terrain {
             // Concave hollows collect pale wind-blown fines.
             albedo = mix(albedo, mix(albedo, uSilt, 0.34), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
 
-            // Regional tone, at TWO scales. macro is the 900 m regional swing;
-            // mid is the 11-45 m patchiness that a frame looking at 200 m of
-            // ground is entirely composed of. Round 5 had only the first, which
-            // is why a quarter of the ridge frame measured as one value.
-            albedo *= 0.84 + macro * 0.20 + mid * 0.20;
+            // Regional tone, at THREE scales now. macro is the 900 m regional
+            // swing; mid is the 11-45 m patchiness that a frame looking at 200 m
+            // of ground is entirely composed of; D.a is the 4.6 m mottle that
+            // fills the gap between mid and the clast field. Round 5 had only the
+            // first, which is why a quarter of the ridge frame measured as one
+            // value; round 6 added mid at half the swing it needed. The mean is
+            // unchanged (1.04) — this only widens the spread, so nothing in the
+            // exposure calibration moves.
+            albedo *= (0.78 + macro * 0.22 + mid * 0.30 + (D.a - 0.5) * 0.16) * uDbg2.y
+                    + 1.04 * (1.0 - uDbg2.y);
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
@@ -2943,6 +3126,98 @@ export class Terrain {
 
               albedo = mix(albedo, mix(gritC, albedo * 1.06, 0.10), gritW * (1.0 - rockW * 0.55));
               gpert = (GN.rg * 2.0 - 1.0) * (1.25 * gritW);
+            }
+
+            // --- desert pavement, the MID field ---------------------------------
+            // ROUND 7, MAJOR 1. A quarter of the ridge frame is a dead plastic
+            // dome: rows 800-1050 are ground at 55-95 m and they measured an
+            // 11x11 high-pass RMS of 0.87 display codes on a mean of 30.6.
+            //
+            // The near-field grit above cannot fix that and no amount of fade
+            // extension will make it. Its clasts are 3-9 cm; at 90 m one pixel of
+            // this camera covers 6 cm across the view and 30 cm along it, so the
+            // mip chain has already averaged every stone away before the tap is
+            // taken. Holding the layer on out to 140 m does not produce stones at
+            // 140 m, it produces the tile's mean colour with an aliasing risk
+            // attached. The honest reading of "extend the grit" is: give the mid
+            // field the layer whose FEATURES are the right size for it.
+            //
+            // So this is the same tile read 3.6x and 11x bigger, which turns its
+            // 3-9 cm clasts into 11-32 cm cobbles and its Worley cells into
+            // 0.7-2.4 m lag patches — 2 px and 20 px respectively at 90 m, which
+            // is exactly what a desert pavement shows at that range. It carries
+            // albedo, a real normal, an interstitial AO and one sun-horizon tap,
+            // so it is LIT micro-geometry and not the albedo speckle a shadow
+            // test cannot tell from paint. Each scale retires on its own
+            // footprint fade (sP dies about 230 m, sQ about 700 m).
+            //
+            // Cost: 4 fetches plus 1 shadow tap on ground fragments inside 330 m.
+            float pavAO = 1.0;
+            {
+              vec2 puv = rot(baseUV, ROT_P) * (1.0 / (GRIT_TILE * 3.6)) + vec2(0.19, 0.83);
+              vec2 quv = rot(baseUV, ROT_Q) * (1.0 / (GRIT_TILE * 11.0)) + vec2(0.61, 0.07);
+              // Derivatives taken HERE, in uniform control flow, and every fetch
+              // below is a textureGrad. Inside the branch the derivatives are
+              // undefined — the quad is not guaranteed to agree on the branch —
+              // and an undefined LOD on a clast tile at grazing incidence is the
+              // moire this shader has spent three rounds removing.
+              vec2 pdx = dFdx(puv), pdy = dFdy(puv);
+              vec2 qdx = dFdx(quv), qdy = dFdy(quv);
+              float sP = sharpnessK(puv, 6.0);
+              float sQ = sharpnessK(quv, 6.0);
+              // Hand over from the true near-field grit rather than doubling it,
+              // and stay off bedrock — a cliff face has its own strata and clast
+              // layers and does not carry a pavement.
+              float pavW = (1.0 - smoothstep(200.0, 340.0, dist))
+                         * (1.0 - rockW * 0.72) * (1.0 - gritW * 0.80) * uDbg2.x;
+              if (pavW > 0.004 && max(sP, sQ) > 0.004) {
+                vec4 PM = textureGrad(uGrit, vec3(puv, 0.0), pdx, pdy);
+                vec4 PN = textureGrad(uGrit, vec3(puv, 1.0), pdx, pdy);
+                vec4 QM = textureGrad(uGrit, vec3(quv, 0.0), qdx, qdy);
+                vec4 QN = textureGrad(uGrit, vec3(quv, 1.0), qdx, qdy);
+                float wP = sP * pavW;
+                float wQ = sQ * pavW;
+
+                // Lag cobbles: varnished, so DARKER than the fines around them,
+                // with a pale quartzy minority. Same rule the near grit uses —
+                // a symmetric spread reads as scattered white confetti.
+                float cover = PM.g * 0.85 + QM.g * 0.55;
+                vec3 lagC = mix(uRockDark * 1.10, uSandLight * 0.94, pow(PM.b, 1.8));
+                vec3 pavC = mix(albedo * (0.94 + PM.r * 0.20), lagC,
+                                clamp(cover, 0.0, 1.0) * 0.85);
+                // 0.7-2.4 m patch tone: whole plates of the pan are swept to
+                // bare lag while others bank pale fines. This is the scale the
+                // eye reads at 100-250 m and there was nothing at it. The mean of
+                // the three terms is 1.01, so this is spread, not a level shift.
+                pavC *= 0.74 + QM.a * 0.38 + QM.r * 0.16;
+                albedo = mix(albedo, pavC, clamp(wP * 0.90 + wQ * 0.70, 0.0, 0.95));
+
+                // Relief. The 3.6x normal is the one that survives to ~230 m; the
+                // 11x normal is a metre-scale undulation that runs to the far
+                // pan and is what stops the dome reading as a moulding.
+                gpert += unrot(PN.rg * 2.0 - 1.0, ROT_P) * (1.05 * wP)
+                       + unrot(QN.rg * 2.0 - 1.0, ROT_Q) * (0.75 * wQ);
+                // Interstices sit below the cobbles and see less sky. This is the
+                // only term of the layer that survives into full cast shadow,
+                // where there is no direct light for the relief to modulate.
+                pavAO = mix(1.0, 0.52 + PN.a * 0.74, wP)
+                      * mix(1.0, 0.70 + QN.a * 0.44, wQ);
+
+                // One sun-horizon tap at the 3.6x scale: a 16 cm cobble under a
+                // low sun throws a 30-60 cm shadow, which is a pixel at 200 m and
+                // several at 80. Without it the layer only ever reaches albedo,
+                // which is the exact failure mode round 4's near grit had.
+                vec2 sxz2 = uSunDir.xz;
+                float sl2 = length(sxz2);
+                if (sl2 > 1e-3) {
+                  const float PSTEP = 0.42;
+                  float PH = GRIT_H * 3.6;
+                  vec2 sd2 = rot(sxz2 / sl2, ROT_P);
+                  float hs2 = textureGrad(uGrit, vec3(puv + sd2 * (PSTEP / (GRIT_TILE * 3.6)), 1.0), pdx, pdy).a;
+                  float rise2 = (hs2 - PN.a) * PH - PSTEP * (uSunDir.y / sl2);
+                  gMicroShadow *= 1.0 - smoothstep(0.0, 0.03, rise2) * 0.55 * wP;
+                }
+              }
             }
 
             // --- wind ripples --------------------------------------------------
@@ -3084,7 +3359,7 @@ export class Terrain {
             gN = normalize(wn + pv);
 
             float cav = mix(nB.a, mix(nC.a, nA.a, nearNW), midNear);
-            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.32, 1.0)) * gritAO;
+            gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.32, 1.0)) * gritAO * pavAO;
             gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05
                            + gStrataRough * rockW, 0.55, 1.0);
           }`,
