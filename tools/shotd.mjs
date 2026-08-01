@@ -66,12 +66,14 @@ const IDLE_MS = Math.max(60, +opt('idle', 600)) * 1000;
 // Each resident world is a page holding ~160 MB of terrain typed arrays plus GPU
 // textures, and a vite server at ~75 MB. Capped hard: unbounded residency is the
 // mistake that took the machine down.
-// One daemon serves every worktree, so the cap must cover the number of authors
-// working at once, not the number of trees one author uses. At 3, nine parallel
-// agents evicted each other continuously: 138 rebuilds in one session, 98 of them
-// on a single tree, 44.7 min (17% of wall clock) spent regenerating worlds that
-// were about to be needed again. Resident worlds are ~0.15 GB each.
-const MAX_WORLDS = Math.max(1, Math.min(+opt('worlds', 10), 16));
+// One chromium, N resident tabs, swapped on demand. The cap is a RAM/thrash
+// tradeoff and both ends have been measured: at 3, seven parallel agents evicted
+// each other continuously (138 rebuilds in a session, 44.7 min of pure
+// regeneration); at 10, six resident worlds cost 10.5 GB. A world is ~1.7 GB
+// once its GPU resources are counted, not the 0.15 GB the JS heap suggests.
+// 5 is the compromise. The real fix is not more tabs, it is a cheaper build:
+// see GenCache — 11.6 s of the 25.7 s page load is terrain generation alone.
+const MAX_WORLDS = Math.max(1, Math.min(+opt('worlds', 5), 16));
 // How long a request may wait behind another tree's batch before it jumps the
 // queue. Without this, a busy tree starves every other tree indefinitely.
 const STARVATION_MS = 45000;
@@ -407,7 +409,24 @@ async function evictIfNeeded(keepRoot) {
  * through: it rebuilds only when the tree's sources actually moved, and keeps
  * recently used trees resident so revisiting one is nearly free.
  */
+const inFlight = new Map(); // root -> Promise<World>, so N callers cause 1 build
+const BUILD_CONCURRENCY = 3;
+let building = 0;
+
+/** Start a build for `root` without blocking the render pump. */
+function prebuild(root) {
+  if (inFlight.has(root) || building >= BUILD_CONCURRENCY) return;
+  const p = getWorld(root).catch(() => null);
+  inFlight.set(root, p);
+  p.finally(() => inFlight.delete(root));
+}
+
 async function getWorld(root, { force = false } = {}) {
+  const pending = inFlight.get(root);
+  if (pending && !force) {
+    const w = await pending;
+    if (w && w.page && !w.page.isClosed()) return w;
+  }
   let w = worlds.get(root);
   const newest = await newestSourceMtime(root);
 
@@ -420,26 +439,39 @@ async function getWorld(root, { force = false } = {}) {
     await evictIfNeeded(root);
     w = new World(root);
     worlds.set(root, w);
-    await w.build('first use');
+    building++;
+    try { await w.build('first use'); } finally { building--; }
   } else {
-    await w.build(force ? 'forced reload' : 'sources changed');
+    building++;
+    try { await w.build(force ? 'forced reload' : 'sources changed'); } finally { building--; }
   }
   w.lastUsed = Date.now();
   return w;
 }
 
 // --- the queue ------------------------------------------------------------
-// Rendering is GPU-serialised and world builds are single-threaded CPU work, so
-// one job at a time is the honest model — overlapping them only adds contention.
-// The ordering rule is what makes it cheap: prefer work for a tree that is
-// already resident, so a build is amortised over a whole batch. A waiter passed
-// over for too long jumps the queue.
+// RENDERING is GPU-serialised: one job at a time, always. BUILDING is not.
+//
+// That distinction was missed originally, when there was one tree and it did not
+// matter. With seven agents in seven worktrees it dominated everything: a build
+// is ~16 s of mostly single-core work (vite start, page load, terrain erosion),
+// it sat inside the serial section, and so six trees waited on the seventh.
+// Observed queue depth was 14 with agents blocked for 3-5 minutes each.
+//
+// Builds are now kicked off as work arrives and overlap with whatever is
+// rendering, capped at BUILD_CONCURRENCY so a burst cannot thrash. The ordering
+// rule still prefers a tree that is already resident, so a build is amortised
+// over a whole batch, and a waiter passed over for too long jumps the queue.
 const queue = [];
 let running = false;
 
 function enqueue(root, job) {
   return new Promise((resolve, reject) => {
     queue.push({ root, job, resolve, reject, at: Date.now() });
+    // Warm this tree now rather than when it reaches the head of the queue, so
+    // its build overlaps with the render already in flight.
+    prebuild(root);
+    for (const q of queue) prebuild(q.root);
     pump();
   });
 }

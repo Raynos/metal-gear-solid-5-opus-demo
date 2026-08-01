@@ -5,3 +5,4 @@ shots/
 # render daemon runtime state
 .shotd/
 .claude/worktrees/
+node_modules/.gencache/
