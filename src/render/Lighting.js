@@ -892,7 +892,11 @@ export class Lighting {
     // the scene itself is 242 draws / 2.31 M triangles, and the three cascades
     // add 520 draws / 4.01 M triangles on a frame where they all refresh — the
     // shadow pass is bigger than the scene it shadows. Amortised over [1,2,4]
-    // that was 299 shadow draws a frame; over [1,3,6] it is 260.
+    // that was 299 shadow draws a frame; over [1,3,6] it is 255.
+    //
+    // The >3 m camera-move guard in update() forces every cascade to refresh, so
+    // this saving lands on standing and slow movement, not on a sprint. In a
+    // stealth game that is most of the play time.
     //
     // Phases are chosen so no two cascades above 0 ever land on the same frame:
     // cascade 1 fires at f mod 3 == 1, cascade 2 at f mod 6 == 3 (which is

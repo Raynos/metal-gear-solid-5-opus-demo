@@ -147,10 +147,48 @@ world into a 56 m box. And cascade 2 rasterises 1.38 M triangles into a map whos
 texel is 34 cm, where nothing under a metre across can survive.
 
 The amortised cost is what the refresh schedule buys: over `[1,2,4]` it was 299
-shadow draws per frame, over `[1,3,6]` it is 260. Note that the >3 m camera-move
+shadow draws per frame, over `[1,3,6]` it is 255. Note that the >3 m camera-move
 guard in `Lighting.update()` forces every cascade to refresh, so the schedule's
 saving lands on standing and slow movement — which, in a stealth game, is most of
 the play time — and not on a sprint.
+
+### Which cull is worth building, from the caster inventory
+
+`cascades.js` also inventories the casters, because a per-cascade cull can only
+reject a whole `Object3D` and it is worth building only if whole objects carry
+the triangles:
+
+| | objects | triangles |
+| --- | --- | --- |
+| `InstancedMesh` | 124 | 668 k |
+| single meshes | 29 | **712 k** |
+
+Single meshes carry more triangles than every instanced cluster combined, and the
+heaviest ten name the target exactly: three terrain clipmap rings (73 k / 55 k /
+55 k, bounding diameters 1.3–1.8 km, so nothing can ever cull them) and then
+**nine characters at 43–48 k triangles each and 3.2 m across**.
+
+Those nine are ~400 k triangles drawn at full LOD into *every* cascade. In
+cascade 2 a 3.2 m character is **9 texels tall**. Rasterising a 45 k-triangle
+skinned mesh to produce nine texels of shadow is 29% of that cascade's triangle
+count for nothing an eye can resolve.
+
+So the cull is: **in cascade c, skip a caster whose bounding-sphere diameter is
+under ~16 texels.** At cascade 2's 34.4 cm texel that threshold is 5.5 m — it
+drops the characters and keeps vehicles and buildings. At cascade 1's 7.9 cm it
+is 1.26 m, which keeps the characters, where they are still 40 texels tall and
+plainly visible. The thresholds fall out of the texel size; there is nothing to
+tune by eye.
+
+It is **not** implemented. three renders every due shadow map inside one
+`renderer.render()` call, and cascade 0 refreshes on every frame, so there is no
+frame on which a `castShadow` mask could apply to one cascade and not another.
+Doing it means driving the outer cascades' shadow passes explicitly —
+`renderer.shadowMap.render([cascade], scene, camera)` from `Lighting.update()`
+with the mask applied and `shadow.needsUpdate` left false so three's own pass
+skips them. That is renderer surgery on a shared object, and shipping it
+unverified at the end of a round with a four-minute measurement queue would have
+been the same mistake this round exists to correct.
 
 `casterreach.js` sweeps `Lighting.casterReach` — how far up-sun a caster can be
 and still be drawn — reporting draws, triangles **and the pixel difference
