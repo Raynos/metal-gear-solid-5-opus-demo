@@ -196,6 +196,7 @@ function parseArgs(argv) {
     else if (a === '--height') o.height = +argv[++i];
     else if (a === '--frames') o.frames = +argv[++i];
     else if (a === '--hide') o.hide = (o.hide ?? []).concat(argv[++i].split(','));
+    else if (a === '--cinematic') o.cinematic = true;
     else if (!a.startsWith('--')) o.shots.push(a);
   }
   return o;
@@ -514,6 +515,17 @@ async function main() {
     if (!hidden.length) console.error(`  WARNING: nothing matched — the shot below is unmodified`);
   }
 
+  // --cinematic: shoot with the PLAY-mode post flags on.
+  //
+  // applyShot() parks the harness in godmode, and main.js turns depth of field
+  // and motion blur off there on purpose — they are cinematic effects for a
+  // gameplay camera and on a free-fly inspection camera they only smear the
+  // thing you are trying to look at. The side effect is that DOF appears in NO
+  // canonical shot, so nobody has ever reviewed it, and a change to it cannot
+  // be seen in any image this harness produces. It is applied per shot, after
+  // applyShot, because applyShot is what turns them off.
+  const cinematic = !!opts.cinematic;
+
   const outDir = path.resolve(ROOT, opts.dir);
   await mkdir(outDir, { recursive: true });
   const all = await page.evaluate(() => Object.keys(window.__GAME.shots));
@@ -529,9 +541,13 @@ async function main() {
   for (const name of wanted) {
     const t = Date.now();
     const meta = await page.evaluate(
-      ({ name, frames }) => {
+      ({ name, frames, cine }) => {
         const g = window.__GAME;
         const s = g.applyShot(name);
+        if (cine) {
+          const pipe = g.engine.pipeline;
+          if (pipe?.enabled) { pipe.enabled.dof = true; pipe.enabled.motionBlur = true; }
+        }
         // Pin AFTER the pose is set (invalidateShadows wants the final camera)
         // and before settle, so the frame is a function of the source alone.
         const pinned = window.__pinDeterminism ? window.__pinDeterminism() : null;
@@ -547,7 +563,7 @@ async function main() {
         g.settle(pinned && pinned.volumetrics ? Math.max(frames, 32) : frames);
         return { note: s.note, tod: s.tod, pinned, stats: g.stats() };
       },
-      { name, frames: opts.frames },
+      { name, frames: opts.frames, cine: cinematic },
     );
     const file = path.join(outDir, `${name}.png`);
     await writeFile(file, await page.screenshot({ type: 'png' }));
