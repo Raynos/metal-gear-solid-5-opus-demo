@@ -177,7 +177,8 @@ uniform float uCirrus;
 uniform float uCirrusAlt;
 uniform float uHeatHaze;
 uniform float uCloudShadow;
-uniform float uWindT;
+uniform float uWindT;            // advection clock; metres = uWindT * per-layer rate
+uniform float uEvolveT;          // metres travelled through the volume's THIRD axis
 uniform float uCloudFar;         // distance at which the deck has faded out (m)
 uniform float uCloudStreak;      // 0 = isotropic weather, 1 = full cloud streets
 uniform float uCloudVSquash;     // vertical anisotropy of the cloud shape lookup
@@ -372,7 +373,14 @@ float altAt(float camY, float rdy, float t) {
  *   x = coverage 0..1, y = cumulus-ness 0..1, z = per-cell top height 0..1
  */
 vec3 weatherAt(vec2 xz) {
-  vec2 w = xz * (1.0 / 46000.0) + vec2(uWindT * 0.000021, uWindT * 0.0000071);
+  // ONE AIRMASS (round 8). This used to drift at 0.966 m per unit of uWindT
+  // while the shape field below drifted at 3.1 — so the BANKS stood almost
+  // still while their own texture streamed through them at 3.2x their speed.
+  // A stationary window with a repeating pattern scrolling behind it is the
+  // most legible loop there is, and it is also not what air does: a cloud and
+  // the cloud it is made of travel together. Same rate as the shape now; the
+  // only differential motion left is the wind shear with height, which is real.
+  vec2 w = (xz + uWindT * vec2(3.1, 1.1)) * (1.0 / 46000.0);
   vec4 s = texture2D(tWeather, w);
   // Squash across the wind so banks form streets rather than an even sprinkle.
   //
@@ -434,7 +442,50 @@ float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
 
   // Wind shear: a cumulus top lags downwind of its base, which is the cue that
   // says "this is a volume in a moving airmass" rather than an extruded decal.
-  vec3 q = p + vec3(uWindT * 3.1 + 260.0 * h, 0.0, uWindT * 1.1 + 90.0 * h);
+  //
+  // ADVECTION *AND* EVOLUTION — the loop fix (round 8).
+  //
+  // What was here advected a FROZEN field: 'q = p + wind*t' and nothing else,
+  // so along a streamline the density was exactly constant in time. A frozen
+  // field dragged past a standing camera is a conveyor belt, and because the
+  // shape volume tiles every 1700 / 620 / 230 m the same puffs came back round
+  // on a fixed beat. Measured on the field itself (top-down density map,
+  // autocorrelation of a fixed 6 km patch, tools-side probe): correlation fell
+  // below 0.2 within 12 s and then RETURNED to 0.27 at a lag of 149 s and 0.19
+  // at 405 s. A field that genuinely never repeats decays and stays down.
+  // Spatially it was worse — side lobes of 0.32 at 621 m and 0.50 at 1840 m
+  // against a decorrelation length of 246 m. That is wallpaper, tiled about a
+  // hundred times across a 65 km deck.
+  //
+  // Two changes fix it and neither costs a texture fetch:
+  //
+  //   1. DRIFT THROUGH THE VOLUME'S THIRD AXIS. The shape volume is 3D and
+  //      tiles in y as well, so a slow slide in y walks every lookup through
+  //      unrelated cross-sections: puffs build, swell and dissolve rather than
+  //      merely arriving from upwind. It is also the cheapest possible
+  //      evolution — one add on a vector that was already being built. The
+  //      three octaves divide this drift by their own scales (and by the
+  //      vertical squash), so they evolve at rates 1 : 1.65 : 2.47 and share no
+  //      beat. Nothing about the vertical PROFILE changes: 'prof' is a function
+  //      of 'alt', not of q.y, so the flat base and the anvil top are untouched.
+  //
+  //   2. READ EACH OCTAVE ALONG ITS OWN HORIZONTAL BEARING. A tiling volume
+  //      always has a lattice; what it must not have is a lattice SHARED with
+  //      the other octaves. Three lattices at incommensurate angles have no
+  //      common one, so a displacement that repeats one octave cannot repeat
+  //      the others, and the partial-repeat side lobes go with it. Rotating a
+  //      statistically isotropic field changes which puff lands where and
+  //      nothing else — the silhouette scale, the vertical squash and the
+  //      octave weights are all exactly as they were.
+  //
+  // Plus a low-frequency domain warp, which is free because 'wx' is already in
+  // hand: it slides successive tiles of the shape volume out of register with
+  // each other as a smooth function of where you are on the weather map, so
+  // even the un-rotated coarse octave has no exact repeat left. The warp is
+  // read from the ADVECTED weather, so it travels with the airmass and does not
+  // shear the clouds as they pass through it.
+  vec2 warp = (wx.yz - 0.5) * 1500.0;
+  vec3 q = p + vec3(uWindT * 3.1 + 260.0 * h + warp.x, uEvolveT, uWindT * 1.1 + 90.0 * h + warp.y);
   // VERTICAL ANISOTROPY OF THE SHAPE LOOKUP — this is the fix for the radial
   // spokes (round 7).
   //
@@ -461,9 +512,31 @@ float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
   // the 230 m one not at all — squashing them too would only make the erosion
   // fringe stripy.
   float vs = uCloudVSquash;
-  float shape = texture(tCloud, q * vec3(1.0, vs, 1.0) * (1.0 / 1700.0)).r * 0.50
-              + texture(tCloud, q * vec3(1.0, mix(1.0, vs, 0.4), 1.0) * (1.0 / 620.0) + 0.31).r * 0.31
-              + texture(tCloud, q * (1.0 / 230.0) + 0.67).r * 0.19;
+  // Bearings for the three octaves: +12.2, -51.2 and +49.6 degrees.
+  //
+  // These are not arbitrary. The bearing that matters is the WIND's bearing
+  // inside each octave's own texture frame, because the deck is dragged along
+  // the wind and that is the direction in which a repeat is handed to the eye
+  // rather than merely present. An octave comes back into register after a
+  // travel of a whole number of tiles in BOTH of its texture axes, so the first
+  // time it does so is governed by how well the tangent of that bearing is
+  // approximated by a small fraction — tangent 1 (45 degrees) is the worst
+  // possible case and repeats after one tile.
+  //
+  // These three put the wind at tangent +0.619, -0.617 and +2.621 in their
+  // respective frames: the golden ratio and its reciprocal, which are the
+  // hardest numbers there are to approximate by a fraction. The coarse octave's
+  // first credible near-register is then 13 tiles out, about 33 minutes of
+  // travel, and the drift through the third axis has moved on long before that.
+  // An earlier pass used 27 degrees here and measured a 0.27 recurrence at 66 s
+  // for exactly this reason: it had put the wind at 46.5 degrees in that
+  // octave's frame, a hair off tangent 1.
+  vec2 a1 = vec2(q.x * 0.97735 - q.z * 0.21166, q.x * 0.21166 + q.z * 0.97735);
+  vec2 a2 = vec2(q.x * 0.62633 + q.z * 0.77947, q.z * 0.62633 - q.x * 0.77947);
+  vec2 a3 = vec2(q.x * 0.64844 - q.z * 0.76127, q.x * 0.76127 + q.z * 0.64844);
+  float shape = texture(tCloud, vec3(a1.x, q.y * vs, a1.y) * (1.0 / 1700.0)).r * 0.50
+              + texture(tCloud, vec3(a2.x, q.y * mix(1.0, vs, 0.4), a2.y) * (1.0 / 620.0) + 0.31).r * 0.31
+              + texture(tCloud, vec3(a3.x, q.y, a3.y) * (1.0 / 230.0) + 0.67).r * 0.19;
 
   float base = shape * prof;
   // Fixed-width transition band rather than "threshold to 1.0". Averaging four
@@ -477,7 +550,15 @@ float cloudDensity(vec3 p, float alt, vec3 wx, float lod) {
   if (d <= 0.0) return 0.0;
 
   float er = mix(0.34, 1.0, lod);
-  vec4 hi = texture(tCloud, (p + vec3(uWindT * 5.0, 0.0, uWindT * 1.8)) * (1.0 / 420.0));
+  // The erosion rides on 'q', not on 'p'. Reading it from raw world position
+  // meant the fringe advected at 20 m/s while the puff it is eroding advected
+  // at 12.4 — a 7.6 m/s slide of the detail THROUGH the shape, on a 420 m tile,
+  // which is a 21 s repeat of the finest thing on screen and the fastest loop
+  // in the deck. On 'q' it travels with its own cloud; the small extra term is
+  // turbulence within the parcel rather than a separate wind, and the evolution
+  // runs 2.7x faster here because wisps really do churn faster than the mass
+  // they hang off.
+  vec4 hi = texture(tCloud, (q + vec3(uWindT * 0.9, uEvolveT * 1.7, uWindT * 0.35)) * (1.0 / 420.0));
   float fbm = hi.g * 0.50 + hi.b * 0.32 + hi.a * 0.18;
   // Erode hard at the base, softly at the top: wispy bottoms, firm anvils.
   float e = mix(fbm, 1.0 - fbm, clamp(h * 2.4, 0.0, 1.0)) * er;
@@ -895,7 +976,14 @@ void main() {
     if (rd.y > 0.012 && uCirrus > 0.001) {
       float tc = shellDist(max(uCamPos.y, 0.0), rd.y, uCirrusAlt);
       vec3 cp = uCamPos + rd * max(tc, 0.0);
-      vec2 cw = cp.xz * (1.0 / 78000.0) + vec2(uWindT * 0.0000075, 0.0);
+      // Round 8: was a pure 1-D scroll at 2.3 m/s, which for a sheet at 8 km is
+      // both too slow and too obviously a conveyor — a one-axis translation has
+      // a repeat along that axis and nothing to hide it. Given a real 2-D
+      // velocity at jet-stream speed instead, veered clockwise of the deck's
+      // wind as it is in the atmosphere. The three lookups below scale 'cw'
+      // differently, so they scroll at 1x, 2.7x and (0.85x, 2.0x) of this and
+      // the composite has no short common period.
+      vec2 cw = (cp.xz + uWindT * vec2(5.0, 1.9)) * (1.0 / 78000.0);
       float f = texture2D(tWeather, cw).r * 0.60 + texture2D(tWeather, cw * 2.7 + 0.4).g * 0.40;
       // Mild anisotropy only: heavy stretching converges to a point overhead and
       // reads as a lens starburst rather than fibrous cirrus.

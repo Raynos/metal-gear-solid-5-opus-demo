@@ -383,6 +383,7 @@ export class VolumetricPass {
         uTime: { value: 0 },
         uFrame: { value: 0 },
         uWindT: { value: 0 },
+        uEvolveT: { value: 0 },
         uTerrainSize: { value: this.fields.size },
         uShadowExtent: { value: 120 },
         uShadowCenter: { value: new THREE.Vector3() },
@@ -840,6 +841,23 @@ export class VolumetricPass {
     // pixel every few seconds, which is what a real sky does. Decoupled from
     // uTime so the shimmer and the deck do not share a beat frequency.
     u.uWindT.value = engine.elapsed * 4.0;
+    // How fast the deck moves through the shape volume's third axis, in metres
+    // per second — i.e. how fast clouds BUILD AND DISSIPATE as opposed to
+    // arriving from upwind. See the long note in `cloudDensity`: advection
+    // alone is a conveyor belt and a conveyor belt of a tiling volume loops.
+    //
+    // 1.0 m/s against a 12.4 m/s advection, so evolution is ~8% of the motion:
+    // the deck still reads as wind-driven, not as a boiling noise field. What
+    // it buys is that the coarse octave crosses one Worley cell in ~190 s, the
+    // finest shape octave in ~77 s and the erosion in ~52 s, which is close to
+    // the real timescales of a cumulus mass, its turrets and its wisps.
+    //
+    // It also destroys the repeat outright. The path through the volume is now
+    // a line whose three components stand in ratio 12.4 : 3.0 : 4.4; the field
+    // can only return when all three are simultaneously whole tiles, which for
+    // the coarse octave alone is 8.5 ks and for the octaves together is far
+    // beyond any session.
+    u.uEvolveT.value = engine.elapsed * 1.0;
 
     const shadow = lighting.sun.shadow;
     if (shadow?.map?.texture) {
