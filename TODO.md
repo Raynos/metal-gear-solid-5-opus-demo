@@ -167,6 +167,44 @@ but its mechanism was wrong. The sun-gated ground bounce is ruled out
 (zeroing `uAmbBounce` moves shaded clast -0.24). Remaining candidates: the
 flat-shaded facet normals, and the chips' albedo / envMapIntensity.
 
+**ROUND 12, MEASURED with a positive control that fires.** The instrument is
+`probes/r12_ab4.js`: long blocks (32 warm + 30 timed), ABBA over 12 pairs,
+constant ballast, and the AO pass as the positive control — it is ~6.45 ms and
+anything that cannot see it cannot see anything. On a quiet machine (load 2.5
+over 12 cores, 0 other chromiums):
+
+| arm | saving | note |
+| --- | --- | --- |
+| null control | 0.16-0.36 ms | the floor; nothing below ~1 ms is real |
+| AO pass off | **+3.80, +4.29 ms** | positive control, twice. Under-reads the 6.45 by ~35%, so everything below is a LOWER bound |
+| ballast -8 blits | +1.96 ms | second control; 8 x 0.34 = 2.7 expected, same under-read |
+| **whole terrain fragment body off** | **+2.67 ms** | uPerf.x. This is the ceiling on terrain shading work |
+| terrain bedrock block gated | +0.25 ms | at the floor |
+| frustum culling off on all instanced clutter | **-0.25 ms** | see below |
+
+Two conclusions, and the second one killed a change I had already made.
+
+**Terrain per-pixel shading is worth 2.7 ms and is the best target left in the
+scene.** That is the whole custom fragment body against a baked-normal flat
+reference, so it is what a complete distance LOD could approach — not what
+tinkering can. The structural move is a SECOND, reduced material for the outer
+clipmap rings with the near-field half compiled out, rather than more uniform
+branches in the one uber-shader; branching does not reduce register allocation
+and this shader's occupancy is paid by every terrain pixel in the frame.
+
+**Vertex/raster is NOT where the money is, and 1 M off-screen triangles cost
+nothing.** Counted at the gameplay pose (`probes/r12_cull.js`), 1.03 M of the
+1.98 M instanced triangles are outside the camera frustum — the clutter rings
+are single world-spanning InstancedMeshes with one bounding sphere each, so
+`bush-n1-2000000` submits 1635 instances at 20.9% frustum occupancy. Tiling
+them so the frustum could reject them took the gameplay pose from 368 draws /
+4.20 M triangles to 587 / 3.79 M. It measured **-0.25 ms against a 0.16 ms null
+control** — i.e. nothing — and turning culling off entirely on all 710 tiled
+meshes also measured nothing. That change is REVERTED: it blew the 350-draw
+budget by 68% and bought nothing. This agrees with the round-12 cascade result
+elsewhere in this file: raster on this GPU is close to free, and the frame is
+bound by per-pixel work.
+
 **Ranked cuts, with expected savings:**
 1. DOF/MB gather at half res — ~2-2.5 ms. **Done**, see below.
 2. Scene shading + geometry — ~2-3 ms available, never optimised because
@@ -331,12 +369,46 @@ lives on. Re-clamp per-term, then add specular AA. Owner: `src/world/Terrain.js`
 Do NOT chase "the specular is broken" — those shaders overwrite `roughnessFactor`
 unconditionally, so setting `material.roughness` from a probe ablates nothing.
 
-### 2.3 Chevron/herringbone on distant mountains — OPEN, lead identified
-`Terrain.js` documents that the Jacobi thermal pass and the cone droplet brush
-both leave a herringbone at the grid cell, and `_smoothFlats` exists to remove
-it — but it is gated to low slope, `w = (1 - smoothstep(0.11, 0.52, slope))`, so
-above ~25° the herringbone is **left in by design**. Mountains are steeper
-than 25°.
+### 2.3 Chevron/herringbone on distant mountains — DIAGNOSED. It is the AO pass.
+**It is not the terrain and the lead this section carried for two rounds was
+wrong.** It is the screen-space occlusion pass, and specifically its BROAD
+radius at range. Owner: `src/render/RenderPipeline.js`, not `Terrain.js`.
+
+Turning `pipe.enabled.ssao` off removes it completely — see
+`shots/hb-ao/shipped.png` against `shots/hb-ao/aoOff.png`, cropped 2x on the
+mountain in the aimed frame. Measured on a vertical luminance profile across the
+massif (`probes/r12_chevao.js`), high-pass RMS over the band:
+
+    shipped                     peak 15.75 px   amp 0.286   hpRms 1.110
+    shipped, measured twice     peak 20.25 px   amp 0.287   hpRms 1.111   <- null
+    AO slice dither unfrozen    peak 15.75 px   amp 0.286   hpRms 1.105
+    broad AO radius x 0.25      peak 41.50 px   amp 0.131   hpRms 0.836
+    AO pass off                 peak 41.50 px   amp 0.145   hpRms 0.810
+
+So the frozen dither is **not** it — unfreezing the slice rotation is
+bit-for-bit inside the null control — and shrinking the broad radius is
+indistinguishable from switching the whole pass off.
+
+The mechanism is visible in the shader. `pixRadius = clamp(uRadius *
+pixPerMetre, 3.0, 52.0)` with `uRadius` = 1.15 m: at a kilometre that projects
+to about one pixel and is clamped UP to three, so the horizon search stops
+measuring occlusion and starts measuring the local slope and the depth buffer's
+quantisation — which is why the pattern follows the contours. The micro term is
+already protected from exactly this (`microFade = smoothstep(1.3, 2.6,
+microPixRaw)` fades it out below 2.6 px); the broad term is not. The fix is
+the same fade on the broad term, not a smaller radius — the near-field radius is
+marked verified, do not retune.
+
+**Six things were ablated and rebuilt before this, and none of them moved it.**
+Recorded so nobody spends the afternoon again: the entire erosion stack
+(thermal + hydraulic + incision + strata + crags + relax + smooth) off;
+`_addCrags` amplitude 0; the `_smoothFlats` slope gate removed entirely — the
+fix this section used to recommend, which does nothing; the strata bench snap
+off; the baked sky occlusion forced to 1; and `uPerf.x`, which bypasses the
+whole 1200-line terrain fragment body. A Lambert hillshade of `far.h` straight
+out of the array (`probes/r12_hillshade.js`, `shots/hs/raw.png`) shows a clean
+mountain with no herringbone in it at all, and neither does the same window
+resampled onto the outer clipmap rings' vertex spacing.
 
 ### 2.4 Dark blotchy stains on open ground — OPEN, new candidate
 `18da009` landed after the defect was filed and added `uSoilD = (0.620, 0.545,
