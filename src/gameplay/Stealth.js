@@ -30,8 +30,25 @@ const DART_SPEED = 62;        // m/s. A tranquilliser dart is slow and it drops.
 const DART_GRAVITY = 9.81;
 const DART_LIFE = 1.6;        // seconds of flight before it is spent
 const FIRE_INTERVAL = 0.42;
-const MAG_SIZE = 6;
-const RELOAD_TIME = 2.1;
+
+/**
+ * The weapon.
+ *
+ * A magazine of 6 reads as a revolver, and it is the number the HUD would have
+ * put on screen. This is a suppressed tranquilliser CARBINE — MGSV's own
+ * starting non-lethal weapon is a rifle — so it carries a rifle magazine and a
+ * reserve, and both are published so the HUD's `ammo / reserve` block has
+ * something to say. The ballistics below are unchanged: it still fires a slow
+ * dart that drops, which is what makes range a decision.
+ */
+const WEAPON = {
+  name: 'AM MRS-4 TRQ',
+  mag: 20,
+  reserve: 100,
+  reloadTime: 2.35,
+  modes: ['SEMI', 'AUTO'],
+  suppressed: true,
+};
 
 const CQC_RANGE = 1.85;
 const CQC_HOLD = 0.25;        // hold longer than this and it is a grab, not a takedown
@@ -42,11 +59,13 @@ const BREATH_DRAIN = 1 / 4.2;   // a full lungful lasts 4.2 s
 const BREATH_RECOVER = 1 / 3.0;
 
 export class StealthActions {
-  constructor({ controller, camera, characters, obstacles, ground, coverPoints, events }) {
+  constructor({ controller, camera, characters, obstacles, ground, coverPoints, events, ai }) {
     this.ctl = controller;
     this.cam = camera;
     this.characters = characters;      // every character, player included
     this.player = controller.ch;
+    /** src/ai, when it is installed. Every verb degrades cleanly without it. */
+    this.ai = ai ?? null;
     this.obstacles = obstacles;
     this.ground = ground;
     this.coverPoints = coverPoints ?? [];
@@ -56,10 +75,18 @@ export class StealthActions {
     this.aimAmount = 0;
     this.breath = 1;
     this.breathLocked = false;
-    this.ammo = MAG_SIZE;
+    this.ammo = WEAPON.mag;
+    this.reserve = WEAPON.reserve;
+    this.magSize = WEAPON.mag;
     this.reloading = 0;
+    /** Seconds the current reload started from — the HUD wants the fraction. */
+    this.reloadTime = WEAPON.reloadTime;
+    this.fireMode = WEAPON.modes[0];
     this._fireCooldown = 0;
     this._cqcHeld = 0;
+    /** Cached trace for the reticle: {dist, character, point} or null. */
+    this.aimHit = null;
+    this._predictT = 0;
 
     /** 'none' | 'takedown' | 'grab' | 'drag' | 'cover' */
     this.action = 'none';
@@ -92,7 +119,7 @@ export class StealthActions {
     this._fireCooldown = Math.max(0, this._fireCooldown - dt);
     if (this.reloading > 0) {
       this.reloading -= dt;
-      if (this.reloading <= 0) this.ammo = MAG_SIZE;
+      if (this.reloading <= 0) this._finishReload();
     }
 
     const cmd = { frozen: false, lockAxis: null, faceYaw: undefined, aiming: false };
@@ -137,11 +164,14 @@ export class StealthActions {
     this.holdingBreath = holding;
 
     // --- weapon -------------------------------------------------------------
-    if (input.pressed('reload') && this.ammo < MAG_SIZE && this.reloading <= 0) {
-      this.reloading = RELOAD_TIME;
-      this.emit({ type: 'reload' });
-    }
-    if (this.isAiming && input.down('fire') && this._fireCooldown <= 0) this.fire();
+    if (input.pressed('reload')) this.reload();
+    if (input.pressed('fireMode')) this.cycleFireMode();
+    // SEMI needs a fresh press per round; AUTO runs off the held key. The old
+    // code only ever read `down`, so the weapon was permanently automatic and
+    // the published fire mode would have been a lie.
+    const trigger = this.fireMode === 'AUTO' ? input.down('fire') : input.pressed('fire');
+    if (this.isAiming && trigger && this._fireCooldown <= 0) this.fire();
+    this._predict(dt);
 
     // --- CQC ----------------------------------------------------------------
     this._updateCqc(dt, input, cmd);
@@ -347,17 +377,43 @@ export class StealthActions {
     this.emit({ type: 'interrogate', target: t });
   }
 
+  /**
+   * Put a man out of the fight.
+   *
+   * THIS USED TO THROW. `Character.downed` is a GETTER — it reports the
+   * animator's own down timer — and the first line of this method assigned to
+   * it. Module code is strict mode, so assigning to a getter-only property is a
+   * TypeError, and it was raised inside `fire()` before the dart's hit had been
+   * announced to anyone: every tranquilliser shot that connected, and every CQC
+   * takedown, threw and aborted mid-way. The whole non-lethal toolkit was dead
+   * and the exception was swallowed by the event bus's try/catch at the call
+   * site above it.
+   *
+   * The right answer was never to write that flag anyway. Two owners have to
+   * agree that a man is down: src/ai owns whether he still patrols and senses,
+   * src/characters owns whether he is lying on the ground. So tell each of them
+   * in its own language and let `ch.downed` report itself.
+   */
   _putDown(t, how) {
-    t.downed = true;
     t.held = false;
-    t.controlled = true;
-    t.tranquillised = how === 'dart';
     t.alerted = false;
-    t.setStance('prone');
-    t.anim.speed = 0;
-    t.anim.aim = 0;
+    t.tranquillised = how === 'dart';
     this._v.set(t.position.x - this.ctl.position.x, 0, t.position.z - this.ctl.position.z);
-    t.takeHit(this._v.lengthSq() > 1e-6 ? this._v.normalize() : new THREE.Vector3(0, 0, 1));
+    const dir = this._v.lengthSq() > 1e-6 ? this._v.normalize() : this._v.set(0, 0, 1);
+
+    // The garrison owns its men: `tranquillise` sets the guard's own `down`,
+    // clears his goal and makes him a body the others can find. It returns null
+    // for anyone the AI does not drive, which is when we do it by hand.
+    const handled = this.ai?.tranquillise ? this.ai.tranquillise(t, how === 'dart' ? 'tranq' : how) : null;
+    if (!handled) {
+      t.controlled = true;
+      t.setStance('prone');
+      t.anim.speed = 0;
+      t.anim.aim = 0;
+    }
+    // Either way the BODY has to play going down; that action is what drives
+    // `Character.downed`, which is what everything else in the game reads.
+    if (!t.playAction('tranq')) t.takeHit(dir);
   }
 
   // ----------------------------------------------------------------- bodies --
@@ -447,9 +503,99 @@ export class StealthActions {
     return outDir;
   }
 
+  /**
+   * The weapon as the HUD wants it. Field names are the ones src/ui/state.js
+   * probes for, so the widget lights up with no adapter work at either end:
+   *   { name, ammo, reserve, mode, suppressed }
+   * plus `reloading` (0..1 progress) and `magSize`, which the adapter ignores
+   * and anything else is free to use.
+   */
+  get weapon() {
+    return {
+      name: WEAPON.name,
+      ammo: this.ammo,
+      reserve: this.reserve,
+      magSize: this.magSize,
+      mode: this.fireMode,
+      suppressed: WEAPON.suppressed,
+      reloading: this.reloading > 0 ? 1 - this.reloading / this.reloadTime : 0,
+    };
+  }
+
+  /** Full magazine, full reserve, nothing mid-reload. Called on mission start. */
+  rearm() {
+    this.ammo = this.magSize;
+    this.reserve = WEAPON.reserve;
+    this.reloading = 0;
+    this._fireCooldown = 0;
+    this.aimHit = null;
+  }
+
+  cycleFireMode() {
+    const i = WEAPON.modes.indexOf(this.fireMode);
+    this.fireMode = WEAPON.modes[(i + 1) % WEAPON.modes.length];
+    this.emit({ type: 'fireMode', mode: this.fireMode });
+    return this.fireMode;
+  }
+
+  /**
+   * Start a reload. Returns false when there is nothing to do, which is the
+   * case the shipped build got wrong twice over: it refused silently when the
+   * magazine was full, and it never told anyone it had started, so pressing R
+   * one second after firing looked identical to pressing nothing at all — the
+   * ammo count does not move until the 2.35 s are up.
+   */
+  reload() {
+    if (this.reloading > 0) return false;
+    if (this.ammo >= this.magSize || this.reserve <= 0) {
+      this.emit({ type: 'reloadRefused', full: this.ammo >= this.magSize });
+      return false;
+    }
+    this.reloading = this.reloadTime;
+    // Cover and CQC are fine mid-reload; aiming is not, and `canAim` already
+    // reads `reloading`, so the weapon comes down on its own.
+    this.emit({ type: 'reload', duration: this.reloadTime });
+    return true;
+  }
+
+  _finishReload() {
+    this.reloading = 0;
+    // A partial magazine keeps its round in the chamber, so a reload at 7/20
+    // with 100 in reserve costs 13 and not 20.
+    const want = Math.min(this.magSize - this.ammo, this.reserve);
+    this.ammo += want;
+    this.reserve -= want;
+    this.emit({ type: 'reloaded', ammo: this.ammo, reserve: this.reserve });
+  }
+
+  /**
+   * Keep `aimHit` current for the reticle: what the dart would hit, and how far
+   * away it is. Throttled to 20 Hz and only while the weapon is up — the trace
+   * integrates 288 steps against every character and there is no reason to pay
+   * for it on a frame where nothing reads it.
+   */
+  _predict(dt) {
+    if (this.aimAmount < 0.05) { this.aimHit = null; return; }
+    this._predictT -= dt;
+    if (this._predictT > 0) return;
+    this._predictT = 0.05;
+    const org = this._ao;
+    const dir = this._ad;
+    this.aimRay(org, dir);
+    const hit = this._trace(org, dir);
+    this.aimHit = hit
+      ? {
+        character: hit.character ?? null,
+        point: hit.point,
+        dist: Math.hypot(hit.point.x - org.x, hit.point.y - org.y, hit.point.z - org.z),
+      }
+      : null;
+  }
+
   fire() {
     if (this.ammo <= 0) {
-      if (this.reloading <= 0) { this.reloading = RELOAD_TIME; this.emit({ type: 'reload' }); }
+      if (this.reloading <= 0 && this.reserve > 0) this.reload();
+      else this.emit({ type: 'dryFire' });
       return null;
     }
     this.ammo--;

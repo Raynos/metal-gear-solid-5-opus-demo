@@ -21,6 +21,15 @@ const MAX_SLOPE = 1.19;      // tan(50 deg) — steeper than this is a cliff, no
 const SLOPE_PROBE = 0.45;    // metres ahead the slope test samples
 const GRAVITY = 18.0;        // deliberately heavy; a floaty drop off a 400 mm kerb reads as a bug
 const LEAN_REACH = 0.34;     // how far out of cover a peek moves the body
+/** Below this the body is treated as stationary for gait and heading purposes. */
+const MOVE_EPS = 1e-4;
+/**
+ * Headings tried either side of the desired one when a step is blocked, in
+ * radians. Coarse at first because most contacts are grazing and resolve in one
+ * try; the last two exist so that walking into an inside corner still creeps
+ * along one of its faces instead of stopping dead.
+ */
+const SLIDE_SWEEP = [0.26, 0.52, 0.79, 1.05, 1.31, 1.48];
 
 /**
  * Per-stance movement envelope.
@@ -55,6 +64,8 @@ export class PlayerController {
     this.footY = ground.heightAt(this.position.x, this.position.z);
     this.fallVel = 0;
     this.grounded = true;
+    /** Vertical speed at the last touchdown, m/s. Consumed by the damage model. */
+    this.landingSpeed = 0;
 
     this.stance = 'stand';
     this.stanceTimer = 0;
@@ -62,13 +73,26 @@ export class PlayerController {
     /** How far the body is currently leaned out of cover, in metres. */
     this.leanOffset = 0;
     this._leanAxis = new THREE.Vector2(1, 0);
+    /**
+     * m/s the body ACTUALLY travelled last frame, not the m/s it wanted to.
+     *
+     * The animator turns this into a stride length, so publishing the intended
+     * velocity is what makes a man walking into a fence run on the spot. See
+     * `_move`.
+     */
     this.speed = 0;
+    /** Intended speed, i.e. |velocity|. Kept for the feel curves only. */
+    this.intendedSpeed = 0;
+    /** True while the last frame's motion was cut short by something solid. */
+    this.blocked = false;
     /** 0..1 loudness right now; the AI module treats this as a hearing radius scale. */
     this.noise = 0;
     this._noisePulse = 0;
     this._lastPhase = 0;
 
     this._n2 = new THREE.Vector2();
+    this._n3 = new THREE.Vector2();
+    this._disp = new THREE.Vector2();
   }
 
   /** Request a stance. Returns false when the body is mid-transition. */
@@ -162,14 +186,26 @@ export class PlayerController {
     this.velocity.z += (dvz - this.velocity.z) * k;
     if (cmd.frozen) this.velocity.set(0, 0, 0);
 
-    this.speed = Math.hypot(this.velocity.x, this.velocity.z);
-    if (this.speed < 0.02) { this.velocity.x = 0; this.velocity.z = 0; this.speed = 0; }
+    this.intendedSpeed = Math.hypot(this.velocity.x, this.velocity.z);
+    if (this.intendedSpeed < 0.02) { this.velocity.x = 0; this.velocity.z = 0; this.intendedSpeed = 0; }
 
-    // --- move, one axis at a time so a wall slides instead of stopping -------
-    if (!cmd.frozen && this.speed > 0) {
-      this._step(this.velocity.x * dt, 0);
-      this._step(0, this.velocity.z * dt);
+    // --- move, sliding along whatever is in the way -------------------------
+    let travelled = 0;
+    if (cmd.frozen || this.intendedSpeed === 0) {
+      // Nothing was asked for, so nothing is stale: last frame's displacement
+      // and contact must not survive into this frame's heading solve.
+      this._disp.set(0, 0);
+      this.blocked = false;
+    } else {
+      travelled = this._move(dt);
     }
+    // THE published speed is the distance actually covered. An animator handed
+    // 1.2 m/s while the root has not moved plays a full walk cycle against a
+    // wall, and that footslide was visible for four and a half seconds in the
+    // shipped build.
+    this.speed = Math.min(this.intendedSpeed, travelled / Math.max(dt, 1e-5));
+    if (this.speed < 0.02) this.speed = 0;
+
     this._lean(dt, cmd);
     this._unstick(dt);
     this._settleY(dt);
@@ -178,7 +214,10 @@ export class PlayerController {
     let want = this.yaw;
     if (cmd.faceYaw !== undefined) want = cmd.faceYaw;
     else if (cmd.aiming) want = cmd.camYaw;
-    else if (this.speed > 0.12) want = Math.atan2(-this.velocity.x, -this.velocity.z);
+    // Face where the body IS going, which after a slide is along the wall and
+    // not into it. Falls back to the intent only when nothing is obstructing.
+    else if (this.speed > 0.12) want = Math.atan2(-this._disp.x, -this._disp.y);
+    else if (this.intendedSpeed > 0.6 && !this.blocked) want = Math.atan2(-this.velocity.x, -this.velocity.z);
     // Slower to swing the further you are leaning into a run: a sprinting body
     // carves, it does not pivot.
     const turnTau = cmd.aiming || cmd.faceYaw !== undefined
@@ -200,9 +239,12 @@ export class PlayerController {
     this._noise(dt, ch);
   }
 
-  /** Try to translate by (dx, dz); leaves position untouched when blocked. */
-  _step(dx, dz) {
-    if (dx === 0 && dz === 0) return;
+  /**
+   * Translate by (dx, dz) if the destination is legal.
+   * @returns {0|1|2} 0 applied, 1 blocked by something solid, 2 blocked by slope
+   */
+  _try(dx, dz) {
+    if (dx === 0 && dz === 0) return 0;
     const p = this.position;
     const nx = p.x + dx;
     const nz = p.z + dz;
@@ -212,35 +254,162 @@ export class PlayerController {
     // Vertical obstruction: anything taller than the step height stops the body.
     const obs = this.obstacles ? this.obstacles.maxIn(nx, nz, env.radius) : -1e9;
     const surface = obs > g + 0.10 ? obs : g;
-    if (surface > this.footY + env.step) {
-      if (dx !== 0) this.velocity.x = 0;
-      else this.velocity.z = 0;
-      return;
-    }
+    if (surface > this.footY + env.step) return 1;
 
     // Slope: sampled at a fixed distance so the test does not get noisier as
     // the step gets shorter.
     const inv = 1 / Math.hypot(dx, dz);
     const px = nx + dx * inv * SLOPE_PROBE;
     const pz = nz + dz * inv * SLOPE_PROBE;
-    const rise = this.ground.heightAt(px, pz) - g;
-    if (rise / SLOPE_PROBE > MAX_SLOPE) {
-      if (dx !== 0) this.velocity.x = 0;
-      else this.velocity.z = 0;
-      return;
-    }
+    if ((this.ground.heightAt(px, pz) - g) / SLOPE_PROBE > MAX_SLOPE) return 2;
 
     p.x = nx;
     p.z = nz;
+    return 0;
+  }
+
+  /**
+   * One frame of translation, RESOLVED AS A SLIDE.
+   *
+   * The old resolution moved on X and then on Z and zeroed whichever component
+   * was blocked. That is not a slide: a wall at 30 degrees to the run direction
+   * blocks both axes in turn — the X step is refused because the destination is
+   * inside the wall, and so is the Z step — and the body welds in place with
+   * the velocity still reading 3.5 m/s. Measured on the shipped build, walking
+   * into the compound fence held position for 4.5 s while `speed` reported up to
+   * 1.21 m/s, and the animator ran a full walk cycle against it.
+   *
+   * The fix is the standard one and the reason it works is geometric: what a
+   * contact removes is the component of motion ALONG THE CONTACT NORMAL, not
+   * the component along a world axis. Project the desired step onto the contact
+   * plane and retry; the same projection is applied to the velocity so the next
+   * frame does not spend itself rebuilding speed into a wall it cannot enter.
+   *
+   * THE NORMAL IS NOT TRUSTED, and that is the part worth reading. The contact
+   * comes from an 8-bit top-down height bake, and `wallNormal` averages a ring
+   * of samples through it: measured against a diagonal perimeter wall it came
+   * back 16 degrees off the true face. Sixteen degrees is nothing for a head-on
+   * contact and it is everything for a grazing one — a step 4 degrees into the
+   * wall reads as 12 degrees away from it, the projection becomes a no-op, and
+   * the body wedges exactly as it did before. So the projection is only the
+   * FIRST candidate; if it does not produce a legal step the resolver sweeps
+   * the desired direction outward in both senses and takes the first heading
+   * that is actually free, each shortened by its own cosine so that pushing at
+   * 80 degrees into a wall crawls and pushing at 10 degrees barely slows. That
+   * costs up to eleven cheap field lookups, and only on a frame that is already
+   * in contact.
+   *
+   * @returns {number} metres actually travelled this frame
+   */
+  _move(dt) {
+    const p = this.position;
+    const x0 = p.x;
+    const z0 = p.z;
+    const dx = this.velocity.x * dt;
+    const dz = this.velocity.z * dt;
+    this.blocked = false;
+
+    const hit = this._try(dx, dz);
+    if (hit) {
+      this.blocked = true;
+      const len = Math.hypot(dx, dz);
+      const ux = dx / len;
+      const uz = dz / len;
+      let ok = false;
+
+      // 1. The contact plane, if the bake can name it.
+      const n = hit === 1
+        ? this._solidNormal(p.x + dx, p.z + dz)
+        : this._slopeNormal(p.x + dx, p.z + dz);
+      if (n) {
+        const into = ux * n.x + uz * n.y;
+        if (into < -1e-3) {
+          ok = this._commit(ux - n.x * into, uz - n.y * into, len);
+        }
+      }
+
+      // 2. Sweep outward from the desired heading until something is free.
+      for (let i = 0; !ok && i < SLIDE_SWEEP.length; i++) {
+        const a = SLIDE_SWEEP[i];
+        const ca = Math.cos(a);
+        const sa = Math.sin(a);
+        ok = this._commit(ux * ca - uz * sa, ux * sa + uz * ca, len * ca)
+          || this._commit(ux * ca + uz * sa, -ux * sa + uz * ca, len * ca);
+      }
+
+      // 3. A genuine pocket — an inside corner, or a doorway too narrow for the
+      // body. Stop wanting to move: a velocity that survives a frame it could
+      // not spend is what turns "pressed against a wall" into "launched the
+      // moment the wall ends".
+      if (!ok) this.velocity.set(0, 0, 0);
+    }
+
+    this._disp.set(p.x - x0, p.z - z0);
+    const d = this._disp.length();
+    if (d < MOVE_EPS) return 0;
+    // Momentum follows the body, not the stick: keep only the component of the
+    // velocity along the direction actually travelled.
+    if (this.blocked) {
+      const t = (this.velocity.x * this._disp.x + this.velocity.z * this._disp.y) / (d * d);
+      this.velocity.x = this._disp.x * t;
+      this.velocity.z = this._disp.y * t;
+    }
+    return d;
+  }
+
+  /** Take a step of `len` metres along the unit vector (ux, uz). */
+  _commit(ux, uz, len) {
+    if (len <= 1e-5) return false;
+    const l = Math.hypot(ux, uz);
+    if (l < 1e-5) return false;
+    return this._try((ux / l) * len, (uz / l) * len) === 0;
+  }
+
+  /**
+   * Outward normal of the solid thing at (x, z), as a 2D unit vector.
+   *
+   * `wallNormal` is the good answer and gives up deliberately when the query
+   * point is buried; the height-field gradient below is the fallback, and it
+   * needs the EMPTY sentinel flattened first or a single -1e9 texel dominates
+   * the difference and points the body at the horizon.
+   */
+  _solidNormal(x, z) {
+    const f = this.obstacles;
+    if (!f?.ok) return null;
+    const n = f.wallNormal(x, z, this.footY + 0.35, this.env.radius * 2.2, this._n2);
+    if (n) return n;
+    const floor = this.footY - 4;
+    const h = (ax, az) => Math.max(floor, f.heightAt(ax, az));
+    const e = 0.32;
+    const gx = h(x + e, z) - h(x - e, z);
+    const gz = h(x, z + e) - h(x, z - e);
+    const len = Math.hypot(gx, gz);
+    if (len < 1e-3) return null;
+    // Downhill on the obstacle field is out of it.
+    return this._n3.set(-gx / len, -gz / len);
+  }
+
+  /** Horizontal part of the terrain normal: the downhill direction. */
+  _slopeNormal(x, z) {
+    const e = 0.5;
+    const gx = this.ground.heightAt(x + e, z) - this.ground.heightAt(x - e, z);
+    const gz = this.ground.heightAt(x, z + e) - this.ground.heightAt(x, z - e);
+    const len = Math.hypot(gx, gz);
+    if (len < 1e-4) return null;
+    return this._n3.set(-gx / len, -gz / len);
   }
 
   /**
    * Peeking out of cover, as a bounded OFFSET rather than a per-frame nudge.
    *
    * The offset is tracked so only the delta is applied, and the delta goes
-   * through `_step` like any other movement — so leaning round a corner stops
+   * through `_try` like any other movement — so leaning round a corner stops
    * at whatever is in the way instead of sliding the body through it, and
    * holding the peek does not walk the player along the wall forever.
+   *
+   * Deliberately NOT counted in `speed`: a peek is a body lean, not a stride,
+   * and 340 mm of it over 140 ms would otherwise read to the animator as a
+   * 2.4 m/s sidestep.
    */
   _lean(dt, cmd) {
     const want = (cmd.lean ?? 0) * LEAN_REACH;
@@ -251,8 +420,8 @@ export class PlayerController {
     const d = (want - this.leanOffset) * (1 - Math.exp(-dt / 0.14));
     const px = this.position.x;
     const pz = this.position.z;
-    this._step(this._leanAxis.x * d, 0);
-    this._step(0, this._leanAxis.y * d);
+    this._try(this._leanAxis.x * d, 0);
+    this._try(0, this._leanAxis.y * d);
     // Bank only the distance actually travelled: a lean into a corner must not
     // build up a debt that snaps the body sideways the moment it clears.
     this.leanOffset += (this.position.x - px) * this._leanAxis.x + (this.position.z - pz) * this._leanAxis.y;
@@ -291,8 +460,14 @@ export class PlayerController {
     } else {
       this.fallVel -= GRAVITY * dt;
       this.footY += this.fallVel * dt;
-      if (this.footY <= surface) { this.footY = surface; this.fallVel = 0; this.grounded = true; }
-      else this.grounded = false;
+      if (this.footY <= surface) {
+        this.footY = surface;
+        // Published for one frame so a fall can cost something. Read and
+        // cleared by whoever owns damage; nothing here depends on it.
+        this.landingSpeed = -this.fallVel;
+        this.fallVel = 0;
+        this.grounded = true;
+      } else this.grounded = false;
     }
     p.y = this.footY;
   }

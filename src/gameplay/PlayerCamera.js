@@ -45,6 +45,23 @@ const PITCH_MIN = -1.02;   // 58 degrees down
 const PITCH_MAX = 0.78;    // 45 degrees up
 const ORBIT = 0.75;        // how much of the pitch the boom follows
 
+/**
+ * The lens is a SPHERE, not a point.
+ *
+ * A point test on the boom passes the moment the camera's origin clears a wall
+ * face, and at that pose the near plane — and about a third of the frustum — is
+ * still on the far side of it. Measured on the shipped build, sweeping the
+ * camera through a full turn at every open cell of the compound: 178 of 3744
+ * poses (4.8%) had the lens inside geometry, the worst 1.12 m deep, and one
+ * aimed pose filled 55% of the frame with the inside of a wall.
+ *
+ * 0.30 m is the frustum's own near-plane half-diagonal at 33 degrees, plus a
+ * margin; SKIN is how far short of the contact the boom then stops.
+ */
+const LENS_R = 0.30;
+const SKIN = 0.06;
+const SWEEP_STEPS = 14;
+
 export class PlayerCamera {
   constructor(camera, { obstacles, ground }) {
     this.camera = camera;
@@ -59,6 +76,8 @@ export class PlayerCamera {
     this.stanceDrop = 0;
     this._kick = 0;
     this._kickVel = 0;
+    /** Fraction of the boom currently in use; 1 is fully extended. */
+    this._boom = 1;
 
     this.follow = new THREE.Vector3();     // smoothed root
     this.lead = new THREE.Vector3();
@@ -74,6 +93,7 @@ export class PlayerCamera {
     this.pitch = 0;
     this.follow.copy(position);
     this.lead.set(0, 0, 0);
+    this._boom = 1;
     this._first = true;
   }
 
@@ -182,22 +202,25 @@ export class PlayerCamera {
     );
 
     // --- collision ----------------------------------------------------------
-    // March the boom from the anchor outward and stop short of anything solid.
-    // The anchor is inside the player's own chest, so it is always a valid
-    // start point even when he is standing in a doorway.
-    let t = 1;
-    if (this.obstacles?.ok) {
-      t = this.obstacles.clearFraction(ax, ay, az, this._want.x, this._want.y, this._want.z, 7, 0.22);
-      t = Math.max(0.14, t);
-    }
+    // Sweep a sphere from the anchor outward and stop short of the first
+    // contact. The anchor is inside the player's own chest, so it is always a
+    // valid start point even when he is standing in a doorway.
+    const t = this._sweep(ax, ay, az, this._want.x, this._want.y, this._want.z);
+    // Asymmetric: pull in on the frame the contact happens (anything else lets
+    // the wall through), ease back out over ~220 ms so clearing a doorpost is
+    // not a snap zoom.
+    this._boom = t < (this._boom ?? 1) ? t : ease(this._boom ?? 1, t, 0.22);
+    const b = this._boom;
     this._pos.set(
-      ax + (this._want.x - ax) * t,
-      ay + (this._want.y - ay) * t,
-      az + (this._want.z - az) * t,
+      ax + (this._want.x - ax) * b,
+      ay + (this._want.y - ay) * b,
+      az + (this._want.z - az) * b,
     );
     // Never below the ground: a camera that dips under a slope behind the
-    // player fills the frame with the inside of the terrain.
-    const gy = this.ground.heightAt(this._pos.x, this._pos.z) + 0.32;
+    // player fills the frame with the inside of the terrain. The lens is a
+    // sphere here too, so the clearance is its radius and not an eyeballed
+    // 320 mm.
+    const gy = this._groundNear(this._pos.x, this._pos.z) + LENS_R;
     if (this._pos.y < gy) this._pos.y = gy;
 
     this.camera.position.copy(this._pos);
@@ -213,6 +236,53 @@ export class PlayerCamera {
       this.camera.fov = this._fov;
       this.camera.updateProjectionMatrix();
     }
+  }
+
+  /** Highest ground under a disc of radius LENS_R — five taps, not one. */
+  _groundNear(x, z) {
+    const g = this.ground;
+    const r = LENS_R;
+    return Math.max(
+      g.heightAt(x, z),
+      g.heightAt(x + r, z), g.heightAt(x - r, z),
+      g.heightAt(x, z + r), g.heightAt(x, z - r),
+    );
+  }
+
+  /**
+   * Fraction of the boom a sphere of radius LENS_R can travel before it touches
+   * something, 0..1.
+   *
+   * Both surfaces are tested: the obstacle bake (walls, containers, the tower
+   * legs) and the terrain itself. The old test looked at obstacles only and
+   * clamped the terrain afterwards, which is why backing into a bank pushed the
+   * lens up through the slope instead of shortening the boom.
+   *
+   * The floor is 2% rather than 0 only so the view direction stays defined; a
+   * body shoved into a corner therefore collapses to a first-person-ish view,
+   * which is what The Phantom Pain does too. Anything higher leaves the lens on
+   * the wrong side of a wall in exactly the cramped places the collision test
+   * exists for.
+   */
+  _sweep(ax, ay, az, bx, by, bz) {
+    const f = this.obstacles;
+    for (let i = 1; i <= SWEEP_STEPS; i++) {
+      const t = i / SWEEP_STEPS;
+      const x = ax + (bx - ax) * t;
+      const y = ay + (by - ay) * t;
+      const z = az + (bz - az) * t;
+      let solid = this._groundNear(x, z);
+      if (f?.ok) {
+        const o = f.maxIn(x, z, LENS_R);
+        if (o > solid) solid = o;
+      }
+      if (solid > y - LENS_R) {
+        // Back off to just before this sample, then by the skin.
+        const len = Math.hypot(bx - ax, by - ay, bz - az) || 1;
+        return Math.max(0.02, (i - 1) / SWEEP_STEPS - SKIN / len);
+      }
+    }
+    return 1;
   }
 
   /**
