@@ -551,7 +551,12 @@ const COVER = {
   // 10 -> -16%, saturating near -26%. 3.4 is the value at which the drainage
   // lines are legible as tone at 300 m without the plain reading as painted.
   gain: 4.2,
-  maxAlpha: 0.62,
+  // Round 8: 0.62 -> 0.80. The cap is what a dense stand is allowed to hide, and
+  // 0.62 means the sand always shows through at least 38% no matter what the
+  // density field says — so the darkest possible mid-field pixel was a 62/38 mix
+  // of stand and pale ground before a photon arrived. The canopy occlusion added
+  // below only bites in proportion to this, so the two numbers move together.
+  maxAlpha: 0.80,
 };
 
 /**
@@ -562,8 +567,19 @@ const COVER = {
  * the blade mean of 0.294 and sandLight's 0.551 — a stand of dry grass seen from
  * 400 m is mostly grass with some soil showing through, so it lands just under
  * the blade and well under the sand.
+ *
+ * ROUND 8 tracks GRASS_COLORS down and warm, holding the SAME ratio to the blade
+ * mean (0.78 before, 0.78 after) so the LOD handover this layer exists to hide
+ * stays hidden. Luminance 0.259 -> 0.200, R/B 2.20 -> 2.86.
+ *
+ * This is the single largest lever this module has on the frame's dynamic range.
+ * The vista printed a black point of 27 and a p0.1 of 58.7 against the real
+ * game's 8.2 and 18.4, and the reason is visible in the frame: there is no
+ * genuinely dark MATERIAL anywhere in it. In mgi-1 and mgi-3 the pan is peppered
+ * with scrub reading 0.126-0.137 linear against ground at 0.25-0.55, and that
+ * stipple IS the dark end of the reference histogram. Ours was a pale wash.
  */
-const COVER_COLOR = new THREE.Vector3(0.330, 0.262, 0.150);
+const COVER_COLOR = new THREE.Vector3(0.252, 0.196, 0.088);
 
 const COVER_VERT = /* glsl */ `
   vec2 cellIdx = uFieldCell + aCell - uRing.y;
@@ -684,6 +700,7 @@ export function createCoverMat(field, uniforms) {
          varying float vCoverA;
          varying vec3 vCoverTint;
          varying vec2 vCoverXZ;
+         float gCanopyAO;
          ${GLSL_NOISE}`,
       )
       .replace(
@@ -708,7 +725,37 @@ export function createCoverMat(field, uniforms) {
          float fine = mC - 0.5;
          diffuseColor.rgb *= vCoverTint * mix(0.86, 1.10, mott) * (1.0 + fine * 0.30);
          diffuseColor.a *= vCoverA * mix(0.30, 1.30, mott) * (1.0 + fine * 0.55);
-         if (diffuseColor.a < 0.004) discard;`,
+         if (diffuseColor.a < 0.004) discard;
+         // ROUND 8 — CANOPY OCCLUSION, and it is the single biggest thing this
+         // module can do for the frame's dynamic range.
+         //
+         // Measured: the vista's darkest 0.1% sits at sRGB 58.6 against MGSV's
+         // 18.4, which is 2.0 of the 3.1 stops we are short. A flat decal lying
+         // on the ground, taking the ground's normal and the ground's light, can
+         // never produce a dark pixel — the darkest it can be is its own albedo
+         // ratio against the sand, and no albedo that survives the LOD handover
+         // to the blades is dark enough. That is why round 7's cover layer read
+         // as a wash: the mechanism was structurally incapable of the result.
+         //
+         // A stand of scrub is a VOLUME. At 300 m a pixel over it is mostly the
+         // shaded gap between tussocks, not their lit tops, and the deeper the
+         // stand the less sky and less sun reaches the floor it is looking at.
+         // In mgi-1 and mgi-3 that is exactly what the mid-ground scrub does:
+         // stands render at 0.126-0.137 linear against ground at 0.25-0.55, a
+         // ratio no albedo difference accounts for. So the stand's own density
+         // drives an occlusion on the LIGHT, not another multiply on the albedo.
+         //
+         // Sky is occluded harder than sun (0.42 vs 0.68 floor) because the sky
+         // is a hemisphere and the canopy blocks most of it, while the sun is one
+         // direction and a low afternoon beam rakes in under the canopy edge.
+         gCanopyAO = mix(1.0, 0.42, mott * vCoverA);`,
+      )
+      .replace(
+        '#include <aomap_fragment>',
+        `#include <aomap_fragment>
+         reflectedLight.indirectDiffuse *= gCanopyAO;
+         reflectedLight.directDiffuse *= mix(1.0, gCanopyAO, 0.62);
+         reflectedLight.indirectSpecular *= gCanopyAO;`,
       );
     mat.userData.shader = shader;
   };
@@ -872,8 +919,20 @@ export function createGrass(field, uniforms) {
  * 1.28), so the tuft stays unambiguously the warmer of the two: warm khaki
  * against pale grey-khaki, which is the relationship reference photography of
  * dry Afghan scrub actually shows.
+ *
+ * ROUND 8. The ratio argument above is still right; the ABSOLUTE it was tied to
+ * moved. Round 8 took the sand palette down (sandMid 0.423 -> 0.406 luminance,
+ * sandDark 0.288 -> 0.233) and, more to the point, measured the real game:
+ *   mgi-9 dry grass, sunlit    rendered lin 0.223 / 0.169 / 0.102  R/B 2.19
+ *   mgi-1 foreground dry grass rendered lin 0.137 / 0.122 / 0.067  R/B 2.04
+ * Those are RENDERED values under a sun that lands MGSV's own bleached sand at
+ * 0.545 — so the albedo behind them is 0.20-0.25, not the 0.29 this pair meant.
+ * Holding the 0.63-of-sand ratio at the new sand level gives a blade mean of
+ * 0.257, which is where these land. R/B goes 2.0 -> 2.5: the reference's scrub
+ * is a distinctly warm khaki against pale ground, and a whole-frame saturation
+ * of 15.4% against 21.7% says every source in the scene was too close to grey.
  */
 export const GRASS_COLORS = {
-  light: new THREE.Vector3(0.520, 0.406, 0.208),
-  dark: new THREE.Vector3(0.286, 0.212, 0.104),
+  light: new THREE.Vector3(0.442, 0.348, 0.150),
+  dark: new THREE.Vector3(0.208, 0.156, 0.062),
 };

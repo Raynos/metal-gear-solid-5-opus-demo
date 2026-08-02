@@ -39,12 +39,22 @@ import { brushParams, deadTreeParams, deadTreeParamsL1, growPlant, scrubParams }
  * it — but it is now a mid-value warm khaki rather than a silhouette, and it is
  * warmer than the sand it stands in (R/B 1.6-1.8 against sand's 1.28) rather
  * than merely darker.
+ *
+ * ROUND 8 leaves the LUMINANCES essentially alone — the round-3 overshoot is a
+ * real trap and these are in the right band — and spends the change on chroma,
+ * R/B 1.6-1.8 -> 2.2-2.6. Measured on the reference, dry Afghan scrub is not a
+ * neutral dark: mgi-1's foreground brush renders at lin 0.137/0.122/0.067 and
+ * mgi-3's at 0.126/0.104/0.034, both R/B ~2.0-3.7 in the RENDERED frame, which
+ * needs more than that in the albedo once a beam at R/B 1.26 has been divided
+ * out. The one exception is `tree`, which drops 12% in luminance: a dead tree in
+ * mgi-3 is a hard dark silhouette against the sky and ours was reading as a
+ * mid-value twig.
  */
 const BRANCH_COLORS = {
-  scrub: [0.262, 0.200, 0.124],
-  bush: [0.248, 0.186, 0.110],
-  brush: [0.330, 0.252, 0.146],
-  tree: [0.268, 0.212, 0.148],
+  scrub: [0.276, 0.198, 0.106],
+  bush: [0.260, 0.184, 0.094],
+  brush: [0.344, 0.250, 0.132],
+  tree: [0.246, 0.186, 0.104],
 };
 
 /**
