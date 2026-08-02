@@ -287,6 +287,40 @@ const HORIZON = [0, 0, 0];
  */
 const DECK_AIRMASS = 0.5;
 
+/**
+ * Linear divisor between the frame and the raymarch buffer: 2 = half res,
+ * 4 = quarter. The depth linearise (`depthRT`) is deliberately NOT scaled by
+ * this — it is a full-res pass measured below noise, and the joint bilateral
+ * upsample in COMPOSITE_FRAG needs full-res depth to have anything to be
+ * bilateral about.
+ *
+ * ROUND 12 MEASURED 4 AND REJECTED IT, and the reason is quality, not the
+ * saving. Multiscale local contrast in a 1500x340 sky box on the vista frame
+ * (probes/contrast.mjs, RMS of L - blur_s(L) as a percentage of box mean):
+ *
+ *   scale px      2      4      8     16     32     64
+ *   half       1.52   1.80   2.88   4.87   7.24   9.26
+ *   quarter    1.33   1.56   2.36   4.12   6.61   8.79
+ *   change      -13%   -13%   -18%   -15%    -9%    -5%
+ *
+ * The null control for that metric is 0.00 at every scale — two half-res builds
+ * of different source give the same six numbers to two decimals — so a 13-18%
+ * loss is enormous by its standards, and it is visible by eye: the small cumulus
+ * lose their turrets and go blocky-edged. TODO 2.10 lists the sky and clouds as
+ * the one thing in this project that beats the reference game.
+ *
+ * What it does NOT do is crawl. Under a moving camera the frame-to-frame change
+ * at quarter res is 5.36 codes against half res's 5.48, i.e. marginally quieter,
+ * because a softer image simply has less to move; the reprojection and the
+ * bilateral upsample both hold up. The cost is entirely spatial definition.
+ *
+ * The saving could not be resolved: 1.44 ms median paired, positive in only 4
+ * reps of 8, against a null control of 2.79 on a machine another author was
+ * running frame-time probes on at the same time. `probes/r12_volres.js` will
+ * re-run it in one page whenever the machine is quiet.
+ */
+const MARCH_DIV = 2;
+
 export class VolumetricPass {
   constructor(world, fields) {
     this.world = world;
@@ -311,6 +345,9 @@ export class VolumetricPass {
     this._hist = 0;
     this._width = 0;
     this._height = 0;
+    /** div -> [volRT, histRT0, histRT1]; see setMarchDiv. */
+    this._marchSets = new Map();
+    this._div = 0;
     this.ownsHaze = false;
 
     /**
@@ -533,8 +570,6 @@ export class VolumetricPass {
     if (w === this._width && h === this._height) return;
     this._width = w;
     this._height = h;
-    const hw = Math.max(2, Math.floor(w / 2));
-    const hh = Math.max(2, Math.floor(h / 2));
 
     const opts = {
       type: THREE.HalfFloatType,
@@ -543,11 +578,52 @@ export class VolumetricPass {
       depthBuffer: false,
       colorSpace: THREE.LinearSRGBColorSpace,
     };
-    for (const rt of [this.depthRT, this.volRT, this.histRT0, this.histRT1]) rt?.dispose();
+    this._rtOpts = opts;
+    this.depthRT?.dispose();
     this.depthRT = new THREE.WebGLRenderTarget(w, h, { ...opts, format: THREE.RedFormat });
-    this.volRT = new THREE.WebGLRenderTarget(hw, hh, opts);
-    this.histRT0 = new THREE.WebGLRenderTarget(hw, hh, opts);
-    this.histRT1 = new THREE.WebGLRenderTarget(hw, hh, opts);
+    for (const set of this._marchSets?.values() ?? []) {
+      for (const rt of set) rt.dispose();
+    }
+    this._marchSets = new Map();
+    this._div = 0;
+    this.setMarchDiv(MARCH_DIV);
+  }
+
+  /**
+   * Point the march at a different resolution, WITHOUT reallocating anything
+   * that already exists.
+   *
+   * This is a measurement hook and it is here because the obvious way to A/B a
+   * render resolution does not work on this machine: reallocating a half-float
+   * target mid-run stalls harder than any effect a resolution change could
+   * have, which is what killed round 12's first attempt at pricing the DOF
+   * gather (r12_frame.js's header). Building two complete sets of march targets
+   * once and swapping the pointers costs three uniform writes and a history
+   * reset, so the two configurations can be rotated inside ONE page against a
+   * null control instead of compared across two builds hours apart.
+   *
+   * Nothing in the shipped game calls this; `MARCH_DIV` is the shipped value
+   * and the second set is only ever allocated if a probe asks for it.
+   */
+  setMarchDiv(div) {
+    if (div === this._div) return;
+    const w = this._width;
+    const h = this._height;
+    if (!w || !h) return;
+    const hw = Math.max(2, Math.floor(w / div));
+    const hh = Math.max(2, Math.floor(h / div));
+    let set = this._marchSets.get(div);
+    if (!set) {
+      set = [
+        new THREE.WebGLRenderTarget(hw, hh, this._rtOpts),
+        new THREE.WebGLRenderTarget(hw, hh, this._rtOpts),
+        new THREE.WebGLRenderTarget(hw, hh, this._rtOpts),
+      ];
+      this._marchSets.set(div, set);
+    }
+    this._div = div;
+    [this.volRT, this.histRT0, this.histRT1] = set;
+    // A history built at another resolution is not reprojectable into this one.
     this._reset = 1;
 
     this.resolveMat.uniforms.uTexel.value.set(1 / hw, 1 / hh);
@@ -1075,7 +1151,12 @@ export class VolumetricPass {
 
   dispose() {
     this.world.scene.remove(this.compositeMesh);
-    for (const rt of [this.depthRT, this.volRT, this.histRT0, this.histRT1]) rt?.dispose();
+    this.depthRT?.dispose();
+    // Every march set, not just the one currently pointed at: a probe may have
+    // allocated a second resolution through setMarchDiv.
+    for (const set of this._marchSets?.values() ?? []) {
+      for (const rt of set) rt.dispose();
+    }
     this.cloudTex.dispose();
     this.weatherTex.dispose();
     this.skyLut.dispose();
