@@ -11,13 +11,38 @@ import * as THREE from 'three';
  * lever the player can pull, which is the whole game. A boolean `canSee()`
  * would delete all of it.
  *
- * Calibration, standing still is the reference (`RATE` is meter units per
- * second, and the meter runs 0..1):
+ * Calibration. Every one of these is measured by `node src/ai/_sim.mjs`, dead
+ * centre in the focus cone, the guard doing nothing but stare (the meter runs
+ * 0..1 and DETECT is 1.0):
  *
- *   10 m, dead centre, standing, sunlit, walking    ~0.9 s to full
- *   30 m, 40 deg off axis, crouched, sunlit, still  ~7 s
- *   30 m, dead centre, prone, in shadow, still      never (below the leak rate)
- *   sprinting doubles the rate at any range
+ *   15 m, standing, open, still          2.0 s      the reference
+ *   15 m, standing, open, walking        1.0 s      movement doubles the rate
+ *   40 m, crouched, in shadow, still    ~26 s       13x the reference
+ *   40 m, prone, in shadow, still        never      out of range entirely
+ *
+ * ROUND 9 — the distance term. `distK` used to be `1 - (d/range)^1.45`, which
+ * is nearly flat across the whole near field: 8 m read 0.95 and 40 m read 0.76,
+ * so closing from 40 m to 8 m bought the player a 24% change in a curve he is
+ * supposed to be playing against. Measured end to end that was 1.82 s at 8 m
+ * against 3.62 s at 40 m — a factor of two across the entire usable range of
+ * the mechanic, which is not a gradient, it is a rounding error.
+ *
+ * Two terms now multiply, because two different things actually fall off:
+ *
+ *   acuity     1 - (d/range)^2.2   how much of a man there is to resolve; goes
+ *                                  hard to zero at the edge of his sight
+ *   attention  26/(26 + d)         what fraction of the arc he is sweeping the
+ *                                  target occupies. A man at 8 m is inside the
+ *                                  glance; a man at 60 m has to be looked FOR.
+ *
+ * Together they give 1.6 s at 8 m and 27.8 s at 70 m: a 17x span instead of 2x.
+ *
+ * The other round-9 fix is that shadow used to be charged TWICE — it cut the
+ * detection rate by 0.34 *and* the sight range by 0.78 — so a crouched man in
+ * shade at 40 m fell off the end of a shortened range and was not merely hard
+ * to see, he was invisible with no gradient at all. Shadow is a rate multiplier
+ * only now. Range is set by stance and by night, which are the two things that
+ * really change how far away a shape is resolvable.
  *
  * Awareness decays once the guard loses the contact, but only after a hold —
  * a man who just saw something does not immediately forget it.
@@ -37,21 +62,33 @@ export const SIGHT = {
   fovDeg: 120,
   /** Inner cone where attention is concentrated. */
   focusDeg: 34,
-  /** Daylight, standing target, calm. Scaled by everything below. */
-  range: 62,
+  /**
+   * Daylight, standing target, calm. Scaled by everything below.
+   *
+   * 62 m was too short once the player's insertion moved to 80-120 m out: he
+   * arrived already inside the only band the mechanic had. A standing man in
+   * open desert is resolvable a long way further than that; what should stop
+   * the guard identifying him is TIME, which is what the two-term `distK`
+   * below now supplies.
+   */
+  range: 76,
   /** Multiplier on range by target stance. */
   stanceRange: { stand: 1.0, crouch: 0.72, prone: 0.42 },
   /** Multiplier on fill rate by target stance. */
-  stanceRate: { stand: 1.0, crouch: 0.5, prone: 0.2 },
+  stanceRate: { stand: 1.0, crouch: 0.55, prone: 0.2 },
+  /** Range at which "attention" has halved — see the two-term distK. */
+  attention: 26,
+  /** How hard acuity collapses at the edge of sight. */
+  acuityExp: 2.2,
   /** An alerted guard is looking for you and looks further. */
   alertRange: 1.3,
   /** Fill rate at the ideal: point blank, centred, sunlit, standing. */
-  gain: 1.15,
+  gain: 1.6,
   /** Meter leak once the contact is lost, and how long before it starts. */
   decay: 0.22,
   hold: 1.6,
-  /** Shadow multiplies the rate by this; open sun by 1. */
-  shadow: 0.34,
+  /** Shadow multiplies the RATE by this; open sun by 1. Range is not touched. */
+  shadow: 0.45,
   /** Night multiplies range and rate by this (guards have torches, not eyes). */
   night: 0.42,
 };
@@ -69,14 +106,36 @@ const _eye = new THREE.Vector3();
 const _to = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 
-/** Guard eye point: head bone if the rig is posed, else a nominal 1.6 m. */
+/** Eye height above the man's own ground, by stance. */
+const EYE_H = { stand: 1.62, crouch: 1.16, prone: 0.42, down: 0.3 };
+
+/**
+ * Guard eye point.
+ *
+ * ROUND 9 — this used to read the head BONE's world position when the rig
+ * existed, falling back to `position.y + 1.6`. Both branches were wrong, and
+ * the first one was catastrophic:
+ *
+ *   - `lod.js` gates the bone-matrix rebuild behind a dirty flag, so a
+ *     character the LOD has parked does not have current bone world matrices
+ *     and `getWorldPosition` returns the ORIGIN. Measured in the real compound:
+ *     8 of 12 guards reported an eye at (0, 1.6, 0). Every line-of-sight test
+ *     those men did was cast from the middle of the map, which means most of
+ *     the garrison's vision was not merely inaccurate, it was unrelated to
+ *     where they were standing.
+ *   - the fallback used `position.y`, which on a Character is 0 — the ground is
+ *     `groundY`. On a compound whose pad sits metres above the valley floor
+ *     that puts the eye underground.
+ *
+ * Analytic, like `targetPoint` beside it: ground + a stance eye height, scaled
+ * by the man's own build. No matrix decompose, no dependence on whether the
+ * animator has run this frame, and it is the same answer at every LOD.
+ */
 export function eyeOf(ch, out = new THREE.Vector3()) {
-  if (ch.rig?.byName?.get('head')) {
-    ch.rig.byName.get('head').getWorldPosition(out);
-    // The bone sits at the base of the skull; the eyes are a little forward.
-    return out;
-  }
-  return out.set(ch.position.x, ch.position.y + 1.6, ch.position.z);
+  const s = ch?.anim?.stance ?? ch?.stance ?? 'stand';
+  const g = ch?.groundY ?? ch?.position?.y ?? 0;
+  const scale = ch?.root?.scale?.y ?? ch?.scale ?? 1;
+  return out.set(ch.position.x, g + (EYE_H[s] ?? EYE_H.stand) * scale, ch.position.z);
 }
 
 /** Target's visible centre — chest for a standing man, much lower prone. */
@@ -116,8 +175,8 @@ export function senseVision(guard, target, ctx, dt) {
   const range = SIGHT.range
     * (SIGHT.stanceRange[stance] ?? 1)
     * (guard.alerted ? SIGHT.alertRange : 1)
-    * nightK
-    * (target.inShadow ? 0.78 : 1);
+    * nightK;
+  out.range = range;
   if (dist > range) return decay(guard, dt);
 
   // Facing is the guard's LOOK direction, not his body yaw: a guard who has
@@ -140,7 +199,10 @@ export function senseVision(guard, target, ctx, dt) {
   // rim. Peripheral vision notices movement; it does not identify a man.
   const focus = THREE.MathUtils.degToRad(SIGHT.focusDeg) * 0.5;
   const angK = ang <= focus ? 1 : 1 - THREE.MathUtils.smoothstep(ang, focus, half) * 0.88;
-  const distK = 1 - Math.pow(THREE.MathUtils.clamp(dist / range, 0, 1), 1.45);
+  // Acuity x attention. See the header: one term for how much of a man is left
+  // to resolve, one for how much of the guard's sweep he occupies.
+  const acuity = 1 - Math.pow(THREE.MathUtils.clamp(dist / range, 0, 1), SIGHT.acuityExp);
+  const distK = acuity * (SIGHT.attention / (SIGHT.attention + dist));
   const speed = target.speed ?? 0;
   const moveK = 0.5 + THREE.MathUtils.clamp(speed / 4.5, 0, 1) * 1.5;
   const stanceK = SIGHT.stanceRate[stance] ?? 1;
@@ -150,6 +212,9 @@ export function senseVision(guard, target, ctx, dt) {
   out.rate = rate;
   guard.awareHold = SIGHT.hold;
   guard.lastSeenAt.copy(_to);
+  // Why this man is suspicious, published for the HUD. Sight outranks a noise
+  // he heard a moment ago: the strongest live channel is the one to show.
+  guard.awareReason = 'sight';
   return rate * dt;
 }
 

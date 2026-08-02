@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { AWARE, eyeOf, targetPoint } from './perception.js';
+import { BALLISTICS, tryChamber, decaySuppression } from './combat.js';
+import { commandThink, fallbackPoint } from './commander.js';
 
 /**
  * One enemy soldier.
@@ -38,6 +40,8 @@ export class Guard {
     this.role = opts.role ?? 'sentry';
     this.home = opts.home ? opts.home.clone() : ch.position.clone();
     this.homeYaw = opts.yaw ?? ch.yaw;
+    /** True when his spawn post cannot see out and `home` is a corrected one. */
+    this.blindPost = false;
     this.route = opts.route ?? null;
     this.routeIndex = opts.routeIndex ?? 0;
     this.routeDir = 1;
@@ -48,8 +52,10 @@ export class Guard {
     this.down = false;
     this.awareness = 0;
     this.awareHold = 0;
+    /** Why he is suspicious: 'sight' | 'sound' | 'body' | 'contact' | null. */
+    this.awareReason = null;
     this.alerted = false;
-    this.vis = { visible: false, rate: 0, dist: Infinity };
+    this.vis = { visible: false, rate: 0, dist: Infinity, range: 0 };
     this.lastSeenAt = new THREE.Vector3();
     this.senseAcc = 0;
 
@@ -83,8 +89,29 @@ export class Guard {
     this.scanFor = 4;
     this.nextState = 'hold';
     this.aimBlend = 0;
+    /** Reused: an aim point allocated per frame per shooter is pure GC churn. */
+    this.aimPoint = new THREE.Vector3();
     this.speedNow = 0;
     this.bodySeen = new Set();
+
+    // --- weapon ------------------------------------------------------------
+    /** Rounds left before a reload, and the reload timer while he is head-down. */
+    this.rounds = BALLISTICS.magazine;
+    this.reloadT = 0;
+    /** 0..1. Incoming fire near him. Cuts his accuracy and pins him in cover. */
+    this.suppression = 0;
+    /** Index of the round inside the current burst — recoil walks the burst off. */
+    this.burstN = 0;
+    this.shotsFired = 0;
+    this.hits = 0;
+
+    // --- commander ----------------------------------------------------------
+    /** Seconds in ALERT before he calls, and how many calls he has made. */
+    this.callT = 0;
+    this.calls = 0;
+    this.inspectT = 12;
+    /** A reserve rifleman waits at his staging point until this goes true. */
+    this.committed = false;
   }
 
   get position() { return this.ch.position; }
@@ -138,6 +165,7 @@ export class Guard {
 
     const squad = ctx.squad;
     this.alerted = squad.level === 'ALERT' || squad.level === 'EVASION';
+    decaySuppression(this, dt);
 
     // Positive ID. The meter is full; tell everyone and start shooting.
     if (this.awareness >= AWARE.DETECT && ctx.target) {
@@ -151,24 +179,42 @@ export class Guard {
       }
     }
 
-    switch (squad.level) {
-      case 'ALERT':
-        if (this.state !== 'combat' && this.state !== 'radio') this.enter('combat', ctx);
-        break;
-      case 'EVASION':
-        if (this.state !== 'search' && this.state !== 'radio') this.enter('search', ctx);
-        break;
-      case 'CAUTION':
-        if (this.state === 'combat' || this.state === 'search') this.enter('return', ctx);
-        break;
-      default:
-        if (this.state === 'combat' || this.state === 'search') this.enter('return', ctx);
-        break;
+    // The commander answers to a different machine: he does not converge and
+    // he does not sweep, because those are the orders he gives other people.
+    // A reserve rifleman is likewise inert until the commander commits him.
+    const special = this.role === 'commander' ? commandThink(this, dt, ctx) : null;
+    if (this.role === 'commander') {
+      if (special && this.state !== special && this.state !== 'radio') this.enter(special, ctx);
+      else if (!special && (this.state === 'fallback' || this.state === 'combat' || this.state === 'search')) {
+        this.enter('return', ctx);
+      }
+    } else if (this.role === 'reserve' && !this.committed) {
+      // He is a checkpoint detail, not a statue: he still sees and hears, and a
+      // positive ID on his own account brings him in without any orders at all.
+      if (this.awareness >= AWARE.DETECT || this.suppression > 0.3) this.committed = true;
+      else if (this.state === 'combat' || this.state === 'search') this.enter('hold', ctx);
+    } else {
+      switch (squad.level) {
+        case 'ALERT':
+          if (this.state !== 'combat' && this.state !== 'radio') this.enter('combat', ctx);
+          break;
+        case 'EVASION':
+          if (this.state !== 'search' && this.state !== 'radio') this.enter('search', ctx);
+          break;
+        case 'CAUTION':
+          if (this.state === 'combat' || this.state === 'search') this.enter('return', ctx);
+          break;
+        default:
+          if (this.state === 'combat' || this.state === 'search') this.enter('return', ctx);
+          break;
+      }
     }
 
     // A personal suspicion, below the squad's threshold: go and look, alone.
+    // The commander sends someone; he does not go himself.
     if (
       this.awareness >= AWARE.SUSPECT
+      && this.role !== 'commander'
       && (this.state === 'hold' || this.state === 'patrol' || this.state === 'converse')
     ) {
       this.enter('investigate', ctx, this.lastSeenAt);
@@ -180,9 +226,11 @@ export class Guard {
       case 'patrol': this.tickPatrol(dt, ctx); break;
       case 'converse': this.tickConverse(dt, ctx); break;
       case 'investigate': this.tickInvestigate(dt, ctx); break;
+      case 'inspect': this.tickInvestigate(dt, ctx); break;
       case 'scan': this.tickScan(dt, ctx); break;
       case 'return': this.tickReturn(dt, ctx); break;
       case 'combat': this.tickCombat(dt, ctx); break;
+      case 'fallback': this.tickFallback(dt, ctx); break;
       case 'search': this.tickSearch(dt, ctx); break;
       case 'radio': this.tickRadio(dt, ctx); break;
       default: this.enter('hold', ctx); break;
@@ -196,8 +244,15 @@ export class Guard {
     this.burst = 0;
     switch (state) {
       case 'investigate':
-        this.setGoal('investigate', point ?? this.lastSeenAt, ctx);
+      case 'inspect':
+        this.setGoal(state, point ?? this.lastSeenAt, ctx);
         this.ch.setStance('stand');
+        break;
+      case 'fallback':
+        // He is walking backwards out of a fight, not into one. The goal is
+        // recomputed in the tick as the squad's picture of the threat moves.
+        this.setGoal('fallback', fallbackPoint(this, ctx), ctx);
+        this.repathT = 2.0;
         break;
       case 'scan':
         this.clearGoal();
@@ -252,6 +307,23 @@ export class Guard {
       this.lookGoal = this.homeYaw + s * arc;
       this.bodyYawGoal = this.homeYaw + s * arc * 0.3;
       this.snapYaw = true;
+      return;
+    }
+
+    // A reserve who answered a call, and whose call is long over, goes back to
+    // being a reserve — otherwise the commander gets exactly one reinforcement
+    // a session no matter how many times the player triggers and loses him.
+    if (this.role === 'reserve' && this.committed && ctx.squad.level === 'CALM'
+      && Math.hypot(this.home.x - this.ch.position.x, this.home.z - this.ch.position.z) < 2.5) {
+      this.committed = false;
+    }
+
+    // A blind post — a man standing inside his own sandbags, see index.js — is
+    // corrected by walking, and only once the game is live, so the screenshot
+    // harness still frames the compound exactly as `characters` laid it out.
+    if (this.blindPost
+      && Math.hypot(this.home.x - this.ch.position.x, this.home.z - this.ch.position.z) > 1.5) {
+      this.enter('return', ctx);
       return;
     }
 
@@ -368,7 +440,9 @@ export class Guard {
   // --- suspicion ----------------------------------------------------------
 
   tickInvestigate(dt, ctx) {
-    this.desiredSpeed = SPEED.investigate;
+    // An inspection is a stroll round his own post; an investigation is a man
+    // going to find out what that noise was.
+    this.desiredSpeed = this.state === 'inspect' ? SPEED.patrol * 0.85 : SPEED.investigate;
     this.lookTimer -= dt;
     if (this.lookTimer <= 0) {
       this.lookGoal = this.ch.yaw + (ctx.rand() * 2 - 1) * 0.9;
@@ -394,7 +468,7 @@ export class Guard {
       this.bodyYawGoal = Math.atan2(-(_tp.x - this.ch.position.x), -(_tp.z - this.ch.position.z));
       this.lookGoal = this.bodyYawGoal;
       this.aimWant = 1;
-      this.aimAt = _tp.clone();
+      this.aimAt = this.aimPoint.copy(_tp);
       const d = Math.hypot(_tp.x - this.ch.position.x, _tp.z - this.ch.position.z);
       if (d > 30) {
         // Too far to shoot usefully: close, re-pathing as the target moves.
@@ -419,6 +493,20 @@ export class Guard {
         this.coverCrouch = true;
       } else {
         this.desiredSpeed = SPEED.alert;
+      }
+      // Reloading or pinned: get down behind whatever he has and stop
+      // advancing. This is the window the player gets to move in, and it only
+      // exists because it is visible — he ducks, so you can see it happen.
+      if (this.reloadT > 0 || this.suppression > 0.55) {
+        this.desiredSpeed = 0;
+        this.coverCrouch = true;
+        // 0.3 while reloading puts the weapon down and stops him firing at all.
+        // Pinned is 0.9, NOT below the 0.85 fire gate: a suppressed man still
+        // shoots, he just shoots badly and less often (see `fire`). Dropping
+        // him under the gate made return fire an off switch — measured, one
+        // burst every half second silenced a rifleman completely, which is not
+        // suppression, it is a stun lock.
+        this.aimWant = this.reloadT > 0 ? 0.3 : 0.9;
       }
       this.fire(dt, ctx, _tp, d);
       return;
@@ -483,17 +571,83 @@ export class Guard {
     return new THREE.Vector3(gx, ctx.grid.heightAt(gx, gz), gz);
   }
 
+  /**
+   * The trigger. Three gates, in this order, and each of them is a gap the
+   * player can move in:
+   *
+   *   aim settle    he has to have the weapon up. Coming out of a run or a
+   *                 reload that costs the better part of a second.
+   *   the magazine  30 rounds and then 3 seconds head-down. With three shooters
+   *                 the reloads interleave into a usable rhythm.
+   *   the burst     2-4 rounds, then 0.75-1.85 s of nothing. Suppression
+   *                 stretches the rest and shortens the burst — a pinned man
+   *                 fires less and hits less.
+   */
   fire(dt, ctx, at, dist) {
     this.fireTimer -= dt;
     if (this.aimBlend < 0.85) return;
     if (this.fireTimer > 0) return;
+    if (!tryChamber(this, ctx.rand)) return;
     if (this.burst > 0) {
       this.burst--;
-      this.fireTimer = 0.11;
-      ctx.onFire(this, at, dist);
+      this.rounds--;
+      this.fireTimer = BALLISTICS.burstGap;
+      ctx.onFire(this, at, dist, this.burstN);
+      this.burstN++;
     } else {
-      this.burst = 2 + Math.floor(ctx.rand() * 3);
-      this.fireTimer = 0.7 + ctx.rand() * 1.4;
+      const sup = THREE.MathUtils.clamp(this.suppression, 0, 1);
+      const span = BALLISTICS.burstMax - BALLISTICS.burstMin;
+      this.burst = BALLISTICS.burstMin + Math.floor(ctx.rand() * (1 + span) * (1 - sup * 0.5));
+      this.burstN = 0;
+      this.fireTimer = (BALLISTICS.restMin + ctx.rand() * (BALLISTICS.restMax - BALLISTICS.restMin))
+        * (1 + sup * 1.6);
+    }
+  }
+
+  /**
+   * The commander under fire. He does not close, he does not sweep: he gets
+   * behind the nearest hard thing on the far side of his post from the shooting
+   * and stays there, firing back only when he actually has a shot. Killing him
+   * is therefore a problem of getting an angle, not of out-shooting him.
+   */
+  tickFallback(dt, ctx) {
+    this.repathT -= dt;
+    const arrived = this.goalDist() < 1.5;
+    if (!this.goal || (this.repathT <= 0 && !arrived)) {
+      this.setGoal('fallback', fallbackPoint(this, ctx), ctx);
+      this.repathT = 2.4;
+    }
+    if (arrived) {
+      this.desiredSpeed = 0;
+      this.coverCrouch = true;
+    } else {
+      this.desiredSpeed = SPEED.alert;
+      this.coverCrouch = false;
+    }
+    this.ch.setStance(this.coverCrouch ? 'crouch' : 'stand');
+
+    const seen = this.vis.visible && ctx.target && !ctx.target.down;
+    if (seen) {
+      targetPoint(ctx.target.ch, _tp);
+      const d = Math.hypot(_tp.x - this.ch.position.x, _tp.z - this.ch.position.z);
+      this.bodyYawGoal = Math.atan2(-(_tp.x - this.ch.position.x), -(_tp.z - this.ch.position.z));
+      this.lookGoal = this.bodyYawGoal;
+      this.aimWant = 1;
+      this.aimAt = this.aimPoint.copy(_tp);
+      // A pistol at a defended post: he shoots inside 34 m and not beyond it.
+      if (arrived && d < 34) this.fire(dt, ctx, _tp, d);
+      return;
+    }
+    this.aimWant = 0.6;
+    this.lookTimer -= dt;
+    if (this.lookTimer <= 0) {
+      // Watching the approach he expects trouble from, not sweeping a circle.
+      const toward = ctx.squad.hasLastKnown ? ctx.squad.lastKnown : null;
+      const base = toward
+        ? Math.atan2(-(toward.x - this.ch.position.x), -(toward.z - this.ch.position.z))
+        : this.homeYaw;
+      this.lookGoal = base + (ctx.rand() * 2 - 1) * 0.9;
+      this.lookTimer = 0.7 + ctx.rand() * 1.3;
     }
   }
 
@@ -519,7 +673,10 @@ export class Guard {
   tickRadio(dt, ctx) {
     this.desiredSpeed = 0;
     this.radioTimer -= dt;
-    if (this.radioTimer <= 0) this.enter(ctx.squad.level === 'ALERT' ? 'combat' : 'return', ctx);
+    if (this.radioTimer > 0) return;
+    const loud = ctx.squad.level === 'ALERT' || ctx.squad.level === 'EVASION';
+    if (this.role === 'commander') this.enter(loud ? 'fallback' : 'return', ctx);
+    else this.enter(ctx.squad.level === 'ALERT' ? 'combat' : 'return', ctx);
   }
 
   // -------------------------------------------------------------- apply ----
