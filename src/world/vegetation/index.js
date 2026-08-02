@@ -2,16 +2,20 @@ import * as THREE from 'three';
 import { VegField } from './VegField.js';
 import { createGrass, GRASS_COLORS } from './Grass.js';
 import { createScrub, createTumbleweed } from './Scrub.js';
+import { createClast } from './Clast.js';
 
 /**
  * vegetation — ground cover for the Afghan highland.
  *
- * Three layers, one shared wind field:
+ * Four layers, one shared wind field:
  *   1. GPU-placed instanced grass in four LOD rings out to ~160 m (widening to
  *      ~630 m when the camera is well above the ground).
  *   2. Procedurally grown thorny scrub, dry brush and dead trees, instanced in
  *      three geometry tiers out to ~900 m.
  *   3. A handful of tumbleweeds actually rolling downwind.
+ *   4. Loose surface CLAST — instanced pebbles in the 0-68 m band. Mineral, not
+ *      vegetable, but it is ground cover by every measure that matters and it
+ *      shares this module's lattice and ground query. See Clast.js.
  *
  * The gust field is what ties it together — grass, scrub and trees all read the
  * same scrolling noise octaves, so a gust crosses the whole landscape as one
@@ -34,9 +38,11 @@ const _sky = new THREE.Color();
 export async function install(world) {
   const { engine, scene, terrain, lighting, registry } = world;
 
-  const field = new VegField(terrain);
-
   const wd = new THREE.Vector2(Math.cos(WIND_AZIMUTH), Math.sin(WIND_AZIMUTH)).normalize();
+
+  // The field needs the wind so its shelter bake can be a DRIFT rather than a
+  // symmetric fringe — see VegField._splatFootprint.
+  const field = new VegField(terrain, wd);
 
   // Shared uniform objects: one write per frame re-tunes every vegetation shader.
   const uniforms = {
@@ -81,6 +87,11 @@ export async function install(world) {
   const grass = createGrass(field, uniforms);
   for (const m of grass.meshes) scene.add(m);
 
+  // Clast binds the same pad texture object grass does, so it can be built here
+  // even though the pad map is not filled until `field.attach` on the first tick.
+  const clast = createClast(field, uniforms);
+  for (const m of clast.meshes) scene.add(m);
+
   const state = { scrub: null, tumble: null, built: false, stats: {} };
 
   /**
@@ -101,6 +112,7 @@ export async function install(world) {
       grassInstances: grass.meshes.reduce((a, m) => a + m.count, 0),
       grassTriangles: grass.meshes.reduce((a, m) => a + (m.geometry.index.count / 3) * m.count, 0),
       grassDraws: grass.meshes.length,
+      ...clast.stats,
       ...scrub.counts,
     };
     console.info('[vegetation]', state.stats);
@@ -123,6 +135,7 @@ export async function install(world) {
       }
       uniforms.uTime.value = e.elapsed;
       grass.update(e.camera);
+      clast.update(e.camera);
       state.tumble?.update(Math.min(dt, 0.05), e.elapsed, e.camera, wd);
 
       if (lighting) {
@@ -138,5 +151,5 @@ export async function install(world) {
     },
   });
 
-  return { field, grass, uniforms, state, get scrub() { return state.scrub; }, get stats() { return state.stats; } };
+  return { field, grass, clast, uniforms, state, get scrub() { return state.scrub; }, get stats() { return state.stats; } };
 }

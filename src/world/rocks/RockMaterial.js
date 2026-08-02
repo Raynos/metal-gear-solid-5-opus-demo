@@ -216,6 +216,46 @@ export function createTalusMaterial() {
   return mat;
 }
 
+/**
+ * ROUND 8 — the shared bedrock albedo, and the one knob for negotiating it.
+ *
+ * The round-9 critique asked the rock and terrain owners to agree a value:
+ * "uRockLight is 0.198 in Terrain.js and 0.534 in RockMaterial.js, so boulders
+ * render 5.6x brighter than the cliffs they fell off". Terrain has since taken
+ * its bedrock further down still — it is 0.175 now, deliberately, because a
+ * weathered Afghan range photographs as its varnished dust-loaded outer
+ * millimetre and not as fresh quarry stone.
+ *
+ * The two numbers are not the same material and should not converge to one
+ * value. Terrain's `uRockLight` is IN-PLACE CLIFF FACE. This module draws loose
+ * bodies that broke off one, tumbled, and are turned over by every flood — the
+ * fresher, paler thing. Terrain already publishes an anchor for exactly that
+ * material and deliberately did NOT take it down with bedrock:
+ *
+ *     Terrain.uGravelClast = 0.318   "loose, dust-coated, freshly turned-over
+ *                                     clasts ... what the near-field ground is
+ *                                     made of"
+ *
+ * That is the number this module should be negotiated against, and against it
+ * 0.534 was 1.68x — a boulder noticeably paler than the gravel bed it lies in,
+ * which is backwards.
+ *
+ * MINERAL is a single scale over the whole mineral colour set so the ratio
+ * between the ramp, the dust film and the lichen is preserved and there is ONE
+ * knob to argue about. At 0.84 the ramp top lands at 0.449 — 1.41x
+ * uGravelClast, 2.6x bedrock. It is deliberately a partial move: this file's
+ * values were calibrated over three rounds by paired-mask measurement against
+ * the exact ground pixels each family covered (see uVarnish below), and taking
+ * them to bedrock parity in one unmeasured step would undo that. uSand and
+ * uVarnish are excluded — the first is the sand reference itself, the second is
+ * a stain whose whole job is to be much darker than what it stains.
+ *
+ * PROPOSAL to the terrain owner: converge on uGravelClast for loose clast and
+ * leave bedrock where it is. If that is agreed, MINERAL goes to 0.72.
+ */
+const MINERAL = 0.84;
+const mineral = (r, g, b) => new THREE.Vector3(r * MINERAL, g * MINERAL, b * MINERAL);
+
 export function createRockMaterial() {
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -277,15 +317,15 @@ export function createRockMaterial() {
   // mix, and with the round-5 varnish on top of it a third of every clast pixel
   // was landing under 0.40 of its own ground — charcoal, not limestone.
   mat.userData.uniforms = {
-    uRockLight: { value: new THREE.Vector3(0.534, 0.440, 0.299) },  // 1.79 buff
-    uRockDark: { value: new THREE.Vector3(0.370, 0.291, 0.192) },   // 1.93 tan
-    uRockDeep: { value: new THREE.Vector3(0.280, 0.208, 0.128) },   // 2.19 stain
-    uRockRed: { value: new THREE.Vector3(0.48, 0.302, 0.198) },     // 2.42 iron
+    uRockLight: { value: mineral(0.534, 0.440, 0.299) },  // 1.79 buff
+    uRockDark: { value: mineral(0.370, 0.291, 0.192) },   // 1.93 tan
+    uRockDeep: { value: mineral(0.280, 0.208, 0.128) },   // 2.19 stain
+    uRockRed: { value: mineral(0.48, 0.302, 0.198) },     // 2.42 iron
     uSand: { value: new THREE.Vector3(...PALETTE.sandLight) },
     // Wind dust is *lighter and warmer* than the sand it came from: the fine
     // fraction is what stays airborne, and fines are pale.
-    uDust: { value: new THREE.Vector3(0.588, 0.487, 0.336) },       // 1.75
-    uLichen: { value: new THREE.Vector3(0.245, 0.228, 0.156) },     // 1.57 khaki
+    uDust: { value: mineral(0.588, 0.487, 0.336) },       // 1.75
+    uLichen: { value: mineral(0.245, 0.228, 0.156) },     // 1.57 khaki
     /**
      * Desert varnish. Round 5: the single term that makes a small clast read as
      * an object rather than a stain on the sand.

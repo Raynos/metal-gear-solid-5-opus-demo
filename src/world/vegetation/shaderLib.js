@@ -136,17 +136,23 @@ float vegDevelopment(vec2 p, float d, float dev, float shelter, float slope) {
   // shoulder term below then put a 0.047 density floor under the entire map.
   float shoulder = max(0.0, 1.0 - abs(dev - 0.42) * 2.8);
   float ok = 1.0 - smoothstep(0.28, 0.62, slope);
-  float out_ = d * (1.0 - yard * 0.985);
+  // ROUND 8: 0.985 -> 0.940. mgi-7 and mgi-9 both have dry tussock growing
+  // inside the wire — around the block wall, between the sandbag courses, up
+  // against the buildings — and ours stopped at the apron because the yard term
+  // was a 66x kill. An occupied FOB is driven on, not weeded; 0.94 is a 17x kill,
+  // which still leaves the hardstand obviously sterile against the wild ground
+  // beside it while letting the stand thin INTO the compound rather than end.
+  float out_ = d * (1.0 - yard * 0.940);
   // Shelter adds rather than scales: the strip against a wall is fertile
   // regardless of what the fertility noise says about the open ground. It is
   // still broken up by a metre-scale noise, though — a continuous unbroken
   // fringe around every object in the compound reads as a decal, not as weeds.
   // (the obvious name for this, 'patch', is a reserved word in GLSL ES.)
   float weedy = smoothstep(0.30, 0.72, vegFbm(p * 0.55 - 19.0, 2));
-  out_ += shelter * 0.52 * ok * weedy;
+  out_ += shelter * 0.70 * ok * weedy;
   // Weeds in the cracks of the hardstand. A perfectly sterile slab is as
   // wrong as a lawn; a graded yard gets a tuft wherever the surface split.
-  out_ += yard * 0.30 * ok * smoothstep(0.58, 0.90, vegFbm(p * 1.15 + 55.0, 2));
+  out_ += yard * 0.44 * ok * smoothstep(0.52, 0.88, vegFbm(p * 1.15 + 55.0, 2));
   out_ += shoulder * 0.62 * ok;
   return out_;
 }
