@@ -1,0 +1,37 @@
+{
+  "systemsRemoved": 2,
+  "meshesHidden": 1,
+  "frameMs": 26.72,
+  "configs": {
+    "full": {
+      "ms": 26.72,
+      "runs": [
+        24.98,
+        26.72,
+        30.58
+      ],
+      "spread": 5.6
+    },
+    "control": {
+      "ms": 28.81,
+      "runs": [
+        28.81,
+        26.16,
+        30.73
+      ],
+      "spread": 4.57
+    },
+    "noVolumetrics": {
+      "ms": 23.96,
+      "runs": [
+        23.36,
+        25.52,
+        23.96
+      ],
+      "spread": 2.16
+    }
+  },
+  "nullControlMs": 2.09,
+  "worstBlockSpreadMs": 5.6,
+  "volumetricsCostMs": 2.76
+}

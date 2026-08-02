@@ -1,0 +1,62 @@
+{
+  "frameMs": 25.93,
+  "gradeReference": {
+    "ca": 0,
+    "grain": 0.036
+  },
+  "lutReference": 1,
+  "configs": {
+    "full": {
+      "ms": 25.93,
+      "runs": [
+        46.18,
+        25.83,
+        25.93
+      ],
+      "spread": 20.35
+    },
+    "control": {
+      "ms": 26.5,
+      "runs": [
+        27.12,
+        26.5,
+        23.5
+      ],
+      "spread": 3.62
+    },
+    "caOn": {
+      "ms": 26.18,
+      "runs": [
+        26.18,
+        22.65,
+        26.54
+      ],
+      "spread": 3.89
+    },
+    "noLUT": {
+      "ms": 25.25,
+      "runs": [
+        23.45,
+        25.25,
+        28.28
+      ],
+      "spread": 4.83
+    },
+    "noGrain": {
+      "ms": 26.03,
+      "runs": [
+        25.41,
+        26.03,
+        26.95
+      ],
+      "spread": 1.54
+    }
+  },
+  "nullControlMs": 0.57,
+  "worstBlockSpreadMs": 20.35,
+  "costMs": {
+    "caOn": "below noise (-0.25, floor 0.57)",
+    "LUT": "0.68 ms",
+    "Grain": "below noise (-0.1, floor 0.57)"
+  }
+}

@@ -2682,11 +2682,24 @@ export class RenderPipeline {
         vec2 dcentre = duv - 0.5;
         float dr2 = dot(dcentre, dcentre);
 
-        vec2 caOff = dcentre * uCA * (0.35 + dr2 * 1.4);
+        // Chromatic aberration costs THREE full-resolution half-float fetches
+        // of the scene where one would do. uCA is a uniform, so this branch is
+        // uniform across the whole draw and the GPU takes one side of it rather
+        // than predicating both. Without the branch, a strength of zero still
+        // did all three fetches at a zero offset -- and the shipping value IS
+        // zero (ArtDirection.js chromaticAberration), so the build was paying
+        // in full, every frame, for an effect that is switched off.
+        // NOTE: no backticks in this comment. It lives inside a JS template
+        // literal and one of them ends the shader.
         vec3 color;
-        color.r = texture2D(tDiffuse, duv + caOff).r;
-        color.g = texture2D(tDiffuse, duv).g;
-        color.b = texture2D(tDiffuse, duv - caOff).b;
+        if (uCA > 0.0) {
+          vec2 caOff = dcentre * uCA * (0.35 + dr2 * 1.4);
+          color.r = texture2D(tDiffuse, duv + caOff).r;
+          color.g = texture2D(tDiffuse, duv).g;
+          color.b = texture2D(tDiffuse, duv - caOff).b;
+        } else {
+          color = texture2D(tDiffuse, duv).rgb;
+        }
 
         float avgLum = exp(texture2D(tAdapt, vec2(0.5)).r);
         float autoScale = mix(1.0, clamp(uKeyValue / max(avgLum, 1e-4), uExposureClamp.x, uExposureClamp.y), uAutoExposure);
@@ -2744,7 +2757,11 @@ export class RenderPipeline {
         // and nothing in the game could ever render darker than that.
         color = max(color, 0.0);
         vec3 disp = linearToSRGB(color);
-        disp = mix(disp, sampleLUT(disp), uLutStrength);
+        // Same reasoning as the CA branch: sampleLUT is two dependent texture
+        // fetches plus a lerp across blue slices, and mix() with a zero weight
+        // still evaluates it. Uniform branch, so it is genuinely skipped.
+        // (No backticks here either -- this is inside a template literal.)
+        if (uLutStrength > 0.0) disp = mix(disp, sampleLUT(disp), uLutStrength);
 
         // Film grain, luminance-weighted (more in the mids, like real stock)
         // and slightly chromatic so it does not read as digital noise. Grain is

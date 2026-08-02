@@ -120,6 +120,31 @@ window.__pinDeterminism = function () {
     lighting.invalidateShadows();
     out.shadows = true;
   }
+
+  // The volumetric pass keeps its OWN temporal history — a half-resolution
+  // reprojected cloud/haze buffer with a reset flag — and nothing above
+  // touches it, because it is an engine SYSTEM rather than a pipeline pass.
+  //
+  // Measured: the same source, same shot, run three times, gave vista mean
+  // R = 145.3, 151.6 and 153.9. Two single-shot runs agreed exactly (153.9),
+  // so the build is deterministic given the same history state; what varied
+  // was how far the haze had converged, which depends on how many frames the
+  // page happened to draw before the shot. That is a 6% swing in the frame's
+  // own mean — larger than most of the effects nine rounds have been trying to
+  // A/B on this exact shot. The ground shot, which is near-field, was stable
+  // to 0.1 over the same runs, which is why this went unnoticed: it only bites
+  // the shots dominated by distance haze, i.e. the establishing frames.
+  //
+  // Forcing the reset makes the shot a function of the source again. The
+  // history then reconverges over settle()'s frames from a known state.
+  // (No backticks anywhere in here: PIN_SRC is a JS template literal.)
+  const volPass = g.world && g.world.registry && g.world.registry.volumetrics
+    ? g.world.registry.volumetrics.pass : null;
+  if (volPass && '_reset' in volPass) {
+    volPass._reset = 1;
+    volPass._lastCamPos = undefined;
+    out.volumetrics = true;
+  }
   return out;
 };
 `;
@@ -457,7 +482,16 @@ async function main() {
         // Pin AFTER the pose is set (invalidateShadows wants the final camera)
         // and before settle, so the frame is a function of the source alone.
         const pinned = window.__pinDeterminism ? window.__pinDeterminism() : null;
-        g.settle(frames);
+        // Resetting the volumetric history is only half the job: it starts the
+        // haze COLD, and 8 frames catch it mid-convergence, which measured
+        // worse than not resetting at all (vista mean R spread 30 against 8.6).
+        // Reset plus enough frames to reconverge from that known state is what
+        // actually helps -- spread 2.9 at 32 frames. Still not zero: the cloud
+        // deck also evolves on its own clock, which settle() does not rewind,
+        // and that clock belongs to src/render/volumetrics. Documented rather
+        // than hidden, because a 2% floor on this shot is still smaller than
+        // most of what gets A/B'd on it, and 6% was not.
+        g.settle(pinned && pinned.volumetrics ? Math.max(frames, 32) : frames);
         return { note: s.note, tod: s.tod, pinned, stats: g.stats() };
       },
       { name, frames: opts.frames },
