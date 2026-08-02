@@ -129,7 +129,25 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function parseArgs(argv) {
-  const o = { shots: [], dir: 'shots', width: 1920, height: 1080, frames: 8, mode: 'shot', probe: null, probeArgs: [] };
+  const o = {
+    shots: [], dir: 'shots', width: 1920, height: 1080, frames: 8,
+    mode: 'shot', probe: null, probeArgs: [],
+    filmFrames: 48, filmEvery: 2, filmSpeed: 1,
+  };
+  if (argv[0] === 'film') {
+    o.mode = 'film';
+    for (let i = 1; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === '--out') o.dir = argv[++i];
+      else if (a === '--width') o.width = +argv[++i];
+      else if (a === '--height') o.height = +argv[++i];
+      else if (a === '--frames') o.filmFrames = +argv[++i];
+      else if (a === '--every') o.filmEvery = +argv[++i];
+      else if (a === '--speed') o.filmSpeed = +argv[++i];
+      else if (!a.startsWith('--')) o.shots.push(a);
+    }
+    return o;
+  }
   if (argv[0] === 'eval') {
     o.mode = 'eval';
     o.probe = argv[1];
@@ -346,6 +364,76 @@ async function main() {
       for (const e of errors.slice(0, 10)) console.error('  ' + e);
     }
     await cleanup(0);
+  }
+
+  if (opts.mode === 'film') {
+    /**
+     * Film a shot with the camera MOVING, one PNG per sampled frame.
+     *
+     * This exists because of the single most expensive lesson in this project:
+     * every defect a human actually complained about — the swirling moire, the
+     * smearing, the cloud loop, the stippled shadow edges — was invisible in the
+     * seven static camera poses nine rounds were optimised against. A still
+     * frame cannot show a temporal artefact, and three of the open defects are
+     * suspected temporal (the shadow cascades refresh on a [1,3,6,12] schedule,
+     * so under a moving camera two thirds of them are stale on any given frame).
+     *
+     * Deliberately NOT pinned per frame. `__pinDeterminism` is run once at the
+     * start so the garrison is in a known pose, and then the sim is left to run:
+     * pinning every frame would reset exactly the temporal state — TAA history,
+     * AO rotation, cascade refresh phase — that this is here to photograph.
+     */
+    const outDir = path.resolve(ROOT, opts.dir);
+    await mkdir(outDir, { recursive: true });
+    const name = opts.shots[0] ?? 'ground';
+    await page.evaluate((n) => {
+      const g = window.__GAME;
+      g.applyShot(n);
+      if (window.__pinDeterminism) window.__pinDeterminism();
+      const eng = g.engine;
+      eng.deterministic = true;
+      eng.stop();
+      // Remember the pose so each step is measured from it rather than
+      // integrating float error over a hundred frames.
+      window.__FILM = { p: eng.camera.position.clone(), q: eng.camera.quaternion.clone(), t: 0 };
+    }, name);
+    const digits = String(opts.filmFrames).length;
+    for (let i = 0; i < opts.filmFrames; i++) {
+      await page.evaluate(
+        ({ every, speed }) => {
+          const g = window.__GAME;
+          const eng = g.engine;
+          const THREE = g.THREE;
+          const f = window.__FILM;
+          // A slow truck plus a slow pan: translation exercises the clipmap
+          // rings and the LOD boundary, rotation exercises TAA reprojection and
+          // the cascade refits. Doing only one of them hides half the defects.
+          for (let k = 0; k < every; k++) {
+            f.t += (1 / 60) * speed;
+            const yaw = Math.sin(f.t * 0.22) * 0.16;
+            const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+            eng.camera.quaternion.copy(q).multiply(f.q);
+            eng.camera.position.copy(f.p);
+            eng.camera.position.x += Math.sin(f.t * 0.35) * 3.2;
+            eng.camera.position.z += (Math.cos(f.t * 0.35) - 1) * 3.2;
+            eng.step(1 / 60);
+            eng.render();
+          }
+        },
+        { every: opts.filmEvery, speed: opts.filmSpeed },
+      );
+      const file = path.join(outDir, `f${String(i).padStart(digits, '0')}.png`);
+      await writeFile(file, await page.screenshot({ type: 'png' }));
+    }
+    console.log(
+      `filmed ${opts.filmFrames} frames of "${name}" ` +
+        `(${opts.filmEvery} sim frames apart) -> ${path.relative(ROOT, outDir)}`,
+    );
+    if (errors.length) {
+      console.error('\npage errors:');
+      for (const e of errors.slice(0, 10)) console.error('  ' + e);
+    }
+    await cleanup(errors.length ? 1 : 0);
   }
 
   const outDir = path.resolve(ROOT, opts.dir);
