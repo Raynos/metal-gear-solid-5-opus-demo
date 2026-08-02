@@ -19,14 +19,23 @@ import { install as installUI } from './ui/index.js';
 import { install as installAudio } from './audio/index.js';
 
 const container = document.getElementById('app');
+// Boot progress. The bar was wired only to boot(), but the terrain simulation
+// runs at module scope BEFORE boot() is ever called — and that is most of the
+// wait. The bar sat at "starting" through the entire 4-12 s it was meant to
+// explain, which is exactly the black screen it replaced, only with a label.
+const B = typeof window !== 'undefined' ? window.__BOOT : null;
+B?.set(0.04, 'starting renderer');
+
 const engine = new Engine(container);
 
 const { width, height } = engine.size;
 engine.pipeline = new RenderPipeline(engine.renderer, width, height, engine.renderer.getPixelRatio());
 
+B?.set(0.08, 'sky');
 const sky = new Sky();
 engine.scene.add(sky.mesh);
 
+B?.set(0.10, 'lighting');
 const lighting = new Lighting(engine, sky);
 engine.addSystem(lighting);
 engine.addSystem({
@@ -37,6 +46,9 @@ engine.addSystem({
 // Terrain.create() consults the generation cache; the plain constructor runs the
 // 11.6 s simulation. The fallback keeps this file working in a tree whose
 // Terrain.js predates the cache, so it can be propagated anywhere safely.
+// The long one: a cached bake is ~1 s, a cold sim is ~12 s. Say which, because
+// "generating terrain" sitting still for twelve seconds looks like a hang.
+B?.set(0.14, 'generating terrain', true);
 const terrain = Terrain.create
   ? await Terrain.create({ size: 4096, segments: 512 })
   : new Terrain({ size: 4096, segments: 512 });
@@ -283,13 +295,12 @@ const MODULES = [
 ];
 
 async function boot() {
-  const B = window.__BOOT;
   // The terrain sim and the module installs are the whole 4-12 s; report each so
   // a slow boot looks like work rather than a hang.
-  B?.set(0.12, 'building world');
+  B?.set(0.42, 'terrain ready', false);
   for (let i = 0; i < MODULES.length; i++) {
     const [name, install] = MODULES[i];
-    B?.set(0.15 + 0.75 * (i / MODULES.length), name);
+    B?.set(0.45 + 0.45 * (i / MODULES.length), name);
     try {
       registry[name] = await install(world);
     } catch (err) {

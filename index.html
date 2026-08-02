@@ -30,6 +30,18 @@
         background: rgba(216,216,208,0.92);
         transition: width 260ms ease;
       }
+      /* The terrain simulation is synchronous and blocks the main thread, so the
+         browser cannot repaint a moving bar during it. A percentage there would
+         be a lie. This sweeps instead: it is a CSS animation, so it keeps running
+         on the compositor while JS is busy, and it says "working" honestly
+         without claiming to know how far along it is. */
+      #boot-bar.busy::after {
+        content: ''; position: absolute; inset: 0;
+        background: linear-gradient(90deg, transparent, rgba(216,216,208,0.55), transparent);
+        animation: bootsweep 1.15s linear infinite;
+      }
+      #boot-bar { position: relative; }
+      @keyframes bootsweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
       #boot-step {
         margin: 12px 0 0; font-size: 10px; letter-spacing: 0.22em;
         color: rgba(216,216,208,0.42); text-transform: uppercase;
@@ -129,9 +141,12 @@
         var bar = el.querySelector('#boot-bar i');
         var step = document.getElementById('boot-step');
         return {
-          set: function (frac, label) {
+          set: function (frac, label, busy) {
             bar.style.width = Math.round(frac * 100) + '%';
             if (label) step.textContent = label;
+            // Sweep during a phase that blocks the main thread; a static bar
+            // through a 12 s stall is the black screen again, with a caption.
+            bar.parentNode.classList.toggle('busy', !!busy);
           },
           fail: function (msg) { step.textContent = 'failed: ' + msg; },
           done: function () {
