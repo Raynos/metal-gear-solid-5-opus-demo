@@ -460,14 +460,51 @@ export function createScrub(field, uniforms, seed = 20260731) {
   const bushDepth = matchingDepthMaterial(uniforms, SWAY.bush, BUSH_LOD);
   bushDepth.side = THREE.DoubleSide;
 
+  // ROUND 11. This tier was the single loudest object in the `ground` frame and
+  // it had been mis-filed. The round-11 brief described "flat plates heaped near
+  // the sandbags" and attributed them to rocks/Scatter.js `rock_chips`; shooting
+  // the same frame with `--hide rock_chips` leaves them untouched, `--hide clast`
+  // leaves them untouched, and `--hide bush` removes them completely. They are
+  // THIS, and they are not stone at all — they are a fan of 1.5 m planks stuck
+  // in the sand in front of the sandbag wall, which is what a bush made of nine
+  // ribbons becomes when you let it grow to nearly 3x.
+  //
+  // Do the arithmetic that nobody did when the tier was authored. A blade is
+  // `width` wide and `maxH` long IN THE GEOMETRY, and `scatterAnnulus` then
+  // applies `scaleRange` AND a further per-axis squash of up to 1.22-1.24. At
+  // the top of the old range that is 0.085 * 2.40 * 1.22 = 0.25 m wide and
+  // 0.66 * 2.40 * 1.24 = 1.96 m long: a quarter-metre plank two metres tall,
+  // straight (two segments cannot curve), double-sided, and shaded off a dome
+  // normal so it holds one flat value across its whole width. Nine of them
+  // radiating from a point is a fan of broken boards, and it is worse in the
+  // near frames than anything the clast field was doing.
+  //
+  // The fix is to make a bush out of twigs rather than out of boards — three
+  // times as many blades, a THIRD of the width, a segment more so the arc is an
+  // arc — and to stop it growing into the dead trees' job. 1.30 caps it at a
+  // ~1.0 m specimen, which is what "low massed clump" was supposed to mean.
+  // Cost: 36 -> 72 triangles an instance on this tier alone.
+  //
+  // Capping the scale is a COVER cost and it has to be paid back, or this is
+  // just deleting clutter. Measured by ID pass (probes/r11_cover.js — flat
+  // emissive magenta, counted per shot; the obvious `--hide` difference cannot
+  // do it, because a stone brought within a stop of the sand stops registering
+  // as changed and the fix reads as a loss), capping alone took the woody
+  // scatter from 0.545% to 0.256% of the outpost frame and 0.464% to 0.228% of
+  // the ground frame — a bit over half. So the cap is paid for with count and a
+  // slightly higher ceiling: 1.30 -> 1.58 and the acceptance 0.60 -> 0.76, which
+  // is 1.5x the footprint per body and 1.25x the bodies. It buys the cover back
+  // out of small specimens rather than out of two-metre boards, which is what
+  // TODO.md 1.6 is asking for: the ground has no 1-10 cm structure, and one
+  // large object is not a substitute for many small ones.
   const bushGeoNear = [0, 1].map((i) => buildTuft({
-    blades: 9, segments: 2, seed: 8810 + i * 57,
-    minH: 0.34, maxH: 0.66, width: 0.085, spread: 0.16, curve: 1.15, dome: 0.7,
+    blades: 12, segments: 3, seed: 8810 + i * 57,
+    minH: 0.34, maxH: 0.66, width: 0.030, spread: 0.15, curve: 1.35, dome: 0.7,
   }));
   const bushNear = scatterAnnulus({
     field, rng, rInner: 0, rOuter: 148, candidates: 19000,
-    accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.60,
-    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.52, 2.40], sink: 0.05,
+    accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.76,
+    variants: bushGeoNear, tilt: 0.55, scaleRange: [0.50, 1.58], sink: 0.05,
   });
   bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMatNear, bushDepth, `bush-n${i}`, 500, 48)));
   counts.bushNear = bushNear.reduce((a, b) => a + b.length, 0);

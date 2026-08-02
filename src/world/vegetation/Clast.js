@@ -106,7 +106,11 @@ function buildClastGeo(subdivide) {
     const v = verts[i];
     // An octahedron is too regular to read as broken stone even before the
     // per-instance jitter, so the base body is already squashed off-axis.
-    const p = [v[0] * 1.0, v[1] * 0.82, v[2] * 0.88];
+    // Round 11: y 0.82 -> 0.86. This squash MULTIPLIES the per-family one in
+    // CLAST_BODY, so a slab was being flattened twice and ended up 0.33 of its
+    // own radius tall. The per-family number is the one that is supposed to say
+    // slab; this one only says "not a sphere".
+    const p = [v[0] * 1.0, v[1] * 0.86, v[2] * 0.88];
     pos[i * 3] = p[0];
     pos[i * 3 + 1] = p[1];
     pos[i * 3 + 2] = p[2];
@@ -140,23 +144,42 @@ function buildClastGeo(subdivide) {
  * reference's 2.8%. Both of those are properties of loose stone in the real
  * frames — a scree of broken limestone is not one colour, it is bleached
  * carbonate next to iron-stained chert next to a dark basalt cobble, and the
- * bleached fraction is what supplies the blown highlights.
+ * bleached fraction is what supplies the blown highlights. Round 11 warmed the
+ * basalt from R/B 1.01 to 1.32 for the same reason it warmed the carbonate: a
+ * neutral albedo lit by nothing but sky is a BLUE object, and at a low sun the
+ * mid band came back as a scatter of small blue wedges. It is still by a
+ * distance the coolest family here — the sand's own albedo is R/B 1.57 — so the
+ * hue spread the round-9 brief asked for survives.
  *
  * `pale` is the brightest albedo in the project and it is a 13% MINORITY. The
  * first build gave it 0.76 and 22% and the ground came back a field of
  * polystyrene chips: in the real frames a pebble is within a stop of the sand it
  * lies on, and all its contrast comes from the facet turned away from the sun
- * and from the shadow it throws — not from its albedo. 0.535 is very nearly
- * LIGHT_TRANSPORT.groundAlbedo, which is what bleached carbonate against quartz
- * sand actually is; the blown highlight comes from the FACET, not the albedo — a
+ * and from the shadow it throws — not from its albedo.
+ *
+ * ROUND 11. It came back anyway, and the reason was HUE, not value. 0.535 was
+ * picked against LIGHT_TRANSPORT.groundAlbedo's *luminance* and its R/B was left
+ * at 1.15 — very nearly neutral — while the sand it lies on renders at R/B 1.43
+ * under a warm sun. A neutral chip in a warm frame does not read as a pale
+ * stone, it reads as a COOL one, and the eye separates by hue long before it
+ * separates by value: the gameplay crop was white-blue plates lying on tan sand.
+ * Measured on shots/before against a --hide clast ablation of the same build,
+ * the clast pixels ran p50 +0.15 and p95 +0.48 stops over the ground median,
+ * which is defensible, and still looked like polystyrene. The number was never
+ * the problem.
+ *
+ * So the pale family is now WARM — R/B 1.39, on the sand's own hue line — and
+ * its luminance is +0.11 stops over LIGHT_TRANSPORT.groundAlbedo rather than
+ * -0.03. It is brighter than it was and it reads darker, because it no longer
+ * detaches. The blown highlight still comes from the FACET, not the albedo: a
  * flat-shaded plane square to a 6-unit sun clears L* 85 at this reflectance
  * while the sand around it, which is never square to anything, does not.
  */
 const LITHO = [
-  new THREE.Vector3(0.535, 0.517, 0.466), // bleached carbonate — R/B 1.15
+  new THREE.Vector3(0.545, 0.478, 0.392), // bleached carbonate — R/B 1.39
   new THREE.Vector3(0.505, 0.418, 0.282), // buff limestone     — R/B 1.79
   new THREE.Vector3(0.442, 0.263, 0.171), // iron-stained chert — R/B 2.58
-  new THREE.Vector3(0.246, 0.238, 0.244), // dark basalt cobble — R/B 1.01
+  new THREE.Vector3(0.252, 0.230, 0.191), // dark basalt cobble — R/B 1.32
   new THREE.Vector3(0.318, 0.302, 0.181), // olive-khaki shale  — R/B 1.76
 ];
 /** Cumulative selection weights for the five families above. */
@@ -278,8 +301,20 @@ const CLAST_BODY = /* glsl */ `
     // thickness was 0.24 in the first build and every one of them read as a
     // sheet of cardboard lying in the sand — a slab still has an edge, and the
     // edge is where its dark face is.
+    //
+    // ROUND 11: 0.40 -> 0.50, and the slab is less elongated with it. 0.24 was
+    // cardboard and 0.40 is still a plate. Do the arithmetic on what a flake
+    // actually SHOWS: the base geometry is squashed in y as well, so a flake
+    // pokes out of the sand by 0.82*0.40*(1-bury) = 3 to 22 per cent of its own
+    // radius while spanning 1.34 of it sideways. That is up to 20:1 between what
+    // you see and what you see it across, and no amount of flat shading puts a
+    // second facet inside a 20:1 sliver — the crease this whole module is built
+    // around was BELOW the sand. What reached the frame was one polygon of one
+    // value with a hard outline, which is the paper cut-out both the round-9 and
+    // the round-11 critique named. A slab still has an edge; it has to be thick
+    // enough that the edge is above the waterline.
     float flake = step(1.0 - uShape.x, vegHash21(cellIdx + 613.1));
-    vec3 axes = vec3(mix(1.0, 1.34, flake), mix(0.72, 0.40, flake), mix(0.86, 1.22, flake));
+    vec3 axes = vec3(mix(1.0, 1.24, flake), mix(0.74, 0.50, flake), mix(0.86, 1.14, flake));
     vec2 asp = 0.74 + 0.52 * vegHash22(cellIdx + 77.7);
     axes.x *= asp.x;
     axes.z *= asp.y;
@@ -292,7 +327,12 @@ const CLAST_BODY = /* glsl */ `
 
     // Lie down, then turn. Flakes lie nearly flat with the ground; lumps take a
     // hard random tilt, because a cobble that has been kicked once is not level.
-    float tilt = mix(0.55, 0.14, flake) * (vegHash21(cellIdx + 205.3) - 0.35);
+    // Round 11: the flake term 0.14 -> 0.26. A slab lying dead level shows the
+    // viewer exactly one face however many it has, and a field of them all lying
+    // level shows one face all pointing the same way — which is why the flakes
+    // caught the sky as a single sheet. A real lag surface is imbricated: the
+    // clasts overlap and lean, and the lean is most of what breaks the sheet up.
+    float tilt = mix(0.72, 0.26, flake) * (vegHash21(cellIdx + 205.3) - 0.42);
     float ta = vegHash21(cellIdx + 331.7) * 6.2831853;
     vec3 axis = normalize(vec3(cos(ta), 0.30, sin(ta)));
     float ct = cos(tilt), st = sin(tilt);
@@ -316,7 +356,18 @@ const CLAST_BODY = /* glsl */ `
     vec3 tz = cross(tx, up);
     p = mat3(tx, up, tz) * p;
 
-    float bury = uShape.z + uShape.w * vegHash21(cellIdx + 88.1);
+    // Angular size of the body, in radians of its own radius. Two things hang
+    // off it, and both are the same argument: a body covering three pixels
+    // cannot show a facet, a crease or a contact shadow, so anything it does
+    // with structure it does as aliasing.
+    float fine = 1.0 - smoothstep(0.0016, 0.0058, size / max(dist, 0.5));
+    // The first: sink the runts. Flat shading gives a small body a hard two-value
+    // split across three pixels — a warm facet against a sky-blue one — and at
+    // that size the split is confetti, not structure. Burying it further leaves
+    // only the cap, which is one value, which is the honest LOD for a thing the
+    // size of a pixel: be a mark on the ground rather than a badly sampled
+    // solid. Costs almost no cover, because the silhouette lost is sub-pixel.
+    float bury = min(0.94, uShape.z + uShape.w * vegHash21(cellIdx + 88.1) + fine * 0.28);
     // The terrain clipmap coarsens with range, so its drawn surface drifts from
     // the fine heightfield this samples. Sinking a little further with distance
     // is the safe direction of that error: a stone that sinks is a smaller
@@ -325,13 +376,35 @@ const CLAST_BODY = /* glsl */ `
     gClastP = vec3(wxz.x, gh - sink, wxz.y) + p;
     gClastN = normalize(p + vec3(0.0, 1e-4, 0.0));
 
+    // ---- the waterline ----
+    // How far up its OWN emergent height this vertex is: 0 where the body meets
+    // the sand, 1 at its highest point. Round 9 divided by the raw radius, and
+    // that is why the waterline was not doing its job. The radius is measured
+    // before the axis squash and before burial, so a flake with axes.y 0.40
+    // buried 0.7 pokes out by 0.06 of it and spent its entire visible height
+    // inside the first 7% of a ramp that ran to 0.30 — every pixel of that body
+    // got the same occlusion, and a solid carrying one value across its whole
+    // silhouette is a paper cut-out whatever that value is. Normalising by what
+    // the body actually shows makes the ramp the same fraction of every stone,
+    // flake or cobble, near or far.
+    float emerge = max(size * axes.y * (1.0 - bury), 1e-4);
+    float above = clamp((gClastP.y - gh) / emerge, -1.0, 2.0);
     // ---- lithology ----
     // Lithology, biased AWAY from the bleached family with size. A 40 cm block
     // has been sitting there long enough to grow desert varnish; a 4 cm chip is
     // freshly broken and shows clean carbonate. Without the bias the pale family
     // lands on the largest bodies in the frame as often as the smallest, and a
     // 40 cm white slab at four metres is the single loudest object in the shot.
-    float lith = mix(vegHash21(cellIdx + 157.1), 0.42 + 0.58 * vegHash21(cellIdx + 157.1), r2.y);
+    //
+    // ROUND 11 adds a SECOND bias, on a different axis: angular size, computed above. The world bias puts the bleached family on the SMALL
+    // bodies, which is right geologically and wrong for the frame — the only
+    // thing a three-pixel body can contribute is its albedo, and an albedo-only
+    // pale mark on sand is exactly the painted pebble this module exists to
+    // replace. The near crops were full of them. So the runts and the far rings
+    // are pushed off the bleached family and further into the fines, and the
+    // bleached family is left where it can pay for itself.
+    float lh = vegHash21(cellIdx + 157.1);
+    float lith = mix(lh, 0.42 + 0.58 * lh, max(r2.y, fine));
     vec3 alb = uLitho[4];
     if (lith < uLithoCdf.x) alb = uLitho[0];
     else if (lith < uLithoCdf.y) alb = uLitho[1];
@@ -341,14 +414,36 @@ const CLAST_BODY = /* glsl */ `
     // mix toward the fines, not a multiply: a dusty stone loses saturation as
     // well as contrast, and a stone half-buried in a drift is dustier than one
     // sitting proud on swept pavement.
-    alb *= 0.78 + 0.44 * vegHash21(cellIdx + 233.9);
-    float dusty = clamp(0.17 + pad.b * 0.30 + bury * 0.22 + vegHash21(cellIdx + 401.3) * 0.22, 0.0, 0.66);
+    // 0.78 + 0.44h let any family come out 22% brighter than its authored value,
+    // and on the pale family that is what actually reached the frame. 0.80+0.32h
+    // keeps the per-body variation that stops a lithology reading as one paint
+    // chip and takes the top off the range.
+    alb *= 0.80 + 0.32 * vegHash21(cellIdx + 233.9);
+    // Fines pile against a stone, and they pile against the BOTTOM of it. The
+    // waterline term is the drift: at the sand line the body is half silt and a
+    // third of the way up it is stone again. That is what softens the outline
+    // where it meets the ground — an edge that changes colour along its length
+    // is an object sitting IN something, an edge that does not is a shape cut
+    // out and laid on top.
+    float dusty = clamp(0.17 + pad.b * 0.30 + bury * 0.22 + vegHash21(cellIdx + 401.3) * 0.22
+                        + (1.0 - smoothstep(0.0, 0.45, above)) * 0.34
+                        + fine * 0.26, 0.0, 0.82);
     vClastCol = mix(alb, uClastDust, dusty);
 
     // Below the waterline the stone is in its own contact shadow and wearing the
-    // fines that piled against it.
-    float above = (gClastP.y - gh) / max(size, 1e-3);
-    vClastAO = mix(0.62, 1.0, smoothstep(-0.55, 0.30, above));
+    // fines that piled against it. Round 11 hung this on the emergent fraction
+    // and pushed the floor 0.62 -> 0.50: the old ramp darkened the base of a
+    // stone by 11%, which is nothing, and a stone whose base is not darker than
+    // its top has no contact with the ground at all. This is the one seating cue
+    // that does not depend on the shadow map, so it is the only one rings D and
+    // E have.
+    //
+    // The floor is 0.50 over a SHORT ramp. 0.34 over a long one was tried first
+    // and it stacks with a facet that is already turned away from the sun: the
+    // near bodies came back with a jet-black wedge down one side, which trades a
+    // paper cut-out for a hole in the ground. Occlusion belongs AT the contact,
+    // not across the lower half of the body.
+    vClastAO = mix(0.50, 1.0, smoothstep(0.0, 0.36, above));
 
     // Roughness by BODY, not one value for the whole class. 60-70% of this world
     // renders as a single flat dielectric at roughness 0.87-0.99; a desert lag
@@ -361,7 +456,16 @@ const CLAST_BODY = /* glsl */ `
     // of them came back as a bright hard-edged triangle. That is the same
     // confetti the grass was pulled up for in rounds 2 and 3, arriving through
     // the specular lobe instead of through albedo or translucency.
-    vClastRough = mix(0.55, 0.94, vegHash21(cellIdx + 509.7)) * mix(1.0, 1.10, dusty);
+    //
+    // Round 11: 0.55 -> 0.74. The same argument holds in DAYLIGHT and nobody had
+    // looked. A flake lying flat at 0.55 against a sky-dominated environment
+    // returns a broad specular lobe across its whole top facet, on top of an
+    // albedo already at the top of the ground's range — the afternoon gameplay
+    // crop was full of small plates reading a full stop brighter than the sand
+    // at a sun angle where a diffuse horizontal face should read DARKER than it.
+    // The sand around them is authored at 0.87-0.99; a wind-polished clast may
+    // sit below that, but it does not sit two thirds of the way to a mirror.
+    vClastRough = mix(0.74, 0.97, vegHash21(cellIdx + 509.7)) * mix(1.0, 1.06, dusty);
   }
 `;
 
@@ -474,7 +578,12 @@ function makeRing(shared, opts) {
     flatShading: true,
     // A stone lying on open pavement sees very nearly the whole sky; what it
     // does not see is under it, and that is what vClastAO is for.
-    envMapIntensity: 0.97,
+    // Round 11: 0.97 -> 0.70, which is what src/world/Terrain.js gives the ground
+    // this stone is lying on. A pebble in a lag surface sees LESS sky than the
+    // open ground next to it — its neighbours are in the way — so 35% more was
+    // the wrong sign as well as the wrong size, and at a low sun, where the sky
+    // is most of the irradiance, it is what tipped the flat facets cool.
+    envMapIntensity: 0.70,
     dithering: true,
   });
   mat.userData.uniforms = local;
@@ -513,14 +622,14 @@ const RINGS = [
   {
     name: 'clast-a', cellSize: 0.24, grid: 44, subdivide: true, casts: true,
     innerStart: -1, innerEnd: 0, outerStart: 3.4, outerEnd: 4.6,
-    sizeMin: 0.020, sizeMax: 0.140, densityGain: 1.22, sinkPerMetre: 0.0008,
-    flake: 0.26, jitter: 0.30, buryMin: 0.34, buryRange: 0.52,
+    sizeMin: 0.020, sizeMax: 0.115, densityGain: 1.30, sinkPerMetre: 0.0008,
+    flake: 0.24, jitter: 0.40, buryMin: 0.36, buryRange: 0.40,
   },
   {
     name: 'clast-b', cellSize: 0.32, grid: 78, subdivide: false, casts: true,
     innerStart: 3.9, innerEnd: 5.0, outerStart: 9.0, outerEnd: 11.5,
-    sizeMin: 0.026, sizeMax: 0.170, densityGain: 1.16, sinkPerMetre: 0.0010,
-    flake: 0.28, jitter: 0.30, buryMin: 0.34, buryRange: 0.50,
+    sizeMin: 0.026, sizeMax: 0.140, densityGain: 1.24, sinkPerMetre: 0.0010,
+    flake: 0.25, jitter: 0.40, buryMin: 0.36, buryRange: 0.40,
   },
   // Casts as well. Cascade 0 reaches ~26 m, so the outer edge of this ring gets
   // nothing from the depth pass — but the body of it is the band the outpost and
@@ -529,14 +638,14 @@ const RINGS = [
   {
     name: 'clast-c', cellSize: 0.55, grid: 100, subdivide: false, casts: true,
     innerStart: 10.0, innerEnd: 12.5, outerStart: 21.0, outerEnd: 26.0,
-    sizeMin: 0.045, sizeMax: 0.245, densityGain: 0.96, sinkPerMetre: 0.0016,
-    flake: 0.30, jitter: 0.28, buryMin: 0.36, buryRange: 0.48,
+    sizeMin: 0.045, sizeMax: 0.205, densityGain: 1.02, sinkPerMetre: 0.0016,
+    flake: 0.26, jitter: 0.38, buryMin: 0.38, buryRange: 0.38,
   },
   {
     name: 'clast-d', cellSize: 1.35, grid: 96, subdivide: false, casts: false,
     innerStart: 23.0, innerEnd: 28.0, outerStart: 50.0, outerEnd: 62.0,
-    sizeMin: 0.090, sizeMax: 0.420, densityGain: 0.80, sinkPerMetre: 0.0022,
-    flake: 0.32, jitter: 0.26, buryMin: 0.38, buryRange: 0.44,
+    sizeMin: 0.085, sizeMax: 0.265, densityGain: 0.92, sinkPerMetre: 0.0022,
+    flake: 0.27, jitter: 0.36, buryMin: 0.40, buryRange: 0.34,
   },
   // The elevated cameras — outpost and vista — never see the first four rings at
   // all: their whole visible yard is 35-110 m out. A fifth ring at 3.4 m spacing
@@ -545,8 +654,8 @@ const RINGS = [
   {
     name: 'clast-e', cellSize: 2.60, grid: 92, subdivide: false, casts: false,
     innerStart: 56.0, innerEnd: 66.0, outerStart: 96.0, outerEnd: 116.0,
-    sizeMin: 0.160, sizeMax: 0.620, densityGain: 0.70, sinkPerMetre: 0.0026,
-    flake: 0.34, jitter: 0.24, buryMin: 0.40, buryRange: 0.42,
+    sizeMin: 0.145, sizeMax: 0.345, densityGain: 0.84, sinkPerMetre: 0.0026,
+    flake: 0.28, jitter: 0.34, buryMin: 0.42, buryRange: 0.32,
   },
 ];
 
