@@ -51,10 +51,74 @@ const MAX_MARKS = 6;
 /** Metres of the meter climbing per second above which a contact is "closing". */
 const URGENT_RATE = 0.35;
 
+/** Two markers closer than this on the ring collide; the later one steps out. */
+const LANE_ARC = THREE.MathUtils.degToRad(17);
+/** Pixels each collision lane adds to the ring radius. */
+const LANE_STEP = 40;
+
+/** Cones past this many are noise; the most aware guards keep theirs. */
+const MAP_CONES = 4;
+
 /** Directional damage wedges recycled from a pool; four is more than enough. */
 const WEDGES = 4;
 
 const CARDINALS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+/** Minimap: half-extent in metres, and the viewBox half-extent it maps onto. */
+const MAP_M = 130;
+const MAP_R = 84;
+/** Metres between range rings. */
+const MAP_RING_M = 50;
+/** Blips are clamped inside this radius, then drawn hollow. */
+const MAP_EDGE = 76;
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** SVG element factory. `el()` from dom.js makes HTML elements, which do not
+ *  render inside an <svg> — an html <circle> is an unknown inline element. */
+function svg(tag, props) {
+  const node = document.createElementNS(SVG_NS, tag);
+  if (props) for (const k in props) if (props[k] != null) node.setAttribute(k, props[k]);
+  return node;
+}
+
+/**
+ * A unit vision wedge: apex at the origin, opening upward (-Y), full angle
+ * `fovDeg`, radius 1. Scaled to the guard's own sight range at draw time, so
+ * one path serves every guard at every range.
+ */
+function conePath(fovDeg) {
+  const h = THREE.MathUtils.degToRad(fovDeg) * 0.5;
+  const x = Math.sin(h).toFixed(4);
+  const y = (-Math.cos(h)).toFixed(4);
+  return `M0,0 L${-x},${y} A1,1 0 0,1 ${x},${y} Z`;
+}
+
+/**
+ * Convex hull (Andrew's monotone chain) of `pts`, an array of [x, z].
+ *
+ * This is how the outpost footprint is found. `src/world/outpost` publishes no
+ * perimeter polygon in world coordinates — only `isInside(x, z)`, a
+ * point-in-polygon test against a 13-sided local perimeter — so the footprint
+ * is recovered by sampling that test on a grid ONCE and hulling the hits. The
+ * true perimeter is very slightly concave in places and the hull spans those,
+ * which is the right error for a map outline to make: it never claims cover
+ * that is not there.
+ */
+function hull(pts) {
+  if (pts.length < 3) return pts;
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const build = (src) => {
+    const out = [];
+    for (const q of src) {
+      while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], q) <= 0) out.pop();
+      out.push(q);
+    }
+    out.pop();
+    return out;
+  };
+  return build(p).concat(build(p.reverse()));
+}
 
 /** Bearing of a horizontal vector, radians, 0 = -Z (north), +clockwise. */
 function bearing(dx, dz) {
@@ -101,6 +165,13 @@ export class Hud {
     this._healT = 0;        // seconds of uninterrupted recovery
     this._wedgeI = 0;
     this._wedges = [];
+    this._vitN = -1;        // segments currently built
+    this._vitHot = 0;       // seconds the vitals block stays up after recovery
+
+    // Map state. The footprint is sampled once; the pools are reused.
+    this._foot = null;
+    this._mCone = [];
+    this._mBlip = [];
 
     this.el = this._build();
     /** Set by index.js: the frame and the scrim live on the root, not in here. */
@@ -160,6 +231,14 @@ export class Hud {
       ]),
     ]);
 
+    // --- vitals -----------------------------------------------------------
+    this.vSeg = el('div.vsg');
+    this.vWait = el('div.vwt');
+    this.vit = el('div.vit', { 'data-wt': '0' }, [el('b', { text: 'VIT' }), this.vSeg, this.vWait]);
+
+    // --- minimap ----------------------------------------------------------
+    this.map = this._buildMap();
+
     // --- damage -----------------------------------------------------------
     this.dmg = el('div.dmg');
     this.hit = el('div.hit');
@@ -170,7 +249,41 @@ export class Hud {
       this.dir.appendChild(w);
     }
 
-    return el('section.hud', null, [this.cmp, this.alr, this.ring, this.obj, this.wpn, this.dmg, this.dir, this.hit]);
+    return el('section.hud', null, [this.cmp, this.alr, this.ring, this.map, this.vit, this.obj, this.wpn, this.dmg, this.dir, this.hit]);
+  }
+
+  /**
+   * The map. Two coordinate systems, and keeping them apart is what makes the
+   * per-frame cost one attribute write:
+   *
+   *   WORLD GROUP  the footprint and the vision cones live here in raw world
+   *                metres. The whole group carries a single transform —
+   *                `rotate(-heading) scale(k) translate(-player)` — so panning
+   *                and turning the map is one string, not N.
+   *   SCREEN       blips, the objective, the player and the N tick. These must
+   *                keep a constant size at any zoom, so they are positioned in
+   *                JS from the bearing and range the HUD already computed for
+   *                the detection ring.
+   */
+  _buildMap() {
+    const s = svg('svg', { class: 'mms', viewBox: `${-MAP_R} ${-MAP_R} ${MAP_R * 2} ${MAP_R * 2}` });
+
+    this.mWorld = svg('g');
+    this.mFoot = svg('polygon', { class: 'mmf' });
+    this.mCones = svg('g');
+    this.mWorld.append(this.mFoot, this.mCones);
+
+    this.mRing = svg('circle', { class: 'mmr', cx: 0, cy: 0, r: (MAP_RING_M * MAP_R) / MAP_M });
+    this.mBlips = svg('g');
+    this.mObj = svg('path', { class: 'mmo', d: 'M0,-4 L4,0 L0,4 L-4,0 Z', style: 'display:none' });
+    // The player is always at the centre facing up — that is what heading-up
+    // means — so this never moves and never rotates.
+    this.mYou = svg('path', { class: 'mmy', d: 'M0,-5.5 L4,4.5 L0,2 L-4,4.5 Z' });
+    this.mN = svg('text', { class: 'mmn', x: 0, y: 0, text: 'N' });
+    this.mN.textContent = 'N';
+
+    s.append(this.mWorld, this.mRing, this.mBlips, this.mObj, this.mYou, this.mN);
+    return el('div.mmp', null, [s, el('b.mmsc', { text: `${MAP_RING_M}M` })]);
   }
 
   /** Called by index.js when the AI (or the stand-in) reports a new phase. */
@@ -226,6 +339,7 @@ export class Hud {
     // --- detection --------------------------------------------------------
     const sensors = this.src.sensors(this._sensors);
     const live = this._syncMarkers(sensors, p, heading);
+    this._syncMap(sensors, p, heading, current);
 
     const hot = this.alert !== 'calm' || live > 0;
     css(this.cmp, '--cmp-o', hot ? '0.9' : '0.3');
@@ -238,6 +352,159 @@ export class Hud {
 
     // --- damage ------------------------------------------------------------
     this._syncHealth(this.src.health(), step);
+    this._syncVitals(this.src.vitals(), step);
+  }
+
+  // ------------------------------------------------------------ vitals --
+
+  /**
+   * The comb. One segment per rifle round you can still take.
+   *
+   * Absent at full health on purpose — see the note in style.js. The two states
+   * that are NOT just "less health" each get their own mark, because each one
+   * implies a different decision: `regen` (the sweep) means staying out of
+   * sight is now paying off, and `untilRegen` (the depleting hairline) is how
+   * much longer you have to keep it up before it starts.
+   */
+  _syncVitals(v, step) {
+    if (!v) {
+      css(this.vit, '--vit-o', '0');
+      return;
+    }
+    if (v.segments !== this._vitN && v.segments > 0 && v.segments <= 24) {
+      this._vitN = v.segments;
+      this.vSeg.replaceChildren(...Array.from({ length: v.segments }, () => el('s')));
+    }
+    const lit = v.health * this._vitN;
+    const seg = this.vSeg.children;
+    for (let i = 0; i < seg.length; i++) {
+      css(seg[i], '--f', Math.max(0, Math.min(1, lit - i)).toFixed(2));
+    }
+
+    const hurt = v.health < 0.999;
+    if (hurt) this._vitHot = 5;
+    else this._vitHot = Math.max(0, this._vitHot - step);
+    css(this.vit, '--vit-o', hurt ? '1' : this._vitHot > 0 ? '0.5' : '0');
+
+    attr(this.vit, 'data-rg', v.regen ? '1' : null);
+    const wait = v.untilRegen;
+    const waiting = hurt && wait != null && wait > 0.05;
+    attr(this.vit, 'data-wt', waiting ? '1' : '0');
+    if (waiting) css(this.vWait, '--w', `${Math.min(100, (wait / (v.regenDelay || 4)) * 100).toFixed(0)}%`);
+  }
+
+  // --------------------------------------------------------------- map --
+
+  /**
+   * Recover the outpost outline once. `src/world/outpost` publishes no world
+   * -space perimeter, only `isInside(x, z)`, so it is sampled on a grid and
+   * hulled. ~1.7 k point-in-polygon tests, one time, at the first tick in play.
+   */
+  _footprint() {
+    if (this._foot) return this._foot;
+    const o = this.src.outpost();
+    if (!o) return null;
+    const { minX, minZ, maxX, maxZ } = o.bounds;
+    let pts = [];
+    if (o.isInside) {
+      const N = 40;
+      for (let i = 0; i <= N; i++) {
+        const x = minX + ((maxX - minX) * i) / N;
+        for (let j = 0; j <= N; j++) {
+          const z = minZ + ((maxZ - minZ) * j) / N;
+          if (o.isInside(x, z)) pts.push([x, z]);
+        }
+      }
+      pts = hull(pts);
+    }
+    // No perimeter test, or it never answered true: the bounds box is the
+    // honest fallback — it is still where the compound is.
+    if (pts.length < 3) pts = [[minX, minZ], [maxX, minZ], [maxX, maxZ], [minX, maxZ]];
+    this._foot = pts;
+    this.mFoot.setAttribute('points', pts.map(([x, z]) => `${x.toFixed(1)},${z.toFixed(1)}`).join(' '));
+    return pts;
+  }
+
+  /**
+   * WHAT THE MAP IS ALLOWED TO SHOW is the only real design rule in here, and
+   * it is a stealth rule, not a graphics one: in CALM the map draws only men
+   * whose meter has actually moved. Drawing the whole garrison all the time
+   * would make the map a wall-hack and delete the tension the entire game is
+   * built on. From CAUTION up the garrison is hunting and its positions are
+   * fair — that is when the vision cones come on too.
+   */
+  _syncMap(sensors, p, heading, objective) {
+    this._footprint();
+
+    const k = MAP_R / MAP_M;
+    // One transform for everything in world space.
+    attr(
+      this.mWorld,
+      'transform',
+      `rotate(${(-deg(heading)).toFixed(2)}) scale(${k.toFixed(4)}) translate(${(-p.x).toFixed(2)} ${(-p.z).toFixed(2)})`,
+    );
+
+    const open = this.alert !== 'calm';
+    let nb = 0;
+    let nc = 0;
+    for (const s of sensors) {
+      if (!open && s.awareness <= 0) continue;
+
+      const dx = s.x - p.x;
+      const dz = s.z - p.z;
+      const rel = wrapPi(bearing(dx, dz) - heading);
+      const dist = Math.hypot(dx, dz);
+      let r = dist * k;
+      const off = r > MAP_EDGE;
+      if (off) r = MAP_EDGE;
+
+      let blip = this._mBlip[nb];
+      if (!blip) {
+        blip = svg('rect', { class: 'mmg', x: -2.2, y: -2.2, width: 4.4, height: 4.4 });
+        this._mBlip[nb] = blip;
+        this.mBlips.appendChild(blip);
+      }
+      nb++;
+      attr(blip, 'transform', `translate(${(r * Math.sin(rel)).toFixed(2)} ${(-r * Math.cos(rel)).toFixed(2)})`);
+      attr(blip, 'data-s', s.tier);
+      attr(blip, 'data-off', off ? '1' : null);
+      css(blip, 'display', '');
+
+      // Cones need a heading and a range, and `contacts()` publishes neither —
+      // both are joined off the raw Guard in state.js and may be absent.
+      // `sensors` arrives sorted by awareness, so the cap keeps the cones that
+      // belong to the men who have most nearly found you.
+      if (open && nc < MAP_CONES && s.yaw != null && s.range) {
+        let cone = this._mCone[nc];
+        if (!cone) {
+          cone = svg('path', { class: 'mmc', d: conePath(120) });
+          this._mCone[nc] = cone;
+          this.mCones.appendChild(cone);
+        }
+        nc++;
+        attr(cone, 'transform', `translate(${s.x.toFixed(1)} ${s.z.toFixed(1)}) rotate(${(-deg(s.yaw)).toFixed(1)}) scale(${s.range.toFixed(1)})`);
+        attr(cone, 'data-s', s.tier);
+        css(cone, 'display', '');
+      }
+    }
+    for (let i = nb; i < this._mBlip.length; i++) css(this._mBlip[i], 'display', 'none');
+    for (let i = nc; i < this._mCone.length; i++) css(this._mCone[i], 'display', 'none');
+
+    // The objective, clamped to the edge like a blip so it always says which
+    // way to go even from the insertion point a hundred metres out.
+    if (objective && objective.x != null) {
+      const rel = wrapPi(bearing(objective.x - p.x, objective.z - p.z) - heading);
+      const r = Math.min(MAP_EDGE, Math.hypot(objective.x - p.x, objective.z - p.z) * k);
+      css(this.mObj, 'display', '');
+      attr(this.mObj, 'transform', `translate(${(r * Math.sin(rel)).toFixed(2)} ${(-r * Math.cos(rel)).toFixed(2)})`);
+    } else {
+      css(this.mObj, 'display', 'none');
+    }
+
+    // North. The only absolute reference on a heading-up map.
+    const n = -heading;
+    attr(this.mN, 'x', (72 * Math.sin(n)).toFixed(1));
+    attr(this.mN, 'y', (-72 * Math.cos(n) + 3).toFixed(1));
   }
 
   // ------------------------------------------------------------ weapon --
@@ -433,6 +700,8 @@ export class Hud {
     sensors.sort((a, b) => b.awareness - a.awareness);
     const seen = new Set();
     let drawn = 0;
+    /** Bearings already placed, so a second marker at the same one can be moved. */
+    const lanes = [];
 
     for (const s of sensors) {
       if (s.awareness <= TRACE || drawn >= MAX_MARKS) break;
@@ -452,10 +721,24 @@ export class Hud {
         this.ring.appendChild(node);
       }
       const rel = deg(wrapPi(bearing(s.x - p.x, s.z - p.z) - heading));
+
+      // DE-CONFLICTION, and it is the difference between a readable ring and
+      // the pile this used to draw. Four guards on the same side of you land on
+      // the same few degrees of ring and their labels sit on top of each other,
+      // which is worse than drawing nothing — it looks like corruption. Moving
+      // them along the bearing would be a lie, since the bearing IS the
+      // information, so instead each collision steps one lane further out. The
+      // angle stays true and the type stops colliding.
+      let lane = 0;
+      while (lanes.some((l) => l.lane === lane && Math.abs(wrapPi(THREE.MathUtils.degToRad(l.rel - rel))) < LANE_ARC)) lane++;
+      lanes.push({ rel, lane });
+      css(node, '--r', `calc(var(--r0) + ${lane * LANE_STEP}px)`);
+
       css(node, 'transform', `rotate(${rel.toFixed(1)}deg)`);
       css(node.__l, '--nr', `${(-rel).toFixed(1)}deg`);
       css(node, '--a', s.awareness.toFixed(2));
       attr(node, 'data-s', s.tier);
+      attr(node, 'data-seeing', s.seeing ? '1' : null);
       // Filling fast and not yet certain: that is the moment worth reacting
       // to, and the only thing on this HUD that gets to blink.
       attr(node, 'data-urgent', s.rate > URGENT_RATE && s.awareness < 0.999 ? '1' : null);
@@ -487,8 +770,14 @@ export class Hud {
     this._hurtT = 0;
     this._healT = 0;
     this._wasReloading = false;
+    this._vitHot = 0;
+    css(this.vit, '--vit-o', '0');
     css(this.dmg, '--hurt', '0');
     this._hpState(null);
     for (const w of this._wedges) w.classList.remove('on');
+    // The map's own state is the outpost footprint, which does not move, so it
+    // survives a restart deliberately. The transient marks do not.
+    for (const b of this._mBlip) css(b, 'display', 'none');
+    for (const c of this._mCone) css(c, 'display', 'none');
   }
 }

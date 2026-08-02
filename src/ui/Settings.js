@@ -48,7 +48,22 @@ const BOOL = [
 export class Settings {
   constructor(world) {
     this.world = world;
-    this.values = { ...DEFAULTS, ...load() };
+    /**
+     * The baseline is what the renderer ACTUALLY booted with, not what this
+     * file guesses it booted with. The two disagreed: `DEFAULTS` claimed depth
+     * of field and motion blur were on, `RenderPipeline` had both off. So the
+     * panel read ON for two passes that were not running, and arming "restored"
+     * that lie into the live pipeline. Reading the real value keeps the panel
+     * honest and keeps arming a genuine no-op for anyone who changed nothing.
+     */
+    const live = world?.engine?.pipeline?.enabled ?? null;
+    this.baseline = { ...DEFAULTS };
+    if (live) {
+      for (const k of ['ssao', 'bloom', 'dof', 'motionBlur', 'taa']) {
+        if (typeof live[k] === 'boolean') this.baseline[k] = live[k];
+      }
+    }
+    this.values = { ...this.baseline, ...load() };
     this.armed = false;
     this._subs = new Set();
     this._rows = [];
@@ -56,11 +71,26 @@ export class Settings {
     this.sel = 0;
   }
 
-  /** Apply everything once the player has proved they are a player. */
+  /**
+   * Apply once the player has proved they are a player — and apply ONLY what
+   * they actually changed.
+   *
+   * This used to run `_effect` over every key, which quietly rewrote the live
+   * renderer configuration on the first keydown from anyone, including a probe
+   * dispatching keys in the middle of a measurement. Re-applying a value that
+   * already equals the default is not a no-op: `renderScale` calls
+   * `setPixelRatio` and fires a `resize`, and `shadowQuality` disposes and
+   * reallocates every cascade's depth target. `this.baseline` is what the
+   * engine and pipeline actually booted with, so a value equal to it has
+   * nothing to apply, and skipping it is what makes arming invisible to
+   * anything that is not a human changing a setting.
+   */
   arm() {
     if (this.armed) return;
     this.armed = true;
-    for (const k in this.values) this._effect(k);
+    for (const k in this.values) {
+      if (this.values[k] !== this.baseline[k]) this._effect(k);
+    }
   }
 
   onChange(fn) {

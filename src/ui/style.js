@@ -392,10 +392,12 @@ export const CSS = `
      meter  fills left to right, coloured at the AI's own thresholds
      reason three or five letters saying what he is reacting to             */
 
+/* --r0 is the base radius; each marker sets its own --r to --r0 plus a lane
+   offset when its bearing collides with one already placed. See _syncMarkers. */
 .ring {
   position: absolute; left: 50%; top: 50%;
   width: 0; height: 0;
-  --r: clamp(118px, 21vh, 210px);
+  --r0: clamp(118px, 21vh, 210px);
 }
 .mk {
   position: absolute; left: 0; top: 0; will-change: transform;
@@ -406,7 +408,10 @@ export const CSS = `
   position: absolute; left: 0; top: 0;
   display: flex; flex-direction: column; align-items: center; gap: 3px;
   width: 76px; margin-left: -38px;
-  transform: translateY(calc(-1 * var(--r))) rotate(var(--nr, 0deg));
+  /* No transition: this transform is rewritten every tick as the player turns,
+     and easing it would smear the whole ring and desync the counter-rotation
+     from .mk's rotation. A lane change is a hard step, which is correct. */
+  transform: translateY(calc(-1 * var(--r, var(--r0)))) rotate(var(--nr, 0deg));
   will-change: transform;
 }
 /* Range. Mono, small, and it is the only number on the ring. */
@@ -421,16 +426,33 @@ export const CSS = `
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 /* The awareness meter. Horizontal so it reads as a bar filling toward
-   certainty rather than as a second glyph. */
+   certainty rather than as a second glyph.
+
+   THE NOTCH AT 66% IS THE POINT OF THE WHOLE ELEMENT. That is the AI's own
+   SUSPECT threshold — the value at which a guard stops glancing and walks over
+   to look. A meter with no threshold marked tells the player how full it is;
+   a meter with the commit point drawn on it tells them how long they still
+   have, which is the only version of this information they can act on. The
+   meter also thickens by tier, so escalation is legible peripherally, before
+   any of the type is read. */
 .mkl i {
-  position: relative; display: block; width: 34px; height: 4px;
+  position: relative; display: block; width: 38px; height: 4px;
   border: 1px solid currentColor; background: rgba(6, 7, 8, 0.45);
   font-style: normal;
+  transition: height 140ms linear;
 }
 .mkl i::after {
   content: ""; position: absolute; inset: 1px auto 1px 1px;
   width: calc(var(--a, 0) * (100% - 2px)); background: currentColor;
 }
+/* The commit threshold, drawn through the meter. */
+.mkl i::before {
+  content: ""; position: absolute; top: -2px; bottom: -2px;
+  left: var(--sus, 66%); width: 1px; background: currentColor; opacity: 0.75;
+}
+.mk[data-s="alerted"] .mkl i, .mk[data-s="seen"] .mkl i { height: 6px; }
+/* Past the commit point the threshold has been answered; stop drawing it. */
+.mk[data-s="alerted"] .mkl i::before, .mk[data-s="seen"] .mkl i::before { display: none; }
 .mkl em {
   font-style: normal; font-family: var(--mono); font-size: 8.5px;
   letter-spacing: 0.18em; color: currentColor; opacity: 0.85;
@@ -451,10 +473,188 @@ export const CSS = `
 .mk[data-s="alerted"] { color: var(--caution); }
 .mk[data-s="noticing"] { color: var(--bone); }
 
+/* EYES ON YOU RIGHT NOW, which is a different fact from "his meter is full" —
+   a guard who saw you and lost you still reads "seen", and running from the
+   first while hiding from the second is the entire skill of the genre. So
+   live line of sight gets its own mark, in the only vocabulary this HUD has:
+   the glyph grows, and the reason tag is underscored. Nothing else on the ring
+   carries a rule, so it cannot be confused with a tier change. */
+.mk[data-seeing="1"] .mkl s { transform: scale(1.2); }
+.mk[data-seeing="1"] .mkl em {
+  opacity: 1; border-bottom: 1px solid currentColor; padding-bottom: 2px;
+}
+
 /* The one repeating animation in the HUD, spent on the one moment that
    deserves it: a meter climbing fast that has not filled yet. */
 .mk[data-urgent="1"] .mkl s { animation: mkpulse 620ms steps(2, end) infinite; }
 @keyframes mkpulse { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0.25; } }
+
+/* --- minimap -------------------------------------------------------------
+
+   WHY A CORNER MAP AND NOT A TOGGLED FULLSCREEN ONE. MGSV uses the iDroid, and
+   a fullscreen map is the more faithful answer — but the iDroid is a pause, and
+   the moment a player most needs to know where the guards are is the moment
+   their awareness meters are climbing, which is exactly the moment you cannot
+   afford to cover the world. So: a corner map, always drawn, at a third of its
+   opacity in CALM and full opacity from CAUTION up, the same way the compass
+   already behaves.
+
+   IT IS HEADING-UP, NOT NORTH-UP, and that is the one decision everything else
+   follows from. The detection ring already teaches the player to read bearings
+   relative to where they are looking; a north-up map would be a SECOND, rival
+   coordinate system on the same screen. Heading-up means a contact on the ring
+   at two o'clock is the same blip at two o'clock on the map. The ring gives
+   bearing; the map gives bearing AND range; they agree, so they read as one
+   instrument at two zoom levels. The rotating N tick is the only absolute
+   reference, and it is all that is needed.
+
+   It is an <svg> rather than divs because the footprint is a polygon and the
+   vision cones are arcs. It still costs no GPU frame time and no draw calls,
+   and every per-frame update is a single transform attribute.               */
+
+/* TOP RIGHT, not top left: index.html owns a #controls-card at left:20px,
+   top:20px that teaches the keys and only collapses after twelve seconds, and
+   a map underneath it would be unreadable for exactly as long as a new player
+   most needs one. Top right is the only free corner, and it puts the map
+   directly above the weapon plate — the two instrument plates stack down the
+   right edge and share a notch, which is what says they are the same kind of
+   object. */
+.mmp {
+  position: absolute; right: 0; top: 0;
+  width: 168px; height: 168px;
+  /* Quieter than the alert state but louder than the compass's 0.3: over bright
+     sky the plate and its hairlines both wash out, and unlike the compass this
+     element still has a job in CALM — it is how the player navigates to the
+     objective before anything has noticed them. */
+  opacity: var(--mm-o, 0.5);
+  transition: opacity 500ms linear;
+  border: 1px solid rgba(231, 229, 221, 0.30);
+  /* Much darker than the weapon plate. That plate is a dense block of type and
+     survives at 0.52; this is 168px of hairlines and 2px marks, and at 0.52 the
+     sunlit wall behind it came straight through and the map read as a smear. */
+  background: rgba(6, 7, 8, 0.88);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 9px 100%, 0 calc(100% - 9px));
+}
+.mms { display: block; width: 100%; height: 100%; overflow: hidden; }
+
+/* Everything in world space rides one transform: rotate(-heading) scale
+   translate(-player). Nothing below is written per frame except that. */
+/* The footprint has to survive being crossed by six cone outlines in the same
+   colour family, so it is the one line on the map drawn heavier than a hairline. */
+.mmf { fill: rgba(231, 229, 221, 0.05); stroke: rgba(231, 229, 221, 0.62); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+
+/* A vision cone is a unit wedge scaled to the guard's EFFECTIVE sight range —
+   src/ai publishes vis.range already multiplied by stance, alert and night,
+   so the drawn cone is the one the simulation is actually using.
+
+   OUTLINED, NOT FILLED, and capped to the four most aware guards. This is not
+   a taste call: translucent fills COMPOUND. Four alerted men facing the same
+   courtyard turned the whole plate into one solid orange blob with the
+   footprint, the blips and the player invisible inside it, because the number
+   of overlaps is chosen by the garrison and not by the designer. An outline
+   crossing another outline leaves both readable at any count, and a hairline
+   arc is the vocabulary the rest of this UI is already built from.
+
+   A cone for a man who has noticed nothing is context and stays nearly
+   invisible; the ones that have earned a colour are what the eye lands on. */
+.mmc {
+  fill: none;
+  stroke: rgba(231, 229, 221, 0.16); stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.mmc[data-s="noticing"] { stroke: rgba(231, 229, 221, 0.46); }
+.mmc[data-s="alerted"]  { stroke: rgba(217, 164, 65, 0.72); stroke-width: 1.2; }
+.mmc[data-s="seen"]     { stroke: rgba(206, 58, 38, 0.9);   stroke-width: 1.4; }
+
+/* Range ring and its scale label. Screen space — it never rotates. */
+.mmr { fill: none; stroke: rgba(231, 229, 221, 0.22); stroke-width: 1; stroke-dasharray: 2 4; }
+/* Bottom right, opposite the notch, where no map content ever reaches. */
+.mmsc {
+  position: absolute; right: 6px; bottom: 3px;
+  font-family: var(--mono); font-size: 7.5px; letter-spacing: 0.16em;
+  color: var(--bone-3);
+}
+
+/* Guard blips, in screen space so they keep a constant size at any range. */
+.mmg { fill: var(--bone-2); stroke: none; }
+.mmg[data-s="noticing"] { fill: var(--bone); }
+.mmg[data-s="alerted"]  { fill: var(--caution); }
+.mmg[data-s="seen"]     { fill: var(--alert); }
+/* Off the edge of the map: hollow, so "he is out there somewhere in that
+   direction" never reads as "he is at the edge of the compound". */
+.mmg[data-off="1"] { fill: none; stroke: var(--bone-2); stroke-width: 1.2; }
+.mmg[data-off="1"][data-s="noticing"] { stroke: var(--bone); }
+.mmg[data-off="1"][data-s="alerted"] { stroke: var(--caution); }
+.mmg[data-off="1"][data-s="seen"] { stroke: var(--alert); }
+
+/* The player. Bone, and the only filled arrow on the map, so "where am I and
+   which way am I facing" is answered before anything else is read. */
+.mmy { fill: var(--bone); }
+.mmn { font-family: var(--mono); font-size: 9px; fill: var(--bone-2); text-anchor: middle; }
+.mmo { fill: none; stroke: var(--sage); stroke-width: 1.4; }
+
+.ui[data-alert="caution"] .mmp,
+.ui[data-alert="alert"] .mmp,
+.ui[data-alert="evasion"] .mmp { --mm-o: 1; }
+
+/* --- vitals ---------------------------------------------------------------
+
+   STILL NO HEALTH BAR. MGSV does not have one and this does not add one; what
+   it adds is the number the player is actually asking for, which is not a
+   percentage. src/gameplay/Vitals.js costs 0.16 per rifle round, so six
+   rounds put you down — and "how many more can I take" is the whole question.
+   So the readout is a SIX SEGMENT COMB, one segment per round, in the same
+   vocabulary the magazine already taught the player one corner away: a comb of
+   ticks, spent ones go dark, the shape is the quantity. A player who has read
+   the magazine once can read this with no instruction at all.
+
+   IT IS ABSENT AT FULL HEALTH. That is what keeps the HUD quiet in CALM, and
+   it is also correct: at full health "am I about to die" answers itself. It
+   cuts in on the frame health drops and fades out a few seconds after full
+   recovery.                                                                   */
+
+.vit {
+  position: absolute; left: 0; bottom: 36px;
+  display: flex; align-items: center; gap: 9px;
+  opacity: var(--vit-o, 0); transition: opacity 400ms linear;
+}
+.vit b {
+  font-weight: 400; font-family: var(--mono); font-size: 8px;
+  letter-spacing: 0.2em; color: var(--bone-2);
+}
+.vsg { position: relative; display: flex; align-items: flex-end; gap: 2.5px; }
+/* Wider and shorter than a magazine tick, so the two combs are never confused
+   at a glance even though they share a grammar. */
+.vsg s {
+  position: relative; display: block; width: 16px; height: 12px;
+  background: rgba(231, 229, 221, 0.16); text-decoration: none; overflow: hidden;
+  transition: background 120ms linear;
+}
+.vsg s::after {
+  content: ""; position: absolute; inset: 0;
+  width: calc(var(--f, 0) * 100%); background: var(--vit-c, var(--bone));
+  transition: width 160ms linear, background 200ms linear;
+}
+.hud[data-hp="critical"] .vit, .hud[data-hp="down"] .vit { --vit-c: var(--alert); }
+.hud[data-hp="hurt"] .vit { --vit-c: var(--caution); }
+/* The heartbeat the damage vignette already runs, on the readout too, so the
+   critical state is legible whether the eye is at the edge or on the corner. */
+.hud[data-hp="critical"] .vsg { animation: pulse 1500ms cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+/* Regeneration sweep. Same travelling highlight as the magazine's reload, for
+   the same reason: the system is working and has no honest progress fraction. */
+.vit[data-rg="1"] .vsg::after {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 34%;
+  background: linear-gradient(90deg, transparent, rgba(168, 192, 182, 0.7), transparent);
+  animation: magload 1100ms linear infinite;
+}
+
+/* The four seconds before regeneration starts — the only number in this model
+   the player can act on, because it is exactly how long they must stay out of
+   sight. A depleting hairline, in the suppressor bar's vocabulary. */
+.vwt { position: relative; width: 34px; height: 3px; border: 1px solid var(--rule-mid); }
+.vwt::after { content: ""; position: absolute; inset: 0; width: var(--w, 0); background: var(--bone-3); }
+.vit[data-wt="0"] .vwt { display: none; }
 
 /* --- objective ticker --------------------------------------------------- */
 

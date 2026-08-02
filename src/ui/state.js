@@ -87,43 +87,81 @@ export function resolveGameState(world) {
  * Wrap the harness entry points so the UI is guaranteed to be gone before a
  * capture. `hide` is called synchronously inside the wrapper; `onDrive` latches
  * the caller's own state.
+ *
+ * TWO TIERS, AND THE SPLIT IS THE WHOLE POINT.
+ *
+ * This used to force `godmode` from all five entry points, and that made play
+ * mode unmeasurable. A probe would `setMode('play')`, call `settle(24)` to warm
+ * the frame — and the settle threw it straight back into godmode, with
+ * `registry.gameplay.active === false` and the camera returned to the shot pose.
+ * Every play-mode frame time this project has ever quoted was therefore a
+ * godmode frame time, with depth of field and motion blur in the wrong state.
+ * The capability check that should have caught it passed because godmode turns
+ * `freeFly` on, so holding KeyW still moved *a* camera.
+ *
+ *   applyShot()  POSES THE CAMERA. It is the only one that may force a mode: a
+ *                play or menu camera still running would fight it for the pose
+ *                on the next frame, which is the real requirement this guard
+ *                exists to serve.
+ *   everything   only observes. It must still HIDE the UI — the harness takes
+ *   else         a full-page screenshot, so a DOM overlay would land in every
+ *                reference frame — but hiding a DOM node cannot disturb a
+ *                measurement, and changing the mode plainly can.
+ *
+ * `__GAME.raw.*` holds the unwrapped originals for a harness that wants no
+ * opinion from the UI at all.
  */
 export function guardHarness(gameState, { hide, onDrive }) {
   const g = window.__GAME;
   if (!g || g.__uiGuarded) return;
   g.__uiGuarded = true;
 
-  const seize = () => {
+  const raw = (g.raw ??= {});
+
+  /** Screenshot safety only. Never touches the mode. */
+  const conceal = () => {
     onDrive();
     hide();
-    // The harness poses the camera itself; godmode is the mode that means
-    // "nothing but the free-fly rig owns the camera", which is exactly right.
+  };
+  /** Screenshot safety AND camera ownership, for the one call that poses. */
+  const seize = () => {
+    conceal();
     if (gameState.mode !== 'godmode') gameState.setMode('godmode');
   };
 
-  // Every tooling-only entry point on the harness API. A probe that measures,
-  // poses or reads the frame will call at least one of these before it captures
-  // anything, so the UI is gone by the time a pixel is read — including for a
-  // probe that never touches applyShot.
-  for (const name of ['applyShot', 'settle', 'stats', 'probeLuminance', 'setTimeOfDay']) {
+  const wrap = (name, before) => {
     const fn = g[name];
-    if (typeof fn !== 'function') continue;
+    if (typeof fn !== 'function') return;
+    raw[name] = fn;
     g[name] = function (...args) {
-      seize();
+      before();
       return fn.apply(this, args);
     };
-  }
+  };
+
+  wrap('applyShot', seize);
+  for (const name of ['settle', 'stats', 'probeLuminance', 'setTimeOfDay']) wrap(name, conceal);
 }
 
 // --- tolerant registry reads ------------------------------------------------
 
-/** First defined property from `names`, invoking it if it is a getter-ish fn. */
+/**
+ * First defined, non-function property from `names`.
+ *
+ * The `continue` on a function is load-bearing and was a `return undefined` for
+ * nine rounds. `registry.ai` publishes a METHOD called `contacts()` and an
+ * ARRAY called `guards`, and `sensors()` probes for `['sensors', 'contacts',
+ * 'guards', ...]` in that order. Bailing out on the method meant the probe
+ * never reached `guards`, so the detection ring — the core feedback loop of the
+ * entire genre — drew nothing at all, in every build, silently. A name that
+ * happens to hold a function is not an answer; it is a name that did not match.
+ */
 function pick(obj, names) {
   if (!obj) return undefined;
   for (const n of names) {
     const v = obj[n];
-    if (v === undefined || v === null) continue;
-    return typeof v === 'function' ? undefined : v;
+    if (v === undefined || v === null || typeof v === 'function') continue;
+    return v;
   }
   return undefined;
 }
@@ -207,13 +245,39 @@ const ALERT_STATES = ['calm', 'caution', 'alert', 'evasion'];
  */
 const AWARE_FALLBACK = { NOTICE: 0.3, SUSPECT: 0.66, DETECT: 1.0 };
 
-/** Short mono tag naming WHY a guard's meter is moving. Four states, no prose. */
+/**
+ * `src/gameplay/Vitals.js`'s health model, duplicated for the same reason and
+ * with the same rule: read the live value when gameplay offers one.
+ *   REGEN_DELAY   seconds of not being shot before health starts coming back
+ *   ROUND_DAMAGE  what one rifle round costs — the unit the vitals comb counts in
+ */
+const REGEN_DELAY_FALLBACK = 4.0;
+const ROUND_DAMAGE_FALLBACK = 0.16;
+
+/**
+ * Short mono tag naming WHY a guard's meter is moving.
+ *
+ * `src/ai` publishes exactly four `awareReason` values — 'sight', 'sound',
+ * 'body', 'contact' — plus null once the meter leaks below 0.02. That enum is
+ * the authority; the guard's `state` is only consulted when we are reading a
+ * raw Guard rather than a `contacts()` record, because a guard walking over to
+ * look ('investigate') has already lost the reason that sent him.
+ */
+const REASON_TAG = {
+  sight: 'SIGHT',
+  sound: 'NOISE',
+  body: 'BODY',
+  contact: 'CONTACT',
+};
+
 function reasonOf(g, visible, awareness) {
+  const published = pick(g, ['reason', 'awareReason']);
+  if (published) return REASON_TAG[String(published).toLowerCase()] ?? String(published).toUpperCase();
   const state = String(pick(g, ['state', 'mode', 'behaviour']) ?? '').toLowerCase();
   if (visible) return 'SIGHT';
   if (state === 'combat') return 'CONTACT';
-  if (state === 'search') return 'SEARCH';
-  if (state === 'investigate' || state === 'scan') return 'NOISE';
+  if (state === 'search' || state === 'investigate' || state === 'inspect') return 'SEARCH';
+  if (state === 'scan') return 'NOISE';
   if (state === 'radio') return 'RADIO';
   return awareness > 0 ? 'LOST' : '';
 }
@@ -236,6 +300,9 @@ export function normaliseAlert(raw) {
  */
 export function makeAdapter(world, source = () => world.registry) {
   const tmp = { x: 0, y: 0, z: 0 };
+  /** Last awareness per guard, so a fill rate exists even if the AI publishes none. */
+  const _prevAware = new Map();
+  let _rateT = 0;
 
   const vec = (v) => {
     if (!v) return null;
@@ -284,35 +351,85 @@ export function makeAdapter(world, source = () => world.registry) {
      * sensor, and leaving him on the ring is the difference between a HUD that
      * teaches the game and one that punishes you for a takedown that worked.
      *
-     * `[{ id, x, y, z, awareness, tier, reason, rate, dist, visible }]`
-     *   tier   'seen' | 'alerted' | 'noticing', cut at the AI's own thresholds
-     *   reason SIGHT | NOISE | SEARCH | CONTACT | RADIO | LOST
+     * `contacts()` FIRST. `src/ai` publishes a method whose own comment calls it
+     * "the shape a renderer could ask for" — flat `{id, role, state, down, x, y,
+     * z, awareness, reason, seeing, dist, suppressed, reloading, commander}`,
+     * with awareness already normalised against AWARE.DETECT. Reading raw
+     * `guards` instead means re-deriving all of that from a 62-field simulation
+     * object, which is how `reason` used to be guessed from `state`.
+     *
+     * What `contacts()` does NOT carry is the two things a map needs — where a
+     * man is LOOKING and how far he can see — plus the meter's fill rate. Those
+     * live on the raw `Guard` (`lookYaw`, `vis.range`, `vis.rate`), so the two
+     * are joined by id. The join is optional in both directions: no `guards`
+     * array still yields a full detection ring, just without cones.
+     *
+     * `[{ id, x, y, z, awareness, tier, reason, rate, dist, visible, seeing,
+     *    yaw, range, role, commander }]`
+     *   tier   'seen' | 'alerted' | 'noticing' | 'trace', at the AI's thresholds
+     *   reason SIGHT | NOISE | BODY | CONTACT | SEARCH | RADIO | LOST
      *   rate   how fast the meter is filling, 1/s — drives the urgency pulse
+     *   yaw    head bearing in radians, 0 = -Z, or null
+     *   range  effective sight range in metres (stance/alert/night), or null
      */
     sensors(out) {
       out.length = 0;
       const ai = source().ai;
       const list =
-        pick(ai, ['sensors', 'contacts', 'guards', 'agents', 'enemies', 'units']) ??
-        call(ai, ['getSensors', 'getContacts', 'getGuards']);
+        call(ai, ['contacts', 'getSensors', 'getContacts', 'getGuards']) ??
+        pick(ai, ['sensors', 'contacts', 'guards', 'agents', 'enemies', 'units']);
       if (!Array.isArray(list)) return out;
+
+      // The raw simulation objects, for the fields contacts() leaves out.
+      const raw = pick(ai, ['guards', 'agents', 'units']);
+      const rawById = new Map();
+      if (Array.isArray(raw)) for (const g of raw) if (g) rawById.set(pick(g, ['id', 'uid']) ?? g, g);
+
       const A = pick(ai, ['AWARE', 'thresholds']) ?? AWARE_FALLBACK;
       const notice = typeof A.NOTICE === 'number' ? A.NOTICE : AWARE_FALLBACK.NOTICE;
       const suspect = typeof A.SUSPECT === 'number' ? A.SUSPECT : AWARE_FALLBACK.SUSPECT;
+      const now = performance.now() / 1000;
+      const dt = _rateT ? Math.min(0.5, now - _rateT) : 0;
+      _rateT = now;
+
       for (let i = 0; i < list.length; i++) {
         const g = list[i];
         if (!g) continue;
         if (pick(g, ['down', 'downed', 'dead', 'incapacitated']) === true) continue;
-        const p = vec(pick(g, ['position', 'pos', 'worldPosition'])) ?? (g.ch && g.ch.position) ?? (g.root && g.root.position) ?? (g.object3D && g.object3D.position);
+        const id = pick(g, ['id', 'uid', 'name']) ?? i;
+        const sim = rawById.get(id) ?? (g.ch ? g : null);
+
+        // contacts() is flat x/y/z; a raw Guard hides position behind `ch`.
+        const p =
+          typeof g.x === 'number'
+            ? g
+            : vec(pick(g, ['position', 'pos', 'worldPosition'])) ??
+              (g.ch && g.ch.position) ??
+              (g.root && g.root.position);
         if (!p) continue;
+
         const a = pick(g, ['awareness', 'suspicion', 'detection', 'alertness', 'meter']);
         const aw = typeof a === 'number' ? Math.max(0, Math.min(1, a)) : 0;
-        const vis = pick(g, ['vis', 'vision', 'sight']) ?? null;
-        const visible = !!(pick(vis, ['visible', 'sees', 'los']) ?? pick(g, ['sees', 'visible']));
-        const rate = pick(vis, ['rate', 'gain']) ?? pick(g, ['rate']) ?? 0;
-        const d = pick(vis, ['dist', 'distance']) ?? pick(g, ['dist']);
+
+        const vis = pick(sim, ['vis', 'vision', 'sight']) ?? pick(g, ['vis']) ?? null;
+        const visible = !!(pick(g, ['seeing', 'sees', 'visible']) ?? pick(vis, ['visible', 'sees', 'los']));
+
+        // The AI's own fill rate when it publishes one. Otherwise difference the
+        // meter ourselves — the urgency pulse is the only pre-completion warning
+        // the player gets, and it must not depend on a field that may be absent.
+        let rate = pick(vis, ['rate', 'gain']) ?? pick(g, ['rate']);
+        if (typeof rate !== 'number' || !Number.isFinite(rate)) {
+          const prev = _prevAware.get(id);
+          rate = dt > 0 && typeof prev === 'number' ? (aw - prev) / dt : 0;
+        }
+        _prevAware.set(id, aw);
+
+        const d = pick(g, ['dist', 'distance']) ?? pick(vis, ['dist', 'distance']);
+        const yaw = pick(sim, ['lookYaw']) ?? pick(sim, ['yaw']) ?? pick(g, ['lookYaw', 'yaw']);
+        const range = pick(vis, ['range']);
+
         out.push({
-          id: pick(g, ['id', 'uid', 'name']) ?? i,
+          id,
           x: p.x,
           y: p.y,
           z: p.z,
@@ -322,9 +439,37 @@ export function makeAdapter(world, source = () => world.registry) {
           rate: typeof rate === 'number' && Number.isFinite(rate) ? rate : 0,
           dist: typeof d === 'number' && Number.isFinite(d) ? d : null,
           visible,
+          /** He has line of sight RIGHT NOW — distinct from "he saw you once". */
+          seeing: visible,
+          yaw: typeof yaw === 'number' && Number.isFinite(yaw) ? yaw : null,
+          range: typeof range === 'number' && Number.isFinite(range) && range > 0 ? range : null,
+          role: pick(g, ['role']) ?? null,
+          commander: pick(g, ['commander']) === true || pick(g, ['role']) === 'commander',
         });
       }
+      // Men who left the list must not keep a stale meter reading behind them.
+      if (_prevAware.size > out.length * 4 + 32) _prevAware.clear();
       return out;
+    },
+
+    /**
+     * The one-line summary of what the garrison knows, straight off the AI's
+     * own `detection()`. `{ level, awareness, reason, by, dist, seeing }` — the
+     * peak meter across the whole outpost, which is the number that answers
+     * "how close am I to being made" without reading six markers.
+     */
+    detection() {
+      const d = call(source().ai, ['detection']);
+      if (!d || typeof d !== 'object') return null;
+      return {
+        level: normaliseAlert(d.level),
+        awareness: typeof d.awareness === 'number' ? Math.max(0, Math.min(1, d.awareness)) : 0,
+        reason: d.reason ? REASON_TAG[String(d.reason).toLowerCase()] ?? String(d.reason).toUpperCase() : '',
+        by: d.by ?? null,
+        dist: typeof d.dist === 'number' && Number.isFinite(d.dist) ? d.dist : null,
+        /** How many men have eyes on the player this instant. */
+        seeing: typeof d.seeing === 'number' ? d.seeing : 0,
+      };
     },
 
     /** The avatar object itself, wherever gameplay decided to publish it. */
@@ -372,6 +517,70 @@ export function makeAdapter(world, source = () => world.registry) {
       if (typeof h !== 'number' || !Number.isFinite(h)) return null;
       const max = pick(p, ['maxHealth', 'healthMax', 'hpMax']) ?? (h > 1 ? 100 : 1);
       return Math.max(0, Math.min(1, h / max));
+    },
+
+    /**
+     * The wound in full, or null when nothing publishes health.
+     *
+     * `{ health, segments, regen, sinceHit, dead, shock }`
+     *
+     * REGENERATION IS DERIVED, and it has to be: `src/gameplay/Vitals.js` runs
+     * MGSV's model — nothing comes back for REGEN_DELAY seconds after the last
+     * round, then it refills over about seven — but publishes no `regenerating`
+     * flag. What it does publish is `vitals.sinceHit`, and the delay is the
+     * whole decision in that model: it is the difference between "break contact
+     * now and you live" and "you are already dead". So the HUD reads
+     * `sinceHit > REGEN_DELAY && health < 1` and shows the two states apart.
+     *
+     * The delay is duplicated here rather than imported for the same reason the
+     * awareness thresholds are — see AWARE_FALLBACK. If gameplay ever publishes
+     * it, `regenDelay` is preferred over the constant.
+     */
+    vitals() {
+      const p = resolvePlayer(source());
+      const h = this.health();
+      if (h == null) return null;
+      const v = pick(p, ['vitals']) ?? p;
+      const sinceHit = pick(v, ['sinceHit', 'timeSinceHit']);
+      const delay = pick(v, ['regenDelay', 'REGEN_DELAY']) ?? REGEN_DELAY_FALLBACK;
+      const since = typeof sinceHit === 'number' && Number.isFinite(sinceHit) ? sinceHit : null;
+      return {
+        health: h,
+        /**
+         * How many rifle rounds you can take. `ROUND_DAMAGE` is 0.16, so the
+         * comb is drawn in the unit the player actually loses health in — the
+         * answer to "am I about to die" is a count of hits, not a percentage.
+         * Six segments of 0.167 against a round's 0.16 drifts by a quarter of a
+         * segment over a whole magazine, which is well inside the width of a
+         * tick and keeps the comb even.
+         */
+        segments: Math.round(1 / ROUND_DAMAGE_FALLBACK),
+        regen: h < 0.999 && since != null && since > delay,
+        sinceHit: since,
+        regenDelay: delay,
+        /** Seconds until regeneration starts, or 0 once it has. */
+        untilRegen: since == null ? null : Math.max(0, delay - since),
+        dead: pick(p, ['dead']) === true || h <= 0.001,
+        shock: typeof pick(p, ['shock']) === 'number' ? pick(p, ['shock']) : 0,
+      };
+    },
+
+    /**
+     * Static outpost layout for the map, read ONCE — none of it moves.
+     * `{ bounds:{minX,minZ,maxX,maxZ}, centre:{x,z}, isInside, gate }` or null.
+     */
+    outpost() {
+      const o = source().outpost ?? source().outpostGround;
+      const b = pick(o, ['bounds']);
+      if (!b || !b.min || !b.max) return null;
+      const gate = vec(pick(o, ['gate']));
+      return {
+        bounds: { minX: b.min.x, minZ: b.min.z, maxX: b.max.x, maxZ: b.max.z },
+        centre: { x: (b.min.x + b.max.x) / 2, z: (b.min.z + b.max.z) / 2 },
+        /** The only perimeter test src/world/outpost publishes. */
+        isInside: typeof o.isInside === 'function' ? (x, z) => o.isInside(x, z) : null,
+        gate: gate ? { x: gate.x, z: gate.z } : null,
+      };
     },
 
     stance() {
@@ -526,6 +735,10 @@ export function makeAdapter(world, source = () => world.registry) {
         stance: p ? this.stance() : null,
         alert: this.alert(),
         sensors: this.sensors([]).length,
+        sensorSample: this.sensors([])[0] ?? null,
+        detection: this.detection(),
+        vitals: this.vitals(),
+        outpost: this.outpost(),
         mission: this.mission(),
       };
     },

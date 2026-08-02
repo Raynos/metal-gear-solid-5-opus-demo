@@ -58,6 +58,29 @@ Each invocation costs roughly 2 s to bundle plus 4.5 s to build the world, then
 about 0.6 s per shot. **Ask for every shot you want in one command.** Seven
 separate invocations cost seven world builds.
 
+## The machine is SHARED. Never blanket-kill.
+
+Several authors run against this machine at once. `pkill -f chrome-headless-shell`,
+`pkill -f vite` and anything else that matches by pattern will kill other people's
+in-flight work, and they will see it as an unexplained "Target page has been
+closed" with no cause they can find. One agent did this twice before noticing the
+other worktrees in the process list.
+
+Kill only what you started, by pid, from the handle you hold:
+
+```js
+const pid = browser.process?.()?.pid;
+await browser.close();
+try { process.kill(-pid, 'SIGKILL'); } catch {}
+```
+
+`tools/render.mjs` already does this correctly — prefer it over your own driver.
+Before assuming a process is a leak, check whether it belongs to somebody else:
+
+```bash
+ps -o args= -p <pid> | grep -o '\.claude/worktrees/[^/]*'
+```
+
 ## Clean up your processes
 
 A headless chromium is a process *tree* — zygote, GPU process, renderers.
