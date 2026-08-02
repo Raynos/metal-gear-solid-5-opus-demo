@@ -295,12 +295,46 @@ lives on. Re-clamp per-term, then add specular AA. Owner: `src/world/Terrain.js`
 Do NOT chase "the specular is broken" — those shaders overwrite `roughnessFactor`
 unconditionally, so setting `material.roughness` from a probe ablates nothing.
 
-### 2.3 Chevron/herringbone on distant mountains — OPEN, lead identified
-`Terrain.js` documents that the Jacobi thermal pass and the cone droplet brush
-both leave a herringbone at the grid cell, and `_smoothFlats` exists to remove
-it — but it is gated to low slope, `w = (1 - smoothstep(0.11, 0.52, slope))`, so
-above ~25° the herringbone is **left in by design**. Mountains are steeper
-than 25°.
+### 2.3 Chevron/herringbone on distant mountains — DIAGNOSED. It is the AO pass.
+**It is not the terrain and the lead this section carried for two rounds was
+wrong.** It is the screen-space occlusion pass, and specifically its BROAD
+radius at range. Owner: `src/render/RenderPipeline.js`, not `Terrain.js`.
+
+Turning `pipe.enabled.ssao` off removes it completely — see
+`shots/hb-ao/shipped.png` against `shots/hb-ao/aoOff.png`, cropped 2x on the
+mountain in the aimed frame. Measured on a vertical luminance profile across the
+massif (`probes/r12_chevao.js`), high-pass RMS over the band:
+
+    shipped                     peak 15.75 px   amp 0.286   hpRms 1.110
+    shipped, measured twice     peak 20.25 px   amp 0.287   hpRms 1.111   <- null
+    AO slice dither unfrozen    peak 15.75 px   amp 0.286   hpRms 1.105
+    broad AO radius x 0.25      peak 41.50 px   amp 0.131   hpRms 0.836
+    AO pass off                 peak 41.50 px   amp 0.145   hpRms 0.810
+
+So the frozen dither is **not** it — unfreezing the slice rotation is
+bit-for-bit inside the null control — and shrinking the broad radius is
+indistinguishable from switching the whole pass off.
+
+The mechanism is visible in the shader. `pixRadius = clamp(uRadius *
+pixPerMetre, 3.0, 52.0)` with `uRadius` = 1.15 m: at a kilometre that projects
+to about one pixel and is clamped UP to three, so the horizon search stops
+measuring occlusion and starts measuring the local slope and the depth buffer's
+quantisation — which is why the pattern follows the contours. The micro term is
+already protected from exactly this (`microFade = smoothstep(1.3, 2.6,
+microPixRaw)` fades it out below 2.6 px); the broad term is not. The fix is
+the same fade on the broad term, not a smaller radius — the near-field radius is
+marked verified, do not retune.
+
+**Six things were ablated and rebuilt before this, and none of them moved it.**
+Recorded so nobody spends the afternoon again: the entire erosion stack
+(thermal + hydraulic + incision + strata + crags + relax + smooth) off;
+`_addCrags` amplitude 0; the `_smoothFlats` slope gate removed entirely — the
+fix this section used to recommend, which does nothing; the strata bench snap
+off; the baked sky occlusion forced to 1; and `uPerf.x`, which bypasses the
+whole 1200-line terrain fragment body. A Lambert hillshade of `far.h` straight
+out of the array (`probes/r12_hillshade.js`, `shots/hs/raw.png`) shows a clean
+mountain with no herringbone in it at all, and neither does the same window
+resampled onto the outer clipmap rings' vertex spacing.
 
 ### 2.4 Dark blotchy stains on open ground — OPEN, new candidate
 `18da009` landed after the defect was filed and added `uSoilD = (0.620, 0.545,
