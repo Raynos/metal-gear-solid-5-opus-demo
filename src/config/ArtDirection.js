@@ -371,6 +371,23 @@ export const QUALITY = {
    * passes and off the scene's own fill.
    */
   renderScale: 1.0,
+  /**
+   * Internal resolution while PLAYING. The note above applies unchanged: the
+   * harness and every visual regression check run at 1.0, because applyShot()
+   * parks in godmode. Only play mode pays this. src/main.js setMode applies it.
+   *
+   * Chosen from measurement, not taste. The frame is per-pixel bound and the
+   * arithmetic is not close: on the moving-camera probe it splits into ~17.8 ms
+   * that scales with pixel count and ~7.4 ms that does not, so deleting every
+   * post effect in the frame cannot reach 16.7 ms — only fewer pixels can,
+   * until the terrain and ground fragment shaders are rebuilt (see TODO).
+   *
+   *   1.00  25.1 ms  40 fps      0.80  18.8 ms  53 fps
+   *   0.72  17.3 ms  58 fps      0.60  14.5 ms  69 fps
+   *
+   * 0.67 is 1286x723 internal, upscaled by the present pass with FXAA over it.
+   */
+  playRenderScale: 0.67,
 };
 
 /**

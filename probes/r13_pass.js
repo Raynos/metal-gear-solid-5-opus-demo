@@ -44,6 +44,19 @@ if (FLAG === 'none') {
     if (/volumetric/i.test(sys.name ?? '')) sys.enabled = false;
   }
   g.world.scene.traverse((o) => { if (/volumetric/i.test(o.name || '')) o.visible = false; });
+} else if (FLAG.startsWith('hide:')) {
+  const subs = FLAG.slice(5).split('+');
+  let n = 0;
+  g.world.scene.traverse((o) => {
+    if (!(o.isMesh || o.isInstancedMesh)) return;
+    const tag = ((o.name || '') + ' ' + (o.material?.name || '')).toLowerCase();
+    if (subs.some((s) => tag.includes(s.toLowerCase()))) { o.visible = false; n++; }
+  });
+  applied = `hide ${subs.join('+')} (${n})`;
+} else if (/^[0-9.]+$/.test(FLAG)) {
+  // A bare number is a render scale, set once before any warm-up.
+  pipe.setRenderScale(parseFloat(FLAG));
+  applied = `renderScale=${pipe.renderScale}`;
 } else if (FLAG in pipe.enabled) {
   pipe.enabled[FLAG] = false;
 } else {
@@ -85,7 +98,9 @@ const q = (f) => s[Math.min(s.length - 1, Math.round(f * (s.length - 1)))];
 
 return {
   flag: applied,
+  internalPx: `${pipe.hdr.width}x${pipe.hdr.height}`,
   medianMs: q(0.5),
+  fps: +(1000 / q(0.5)).toFixed(1),
   iqrMs: +(q(0.75) - q(0.25)).toFixed(2),
   runs,
 };

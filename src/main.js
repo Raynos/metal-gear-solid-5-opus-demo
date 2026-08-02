@@ -6,6 +6,7 @@ import { Lighting } from './render/Lighting.js';
 import { Terrain } from './world/Terrain.js';
 import { SHOTS } from './debug/Shots.js';
 import { stats as genCacheStats } from './core/GenCache.js';
+import { QUALITY } from './config/ArtDirection.js';
 
 // Feature modules. Each is owned by exactly one author and exposes install(world).
 // Order matters: later modules may read handles published by earlier ones.
@@ -97,6 +98,21 @@ function setMode(next) {
     const cinematic = next === 'play';
     pipe.enabled.dof = cinematic;
   }
+  // Internal resolution: PLAY_SCALE while playing, native everywhere else.
+  //
+  // ArtDirection's QUALITY.renderScale has documented since round 8 that it
+  // "MUST STAY 1.0 here — the screenshot harness and every visual regression
+  // check compare pixels at native resolution. Lower it at runtime for play
+  // mode." Nothing ever did: setRenderScale had no caller anywhere in src/, so
+  // the game has always played at native while the config described a frame it
+  // was not rendering. Measured on the moving-camera probe, at 1920x1080:
+  //
+  //   1.00   25.2 ms   40 fps        0.80   18.8 ms   53 fps
+  //   0.70   17.3 ms   58 fps
+  //
+  // The harness still shoots at 1.0 because applyShot() parks in godmode, so
+  // every canonical frame and every A/B in this project is unaffected.
+  if (pipe?.setRenderScale) pipe.setRenderScale(next === 'play' ? QUALITY.playRenderScale : 1.0);
   for (const fn of modeListeners) {
     try {
       fn(next, prev);
