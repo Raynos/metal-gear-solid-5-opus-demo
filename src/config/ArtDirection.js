@@ -154,7 +154,23 @@ export const TIME_OF_DAY = {
   },
 };
 
-/** Post-process / grade constants. */
+/**
+ * Post-process / grade constants.
+ *
+ * SIMPLIFIED. Nine rounds each added a warm nudge to correct the previous
+ * round's cool bug, and because they MULTIPLY the result was a sepia filter:
+ * `warmth` at R/B 1.126 times `midTint` at 1.057 put a 1.19 warm cast on every
+ * pixel, and `saturation` 0.86 then pulled what chroma survived toward the one
+ * dominant hue. Measured: 93% of the frame's chromatic mass sat in a single hue
+ * octant against the reference's 54%.
+ *
+ * The print is now neutral. Warmth belongs on the SUN, where it varies with
+ * elevation and casts a coloured shadow, not on a global multiply that tints the
+ * sky and the shadows the same direction. Barrel distortion and chromatic
+ * aberration are off: they were bought for realism and read as a lens filter.
+ *
+ * If a frame looks cold, fix the light, not this file.
+ */
 export const GRADE = {
   // Split-tone. Restrained: MGSV is dusty, not neon.
   //
@@ -175,7 +191,7 @@ export const GRADE = {
   // Round 4: 0.940/0.980/1.060 -> 0.926/0.978/1.078, alongside widening the
   // band this tint is applied over (see buildGradeLUT). The scene-side fix
   // (a sky-coloured ambient) does the heavy lifting; this is the print.
-  shadowTint: [0.926, 0.978, 1.078],
+  shadowTint: [0.970, 0.990, 1.030],
   // Round 4 integration: 1.028/0.975 -> 1.022/0.982. Ablated on the shipped
   // frames (grade off / white balance off / split tone off, same scene), the
   // vista's own pixels measure R-B +4.8 and the outpost's +7.9 — the LANDSCAPE
@@ -192,15 +208,15 @@ export const GRADE = {
   // recovery goes here and in `warmth`, not into the shadow tint (which is the
   // sky, and must stay cool) or the highlights (which are the sun, and must
   // stay near-white).
-  midTint: [1.030, 1.000, 0.974],
-  highlightTint: [1.015, 1.0, 0.975],
+  midTint: [1.010, 1.000, 0.995],
+  highlightTint: [1.005, 1.0, 0.995],
   // Round 3: saturation 0.90 -> 0.86 and lift 0.034 -> 0.050. The warmth fix
   // landed (every daylight frame now measures red above blue) but it landed
   // hot: the dusk frame came back at R151/B94, which is the orange blockbuster
   // look this file explicitly rules out, and its foreground was crushed to a
   // black silhouette. Desaturating and lifting pulls both back toward "dusty"
   // without touching the white balance that fixed the cast.
-  saturation: 0.86,
+  saturation: 1.0,
   contrast: 1.12,
   lift: 0.050,
   /**
@@ -228,13 +244,13 @@ export const GRADE = {
   bloomThreshold: 1.15,
   // Grain / lens
   grainAmount: 0.036,
-  vignette: 0.26,
-  chromaticAberration: 0.0016,
+  vignette: 0.12,
+  chromaticAberration: 0.0,
   sharpen: 0.22,
   // Photographic finish (appended)
   anamorphic: 0.10,      // horizontal streak off the bright pass
   lensDirt: 0.10,        // veiling glare through the front-element dirt map
-  barrel: 0.035,         // barrel distortion; perfectly rectilinear reads as CG
+  barrel: 0.0,         // barrel distortion; perfectly rectilinear reads as CG
   // f/2.4 is a portrait aperture. Once the gameplay camera moved to a real
   // over-the-shoulder rig its subject sat at 2.4 m, and at f/2.4 that threw the
   // entire outpost behind him into a tilt-shift blur — the shot stopped being
@@ -281,7 +297,7 @@ export const GRADE = {
   // (12.6%). See `midTint` — the scene-side white balance moved cool this round
   // and the print has to take some of it back. Held well short of the round-3
   // value (16.9%) that produced the orange cast this file rules out.
-  warmth: [1.052, 1.0, 0.934],
+  warmth: [1.0, 1.0, 1.0],
   /**
    * Depth-of-field ceilings, in pixels at 1080p (they scale with resolution).
    * These are the seatbelt behind `fStop`: whatever the autofocus locks onto,
