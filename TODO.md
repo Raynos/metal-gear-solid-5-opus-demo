@@ -228,6 +228,24 @@ relocates the objective.
 expects dropping the garrison to accomplish the mission, which exfil-only
 deliberately replaced. Fix the probe before believing its FAILs.
 
+**There was one aim pose and it was the standing one.** `_weaponTargetPose`
+scales every stance carry by `base = 1 - aim`, so at full aim the stance term
+went to zero and a single standing pose was all that survived — whatever the
+body was doing. Reported as "the gun is floating in the air at standing
+position and the hands dangle way up overhead". Measured in root space:
+
+| stance | shoulder | head | BORE | hand |
+| --- | --- | --- | --- | --- |
+| stand+aim | 1.487 | 1.617 | 1.545 | 1.544 |
+| crouch+aim | 1.141 | 1.263 | **1.545** | **1.539** |
+| prone+aim | 0.481 | 0.604 | **1.545** | **1.067** |
+
+`aimCrouch` and `aimProne` now hold the same relationship that makes the
+standing pose read as a cheek weld — bore ~0.055 above the shoulder, ~0.07
+under the head — against the bones each stance actually produces. It fixes the
+garrison too: guards crouch in cover and aim from there through the same
+animator. `probes/r13_stanceaim.js` measures it and photographs it.
+
 Still open: rank thresholds are a guess nobody has played against; a guard post
 is walled into a pocket the pathfinder can only reach from outside the wire; no
 hip fire; no stealth verbs beyond CQC.

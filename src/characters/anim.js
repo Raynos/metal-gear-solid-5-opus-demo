@@ -196,6 +196,37 @@ const WEAPON_POSES = {
   // the whole weapon slung below the shoulder line like a hip carry with the
   // stock touching. 0.145 m up and 0.05 m outboard is a cheek weld.
   aim: weaponPose([0.166, 1.545, -0.28], [-0.03, -0.02, -1.0]),
+  // AIMED FROM A CROUCH, and AIMED FROM PRONE.
+  //
+  // There was one aim pose and it was the standing one. `_weaponTargetPose`
+  // scales every stance carry by `base = 1 - aim`, so at full aim the stance
+  // term is multiplied by zero and this single pose is all that survives —
+  // whatever the man's body is doing. Reported as "the gun is floating in the
+  // air at standing position and the hands dangle way up overhead", which is
+  // exactly what it is. Measured, in root space, with the stance blend at 1:
+  //
+  //   stance        shoulder   head    BORE     hand
+  //   stand+aim       1.487    1.617   1.545    1.544   <- correct
+  //   crouch+aim      1.141    1.263   1.545    1.539   <- 0.28 above his head
+  //   prone+aim       0.481    0.604   1.545    1.067   <- 1.06 above the shoulder
+  //
+  // What makes the standing pose read as a cheek weld is where it sits BETWEEN
+  // those two bones: 0.058 above the shoulder and 0.072 under the head. Both
+  // poses below hold that same relationship against the shoulder and head the
+  // stance actually produces, which is why they are these numbers and not
+  // rounder ones.
+  //
+  // The arms are two-bone-IK'd to this matrix, so getting the height wrong does
+  // not merely look wrong, it drags the hands off the body — 1.539 is a crouched
+  // man's hand above his own skull.
+  //
+  // z: a crouched shooter holds much the same extension as a standing one, so
+  // -0.27 against the standing -0.28. Prone goes further forward (-0.42, near
+  // the prone carry's -0.4) because the elbows are down and the weapon is out
+  // over them, and inboard in x because a prone shooter is square behind it
+  // rather than bladed.
+  aimCrouch: weaponPose([0.166, 1.195, -0.27], [-0.03, -0.02, -1.0]),
+  aimProne: weaponPose([0.140, 0.535, -0.42], [-0.03, 0.00, -1.0]),
   // Crouched carry sits lower and tighter to the body.
   crouch: weaponPose([0.13, 1.09, -0.19], [-0.4, -0.42, -0.82]),
   // Prone: weapon on the ground ahead, elbows down.
@@ -855,7 +886,13 @@ export class Animator {
     add(WEAPON_POSES.crouch, crouch * (1 - prone) * base);
     add(WEAPON_POSES.sprint, run * (1 - crouch) * (1 - prone) * base);
     add(WEAPON_POSES.ready, (1 - run) * (1 - crouch) * (1 - prone) * base);
-    add(WEAPON_POSES.aim, aim);
+    // The aim half is split by stance the same way the carry half is. It used
+    // to be one unconditional `add(WEAPON_POSES.aim, aim)`, which is why
+    // aiming from a crouch or from prone put the weapon at standing bore
+    // height with the arms stretched up to reach it.
+    add(WEAPON_POSES.aimProne, aim * prone);
+    add(WEAPON_POSES.aimCrouch, aim * crouch * (1 - prone));
+    add(WEAPON_POSES.aim, aim * (1 - crouch) * (1 - prone));
     if (total < 1e-4) {
       add(WEAPON_POSES.ready, 1);
     }

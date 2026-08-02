@@ -8,3 +8,4 @@ shots/
 node_modules/.gencache/
 bench-history.jsonl
 .vite-cache/
+.vercel
