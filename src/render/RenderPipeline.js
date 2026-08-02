@@ -924,13 +924,24 @@ export class RenderPipeline {
     // Full-res AO. Contact darkening lives in a 2-3 pixel band and a half-res
     // buffer cannot carry it however good the upsample is.
     //
-    // Two channels, not four. This buffer only ever holds (occlusion, view
-    // depth) — the blur reads .rg and the prepare pass reads .r — and it is the
-    // most-fetched surface in the chain: the separable blur takes 15 taps per
-    // pixel per axis, so 2 MP of it is 60 M fetches a frame. RG16F halves every
-    // one of those against the RGBA16F it used to be, for no change to a single
-    // pixel of output.
-    const ao = { format: THREE.RGFormat };
+    // FOUR channels. This was RG16F for one round, on the argument that the
+    // buffer only ever held (occlusion, view depth) and that the separable blur
+    // takes 15 taps per pixel per axis, so halving the fetch width was free.
+    // That argument died the moment the occlusion pass started writing three
+    // signals instead of one: it is now
+    //
+    //     .r broad AO   .g view depth   .b micro AO   .a contact shadow
+    //
+    // and the two new ones live exactly in the channels RG16F does not have.
+    // Sampling a missing channel is not an error — .b reads 0 and .a reads 1 —
+    // so the composite silently applied FULL micro-occlusion to every lit pixel
+    // in the frame. It cost the ground band 66-93% of its luminance (night
+    // 0.069x against the previous round) and it did it without one warning.
+    //
+    // If the fetch width is wanted back, pack depth and the two contact terms
+    // rather than dropping channels, and re-measure the blur — do not simply
+    // narrow the format again.
+    const ao = { format: THREE.RGBAFormat };
     this.aoRT = this._rt(w, h, ao);
     this.aoBlurRT = this._rt(w, h, ao);
 
