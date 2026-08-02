@@ -198,6 +198,42 @@ flat-shaded facet normals, and the chips' albedo / envMapIntensity.
 6. Fuse composite + present — only ~0.4-0.5 ms. Feeding the luminance chain from
    a bloom mip is worth nothing: the whole chain is 0.3 ms.
 
+**Round-12 cut results, measured on a quiet machine (load 4.77, status said
+"quiet"), two runs each, back to back in one sitting:**
+
+| cut | measured | verdict |
+| --- | --- | --- |
+| half-res DOF gather | **0.2-0.4 ms**, inside the spread | kept — it is free, but it is not a win |
+| half-res AO | **~2 ms** | REVERTED — costs the contact band |
+| cascade 0 every 2 frames | 0.30 / -0.25 ms vs controls 0.01 / 0.79 | reverted; 86 draws saved, no time |
+| quarter-res volumetric march | unconfirmed | rejected — 9-18% cloud contrast |
+
+    half-res DOF   median 24.29 / 24.78   min 18.07 / 18.07
+    full-res DOF   median 25.13 / 24.82   min 18.32 / 18.23
+    half-res AO    median 22.34           min 17.04
+
+DOF disappointed because the gather early-outs to ONE tap for any in-focus
+pixel, and most of the frame is in focus — halving resolution only halves the
+gather for the defocused minority. The audit's 2.5-3.3 ms for that pass is
+presumably mostly its always-run full-resolution blit, which half res does not
+remove.
+
+**Half-res AO works and was reverted on purpose.** Cropping the sandbag wall on
+`ground` at 1:1 shows what the pass comments predict: at full res the seams
+between bags are clearly darker and the bags read as separate objects; at half
+res the seams soften and the wall flattens toward one mass. Contact occlusion
+was round 9's entire deliverable, and section 6 says the weakest thing about
+this game's look is that nothing is seated. 2 ms does not reach 60 FPS on its
+own (24 -> 22 ms is 45 FPS), so trading seated geometry for 8% of a frame is a
+decision for whoever owns the look, not something to slip into a perf pass.
+
+**The correct version of that cut is a half-res BROAD term with a full-res micro
+and contact term.** The broad GTAO horizon search is 3 slices x 8 steps = 24 taps
+and is inherently low frequency; the micro search is 12 taps and the contact
+march 8, and those are the fine ones. Splitting them should keep the band and
+still take most of the 2 ms. It is a shader restructure into two passes and it
+is the largest well-understood piece of work left in the pipeline.
+
 **Is 16.7 ms at native reachable? Not by post-chain work alone, and that is
 arithmetic.** Post in its entirety is ~10-11 ms, so deleting every effect except
 composite and present still leaves ~15-16 ms of scene — at budget with nothing
