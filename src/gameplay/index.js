@@ -4,6 +4,10 @@ import { ObstacleField } from './Obstacles.js';
 import { PlayerController } from './PlayerController.js';
 import { PlayerCamera } from './PlayerCamera.js';
 import { StealthActions } from './Stealth.js';
+import { Vitals } from './Vitals.js';
+import { MissionState } from './Mission.js';
+import { Reticle } from './Reticle.js';
+import { resolveSpawn } from './Spawn.js';
 
 /**
  * gameplay — the player.
@@ -37,6 +41,21 @@ import { StealthActions } from './Stealth.js';
  *
  * The last four are additive: nothing in src/characters reads them yet and
  * nothing breaks if it never does.
+ *
+ * THE REGISTRY CONTRACT with src/ui. `registry.gameplay` is this object, and
+ * src/ui/state.js probes it for these names — they are chosen to match what
+ * that adapter already looks for, so no translation layer exists on either
+ * side:
+ *
+ *   health        0..1, 1 is untouched          maxHealth   1
+ *   weapon        { name, ammo, reserve, mode, suppressed, magSize, reloading }
+ *   mission       { name, status, elapsed, alerts, reason }
+ *                 status: 'briefing' | 'active' | 'accomplished' | 'failed'
+ *   objectives    [{ id, label, done, position }], current first
+ *   stance        'stand' | 'crouch' | 'prone'   position/velocity/speed
+ *   spawnPoint    { x, z, y, yaw } the insertion point, for map/exfil markers
+ *
+ * Everything on it is a live getter, so a reader never holds a stale snapshot.
  */
 
 export const ANIM_CHANNELS = [
@@ -159,7 +178,18 @@ export async function install(world) {
     ground,
     coverPoints: outpost?.coverPoints ?? [],
     events,
+    ai: world.registry?.ai ?? null,
   });
+  const vitals = new Vitals({ controller, character: player, events });
+  // A fire-mode toggle: nothing in the default map has one, and a published
+  // fire mode nobody can change is a label rather than a mechanic.
+  input.rebind('fireMode', ['KeyB', 'Pad9']);
+  const reticle = new Reticle(engine.renderer.domElement.parentElement, { camera, stealth });
+
+  // --- where the mission starts --------------------------------------------
+  // NOT the screenshot pose. See Spawn.js for the measurement that forced this.
+  const spawn = resolveSpawn({ ground, obstacles, outpost });
+  const mission = new MissionState({ registry: world.registry, controller, events, spawn });
 
   // The pose the `gameplay` shot was framed against. Play mode borrows the
   // player; leaving it must hand him back byte-identical.
@@ -189,22 +219,30 @@ export async function install(world) {
     // default instead of the shot's own FOV.
     parked.fov = engine.camera.fov;
     player.controlled = true;
-    controller.position.set(parked.x, ground.heightAt(parked.x, parked.z), parked.z);
+    controller.position.set(spawn.x, ground.heightAt(spawn.x, spawn.z), spawn.z);
     controller.footY = controller.position.y;
     controller.velocity.set(0, 0, 0);
-    controller.yaw = parked.yaw;
+    controller.speed = 0;
+    controller.yaw = spawn.yaw;
     controller.stance = 'stand';
     controller.stanceTimer = 0;
-    camera.reset(controller.position, parked.camYaw);
+    // The camera starts on the body's own heading, i.e. looking at the
+    // objective. The shot's 0.62 rad offset is a framing device for a still.
+    camera.reset(controller.position, spawn.yaw);
+    vitals.reset();
+    stealth.rearm();
+    mission.begin();
     input.enable();
     setFocus();
-    events.emit({ type: 'modeEnter' });
+    events.emit({ type: 'modeEnter', spawn });
   }
 
   function exitPlay() {
     if (!active) return;
     active = false;
     input.disable();
+    mission.stop();
+    reticle.hide();
     // Let go of anyone being held or dragged. A guard left flagged `held` with
     // nothing driving him is a character the AI will never take back.
     if (stealth.grabbed) {
@@ -268,6 +306,37 @@ export async function install(world) {
     }
   }
 
+  // --- taking fire ----------------------------------------------------------
+  // src/ai publishes every trigger pull with the cone it was fired into and
+  // says, in its own comment, that whether anything is hit is gameplay's
+  // decision. Nothing had ever taken it up on that.
+  const ai = world.registry.ai;
+  if (typeof ai?.onGuardFire === 'function') {
+    ai.onGuardFire((ev) => {
+      if (!active || vitals.dead) return;
+      vitals.resolveShot(ev);
+    });
+  } else {
+    console.warn('gameplay: registry.ai publishes no onGuardFire; the player cannot be shot');
+  }
+
+  events.on((e) => {
+    if (e.type === 'death') {
+      mission.fail(e.cause);
+      // He goes down where he stood: stance straight through the transition
+      // timer, weapon out of the shoulder, nothing left driving the body.
+      controller.stance = 'prone';
+      controller.stanceTimer = 0;
+      controller.velocity.set(0, 0, 0);
+      stealth.isAiming = false;
+      stealth.aimAmount = 0;
+      stealth.lean = 0;
+      reticle.hide();
+    } else if (e.type === 'tranq') {
+      reticle.confirm();
+    }
+  });
+
   // --- per-frame ------------------------------------------------------------
   // Order 15: before src/characters ticks its animators at 20, so the pose the
   // animator solves is this frame's position and not last frame's.
@@ -275,7 +344,16 @@ export async function install(world) {
     order: 15,
     update(dt) {
       if (!active) return;
+      vitals.update(dt);
+      mission.update(dt);
       input.update(dt);
+
+      // Dead men do not walk. The camera keeps running (order 1100) so the end
+      // card plays over a live frame rather than a frozen one.
+      if (vitals.dead) {
+        controller.update(dt, { moveX: 0, moveY: 0, camYaw: camera.yaw, frozen: true });
+        return;
+      }
       if (input.pressed('swapShoulder')) {
         camera.swapShoulder();
         setFocus();
@@ -313,7 +391,10 @@ export async function install(world) {
   engine.addSystem({
     order: 1100,
     update(dt) {
-      if (!active) return;
+      if (!active) {
+        reticle.hide();
+        return;
+      }
       camera.update(dt, {
         position: controller.position,
         velocity: controller.velocity,
@@ -321,6 +402,11 @@ export async function install(world) {
         stance: controller.stance,
         sprint: controller.sprinting,
       });
+      // After the camera, because the reticle is a projection THROUGH it: run
+      // it first and the sight sits one frame behind the stick, which is the
+      // one thing in the game that has to be exact. `deterministic` is the
+      // screenshot harness driving, and no DOM of ours may be in that capture.
+      reticle.update(dt, engine.camera, !engine.deterministic);
     },
   });
 
@@ -377,9 +463,61 @@ export async function install(world) {
     get ammo() {
       return stealth.ammo;
     },
+    get reserve() {
+      return stealth.reserve;
+    },
     get reloading() {
       return stealth.reloading > 0;
     },
+
+    // --- the HUD's contract -------------------------------------------------
+    // Field names below are the ones src/ui/state.js probes for, verbatim, so
+    // the widgets light up with no adapter work at either end. Agreed with the
+    // UI author: `weapon {name, ammo, reserve, mode, suppressed}`, `health`
+    // 0..1 with `maxHealth`, `mission {name, status}`, `objectives [{id, label,
+    // done, position}]`.
+
+    /** 0..1, 1 is untouched. Regenerates out of contact; see Vitals.js. */
+    get health() {
+      return vitals.health;
+    },
+    get maxHealth() {
+      return vitals.maxHealth;
+    },
+    get dead() {
+      return vitals.dead;
+    },
+    /** 0..1, spikes on every round that lands. Drives the damage vignette. */
+    get shock() {
+      return vitals.shock;
+    },
+    get weapon() {
+      return stealth.weapon;
+    },
+    get mission() {
+      return mission.view;
+    },
+    get objectives() {
+      return mission.objectives;
+    },
+    get spawnPoint() {
+      return spawn;
+    },
+    get commander() {
+      return mission.commander;
+    },
+    /** What the aim ray is on right now: {character, point, dist} or null. */
+    get aimHit() {
+      return stealth.aimHit;
+    },
+    vitals,
+    missionState: mission,
+    reticle,
+
+    /** Hurt the player. `from` is a world position and may be null. */
+    damage: (amount, from, cause) => vitals.damage(amount, from, cause),
+    /** End the run from outside — used by tests and by anything scripted. */
+    endMission: (result, reason) => (result === 'failed' ? mission.fail(reason) : mission.accomplish(reason)),
     /** World point the weapon is pointed at, sway included. */
     get aimPoint() {
       return stealth.aimPoint;
