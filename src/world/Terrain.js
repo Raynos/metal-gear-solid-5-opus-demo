@@ -198,6 +198,21 @@ function tileFbm(u, v, period, oct) {
 // vertex shader, the shadow-depth pass and heightAt() return the same surface
 // to within 1e-5 m. That is what lets the near rings carry real geometric
 // ripple without props, feet or the outpost pad floating.
+/**
+ * A 1x1 all-zero texture, for a sampler that has nothing bound to it yet.
+ * three.js cannot leave a sampler uniform null — an unbound sampler2D reads
+ * whatever texture unit 0 happens to hold, which on this material is the
+ * heightfield — so the "off" state has to be a real texture.
+ */
+let EMPTY_TEX = null;
+function emptyTex() {
+  if (!EMPTY_TEX) {
+    EMPTY_TEX = new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat);
+    EMPTY_TEX.needsUpdate = true;
+  }
+  return EMPTY_TEX;
+}
+
 const MICRO_N = 256;
 const MICRO_PERIOD = 64;
 const MICRO_FIELD = new Float32Array(MICRO_N * MICRO_N * 4);
@@ -1426,7 +1441,7 @@ export class Terrain {
           g.deposit[c] += (f.sample(f.deposit, wx, wz) - g.deposit[c]) * (1 - w);
           g.ao[c] += (f.sample(f.ao, wx, wz) - g.ao[c]) * (1 - w);
           g.curv[c] += (f.sample(f.curv, wx, wz) - g.curv[c]) * (1 - w);
-          // The near grid runs one more octave of `mid` than the far grid can
+          // The near grid runs one more octave of "mid" than the far grid can
           // hold, so the two disagree by that octave; cross-fade it out.
           g.mid[c] += (f.sample(f.mid, wx, wz) - g.mid[c]) * (1 - w);
           // Normals too: a 2 m central difference of an upsampled 8 m field is
@@ -2273,6 +2288,7 @@ export class Terrain {
     this._rings[0].onBeforeRender = function (renderer, scene, camera) {
       if (camera && camera.isPerspectiveCamera) self._recenter(camera.position);
       self._trackSun(scene);
+      self._trackWear(scene);
     };
     this._recenter(new THREE.Vector3(0, 0, 0));
   }
@@ -2295,6 +2311,69 @@ export class Terrain {
     d.copy(this._sun.position);
     if (this._sun.target) d.sub(this._sun.target.position);
     d.normalize();
+  }
+
+  /**
+   * Bind the outpost's wear field to the terrain.
+   *
+   * The record of traffic — every desire line, wheel rut, vehicle corridor and
+   * oil spill on the site — is rasterised by `outpost/wear.js` at 0.5 m/texel,
+   * and until now only the outpost's own pad sampled it. So the ground stopped
+   * being used at the pad edge: the access road ran out through the gate onto a
+   * surface nothing had ever driven over, which is most of "nothing in this
+   * world has been touched".
+   *
+   * Terrain is constructed before any module installs and is not registered as
+   * a system, so this discovers the field the same way `_trackSun` discovers the
+   * sun: off the ring-0 draw hook, once, by traversal. That keeps the coupling
+   * one-directional — nothing in `outpost/` has to know terrain exists — and a
+   * failed bind leaves `uWearOn` at 0, which costs one uniform compare per
+   * fragment and changes nothing.
+   *
+   * The world -> compound-local transform is measured rather than assumed: the
+   * pad's wear uv is its own object-space xz, so the inverse of its world matrix
+   * is the map, and probing it at three points recovers the 2x3 affine exactly
+   * whatever the outpost's yaw and origin happen to be. A transform with any
+   * height dependence would not be expressible that way, so it is checked and
+   * the bind refused rather than silently skewing the field.
+   */
+  _trackWear(scene) {
+    if (this._wearState) return;
+    // A handful of retries, not forever: modules install asynchronously, but a
+    // traversal of the whole scene on every frame of a build with no outpost in
+    // it is a cost with no upside.
+    this._wearTries = (this._wearTries || 0) + 1;
+    if (this._wearTries > 240) { this._wearState = 'absent'; return; }
+
+    let mesh = null;
+    scene.traverse((o) => {
+      if (mesh || !o.isMesh) return;
+      const t = o.material?.userData?.u?.uWearMap?.value;
+      if (t && t.image && t.image.width > 4) mesh = o;
+    });
+    if (!mesh) return;
+
+    const u = mesh.material.userData.u;
+    mesh.updateWorldMatrix(true, false);
+    const inv = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
+    const P = (x, y, z) => new THREE.Vector3(x, y, z).applyMatrix4(inv);
+    const o0 = P(0, 0, 0);
+    const ox = P(1, 0, 0);
+    const oz = P(0, 0, 1);
+    const oy = P(0, 100, 0);
+    if (Math.abs(oy.x - o0.x) > 1e-4 || Math.abs(oy.z - o0.z) > 1e-4) {
+      this._wearState = 'skewed';
+      return;
+    }
+    this.uniforms.uWearXf.value.set(ox.x - o0.x, oz.x - o0.x, ox.z - o0.z, oz.z - o0.z);
+    this.uniforms.uWearOff.value.set(o0.x, o0.z);
+    this.uniforms.uWearOrg.value.copy(u.uWearOrg.value);
+    this.uniforms.uWearMap.value = u.uWearMap.value;
+    this.uniforms.uWearOn.value = 1;
+    // The sampler binding changed, so the program's texture units have to be
+    // re-resolved. Everything else here is a plain uniform upload.
+    this.material.needsUpdate = true;
+    this._wearState = 'bound';
   }
 
   _recenter(p) {
@@ -2381,6 +2460,57 @@ export class Terrain {
       // of. It used to borrow uRockLight, so the round-7 bedrock cut would have
       // taken 0.55x out of the valley floor as well.
       uGravelClast: { value: C(0.318, 0.294, 0.266) },
+
+      // --- soil classes ---------------------------------------------------
+      //
+      // Four surfaces, as MULTIPLIERS on the assembled ground colour so each
+      // one carries a hue shift AND a value shift off the same uniform. See the
+      // SOIL CLASS block in the fragment shader for why they exist; the short
+      // version is that the ground had nothing between the 45 m "mid" field and
+      // the 900 m `macro` fbm, so two hillsides 200 m apart rendered the same
+      // colour, and the near-ground band measured L* sd 5.0 against 18-24 in
+      // every reference frame.
+      //
+      // The value spread across the four is 0.62 -> 1.78, i.e. 1.52 stops.
+      // That is deliberately most of the total: value, not hue, is what was
+      // missing, and the class boundaries are what carry it at 60-250 m.
+      //
+      // A: caliche / deflation lag. The pale one, and the only surface in the
+      //    whole material that can reach L* > 85 in full sun — the references
+      //    put 2.8-12% of their ground band above that and we had zero pixels.
+      //    Calcrete and gypsum crust genuinely photograph at 0.55-0.70
+      //    reflectance, so this is a real material and not an exposure cheat.
+      //    Its R/B multiplier is 0.95 rather than 1: a caliche crust is a pale
+      //    CREAM, less saturated than the khaki around it, not a warmer version
+      //    of it. Tried at 2.10x first and the outpost frame — which happens to
+      //    sit almost entirely inside one class — bleached to a salt flat. The
+      //    class field's wavelength came down from 118 m to 96 m at the same
+      //    time so that a wide framing sees two or three classes rather than
+      //    one; a single-class frame is what makes any value this extreme
+      //    unusable.
+      uSoilA: { value: C(1.42, 1.44, 1.49) },
+      // B: wind-packed khaki. The old single surface, unchanged, so anything
+      //    calibrated against the previous build still lands where it did.
+      uSoilB: { value: C(1.06, 1.06, 1.06) },
+      // C: grey silt plain — playa fines, cool and flat. R/B drops from the
+      //    palette's 1.28 to 1.16, which is the one place this material is
+      //    allowed to go cool.
+      uSoilC: { value: C(0.920, 0.940, 1.010) },
+      // D: iron-stained gravel lag. Dark and hot: R/B 1.28 -> 1.71.
+      uSoilD: { value: C(0.620, 0.545, 0.470) },
+
+      // --- traffic --------------------------------------------------------
+      // The outpost's wear field, sampled by the TERRAIN as well as by the pad.
+      // Bound lazily off the ring-0 draw hook (see _trackWear) because Terrain
+      // is constructed before any module installs. uWearOn is 0 until it binds,
+      // so a failed bind costs one compare and changes nothing.
+      uWearMap: { value: emptyTex() },
+      uWearOrg: { value: new THREE.Vector4(0, 0, 1, 1) },
+      // world xz -> compound-local uv, as a 2x2 (xy = row 0, zw = row 1)...
+      uWearXf: { value: new THREE.Vector4(1, 0, 0, 1) },
+      uWearOff: { value: new THREE.Vector2(0, 0) },   // ... plus this translation
+      uWearOn: { value: 0 },
+
       uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
       /**
        * Second ablation hook: (pavement lag layer, mid-field albedo swing,
@@ -2392,6 +2522,13 @@ export class Terrain {
        * black, so "varnish coverage" becomes a pixel count instead of an opinion.
        */
       uDbg2: { value: new THREE.Vector4(1, 1, 0, 0) },
+      /**
+       * Third ablation hook: (soil class, traffic wear, spare, spare). Both are
+       * 1/0 kill switches on layers added this round, so a claim about either
+       * can be proved by toggling it and re-rendering the SAME build rather than
+       * by diffing against a previous one where five things moved at once.
+       */
+      uDbg3: { value: new THREE.Vector4(1, 1, 0, 0) },
     };
     this.uniforms = u;
 
@@ -2527,6 +2664,16 @@ export class Terrain {
           uniform vec4 uDbg;
           uniform vec3 uGravelClast;
           uniform vec4 uDbg2;
+          uniform vec4 uDbg3;
+          uniform vec3 uSoilA;
+          uniform vec3 uSoilB;
+          uniform vec3 uSoilC;
+          uniform vec3 uSoilD;
+          uniform sampler2D uWearMap;
+          uniform vec4 uWearOrg;
+          uniform vec4 uWearXf;
+          uniform vec2 uWearOff;
+          uniform float uWearOn;
 
           // The stratigraphic resistance hash, bit-identical to the CPU's in
           // _addStrata. It has to be identical: it decides which beds the
@@ -2567,6 +2714,31 @@ export class Terrain {
           // removing. A rotation per scale is not optional.
           #define ROT_P vec2(0.94, -0.34)
           #define ROT_Q vec2(-0.52, 0.854)
+
+          // One octave of value noise, for the soil-class field only.
+          //
+          // Every other low-frequency field in this shader is baked, because a
+          // baked field can be built from the erosion sim and therefore knows
+          // about the landform. This one cannot be: both material textures are
+          // full (4 channels each of the 8-bit and the half-float set) and the
+          // soil class is worth more than a fifth channel would cost in memory
+          // and bake time. 24 ALU and no fetch is cheaper than either.
+          //
+          // Hash is Hoskins' fract-multiply rather than the usual sin(dot(..)),
+          // because a sin hash bands into visible stripes once the argument gets
+          // large and this is evaluated on world coordinates out to 6 km.
+          float shash(vec2 p) {
+            vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+            q += dot(q, q.yzx + 33.33);
+            return fract((q.x + q.y) * q.z);
+          }
+          float vnoise2(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = p - i;
+            f = f * f * (3.0 - 2.0 * f);
+            return mix(mix(shash(i), shash(i + vec2(1.0, 0.0)), f.x),
+                       mix(shash(i + vec2(0.0, 1.0)), shash(i + vec2(1.0, 1.0)), f.x), f.y);
+          }
 
           // Detail anti-aliasing.
           //
@@ -2735,6 +2907,88 @@ export class Terrain {
             // Break the boundaries with the mid-scale mottle so nothing reads as
             // a smoothstep on slope.
             float jitter = (D.a - 0.5) * 0.26 + (macro - 0.5) * 0.20 + (mid - 0.5) * 0.24;
+
+            // --- SOIL CLASS, at 96 m -------------------------------------
+            //
+            // The hole in the spectrum. Everything below the 45 m "mid" field
+            // is a tiling detail set and everything above it is "macro", a
+            // 7-octave fbm from 900 m — so the 60-250 m band was carried by
+            // macro's second and third octaves at 1/4 and 1/8 amplitude, which
+            // measured as a couple of per cent. Two hillsides 200 m apart came
+            // out the same colour, and the near-ground band of the ground shot
+            // measured L* sd 5.0 where every reference frame runs 18-24. A
+            // desert is not one substance: it is a MOSAIC of soil classes, each
+            // with its own hue and — the part that was actually missing — its
+            // own value.
+            //
+            // ONE value-noise evaluation selects between four palette entries.
+            // Not a new fbm stack: this is already the most expensive shader in
+            // the frame, and a second stack would buy detail the four classes
+            // give for 24 ALU. Regional grouping is borrowed from "macro", which
+            // is already fetched, so classes cluster into basins instead of
+            // salting evenly across the map; the boundaries are then broken into
+            // fingers by "mid" and the 4.6 m mottle, so what the eye reads is a
+            // soil boundary and not a threshold on smooth noise.
+            //
+            // TWO taps, not one, and the reason is a measurement. With a single
+            // 96-118 m tap the field is smaller than the frame in a ground shot
+            // and smaller than a pixel in a vista, so it delivered a constant:
+            // masked to the pixels the terrain owns, turning the whole palette
+            // on moved the band's L* spread from 10.2 to 10.1 and its mean by
+            // 0.4 codes. A soil mosaic has to work at 30 m and at 250 m or it is
+            // a flat multiply. 236 m carries the "why does that hillside not
+            // match this one", 79 m carries the patchwork inside one basin, and
+            // the baked 11-45 m mid field carries the near ground — where a
+            // class boundary is the only large feature a player standing on the
+            // pan can see. That is three scales for two extra noise evaluations
+            // and no extra fetch.
+            float soilN = vnoise2(vWPos.xz * (1.0 / 236.0) + vec2(31.7, -12.3)) * 0.55
+                        + vnoise2(vWPos.xz * (1.0 / 79.0) + vec2(-8.4, 21.9)) * 0.33
+                        + vnoise2(vWPos.xz * (1.0 / 24.0) + vec2(57.1, 4.6)) * 0.12;
+            // The class field is built from NOTHING ELSE, and that is the whole
+            // point. The first version drove it off "macro", "mid" and the 4.6 m
+            // mottle, on the reasoning that reusing fetched fields is cheaper
+            // than new noise — and it measured as a small NEGATIVE on every
+            // statistic in every band. The reason is that those three fields
+            // already drive the regional tone eight lines below, where high
+            // means brighter; selecting the DARK classes off the same high
+            // values made the class multiplier anti-correlated with the tone and
+            // the two cancelled. Ablated in place on the vista's mid band, the
+            // 32 px high-pass went 8.12% with the class off to 7.82% with it on.
+            //
+            // Three octaves of its own noise cost ~72 ALU and no fetch, are
+            // exactly mean-0.5 by construction, and are independent of every
+            // other field in the shader — so the classes can only add spread.
+            // 236 m and 79 m are the hole in the spectrum; 24 m is there to break
+            // the class boundaries into fingers, which is what stops a boundary
+            // reading as a contour line on smooth noise.
+            float soilK = clamp(0.5 + (soilN - 0.5) * 1.38, 0.0, 1.0);
+            // Where each class can physically be. Calcrete and deflation lag
+            // need a stable, flat, long-exposed surface and are scoured out of
+            // anything that drains; the fine silt plains are the opposite, they
+            // are where the water stops. Without these gates the classes are
+            // just tinted noise and the eye reads them as a texture.
+            //
+            // The four weights are complementary ramps, so they sum to exactly 1
+            // at every value of soilK and each class gets a PURE interval rather
+            // than existing only at a threshold. soilK is a sum of three
+            // near-symmetric fields and lands at mean 0.50 sd 0.139 (measured on
+            // the CPU against the same hash), which puts the four classes at
+            // roughly 14 / 36 / 36 / 14 per cent of the ground — the khaki the
+            // whole world used to be is still the plurality, so this widens the
+            // distribution rather than replacing it.
+            float soilA = 1.0 - smoothstep(0.32, 0.42, soilK);
+            float soilB = smoothstep(0.32, 0.42, soilK) * (1.0 - smoothstep(0.45, 0.55, soilK));
+            float soilC = smoothstep(0.45, 0.55, soilK) * (1.0 - smoothstep(0.58, 0.68, soilK));
+            float soilD = smoothstep(0.58, 0.68, soilK);
+            // Calcrete and deflation lag need a stable, flat, long-exposed
+            // surface: what a wash takes away, it takes the crust with it. So the
+            // pale class hands back to khaki wherever the ground drains.
+            float exposedW = (1.0 - flow) * (1.0 - smoothstep(0.05, 0.24, slope));
+            float shed = soilA * (1.0 - mix(0.25, 1.0, exposedW));
+            soilA -= shed;
+            soilB += shed;
+
             float rockW  = smoothstep(0.34, 0.60, rockM + jitter * 0.8 + slope * 0.30);
             float screeW = smoothstep(0.26, 0.62, screeM + jitter * 0.7);
             // Desert pavement: the flats are never uniform sand. Irregular
@@ -2751,6 +3005,13 @@ export class Terrain {
             // 8% relative modulation across a quarter of the frame.
             float lag = smoothstep(0.36, 0.62,
               macro * 0.46 + mid * 0.52 + D.a * 0.32 + (mix(0.5, dB.g, sB) - 0.5) * 0.25);
+            // A soil class has to be a MATERIAL and not a tint, or it reads as
+            // paint over an unchanged gravel pattern. The pale crust is a
+            // sealed, swept surface that carries almost no lag; the iron class
+            // is a lag by definition. So the class moves the cobble cover as
+            // well as the colour, and the boundary therefore carries a texture
+            // change, which is what makes it read as ground.
+            lag = clamp(lag * (1.0 - soilA * 0.62) + soilD * 0.28, 0.0, 1.0);
             screeW = max(screeW, lag * 0.9) * (1.0 - rockW);
             float flowW  = smoothstep(0.26, 0.70, flow + (D.a - 0.5) * 0.16) * (1.0 - rockW * 0.85);
             // Trunk washes only: the wide, sandy-floored part of the drainage.
@@ -2879,7 +3140,15 @@ export class Terrain {
             // value; round 6 added mid at half the swing it needed. The mean is
             // unchanged (1.04) — this only widens the spread, so nothing in the
             // exposure calibration moves.
-            albedo *= (0.78 + macro * 0.22 + mid * 0.30 + (D.a - 0.5) * 0.16) * uDbg2.y
+            //
+            // Round 8: the coefficients are up 1.36x. Measured, this term was
+            // delivering +-8% RMS (+-0.11 stops) against a comment claiming
+            // 1.46 stops — the swing had been written as an intention and never
+            // as a number. The mean is held at 1.03 so nothing in the exposure
+            // calibration moves; only the spread widens. The rest of the missing
+            // range is the soil class below, which carries it as a boundary
+            // rather than as more noise.
+            albedo *= (0.66 + macro * 0.30 + mid * 0.41 + (D.a - 0.5) * 0.22) * uDbg2.y
                     + 1.04 * (1.0 - uDbg2.y);
 
             // --- near-field grit ----------------------------------------------
@@ -2986,12 +3255,19 @@ export class Terrain {
                   float hs = GRITN(guv + sdir * (sd / GRIT_TILE)).a;
                   occ = max(occ, smoothstep(0.0, 0.008, (hs - GN.a) * GRIT_H - sd * tanE));
                 }
-                gMicroShadow = 1.0 - occ * 0.85 * gritW;
+                gMicroShadow = 1.0 - occ * 0.95 * gritW;
               }
               // Contact darkening in the interstices. The sand banked between
               // stones sees less of the sky than the stones standing over it,
               // and that cavity term is most of what a close-up of gravel is.
-              gritAO = mix(1.0, 0.52 + GN.a * 0.80, gritW);
+              //
+              // Round 8 took the floor from 0.52 to 0.36. Cropped at 2x against
+              // the references, the single clearest tell was that our pebbles
+              // are albedo-only marks on a flat plane: a lit face, no dark face,
+              // and nothing underneath them. This is the "nothing underneath"
+              // half — the measured 2 px high-pass on the near band was 1.98%
+              // against 4.0-7.4% in the references.
+              gritAO = mix(1.0, 0.36 + GN.a * 0.96, gritW);
 
               float clast = GM.g * smoothstep(0.10, 0.62, 0.42 + GB.a * 0.85);
               float grain = GM.r;
@@ -3002,16 +3278,28 @@ export class Terrain {
               // the stones are varnished and the sand between them is not — with
               // a minority of pale quartzy ones. A symmetric spread reads as
               // scattered white confetti.
-              vec3 clastC = mix(uRockDark * 1.18, uSandLight * 0.98, pow(GM.b, 1.7));
+              // Pale end raised 0.98 -> 1.20: the quartzy minority in a real
+              // pavement is bleached limestone and reads near-white in full sun,
+              // and pow(GM.b, 1.7) keeps it a minority so the mean barely moves.
+              vec3 clastC = mix(uRockDark * 1.18, uSandLight * 1.20, pow(GM.b, 1.7));
               clastC = mix(clastC, uRockRed * 0.94, smoothstep(0.30, 0.72, GM.b) * 0.40);
 
               vec3 fines = mix(uSandMid, uSandLight, clamp(grain * 0.75 + drift * 0.45 - 0.10, 0.0, 1.0));
               vec3 gritC = mix(fines, clastC, clast * 0.92);
               // Drifts: paler where blown sand has banked up between stones.
-              gritC *= (0.94 + drift * 0.14) * (0.93 + GB.r * 0.15);
+              // Both taps are 3.1 m tiles, so this is the one term in the near
+              // field with structure at metres rather than centimetres — and it
+              // was running at +-6%. That is most of why the ground shot's 32 px
+              // high-pass measured 4.9% against 19-21% in the references: below a
+              // metre the frame is full of clasts and above ten it has the mid
+              // field, and the band in between was almost flat.
+              gritC *= (0.85 + drift * 0.32) * (0.84 + GB.r * 0.34);
 
               albedo = mix(albedo, mix(gritC, albedo * 1.06, 0.10), gritW * (1.0 - rockW * 0.55));
-              gpert = (GN.rg * 2.0 - 1.0) * (1.25 * gritW);
+              // 1.25 -> 1.70. The other half of "a lit face plus a dark face":
+              // a stone that has no shading gradient across it looks identical
+              // wherever the sun is, which is exactly what the crop showed.
+              gpert = (GN.rg * 2.0 - 1.0) * (1.70 * gritW);
             }
 
             // --- desert pavement, the MID field ---------------------------------
@@ -3054,9 +3342,10 @@ export class Terrain {
               // Hand over from the true near-field grit rather than doubling it,
               // and stay off bedrock — a cliff face has its own strata and clast
               // layers and does not carry a pavement.
-              float pavW = (1.0 - smoothstep(200.0, 340.0, dist))
-                         * (1.0 - rockW * 0.72) * (1.0 - gritW * 0.80) * uDbg2.x;
-              if (pavW > 0.004 && max(sP, sQ) > 0.004) {
+              float pavReach = (1.0 - smoothstep(200.0, 340.0, dist))
+                             * (1.0 - rockW * 0.72) * uDbg2.x;
+              float pavW = pavReach * (1.0 - gritW * 0.80);
+              if (pavReach > 0.004 && max(sP, sQ) > 0.004) {
                 vec4 PM = textureGrad(uGrit, vec3(puv, 0.0), pdx, pdy);
                 vec4 PN = textureGrad(uGrit, vec3(puv, 1.0), pdx, pdy);
                 vec4 QM = textureGrad(uGrit, vec3(quv, 0.0), qdx, qdy);
@@ -3075,8 +3364,18 @@ export class Terrain {
                 // bare lag while others bank pale fines. This is the scale the
                 // eye reads at 100-250 m and there was nothing at it. The mean of
                 // the three terms is 1.01, so this is spread, not a level shift.
-                pavC *= 0.74 + QM.a * 0.38 + QM.r * 0.16;
+                float patchT = 0.62 + QM.a * 0.52 + QM.r * 0.24;
+                pavC *= patchT;
                 albedo = mix(albedo, pavC, clamp(wP * 0.90 + wQ * 0.70, 0.0, 0.95));
+                // The COBBLES have to hand over to the near-field grit, because
+                // both are clast layers and running them together doubles the
+                // stones. The metre-scale patch TONE does not: the grit's
+                // features are 1-2 cm and this one is 0.7-2.4 m, so gating it on
+                // gritW as well took the only patchy thing in the frame off the
+                // whole 0-30 m band. Measured on the ground shot, that band's
+                // 32 px high-pass came out at 4.9% of its mean against 19-21% in
+                // the references — the metre-to-ten-metre scale was empty.
+                albedo *= mix(1.0, patchT, clamp(sQ * pavReach - wQ, 0.0, 1.0));
 
                 // Relief. The 3.6x normal is the one that survives to ~230 m; the
                 // 11x normal is a metre-scale undulation that runs to the far
@@ -3192,6 +3491,88 @@ export class Terrain {
               }
             }
 
+            // --- soil class, applied -------------------------------------------
+            // Deliberately the LAST albedo term. The near-field grit and the
+            // mid-field pavement both mix toward colours of their own rather
+            // than scaling whatever they land on, so a class applied before them
+            // would have been overwritten across the 0-330 m band — which is the
+            // entire band a player reads material off. Applied here it scales
+            // all three, so a clast on the pale crust is a pale clast and the
+            // class survives all the way into the foreground.
+            {
+              vec3 soil = uSoilA * soilA + uSoilB * soilB + uSoilC * soilC + uSoilD * soilD;
+              // Bedrock keeps most of its own palette and all of its varnish —
+              // it is a rock type, not a soil. But not ALL of it: at 100-250 m a
+              // soil-class boundary is very largely a lithology boundary, and
+              // the regolith and dust veneer on a slope carry it too. Held at
+              // 0.85 the class stopped at the foot of every hill, which left the
+              // "adjacent hillsides 200 m apart look identical" complaint
+              // exactly where it was — the vista frame is mostly hillside.
+              soil = mix(soil, vec3(1.0), rockW * 0.70);
+              albedo *= mix(vec3(1.0), soil, uDbg3.x);
+              // Measurement hook, not a look: uDbg3.z is 0 in the shipped build.
+              // Set it and every ground fragment renders its class as a flat
+              // primary, so "how much of this frame is the pale class" is a pixel
+              // count rather than an opinion. A -> white, B -> yellow, C -> blue,
+              // D -> red, bedrock -> black.
+              if (uDbg3.z > 0.5) {
+                albedo = (vec3(1.0) * soilA + vec3(1.0, 0.85, 0.0) * soilB
+                        + vec3(0.0, 0.3, 1.0) * soilC + vec3(1.0, 0.0, 0.0) * soilD)
+                       * (1.0 - rockW);
+              }
+            }
+
+            // --- traffic --------------------------------------------------------
+            // The world outside the fence had never been walked on.
+            //
+            // outpost/wear.js already rasterises every desire line, wheel rut,
+            // vehicle corridor and oil spill on the site into a distance field at
+            // 0.5 m/texel — and that field was sampled ONLY by the outpost's own
+            // pad, so the access road ran out of the gate onto ground no vehicle
+            // had ever touched and stopped dead at the pad edge.
+            //
+            // Worn tracks in the reference frames are PALER than the ground
+            // beside them, not darker: traffic strips the dark varnished lag and
+            // the crust, pulverises what is left to fines, and polishes the
+            // crown. So this lightens, and takes the lag off, and the ruts
+            // themselves are the only part that darkens — spoil and torn ground
+            // either side of a polished centre.
+            //
+            // Cost: one fetch, on ground fragments inside the field's own
+            // footprint. Everything else pays a uniform compare.
+            float polish = 0.0;
+            float spillK = 0.0;
+            if (uWearOn > 0.5) {
+              vec2 wl = vec2(dot(uWearXf.xy, vWPos.xz), dot(uWearXf.zw, vWPos.xz)) + uWearOff;
+              vec2 wuv = (wl - uWearOrg.xy) * uWearOrg.zw;
+              if (all(greaterThanEqual(wuv, vec2(0.0))) && all(lessThanEqual(wuv, vec2(1.0)))) {
+                vec4 WR = texture2D(uWearMap, wuv);
+                // Break the distance field's edge into fingers with fields that
+                // are already fetched. A 0.5 m texel resolves a path edge to
+                // about 60 mm, which is sharp enough to read as a drawn line if
+                // it is left alone.
+                float e = (D.a - 0.5) * 0.13 + (mid - 0.5) * 0.09;
+                float foot = smoothstep(0.50, 0.74, WR.r + e);
+                float corr = smoothstep(0.50, 0.70, WR.b + e);
+                // Where the wheels actually ran. WR.g is a lateral coordinate in
+                // metres with the lorry's own wander already removed, so a rut
+                // pair stays a pair through every bend instead of smearing.
+                float lat = (WR.g - 0.5) * 12.0;
+                float rut = exp(-pow((abs(lat) - 0.95) / 0.42, 2.0)) * corr;
+                float crown = (1.0 - smoothstep(0.10, 0.62, abs(lat))) * corr;
+                float traffic = max(foot, corr) * uDbg3.y * (1.0 - rockW * 0.70);
+                polish = traffic;
+                spillK = WR.a * uDbg3.y;
+                vec3 beaten = mix(uSilt, uSandLight, 0.45);
+                albedo = mix(albedo, mix(albedo * 1.30, beaten, 0.34),
+                             clamp(traffic * 0.70 + crown * 0.26, 0.0, 0.92));
+                albedo = mix(albedo, albedo * 0.82, rut * 0.45);
+                // Oil, diesel, hydraulic: dark, and the one genuinely glossy
+                // thing anywhere on the terrain.
+                albedo *= 1.0 - spillK * 0.55;
+              }
+            }
+
             diffuseColor.rgb *= albedo * 0.80;
 
             // --- normal --------------------------------------------------------
@@ -3220,6 +3601,12 @@ export class Terrain {
             // and at 150-250 m this term is most of the relief there is.
             pert *= mix(0.52, 1.0, clamp(screeW * 0.55 + rockW, 0.0, 1.0));
             pert += gpert + rpert;
+            // A compacted lane is SMOOTH. Wind ripples do not form on it and the
+            // loose clasts have been driven into it, so the same term that
+            // lightens the track has to take the relief off it as well — a pale
+            // stripe with the surrounding ripple still running across it reads as
+            // a decal, which is what the pad's own wear looked like before this.
+            pert *= 1.0 - polish * 0.62;
 
             // The 7 cm geometric ripple in the vertex shader needs a matching
             // shading normal, or the ground wobbles in silhouette and stays flat
@@ -3247,7 +3634,11 @@ export class Terrain {
             float cav = mix(nB.a, mix(nC.a, nA.a, nearNW), midNear);
             gAO = bake * mix(1.0, cav * 1.45, 0.6 * midW * clamp(screeW + rockW, 0.32, 1.0)) * gritAO * pavAO;
             gRough = clamp(mix(0.92, 0.99, rockW) - (D.r - 0.5) * 0.10 - flowW * 0.05
-                           + gStrataRough * rockW, 0.55, 1.0);
+                           + gStrataRough * rockW
+                           // Traffic polishes; spilt oil is the one specular
+                           // surface on the terrain and it has to be legible as
+                           // one, or a fuel point is a brown stain.
+                           - polish * 0.10 - spillK * 0.42, 0.30, 1.0);
           }`,
         )
         .replace(
@@ -3274,7 +3665,13 @@ export class Terrain {
             float ao = clamp(gAO, 0.0, 1.6);
             // Sky occlusion belongs on the indirect term only; the sun is
             // already shadow-mapped and double-darkening kills the high-key look.
-            reflectedLight.indirectDiffuse *= mix(0.45, 1.05, ao);
+            // 0.45 -> 0.36 at the closed end. This is the only path by which
+            // the near-field cavity term reaches the screen, and it was
+            // compressing an AO that swings 0.36-1.32 into a 0.45-1.05 window
+            // — so a stone sitting in a hollow darkened the ground under it by
+            // about two display codes. The open end is untouched, so nothing
+            // on lit flat ground moves.
+            reflectedLight.indirectDiffuse *= mix(0.36, 1.06, ao);
             reflectedLight.indirectSpecular *= mix(0.3, 1.0, ao);
           }`,
         );
