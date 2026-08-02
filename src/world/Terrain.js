@@ -2554,7 +2554,6 @@ export class Terrain {
       uClipCentre: { value: new THREE.Vector2(0, 0) },
       uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.5) },
       uDip: { value: new THREE.Vector2(DIP_X, DIP_Z) },
-<<<<<<< HEAD
       // THE PALETTE IS A SET, NOT A FAMILY.
       //
       // Every entry here used to be the same hue — R > G > B, khaki, R/B 1.5 to
@@ -2591,39 +2590,10 @@ export class Terrain {
       // varnish coat as well — they are the same mineral and there is no reason
       // to carry two constants for it. (Deleted: uVarnish.)
       uBasalt: { value: C(...ROCK.basalt) },
-=======
-      uSandLight: { value: C(0.605, 0.548, 0.472) },  // R/B 1.28
-      uSandMid: { value: C(0.470, 0.416, 0.352) },    // 1.34
-      uSandDark: { value: C(0.325, 0.282, 0.240) },   // 1.35
+      // Playa fines, kept from the round-9 terrain pass because the traffic
+      // block below mixes its "beaten ground" out of it. Between uGravel's grey
+      // and uSandLight's khaki, and slightly cooler than either.
       uSilt: { value: C(0.640, 0.586, 0.510) },       // 1.25
-      uGravel: { value: C(0.372, 0.328, 0.290) },     // 1.28
-      // Round 5 measured the distant ranges rendering BRIGHTER than the sky
-      // directly above them, which no unlit surface can do. Two owners share
-      // that error: the volumetrics owner is cutting fog extinction, and this
-      // is the albedo half. Bedrock is not pale — dry Afghan limestone and
-      // schist photograph at 0.20-0.28 linear reflectance, and the varnished
-      // faces at half that. Round 5's 0.456 was a fresh-quarry value.
-      // Round 6 took bedrock from 0.456 to 0.318 and the range still measured as
-      // the brightest large object in the outpost frame. 0.318 is a FRESH
-      // limestone value; what a camera sees on a weathered Afghan range is the
-      // varnished, dust-loaded outer millimetre, and that photographs at
-      // 0.14-0.20. This is 0.55x, which is the number the critique asked for and
-      // also where the measurement lands: the ridge stops out-reading the sky it
-      // is silhouetted against without the haze owner having to carry the whole
-      // correction in extinction.
-      uRockLight: { value: C(0.175, 0.162, 0.146) },  // 1.20  (was 0.318)
-      // The dark end moves less. It is already at limestone-in-shadow and taking
-      // it down by the same factor makes every gorge charcoal, which is the exact
-      // crushed-shadow failure four rounds of light transport exist to prevent.
-      uRockDark: { value: C(0.140, 0.126, 0.113) },   // 1.24  (was 0.198)
-      uRockRed: { value: C(0.238, 0.177, 0.150) },    // 1.59 iron stain
-      uVarnish: { value: C(0.098, 0.082, 0.076) },    // 1.29
-      // The scree/gravel apron on the PAN is not the same material as a cliff
-      // face and must not follow bedrock down: the pan is loose, dust-coated,
-      // freshly turned-over clasts and it is what the near-field ground is made
-      // of. It used to borrow uRockLight, so the round-7 bedrock cut would have
-      // taken 0.55x out of the valley floor as well.
-      uGravelClast: { value: C(0.318, 0.294, 0.266) },
 
       // --- soil classes ---------------------------------------------------
       //
@@ -2656,11 +2626,11 @@ export class Terrain {
       // B: wind-packed khaki. The old single surface, unchanged, so anything
       //    calibrated against the previous build still lands where it did.
       uSoilB: { value: C(1.06, 1.06, 1.06) },
-      // C: grey silt plain — playa fines, cool and flat. R/B drops from the
-      //    palette's 1.28 to 1.16, which is the one place this material is
+      // C: grey silt plain — playa fines, cool and flat. It pulls R/B down by
+      //    0.91x wherever it lands, which is the one place this material is
       //    allowed to go cool.
       uSoilC: { value: C(0.920, 0.940, 1.010) },
-      // D: iron-stained gravel lag. Dark and hot: R/B 1.28 -> 1.71.
+      // D: iron-stained gravel lag. Dark and hot: R/B up 1.32x.
       uSoilD: { value: C(0.620, 0.545, 0.470) },
 
       // --- traffic --------------------------------------------------------
@@ -2675,7 +2645,6 @@ export class Terrain {
       uWearOff: { value: new THREE.Vector2(0, 0) },   // ... plus this translation
       uWearOn: { value: 0 },
 
->>>>>>> worktree-wf_6b64fdf4-c1e-3
       uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
       /**
        * Second ablation hook: (pavement lag layer, mid-field albedo swing,
@@ -3372,7 +3341,6 @@ export class Terrain {
             // value; round 6 added mid at half the swing it needed. The mean is
             // unchanged (1.04) — this only widens the spread, so nothing in the
             // exposure calibration moves.
-<<<<<<< HEAD
             // Round 8 adds region (240 m) and sub (82 m) and rebalances so the
             // mean is unchanged at 1.04 — nothing in the exposure calibration
             // moves — while the SPREAD goes from 0.78-1.38 (0.82 stops) to
@@ -3388,17 +3356,6 @@ export class Terrain {
             // thing that has to be measured rather than reasoned about.
             albedo *= (0.55 + macro * 0.16 + region * 0.26 + sub * 0.22
                             + mid * 0.24 + (D.a - 0.5) * 0.16) * uDbg2.y
-=======
-            //
-            // Round 8: the coefficients are up 1.36x. Measured, this term was
-            // delivering +-8% RMS (+-0.11 stops) against a comment claiming
-            // 1.46 stops — the swing had been written as an intention and never
-            // as a number. The mean is held at 1.03 so nothing in the exposure
-            // calibration moves; only the spread widens. The rest of the missing
-            // range is the soil class below, which carries it as a boundary
-            // rather than as more noise.
-            albedo *= (0.66 + macro * 0.30 + mid * 0.41 + (D.a - 0.5) * 0.22) * uDbg2.y
->>>>>>> worktree-wf_6b64fdf4-c1e-3
                     + 1.04 * (1.0 - uDbg2.y);
             // (Deleted: a buff/ochre hue tint multiplied over every fragment
             // here. It was mineral zoning done as a filter, and a filter can
@@ -3551,18 +3508,11 @@ export class Terrain {
               // the stones are varnished and the sand between them is not — with
               // a minority of pale quartzy ones. A symmetric spread reads as
               // scattered white confetti.
-<<<<<<< HEAD
               // The pale end is quartz, not sand: a stone the colour of the
               // sand it lies on is not a stone. Black basalt chip -> white
               // quartz pebble, with a red iron-stained minority — three hues of
               // clast at the range the player is standing at.
               vec3 clastC = mix(uBasalt * 1.60, uCrust * 0.86, pow(GM.b, 1.7));
-=======
-              // Pale end raised 0.98 -> 1.20: the quartzy minority in a real
-              // pavement is bleached limestone and reads near-white in full sun,
-              // and pow(GM.b, 1.7) keeps it a minority so the mean barely moves.
-              vec3 clastC = mix(uRockDark * 1.18, uSandLight * 1.20, pow(GM.b, 1.7));
->>>>>>> worktree-wf_6b64fdf4-c1e-3
               clastC = mix(clastC, uRockRed * 0.94, smoothstep(0.30, 0.72, GM.b) * 0.40);
 
               vec3 fines = mix(uSandMid, uSandLight, clamp(grain * 0.75 + drift * 0.45 - 0.10, 0.0, 1.0));
@@ -3772,31 +3722,6 @@ export class Terrain {
               }
             }
 
-<<<<<<< HEAD
-            // Mask read-out, not a look. uDbg2.w is 0 in the shipped build; a
-            // probe sets it to a mask index and the frame becomes that mask as a
-            // greyscale albedo, so "how much of the vista's massif is drawn as
-            // bedrock" is a pixel measurement rather than an opinion. This exists
-            // because round 8 started by *assuming* the ranges were sand-coloured
-            // because rockW was low there, and the assumption was worth 20 minutes
-            // to check instead of an afternoon to tune against.
-            // Modes 6 and 7 are not masks: they force the albedo to black and to
-            // white. The pair measures the terrain's AUTHORITY over a band of the
-            // frame — everything between the two readings is what albedo can
-            // possibly control, and everything under the black reading is
-            // atmospheric inscatter that no material change can touch. Round 8
-            // used it to find out why widening the albedo range from 0.82 to 1.38
-            // stops moved the vista's spatial variance by 3%.
-            if (uDbg2.w > 0.0) {
-              float m = uDbg2.w < 1.5 ? rockW
-                      : uDbg2.w < 2.5 ? screeW
-                      : uDbg2.w < 3.5 ? region
-                      : uDbg2.w < 4.5 ? sub
-                      : uDbg2.w < 5.5 ? flowW
-                      : uDbg2.w < 6.5 ? 0.0
-                      : 1.0;
-              albedo = vec3(m);
-=======
             // --- soil class, applied -------------------------------------------
             // Deliberately the LAST albedo term. The near-field grit and the
             // mid-field pavement both mix toward colours of their own rather
@@ -3877,7 +3802,31 @@ export class Terrain {
                 // thing anywhere on the terrain.
                 albedo *= 1.0 - spillK * 0.55;
               }
->>>>>>> worktree-wf_6b64fdf4-c1e-3
+            }
+
+            // Mask read-out, not a look. uDbg2.w is 0 in the shipped build; a
+            // probe sets it to a mask index and the frame becomes that mask as a
+            // greyscale albedo, so "how much of the vista's massif is drawn as
+            // bedrock" is a pixel measurement rather than an opinion. This exists
+            // because round 8 started by *assuming* the ranges were sand-coloured
+            // because rockW was low there, and the assumption was worth 20 minutes
+            // to check instead of an afternoon to tune against.
+            // Modes 6 and 7 are not masks: they force the albedo to black and to
+            // white. The pair measures the terrain's AUTHORITY over a band of the
+            // frame — everything between the two readings is what albedo can
+            // possibly control, and everything under the black reading is
+            // atmospheric inscatter that no material change can touch. Round 8
+            // used it to find out why widening the albedo range from 0.82 to 1.38
+            // stops moved the vista's spatial variance by 3%.
+            if (uDbg2.w > 0.0) {
+              float m = uDbg2.w < 1.5 ? rockW
+                      : uDbg2.w < 2.5 ? screeW
+                      : uDbg2.w < 3.5 ? region
+                      : uDbg2.w < 4.5 ? sub
+                      : uDbg2.w < 5.5 ? flowW
+                      : uDbg2.w < 6.5 ? 0.0
+                      : 1.0;
+              albedo = vec3(m);
             }
 
             diffuseColor.rgb *= albedo * 0.80;
