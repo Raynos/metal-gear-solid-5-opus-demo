@@ -551,19 +551,22 @@ export async function install(world) {
     const p = toVec(post);
     if (!p) continue;
     const facing = Math.atan2(-p.x, -p.z) + Math.PI;
-    // Exactly one commander, standing his post rather than patrolling — the
-    // objective needs a designated target, and a figure that never walks a
-    // route is also the one the player can find twice.
-    const isCmd = !commander;
+    // No commander here any more, and that is a correctness fix, not a taste
+    // one. This used to promote the FIRST garrisoned post soldier to the full
+    // rank loadout — peaked cap, command coat, shoulder boards, red brassard —
+    // and park him on the wire. src/ai then spawns the real mission target deep
+    // inside the compound, and src/gameplay/Mission.js takes the AI's man. So
+    // the figure carrying every rank cue the player is taught to look for was a
+    // decoy, and killing him did nothing.
+    //
+    // The `commander` variant is unchanged and still used; it is now applied
+    // once, by the module that owns the objective. If src/ai fails to install,
+    // the cordon fallback further down still designates one, so a tree without
+    // AI is still winnable — which is why that path keeps its own promotion.
     const s = spawnSoldier([p.x, 0, p.z], {
       yaw: facing + (rand() - 0.5) * 1.2,
-      variant: isCmd ? 'commander' : undefined,
-      scale: isCmd ? 1.06 : undefined,
     });
-    if (isCmd) {
-      s.role = 'commander';
-      commander = s;
-    } else if (post.kind === 'emplacement' && rand() < 0.5) {
+    if (post.kind === 'emplacement' && rand() < 0.5) {
       s.setStance('crouch');
     }
     garrisoned++;

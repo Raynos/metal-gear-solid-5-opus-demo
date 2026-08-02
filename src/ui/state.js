@@ -685,6 +685,30 @@ export function makeAdapter(world, source = () => world.registry) {
     },
 
     /**
+     * Why the mission ended, and how well it went, for the end card.
+     *
+     * Gameplay publishes `reason`, `rank` (S/A/B/C off never-seen, alerts and
+     * the clock) and a formatted `summary`, and until now the card drew none of
+     * it: `end()` was called with the status alone, so a run that was never
+     * seen and a run that woke the whole garrison printed the same screen. Read
+     * defensively like everything else here — a tree whose gameplay module
+     * predates the rank still gets a card, just without the grade.
+     */
+    missionOutcome() {
+      const m = resolveMission(source());
+      if (!m) return null;
+      const reason = pick(m, ['reason', 'cause']);
+      const rank = pick(m, ['rank', 'grade']);
+      const summary = pick(m, ['summary']);
+      if (reason == null && rank == null && summary == null) return null;
+      return {
+        reason: reason == null ? null : String(reason),
+        rank: rank == null ? null : String(rank).toUpperCase(),
+        summary: summary == null ? null : String(summary),
+      };
+    },
+
+    /**
      * Subscribe to gameplay's own event bus if it has one. Round 8's
      * `src/gameplay` emits { type: 'reload' | 'shot' | 'tranq' | 'takedown' |
      *  'grab' | 'drag' | 'stow' | 'cover' | 'hurt' | ... }, which is how the

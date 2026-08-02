@@ -195,6 +195,7 @@ function parseArgs(argv) {
     else if (a === '--width') o.width = +argv[++i];
     else if (a === '--height') o.height = +argv[++i];
     else if (a === '--frames') o.frames = +argv[++i];
+    else if (a === '--hide') o.hide = (o.hide ?? []).concat(argv[++i].split(','));
     else if (!a.startsWith('--')) o.shots.push(a);
   }
   return o;
@@ -459,6 +460,34 @@ async function main() {
       for (const e of errors.slice(0, 10)) console.error('  ' + e);
     }
     await cleanup(errors.length ? 1 : 0);
+  }
+
+  // --hide <substr>[,<substr>] — shoot the scene with matching meshes hidden.
+  //
+  // "Which system draws that?" is asked constantly here and has been answered
+  // by reading source and guessing. Answering it by DIFFERENCE needs an A/B of
+  // the same frame, and a probe cannot take a screenshot. Doing it statistically
+  // from inside the page was tried first and does not work: hiding meshes
+  // perturbs the AO and the volumetric history, so a baseline-against-baseline
+  // control still came back 12% of the ground band changed — larger than most
+  // of the groups being separated. Two PNGs and a pair of eyes settles in
+  // seconds what the statistic could not settle at all, which is what this
+  // project's own rule about judging by eye rather than by histogram says.
+  if (opts.hide?.length) {
+    const hidden = await page.evaluate((subs) => {
+      const names = [];
+      window.__GAME.world.scene.traverse((o) => {
+        if (!(o.isMesh || o.isInstancedMesh || o.isPoints)) return;
+        const tag = ((o.name || '') + ' ' + (o.material?.name || '')).toLowerCase();
+        if (subs.some((s) => tag.includes(s.toLowerCase()))) {
+          o.visible = false;
+          names.push(o.name || '(unnamed)');
+        }
+      });
+      return names;
+    }, opts.hide);
+    console.log(`hidden: ${hidden.length} mesh(es) matching ${opts.hide.join(',')}`);
+    if (!hidden.length) console.error(`  WARNING: nothing matched — the shot below is unmodified`);
   }
 
   const outDir = path.resolve(ROOT, opts.dir);

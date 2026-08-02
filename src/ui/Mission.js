@@ -127,7 +127,7 @@ export class Mission {
    * @param {'accomplished'|'failed'} result
    * @param {string} [because]  one clause naming what ended it, e.g. 'KILLED IN ACTION'
    */
-  end(result, because) {
+  end(result, because, rank = null) {
     if (!this.running) return;
     this.running = false;
     const kind = result === 'failed' ? 'failed' : 'accomplished';
@@ -138,6 +138,11 @@ export class Mission {
       ['TIME', `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`],
       ['ALERTS', String(this.alerts).padStart(2, '0')],
     ];
+    // Rank first: it is the line a player looks for, and MGSV puts the grade at
+    // the top of its results screen for the same reason. Only on a win — there
+    // is no grade for dying, and printing "RANK C" under MISSION FAILED reads
+    // as a consolation prize.
+    if (rank && kind !== 'failed') meta.unshift(['RANK', String(rank).toUpperCase()]);
     if (because) meta.push([kind === 'failed' ? 'CAUSE' : 'RESULT', String(because).toUpperCase()]);
     this._show(
       kind,
@@ -198,7 +203,13 @@ export class Mission {
     const state = this.src.mission();
     if (state && state !== this._lastMission) {
       this._lastMission = state;
-      if (state === 'accomplished' || state === 'failed') this.end(state);
+      // Pass the CAUSE through, not just the status. Gameplay publishes why the
+      // run ended and what it graded, and dropping it here is why a flawless
+      // infiltration and a firefight printed an identical end card.
+      if (state === 'accomplished' || state === 'failed') {
+        const o = this.src.missionOutcome?.() ?? null;
+        this.end(state, o?.reason ?? undefined, o?.rank ?? null);
+      }
     }
 
     if (this._t < 0) return;
