@@ -30,8 +30,14 @@ agents produced **27 chromium processes and 6.8 GB**.
 
 ## 1. Graphics — what a human saw while playing
 
-Ranked by how loudly it reads. All four were invisible in the seven static
-screenshots this project spent nine rounds optimising against.
+Ranked by how loudly it reads. **Every one of these was invisible in the seven
+static screenshots this project spent nine rounds optimising against.** They came
+from a human playing the build and from a 40 s screen recording of god-mode
+flight; four representative frames are saved in `shots/recording/`.
+
+Anyone working on this should watch a recording of the game in motion before
+touching anything, and should verify fixes the same way — comparing consecutive
+frames while the camera moves, not by looking at a still.
 
 ### 1.1 The world is brown
 Not the grade — that is fixed and neutral now. The *world* is one material family.
@@ -111,6 +117,43 @@ of any frame; loose stone is 0.00%.
 ablates nothing — the old test measured itself. Ablated properly through the
 materials' own `uAbl` uniforms, `op-steel` reads 16.7/255 against a 5.0 noise
 floor. Authored metal works.
+
+### 1.8 Chevron / herringbone banding on distant mountains
+**NEW — only visible in the recording.** The large far peak carries a hard
+diagonal stripe pattern, regular and geometric, running across the whole
+landform (clearest in `shots/recording/f072.jpg`, upper left). It is not rock
+strata — it is uniform, straight, and ignores the terrain's shape. Suspect a
+texture projection on the far clipmap ring, or a normal derived from a
+lower-resolution height sample tiling against itself.
+
+### 1.9 Distant mountains are GREEN, nearer ones brown
+In the same frame, the far peak reads green-grey while everything mid-ground is
+warm brown. Either the aerial-perspective in-scatter is tinting the far field
+green, or the far clipmap ring uses a different palette from the near rings.
+Whichever it is, it is not a deliberate choice and it reads as an artefact.
+
+### 1.10 Visible LOD/detail boundary across the mid-ground
+A horizontal line where ground detail density changes abruptly. Clipmap ring
+transition, un-blended.
+
+### 1.11 Mountains read as repeating spiky cones
+Rows of near-identical triangular peaks along the horizon
+(`shots/recording/f008.jpg`). Amplitude does not vary, so there are no dominant
+massifs and no subordinate foothills — it reads as noise output rather than
+landform. There IS already a hydraulic erosion sim and a thermal talus pass in
+`Terrain.js`; a previous round was asked to instrument whether those passes
+affect the pixels the vista and ridge cameras actually see, and never reported
+back. Do that first: a feature that changes nothing on the two frames that show
+mountains is not done.
+
+### 1.12 Dark blotchy stains scattered across open ground
+Irregular dark patches on flat sand with no plausible occluder above them
+(`f072`). Distinct from 1.3's hard-edged shadow blobs — these are soft and look
+like a broken splat or decal layer rather than a shadow.
+
+### 1.13 Hard dark wedge in the frame corner
+A sharp-edged dark triangle intrudes at the bottom-left of `f072`. Geometry
+poking the near plane, or a shadow cascade edge.
 
 ---
 
