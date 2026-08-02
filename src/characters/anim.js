@@ -255,6 +255,24 @@ export class Animator {
     this.coarse = false;
     this.weaponSway = new THREE.Vector3();
     this.weaponSwayVel = new THREE.Vector3();
+    /**
+     * The carry sway, as an ANGLE triple (pitch, yaw, roll) about the chest
+     * rather than a translation of the grip. See `_solveWeapon` for why it is
+     * expressed that way; the short version is that a rotation about the chest
+     * costs the arms nothing, and a translation of the grip costs them all of
+     * it.
+     */
+    this.carryAng = new THREE.Vector3();
+    this.carryAngVel = new THREE.Vector3();
+    /** Accumulated gait rotation at the chest, written by `_poseBody`. */
+    this._gaitYaw = 0;
+    this._gaitRoll = 0;
+    /**
+     * Locomotion's own wrist override, parallel to the action layer's. The
+     * action layer wins where the two overlap — a magazine change during a
+     * sprint is still a magazine change.
+     */
+    this.locoHand = { L: { w: 0, pos: new THREE.Vector3() }, R: { w: 0, pos: new THREE.Vector3() } };
 
     const bw = ch.rig.bindWorld;
     this.armLen = { upper: bw.get('armR').distanceTo(bw.get('forearmR')), lower: bw.get('forearmR').distanceTo(bw.get('handR')) };
@@ -268,6 +286,12 @@ export class Animator {
     this._lastPos = new THREE.Vector3(NaN, NaN, NaN);
     this._weaponM = new THREE.Matrix4();
     this._basisM = new THREE.Matrix4();
+    this._chestM = new THREE.Matrix4();
+    /** Chest joint centre in character space — the pivot the carry hangs off. */
+    this._chestPivot = ch.rig.bindWorld.get('chest').clone();
+    this._eul = new THREE.Euler(0, 0, 0, 'YXZ');
+    this._qc = new THREE.Quaternion();
+    this._vc = new THREE.Vector3();
 
     // Per-instance scratch (an Animator is only ever ticked from one place).
     this._p = new THREE.Vector3();
@@ -437,6 +461,20 @@ export class Animator {
       chestYaw * 0.35 + bladed * 0.45 + ty * 0.32 + L.turnLead * 0.35 + A.chestY,
       -hipRoll * 0.3 + shift2 * 0.02 + A.chestZ,
     );
+
+    // How much of the GAIT has arrived at the chest by the time the chain gets
+    // there. Summed here, from the same four writes above, so there is exactly
+    // one definition of it: root(1.0) + spine1(-0.25) for the hip term, and
+    // spine1(0.30) + spine2(0.35) + chest(0.35) for the contralateral term.
+    //
+    // `_solveWeapon` hangs the rifle off this. Only the gait is collected — not
+    // `bladed`, not `torsoAim`, not `turnLead`. Anchoring the weapon to
+    // `b.chest.matrixWorld` outright is the obvious move and it is wrong: at
+    // full aim `bladed` alone is -0.5 rad of shoulder blading spread across the
+    // spine, so a weapon parented to the chest would swing 28 degrees off the
+    // aim point the moment the player shoulders it.
+    this._gaitYaw = hipYaw * 0.75 + chestYaw;
+    this._gaitRoll = hipRoll * 0.15;
 
     b.clavR.rotation.set(-breathAmp * br * 0.5, -aim * 0.14, -aim * 0.1 - breathAmp * br * 0.3 + A.clavRZ);
     b.clavL.rotation.set(-breathAmp * br * 0.5, aim * 0.24, aim * 0.1 + breathAmp * br * 0.3 + A.clavLZ);
@@ -709,7 +747,15 @@ export class Animator {
     const aim = this._aimEff ?? this.aim;
     const prone = L.proneBlend;
     const crouch = L.stanceBlend;
-    const run = L.sprint01;
+    // How far the carry is tucked in toward the body. This used to be
+    // `L.sprint01`, which does not leave the floor until the gait axis passes
+    // 2.1 — so everything from a walk to a full run held the weapon at arm's
+    // length in the low-ready pose. A man running brings it IN, and here that
+    // is load-bearing rather than cosmetic: the low-ready support grip is at
+    // the very end of the left arm's reach (measured 1.01 of it before the
+    // foregrip moved), and pulling the weapon 9 cm closer is what buys the
+    // reach the carry sway needs to swing through.
+    const run = smoothstep(L.smoothG, 1.3, 2.6);
 
     const pos = this._p.set(0, 0, 0);
     const dir = this._d.set(0, 0, 0);
@@ -742,18 +788,66 @@ export class Animator {
     const run = L.run01;
     const moving = L.moving;
 
-    const bobAmp = lerp(0.012, 0.042, run) * moving;
-    const target = this._t1.set(
-      Math.sin(ph) * bobAmp * 0.8 + Math.sin(this.breath * 1.1) * 0.006 * (1 - moving),
-      -Math.abs(Math.cos(ph)) * bobAmp + Math.sin(this.breath * 1.9) * 0.005 * (1 - moving),
-      Math.cos(ph * 2) * bobAmp * 0.4,
-    );
+    const aim = this._aimEff ?? this.aim;
+    // A shouldered weapon is braced against the shoulder and the cheek; it is
+    // meant to be the steady thing in the frame. Everything below is the CARRY,
+    // and it fades out as the weapon comes up.
+    const brace = 1 - 0.82 * aim;
+
+    // --- the carry sway ----------------------------------------------------
+    //
+    // This used to be a translation of the grip in character space, with a
+    // peak-to-peak of 68-84 mm at a run, and it was the whole reason the upper
+    // body read as a rigid passenger: both arms are two-bone-IK'd to the weapon
+    // matrix, so 8 cm was all the hands could ever inherit from a gait that was
+    // producing 0.24 rad of contralateral chest yaw two joints above them.
+    //
+    // Two things changed. The sway is now an ANGLE about the chest joint, and
+    // its yaw/roll terms are the gait's own accumulated chest rotation
+    // (`_gaitYaw`, `_gaitRoll`) rather than an independent oscillator.
+    //
+    // WHY AN ANGLE. The support arm is the binding constraint here: measured,
+    // it sat on the two-bone solver's own reach clamp in the low-ready carry —
+    // 0.993 of full extension, i.e. dead straight, with the hand already 8 mm
+    // short of the handguard it is holding. Translating the grip 7 cm forward
+    // puts it 8% beyond reach and the hand visibly leaves the weapon, which is
+    // an animation bug the player would name. A rotation does not: shoulder and grip
+    // both hang off that pivot, so to first order the shoulder-to-grip distance
+    // is INVARIANT under it — d.(dgrip - dshoulder) works out to
+    // 0.0711*theta*(1 - gain), which is zero at unity gain and only 2.4 cm at
+    // the gain used here. Amplitude is cheap in rotation and ruinous in
+    // translation, which is why the old term could never have been tuned up.
+    //
+    // WHY THE PITCH TERM IS AT STRIDE FREQUENCY. The old vertical was
+    // `-|cos(phase)| * bobAmp` — the same waveform, the same sign and the same
+    // frequency as the pelvis bob in `_placeRoot`. That is why a reviewer
+    // measuring this rig found hand height tracking head height at r = 0.99:
+    // the hands carried the body's bob and nothing else. |cos(phase)| has
+    // period pi; sin(phase + c) has period 2pi and integrates to zero against
+    // it for ANY offset c, so a stride-frequency term decorrelates the two by
+    // construction rather than by tuning.
+    const swayT = this._t3.set(
+      Math.sin(ph + 2.1) * lerp(0.025, 0.26, run) * moving,         // pitch: muzzle rise/fall
+      this._gaitYaw * lerp(1.5, 3.8, run),                          // yaw: rides the chest
+      this._gaitRoll * lerp(1.5, 3.0, run) + Math.sin(ph) * lerp(0.012, 0.075, run) * moving,
+    ).multiplyScalar(brace);
     // Spring-damped so the weapon lags the body rather than being welded to it.
+    this.carryAngVel.addScaledVector(this._t2.subVectors(swayT, this.carryAng), Math.min(1, dt * 40));
+    this.carryAngVel.multiplyScalar(Math.max(0, 1 - dt * 9));
+    this.carryAng.addScaledVector(this.carryAngVel, Math.min(1, dt * 12));
+
+    // What is left in translation is breathing, which has no business being a
+    // rotation, plus a small lateral shove so the swing is an arc and not a
+    // pure hinge.
+    const target = this._t1.set(
+      Math.sin(ph) * lerp(0.004, 0.020, run) * moving * brace + Math.sin(this.breath * 1.1) * 0.006 * (1 - moving),
+      Math.sin(this.breath * 1.9) * 0.005 * (1 - moving),
+      Math.cos(ph * 2) * lerp(0.004, 0.016, run) * moving * brace,
+    );
     this.weaponSwayVel.addScaledVector(this._t2.subVectors(target, this.weaponSway), Math.min(1, dt * 40));
     this.weaponSwayVel.multiplyScalar(Math.max(0, 1 - dt * 9));
     this.weaponSway.addScaledVector(this.weaponSwayVel, Math.min(1, dt * 12));
 
-    const aim = this._aimEff ?? this.aim;
     let pitch = this.torsoAim.y * 0.45;
     if (aim > 0.01 && this.aimActive) {
       this._t2.subVectors(this.aimTarget, ch.root.position);
@@ -769,10 +863,52 @@ export class Animator {
     if (act.weaponRoll !== 0) up.applyAxisAngle(dir, act.weaponRoll).normalize();
     const right = this._t3.crossVectors(dir, up);
     this._basisM.makeBasis(dir, up, right).setPosition(wpos);
-    this._weaponM.multiplyMatrices(ch.root.matrixWorld, this._basisM);
 
+    // The chest frame: a rotation about the chest joint by the carry sway,
+    // plus the pelvis bob the chest is standing on. `bobY` used to be absent
+    // from the weapon entirely and approximated by the old translational term,
+    // which meant the arms were acting as suspension for 5.5 cm of body bob
+    // every cycle. Riding it costs the arms nothing and buys back that reach.
+    this._eul.set(this.carryAng.x, this.carryAng.y, this.carryAng.z);
+    this._qc.setFromEuler(this._eul);
+    this._chestM.makeRotationFromQuaternion(this._qc);
+    const c = this._chestPivot;
+    this._vc.copy(c).applyQuaternion(this._qc);
+    this._chestM.setPosition(c.x - this._vc.x, c.y - this._vc.y + this.bobY, c.z - this._vc.z);
+    this._weaponM.multiplyMatrices(ch.root.matrixWorld, this._chestM).multiply(this._basisM);
+
+    this._supportSwing();
     this._solveArm('R');
     this._solveArm('L');
+  }
+
+  /**
+   * Sprint carry: the support hand comes off the weapon and the left arm pumps.
+   *
+   * A soldier at 6 m/s does not hold a carbine in two hands, and the two-handed
+   * carry is also the thing that caps how much the upper body can move — every
+   * centimetre the weapon swings has to be absorbed by an arm that is already
+   * on its reach clamp. Letting go is what makes a genuinely large arm swing
+   * available at all: measured at the sprint knot this path gives the left
+   * wrist 44.3 cm of fore-aft travel, against 20.1 cm for the right hand, which
+   * is still on the weapon and can only go where the weapon goes.
+   *
+   * Contralateral, like every other limb here: the left arm is forward when the
+   * left leg is back, and `_solveFeet` puts the RIGHT foot forward at phase 0,
+   * so cos(phase) is the correct signal and sin(phase) is a quarter cycle late.
+   */
+  _supportSwing() {
+    const L = this.loco;
+    const h = this.locoHand.L;
+    // Not while aiming, not on the ground, not from a crouch — all three are
+    // poses where both hands are on the weapon by definition.
+    const w = L.sprint01 * (1 - (this._aimEff ?? this.aim)) * (1 - L.proneBlend) * (1 - L.stanceBlend) * L.moving;
+    h.w = w;
+    if (w <= 0.001) return;
+    const s = Math.cos(L.phase * Math.PI * 2);
+    // Authored against the rig: the left shoulder is at (-0.190, 1.452) with
+    // 0.572 m of reach, and these two extremes sit at 72% and 81% of it.
+    h.pos.set(-0.20 + 0.04 * s, 1.11 + 0.09 * Math.abs(s), -0.10 - 0.24 * s);
   }
 
   _solveArm(side) {
@@ -792,6 +928,14 @@ export class Animator {
     // CQC grab, a thrown decoy. The override is authored in character space, so
     // it goes through the character's own matrix, not the weapon's.
     const ov = this.actions.hand[side];
+    const lv = this.locoHand[side];
+    // Locomotion can take the hand off too (the sprint arm pump), and the two
+    // overlap: sprinting into a magazine change is legal. The action wins by
+    // the amount it is asserting, so the arm never gets two destinations.
+    if (lv.w > 0.001) {
+      this._t5.copy(lv.pos).applyMatrix4(ch.root.matrixWorld);
+      wrist.lerp(this._t5, lv.w * (1 - ov.w));
+    }
     if (ov.w > 0.001) {
       this._t5.copy(ov.pos).applyMatrix4(ch.root.matrixWorld);
       wrist.lerp(this._t5, ov.w);

@@ -1642,13 +1642,35 @@ export function buildRifle(o = {}) {
     9,
     { radial: 12, capStart: true, capEnd: true, forward: V(0, 1, 0) },
   ));
-  // Barrel + flash hider.
+  // Barrel.
   push(tube(V(0.28, 0.012, 0), V(0.4, 0.012, 0), 0.0085, 0.0075, 10, MZ.GUNMETAL));
-  push(tube(V(0.395, 0.012, 0), V(0.44, 0.012, 0), 0.0125, 0.0135, 10, MZ.GUNMETAL));
   // Gas block + front sight.
   push(roundedBox(0.022, 0.05, 0.026, 0.004, { zone: MZ.GUNMETAL, radial: 8 }).transform(
     new THREE.Matrix4().setPosition(0.3, 0.03, 0),
   ));
+
+  // --- suppressor ---------------------------------------------------------
+  // There was never one, on a weapon `src/gameplay/Stealth.js` declares
+  // `suppressed: true` and whose `muzzlePoint()` says it is pushing the flash
+  // "off the end of the suppressor". A 45 mm flash hider was standing in for
+  // it. This is the largest silhouette change available on the asset that is
+  // at the centre of every over-the-shoulder frame, and it is also just what
+  // the rest of the game already believes is there.
+  //
+  // 190 mm and 45 mm across: a rifle can and, i.e. clearly fatter than the
+  // barrel and long enough to change the outline, rather than the stubby
+  // pistol can that would disappear at gameplay distance. The mount collar and
+  // the end cap are separate lofts because the two step changes in radius are
+  // what catch the sun along the top edge and give the tube its length.
+  push(tube(V(0.372, 0.012, 0), V(0.408, 0.012, 0), 0.0155, 0.0225, 12, MZ.GUNMETAL));
+  push(tube(V(0.405, 0.012, 0), V(0.558, 0.012, 0), 0.0225, 0.0215, 12, MZ.GUNMETAL));
+  push(tube(V(0.554, 0.012, 0), V(0.578, 0.012, 0), 0.0235, 0.0205, 12, MZ.GUNMETAL));
+  // Two shallow bands. A plain 190 mm cylinder reads as a length of pipe; the
+  // bands give the specular something to break against and imply the baffle
+  // stack under the tube.
+  for (const x of [0.452, 0.505]) {
+    push(tube(V(x, 0.012, 0), V(x + 0.008, 0.012, 0), 0.0238, 0.0238, 12, MZ.DARKPOLY));
+  }
   // Magazine: curved, angled forward-down.
   push(loftKeys(
     [
@@ -1693,22 +1715,98 @@ export function buildRifle(o = {}) {
       { radial: 10, capStart: true, capEnd: true, forward: V(0, 1, 0) },
     ));
   }
-  // Charging handle + ejection port lip.
+  // Charging handle, with the latch that actually gets pulled.
   push(roundedBox(0.05, 0.012, 0.014, 0.003, { zone: MZ.GUNMETAL, radial: 8 }).transform(
     new THREE.Matrix4().setPosition(-0.12, 0.042, 0.026),
   ));
+  push(roundedBox(0.016, 0.01, 0.024, 0.003, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+    new THREE.Matrix4().setPosition(-0.138, 0.042, 0.030),
+  ));
+
+  // --- the controls -------------------------------------------------------
+  // None of these existed. Individually they are 10-30 mm details that nobody
+  // can name at gameplay distance, but a receiver with nothing on its flanks
+  // reads as a solid block: what the eye is picking up is that there is
+  // nothing for the light to break on between the magazine and the stock.
+  // Every one of them stands 4-8 mm proud so it catches a rim and throws a
+  // contact shadow, which is the only thing at this scale that survives.
+  //
+  // +Z is the shooter's right. The port and the deflector go on that side, the
+  // bolt catch and the selector on the other, which is where they belong on a
+  // right-handed weapon.
+
+  // Ejection port: a dust cover panel with the port lip proud above it, and
+  // the brass deflector behind. Modelled as raised plates rather than a cut,
+  // because a cut in a lofted surface would need the receiver re-lofted and
+  // the silhouette does not change either way.
+  push(roundedBox(0.088, 0.03, 0.006, 0.002, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+    new THREE.Matrix4().makeRotationX(Math.PI / 2).setPosition(-0.012, 0.012, 0.031),
+  ));
+  push(roundedBox(0.092, 0.007, 0.008, 0.002, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+    new THREE.Matrix4().makeRotationX(Math.PI / 2).setPosition(-0.012, 0.031, 0.030),
+  ));
+  push(roundedBox(0.022, 0.03, 0.016, 0.004, { zone: MZ.GUNMETAL, radial: 8 }).transform(
+    new THREE.Matrix4().setPosition(-0.062, 0.026, 0.026),
+  ));
+  // Bolt catch paddle, left side, just above the magazine well.
+  push(roundedBox(0.03, 0.012, 0.009, 0.003, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+    new THREE.Matrix4().makeRotationX(Math.PI / 2).setPosition(-0.016, 0.004, -0.031),
+  ));
+  // Fire selector: a paddle on a boss, above the pistol grip. This is the one
+  // control a player would actually look for on a weapon with two fire modes,
+  // and `WEAPON.modes` in Stealth.js has had SEMI/AUTO the whole time.
+  push(tube(V(-0.052, -0.014, -0.026), V(-0.052, -0.014, -0.037), 0.008, 0.008, 8, MZ.GUNMETAL));
+  push(roundedBox(0.026, 0.009, 0.008, 0.002, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+    new THREE.Matrix4().makeRotationZ(0.5).setPosition(-0.062, -0.006, -0.036),
+  ));
+  // Magazine well collar — the step where the receiver meets the magazine.
+  // Without it the magazine grows straight out of the underside like a fin.
+  push(roundedBox(0.056, 0.026, 0.078, 0.006, { zone: MZ.GUNMETAL, radial: 10 }).transform(
+    new THREE.Matrix4().setPosition(0.028, -0.026, 0),
+  ));
+  // Folding rear sight, behind the optic where the rail is otherwise bare.
+  push(roundedBox(0.014, 0.03, 0.03, 0.003, { zone: MZ.GUNMETAL, radial: 8 }).transform(
+    new THREE.Matrix4().setPosition(-0.062, 0.068, 0),
+  ));
+  // Rail slots. Five transverse ribs along the upper rail: the single cheapest
+  // way to say "this is a rail" instead of "this is a bar".
+  for (let i = 0; i < 5; i++) {
+    const x = -0.13 + i * 0.028;
+    push(roundedBox(0.006, 0.007, 0.03, 0.002, { zone: MZ.GUNMETAL, radial: 6 }).transform(
+      new THREE.Matrix4().setPosition(x, 0.058, 0),
+    ));
+  }
   // Trigger guard.
   push(strap([V(-0.052, -0.02, 0), V(-0.045, -0.05, 0), V(-0.01, -0.055, 0), V(0.01, -0.03, 0)], 0.03, 0.007, MZ.GUNMETAL, { stations: 9 }));
-  // Sling attachment.
+  // Sling attachments, front and rear.
   push(tube(V(-0.14, -0.02, 0.024), V(-0.14, -0.02, 0.032), 0.007, 0.007, 8, MZ.GUNMETAL));
+  push(tube(V(0.255, -0.016, 0.020), V(0.255, -0.016, 0.030), 0.007, 0.007, 8, MZ.GUNMETAL));
 
   return {
     parts,
     gripCenter: V(-0.078, -0.075, 0),
     gripUp: V(0.32, 0.947, 0).normalize(),
-    foregrip: V(0.205, 0.006, 0),
+    // ROUND 11. Was 0.205, i.e. 283 mm forward of the pistol grip — a long
+    // C-clamp reach, and it does not fit this rig. Measured with an arm-reach
+    // probe (`probes/r11_upper.js`), the support arm sat on the two-bone
+    // solver's reach clamp in the low-ready carry — 0.993 of full extension,
+    // dead straight, with the clamp leaving the hand 8 mm short of the
+    // handguard it is supposed to be holding, in EVERY frame.
+    // It also meant the arm had no reach left to absorb any carry motion at
+    // all, which is half of why the upper body could not be given one.
+    // 0.12 is at the rear of the handguard (which runs 0.11 to 0.29): a
+    // magwell-style grip rather than a C-clamp, and a normal way to hold a
+    // carbine. It measures 0.92-0.95 extension at a walk, which is the reach
+    // the carry sway then has to swing through.
+    foregrip: V(0.12, 0.006, 0),
     foreAxis: V(1, 0, 0),
-    muzzle: V(0.45, 0.012, 0),
+    // End of the SUPPRESSOR now, not of a flash hider — 135 mm further out.
+    // `Stealth.muzzlePoint()` (not this module's file) hardcodes 0.46 m from
+    // the `handR` bone for the flash and the case; that was already ~70 mm
+    // short of the old muzzle and it is ~205 mm short of this one. Nothing
+    // here can fix it, and the flash lives two frames on a weapon that is
+    // suppressed, so it is reported rather than worked around.
+    muzzle: V(0.585, 0.012, 0),
   };
 }
 
