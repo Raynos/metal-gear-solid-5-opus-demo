@@ -56,6 +56,12 @@ const WEAPON = {
   suppressed: true,
 };
 
+/**
+ * Hand bone to muzzle, in metres, for a character that publishes no weapon
+ * anchors at all. See `muzzleReach()` — the real figure is read off the model.
+ */
+const MUZZLE_FALLBACK = 0.46;
+
 const CQC_RANGE = 1.85;
 const CQC_HOLD = 0.25;        // hold longer than this and it is a grab, not a takedown
 const DRAG_RANGE = 1.6;
@@ -334,6 +340,20 @@ export class StealthActions {
     const silent = this.isBehind(t) && !t.alerted;
     this.action = 'takedown';
     this.actionTimer = silent ? 0.75 : 1.05;
+    // THE PLAYER TAKES PART IN HIS OWN TAKEDOWN. The clip is authored and the
+    // victim has been animating for two rounds; nothing ever played it on the
+    // player, so the grab, the throw and the choke all happened to a man
+    // standing perfectly still. Same mechanism as `reload()`, and for the same
+    // reason: hand it the timer this state actually runs on, so the gesture
+    // ends when the freeze ends.
+    //
+    // The clip is 1.60 s and these are 0.75 / 1.05, i.e. it plays compressed —
+    // deliberately. The freeze length is the mechanic (how long you are a
+    // stationary target after a takedown) and it has been tuned; the animation
+    // is the depiction of it. src/characters measured all three durations
+    // playing the whole gesture, wrist travel 0.508-0.542 m against 0.568 m at
+    // full length, which is the compression being paid for and it is small.
+    this.player.playAction?.('takedown', { duration: this.actionTimer });
     // Face him, and close the last half metre so the two bodies are not a
     // metre apart during the animation the characters module will play.
     this.ctl.yaw = Math.atan2(t.position.x - this.ctl.position.x, t.position.z - this.ctl.position.z) + Math.PI;
@@ -371,6 +391,9 @@ export class StealthActions {
     this.grabbed = null;
     this.action = 'takedown';
     this.actionTimer = 0.9;
+    // See cqc(): the player animates his own takedown, at the length of the
+    // freeze rather than the length of the clip.
+    this.player.playAction?.('takedown', { duration: this.actionTimer });
     this._putDown(t, 'choke');
     this.ctl.addNoise(0.12);
     this.emit({ type: 'takedown', target: t, silent: true });
@@ -608,22 +631,64 @@ export class StealthActions {
   }
 
   /**
+   * How far the muzzle is from the firing hand's bone — ASKED, not assumed.
+   *
+   * This was the constant 0.46, and it was wrong the moment the weapon changed:
+   * src/characters fitted the suppressor the loadout has always claimed
+   * (`WEAPON.suppressed` has been true since the weapon was written) and the
+   * muzzle went past 0.7 m, so every flash, tracer origin and impact ray
+   * started a quarter of a metre inside the barrel. A hardcoded length is a
+   * copy of somebody else's model that nothing keeps in sync.
+   *
+   * `characters` publishes everything needed to derive it. `ch.rifle` carries
+   * the weapon's own anchors in weapon space, and `ch.attach.R` carries both
+   * the wrist-to-grip offset and the two axis pairs that define weapon space
+   * against hand space — which is exactly the rotation that turns the
+   * grip-to-muzzle vector into the hand's frame. The result is a length, so it
+   * is invariant under everything the animator does to the arm, and it follows
+   * the model the next time somebody fits a longer can.
+   */
+  muzzleReach() {
+    if (this._reach !== undefined) return this._reach;
+    this._reach = null;
+    const rifle = this.player?.rifle;
+    const a = this.player?.attach?.R;
+    if (rifle?.muzzle && rifle?.gripCenter && a?.wristToGrip && a.weaponAxis1 && a.handAxis1) {
+      // Orthonormal basis from a pair of axes, exactly as Character.js builds
+      // the bind: first axis kept, second one made perpendicular to it.
+      const basis = (a1, a2, m) => {
+        const x = a1.clone().normalize();
+        const y = a2.clone().addScaledVector(x, -a2.clone().normalize().dot(x)).normalize();
+        return m.makeBasis(x, y, new THREE.Vector3().crossVectors(x, y));
+      };
+      const Bw = basis(a.weaponAxis1, a.weaponAxis2, new THREE.Matrix4());
+      const Bh = basis(a.handAxis1, a.handAxis2, new THREE.Matrix4());
+      const R = Bh.multiply(Bw.transpose());
+      this._reach = new THREE.Vector3()
+        .subVectors(rifle.muzzle, rifle.gripCenter)
+        .applyMatrix4(R)
+        .add(a.wristToGrip)
+        .length();
+    }
+    return this._reach;
+  }
+
+  /**
    * Where the flash and the case come from.
    *
    * The rifle is skinned into the right hand rather than parented to a node, so
    * there is no muzzle transform to read; the hand bone is the closest thing
    * that exists and it moves with the recoil the animator just played. Take its
-   * world position and push a barrel length down the line the dart is on. The
-   * flash lives for two frames, so this being a centimetre out is invisible,
-   * whereas hanging it off the camera instead would put it in mid-air.
+   * world position and push the weapon's own barrel length down the line the
+   * dart is on.
    */
   muzzlePoint(out, dir) {
     const hand = this.player?.rig?.byName?.get?.('handR');
     if (hand) {
       hand.getWorldPosition(out);
-      // Barrel runs forward from the grip; 0.46 m clears the handguard on this
-      // carbine and lands the flash off the end of the suppressor.
-      return out.addScaledVector(dir, 0.46);
+      // MUZZLE_FALLBACK only for a character that publishes no weapon anchors;
+      // it is the old hardcoded figure and it is known to be short.
+      return out.addScaledVector(dir, this.muzzleReach() ?? MUZZLE_FALLBACK);
     }
     const p = this.ctl.position;
     const eye = p.y + (this.ctl.stance === 'prone' ? 0.32 : this.ctl.stance === 'crouch' ? 1.10 : 1.42);

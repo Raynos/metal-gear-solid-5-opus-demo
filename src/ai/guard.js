@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { AWARE, eyeOf, targetPoint } from './perception.js';
 import { BALLISTICS, tryChamber, decaySuppression } from './combat.js';
-import { commandThink, fallbackPoint } from './commander.js';
+import { commandThink, fallbackPoint, escortPoint } from './commander.js';
 
 /**
  * One enemy soldier.
@@ -112,6 +112,12 @@ export class Guard {
     this.inspectT = 12;
     /** A reserve rifleman waits at his staging point until this goes true. */
     this.committed = false;
+    /** Set on the commander once he has re-posted for THIS alert. */
+    this.hardened = false;
+    /** The commander this man has committed to protecting, or null. */
+    this.bodyguard = null;
+    /** Seconds since the duty roster last relieved him. See roster.js. */
+    this.reliefT = 0;
   }
 
   get position() { return this.ch.position; }
@@ -187,6 +193,22 @@ export class Guard {
       if (special && this.state !== special && this.state !== 'radio') this.enter(special, ctx);
       else if (!special && (this.state === 'fallback' || this.state === 'combat' || this.state === 'search')) {
         this.enter('return', ctx);
+      }
+    } else if (this.bodyguard && !this.bodyguard.down) {
+      // Committed to the commander. He answers the alert ladder like anyone
+      // else, but EVASION must NOT put him into `search`: the sweep is the one
+      // order that would walk him off the objective, and measured with the
+      // ordinary machine that is exactly what happened — 20 s after the shot
+      // both bodyguards were 47 m away searching, which is worse than not
+      // having assigned any. `combat` covers both loud rungs; the escort branch
+      // in tickCombat holds him on station until he can actually see somebody.
+      if (squad.level === 'ALERT' || squad.level === 'EVASION') {
+        if (this.state !== 'combat' && this.state !== 'radio') this.enter('combat', ctx);
+      } else {
+        // Stood down. He goes back to being a sentry, or the compound ends the
+        // mission with two men permanently orbiting one officer.
+        this.bodyguard = null;
+        if (this.state === 'combat' || this.state === 'search') this.enter('return', ctx);
       }
     } else if (this.role === 'reserve' && !this.committed) {
       // He is a checkpoint detail, not a statue: he still sees and hears, and a
@@ -516,6 +538,41 @@ export class Guard {
     this.aimWant = 0.55;
     this.coverCrouch = false;
     this.desiredSpeed = SPEED.alert;
+
+    // ...unless he is on the commander. A garrison that converges to the last
+    // man on a reported position is a garrison the player empties by throwing a
+    // noise: make one, walk in the other side, shoot the objective in an empty
+    // compound. Two men stay, between the commander and the trouble, and they
+    // are the reason a loud approach is worse than a quiet one rather than
+    // better. They still shoot the moment they see him — this only replaces the
+    // convergence, not the fight.
+    if (this.bodyguard && !this.bodyguard.down) {
+      const cmd = this.bodyguard;
+      const threat = squad.hasLastKnown ? squad.lastKnown : null;
+      // The station is a point relative to a man who is himself moving to
+      // cover, so it is re-solved when he leaves it behind as well as on the
+      // timer.
+      const stale = !this.goal || this.goalKind !== 'escort'
+        || Math.hypot(this.goal.x - cmd.ch.position.x, this.goal.z - cmd.ch.position.z) > 6.5;
+      if (stale || this.repathT <= 0) {
+        this.setGoal('escort', escortPoint(this, cmd, threat, ctx), ctx);
+        this.repathT = 2.0;
+      }
+      if (this.goalDist() < 1.4) {
+        this.desiredSpeed = 0;
+        this.coverCrouch = false;
+      }
+      this.lookTimer -= dt;
+      if (this.lookTimer <= 0) {
+        const base = threat
+          ? Math.atan2(-(threat.x - this.ch.position.x), -(threat.z - this.ch.position.z))
+          : this.ch.yaw;
+        this.lookGoal = base + (ctx.rand() * 2 - 1) * 1.1;
+        this.lookTimer = 0.7 + ctx.rand() * 1.3;
+      }
+      return;
+    }
+
     if (squad.hasLastKnown) {
       if (!this.goal || this.goalKind !== 'converge' || this.repathT <= 0) {
         this.setGoal('converge', squad.lastKnown, ctx);
@@ -752,6 +809,24 @@ export class Guard {
       // Do not walk sideways: a guard turns first, then moves off.
       const facing = 1 - THREE.MathUtils.clamp(Math.abs(dy) / 1.4, 0, 1) * 0.85;
       ch.yaw += dy * Math.min(1, dt * turn);
+      // TELL THE CHARACTER WHERE HE IS GOING, or he spends the whole walk
+      // turning back.
+      //
+      // `Character.update` runs at order 20, right after this, and steers
+      // `ch.yaw` toward `ch.desiredYaw` at 6 rad/s — and `drive(dt, speed,
+      // undefined)` never sets `desiredYaw`, so for every AI-driven man it was
+      // still the yaw he was spawned facing. The two controllers pulled against
+      // each other to an equilibrium about 1.4 rad off the direction of travel,
+      // which is exactly where the `facing` term above bottoms out. Measured on
+      // a sentry given a 16 m walk: commanded 1.52 m/s, applied 0.23, and 4.5 m
+      // covered in 20 seconds — the whole garrison creeping at a sixth of its
+      // own patrol speed, in every build since the AI landed.
+      //
+      // Both controllers now aim at the same bearing, so they add instead of
+      // cancelling. Deliberately NOT set in the backdrop branch below: that one
+      // assigns yaw outright and every canonical screenshot is framed against
+      // the equilibrium it currently produces.
+      ch.desiredYaw = yaw;
       this.speedNow = speed * facing;
       ch.drive(dt, this.speedNow, undefined);
 
