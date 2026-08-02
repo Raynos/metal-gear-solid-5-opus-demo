@@ -486,9 +486,10 @@ setBase();
 // sets — A rasterises the scene into HDR and stops, B draws the whole frame.
 const allOff = Object.fromEntries(FLAGS.map((f) => [f, false]));
 /**
- * Pairing two RENDER functions instead of two flag sets. `paired()` alternates
- * A and B itself by frame index, so the render function is handed the index and
- * dispatches; the applied "configuration" is a no-op on both sides.
+ * The same ABBA frame pairing as `paired()`, but the two sides differ by which
+ * RENDER function runs rather than by which flags are set — there is no flag
+ * that can turn the post chain off, which is the whole point of measuring it
+ * this way.
  */
 function pairedTwoRenders(renderA, renderB) {
   const diffs = [];
