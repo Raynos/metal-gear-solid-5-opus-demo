@@ -39,7 +39,40 @@ const RIG = {
 // 140 mm is 11% of the subject's screen height back and the extra lateral pushes
 // what remains further off-axis; the aim space is unchanged because the boom
 // still sits on the same side.
-const AIM = { eye: 1.665, lat: 0.41, dist: 1.44, pitchBase: -0.055, fov: 33 };
+//
+// ROUND 12: fov 33 -> 22, dist 1.44 -> 1.52, lat 0.41 -> 0.50, eye 1.665 ->
+// 1.70, pitchBase -0.055 -> -0.020.
+//
+// THE OLD ADS WAS A 1.36x ZOOM and that is the whole of "its hard to zoom in
+// and see someone". A 0.22 m head on a 1080-line frame measured 26.7 px at
+// 15 m, 16.0 px at 25 m and 10.0 px at 40 m — at the ranges this game asks for
+// tranquilliser headshots the target's head was the same size as the reticle
+// box drawn over it. 22 degrees is a 2.13x zoom and takes those to 40.9 / 24.5 /
+// 15.3 px. It is a real ADS rather than a lens twitch.
+//
+// MOST OF THE FRAMING FIX IS THE SAME CHANGE, which is not obvious and is worth
+// writing down. "The player's own body fills the left 40% of the frame" reads
+// like a reason to swing the camera out to the right, and swinging it far
+// enough to clear him would throw the WEAPON out of frame with it — the two are
+// only 0.17 m apart laterally, and at half-FOV 11 degrees the whole in-frame
+// band at the boom plane is 0.59 m wide. Narrowing the frustum does most of the
+// work for free: the body sits at a FIXED ANGLE off the lens axis, so it moves
+// toward the edge in normalised screen space as the frustum closes. Measured on
+// the canonical aimed frame (`probes/r12_ads.js`, torso/head bones only, arms
+// excluded because the firing hand is further right than any part of him):
+//
+//   fov 33, lat 0.41, dist 1.44   torso+head inboard edge at 26% of frame width
+//   fov 22, lat 0.41, dist 1.52   15%
+//   fov 22, lat 0.50, dist 1.52    6%   <- shipped
+//
+// The last 90 mm of lateral is the only part that is a camera move, and it buys
+// the difference between a head cut in half at the left edge and a clean
+// shoulder. The extra 80 mm of boom is for the weapon, not the body.
+//
+// pitchBase is nearly zeroed because 3.15 degrees of built-in downward tilt is
+// 29% of an 11-degree half-height. It exists to frame a subject on a 22.5
+// degree half-angle; on this lens it just points the sight at the dirt.
+const AIM = { eye: 1.70, lat: 0.50, dist: 1.52, pitchBase: -0.020, fov: 22 };
 
 const PITCH_MIN = -1.02;   // 58 degrees down
 const PITCH_MAX = 0.78;    // 45 degrees up

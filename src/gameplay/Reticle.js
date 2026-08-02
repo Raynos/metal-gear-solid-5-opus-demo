@@ -25,16 +25,33 @@ import * as THREE from 'three';
  */
 
 const CSS = `
+/*
+ * IT HAS TO READ ON SAND, and until round 12 it did not.
+ *
+ * A near-white 1 px stroke at 0.86 alpha, over a 1 px dark ring at 0.55, is a
+ * sight designed against a dark background. This game is set on a high-key
+ * desert floor whose display luminance is calibrated to land near 0.5 — the
+ * same value as the stroke — and the round-12 ADS frame shows the result: the
+ * reticle is at the point the probe says it is, at opacity 0.94, and you cannot
+ * find it in the image. It was reported to me as "there is no reticle in the
+ * frame at all". There is; it is camouflaged.
+ *
+ * Fixed by contrast rather than by size: the stroke goes opaque, the dark ring
+ * goes to 0.85 and is doubled to a 2 px halo, and the range text gets the same
+ * halo instead of a soft drop shadow. A 16 px box is the reference frame's own
+ * size and enlarging it would have traded away the thing it is measuring.
+ */
 .gp-ret {
   position: absolute; left: 0; top: 0; width: 0; height: 0;
   z-index: 1; pointer-events: none; opacity: 0;
-  --col: rgba(233, 237, 230, 0.86);
-  --shd: rgba(4, 6, 8, 0.55);
+  --col: rgba(246, 249, 243, 1);
+  --shd: rgba(3, 5, 7, 0.85);
   transition: opacity 90ms linear;
-  font: 200 11px/1 "Helvetica Neue", "Inter", system-ui, sans-serif;
+  font: 400 11px/1 "Helvetica Neue", "Inter", system-ui, sans-serif;
   letter-spacing: 0.09em;
   color: var(--col);
-  text-shadow: 0 1px 2px var(--shd);
+  text-shadow: 0 0 3px var(--shd), 0 1px 1px var(--shd), 0 -1px 1px var(--shd),
+               1px 0 1px var(--shd), -1px 0 1px var(--shd);
   will-change: transform;
 }
 .gp-ret b {
@@ -42,14 +59,15 @@ const CSS = `
   width: var(--sz); height: var(--sz);
   left: calc(var(--sz) / -2); top: calc(var(--sz) / -2);
   border: 1px solid var(--col);
-  box-shadow: 0 0 0 1px var(--shd), inset 0 0 0 1px var(--shd);
+  box-shadow: 0 0 0 1px var(--shd), 0 0 0 2px rgba(3, 5, 7, 0.45),
+              inset 0 0 0 1px var(--shd);
   transition: width 70ms ease-out, height 70ms ease-out, left 70ms ease-out, top 70ms ease-out, border-color 120ms linear;
 }
 /* Centre pip: only when the trace is on a body, so it reads as confirmation. */
 .gp-ret i {
-  position: absolute; left: -1px; top: -1px; width: 2px; height: 2px;
+  position: absolute; left: -1.5px; top: -1.5px; width: 3px; height: 3px;
   background: var(--col); opacity: 0;
-  box-shadow: 0 0 0 1px var(--shd);
+  box-shadow: 0 0 0 1px var(--shd), 0 0 3px var(--shd);
   transition: opacity 90ms linear;
 }
 .gp-ret u {

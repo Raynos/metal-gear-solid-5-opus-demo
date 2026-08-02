@@ -164,7 +164,38 @@ const WEAPON_POSES = {
   // the weapon is visible instead of eclipsed.
   ready: weaponPose([0.178, 1.148, -0.292], [-0.36, -0.46, -0.81]),
   // Shouldered.
-  aim: weaponPose([0.115, 1.4, -0.3], [-0.03, -0.02, -1.0]),
+  //
+  // ROUND 12. This was [0.115, 1.4, -0.3], and on the over-the-shoulder camera
+  // it put nearly all of the weapon behind the man holding it. `probes/
+  // r12_ads.js` traces the lens to eleven points along the grip-to-muzzle line:
+  // NINE OF ELEVEN were behind his own body, the first blocker being his right
+  // deltoid at char (0.17, 1.42, 0.13), 0.37 m in front of the barrel. What the
+  // player could see of his weapon was the magazine and the top of the receiver
+  // over the shoulder — "the gun is not very visible", exactly.
+  //
+  // THAT FIGURE STARTED OUT AS ELEVEN OF ELEVEN AND THAT NUMBER WAS WRONG.
+  // The rifle is welded into the character's own skinned geometry, so the naive
+  // ray-to-the-muzzle test hits the SUPPRESSOR on the way in and calls every
+  // sample occluded no matter where the weapon is. The probe now classifies by
+  // how far in front of the sample the blocker sits. The same caveat applies to
+  // the map below, which is drawn with the same skin: it can tell "his body is
+  // in the way here" from "nothing is", but a cell it marks blocked may be
+  // blocked by the weapon itself.
+  //
+  // `probes/r12_clear.js` maps where the weapon is allowed to be. From this
+  // lens the clear region starts at y = 1.55 for anything inboard of x = 0.20,
+  // and at chest height (y = 1.35-1.45) nothing inboard of x = 0.30 is visible
+  // at all. The old pose sat at (0.115, 1.40) — dead in the blocked band. With
+  // the pose below and the round-12 camera the same eleven-point trace comes
+  // back 0 of 11.
+  //
+  // 1.545 is also the anatomically correct height and the old one was not: the
+  // pose origin is on the BORE, and a shouldered weapon puts the bore an inch
+  // or two under the aiming eye, not level with the sternum. At 1.40 the butt
+  // pad measured 0.076 m from the shoulder ball — technically shouldered — with
+  // the whole weapon slung below the shoulder line like a hip carry with the
+  // stock touching. 0.145 m up and 0.05 m outboard is a cheek weld.
+  aim: weaponPose([0.166, 1.545, -0.28], [-0.03, -0.02, -1.0]),
   // Crouched carry sits lower and tighter to the body.
   crouch: weaponPose([0.13, 1.09, -0.19], [-0.4, -0.42, -0.82]),
   // Prone: weapon on the ground ahead, elbows down.
@@ -287,6 +318,31 @@ export class Animator {
     this._weaponM = new THREE.Matrix4();
     this._basisM = new THREE.Matrix4();
     this._chestM = new THREE.Matrix4();
+    /** root * chest — the frame the weapon pose is authored in, in world. */
+    this._parentM = new THREE.Matrix4();
+    this._invM = new THREE.Matrix4();
+    this._gripW = new THREE.Vector3();
+    /**
+     * THE BORE IS NOT THE POSE AXIS, and assuming it was cost 7.0 degrees.
+     *
+     * A weapon pose's `dir` is where the rifle's local +x points, and the line
+     * the round leaves on is grip-centre to muzzle — which on this model is
+     * (0.663, 0.087, 0), i.e. 7.5 degrees ABOVE local +x, because the grip
+     * hangs below the barrel. Pointing `dir` straight at the target therefore
+     * left the barrel 7.0 degrees high, which is most of what was left of the
+     * misalignment after the yaw was fixed (0.4 deg flat, 7.0 deg in pitch).
+     * Measured off the model's own anchors so it follows the next weapon.
+     */
+    this._borePitch = 0;
+    this._boreYaw = 0;
+    {
+      const rf = ch.rifle;
+      if (rf?.muzzle && rf?.gripCenter) {
+        const v = rf.muzzle.clone().sub(rf.gripCenter);
+        this._borePitch = Math.atan2(v.y, Math.hypot(v.x, v.z));
+        this._boreYaw = Math.atan2(-v.z, v.x);
+      }
+    }
     /** Chest joint centre in character space — the pivot the carry hangs off. */
     this._chestPivot = ch.rig.bindWorld.get('chest').clone();
     this._eul = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -341,6 +397,34 @@ export class Animator {
    * it here costs nothing and keeps the getter honest.
    */
   set action(v) { this.intentAction = v; }
+
+  /**
+   * The weapon's world transform — rifle space to world.
+   *
+   * PUBLISHED, because the alternative was worse. `_weaponM` has existed since
+   * round 6 and was private, so gameplay had no way to ask where the barrel
+   * was: `Stealth.muzzlePoint` took the right hand's bone and pushed a derived
+   * reach down the line the DART is on, which is not the line the barrel is on
+   * and does not start where the barrel starts. Measured on the aimed pose that
+   * landed the flash 0.112 m from the model's own muzzle — 40-60 px on screen
+   * at this range, i.e. the flash visibly came out of the wrong place.
+   *
+   * Read-only by contract: it is rebuilt from scratch every `_solveWeapon`, so
+   * writing to it is silently discarded on the next frame.
+   */
+  get weaponMatrix() {
+    return this._weaponM;
+  }
+
+  /**
+   * Where the barrel actually ends, in world space. `null` if this character
+   * publishes no weapon anchors, so callers can keep their own fallback.
+   */
+  muzzleWorld(out) {
+    const m = this.ch.rifle?.muzzle;
+    if (!m) return null;
+    return out.copy(m).applyMatrix4(this._weaponM);
+  }
 
   /** World-space impulse direction (pointing away from the shooter). */
   hit(dir) {
@@ -848,34 +932,94 @@ export class Animator {
     this.weaponSwayVel.multiplyScalar(Math.max(0, 1 - dt * 9));
     this.weaponSway.addScaledVector(this.weaponSwayVel, Math.min(1, dt * 12));
 
-    let pitch = this.torsoAim.y * 0.45;
-    if (aim > 0.01 && this.aimActive) {
-      this._t2.subVectors(this.aimTarget, ch.root.position);
-      pitch = clamp(Math.atan2(this._t2.y - 1.4, Math.hypot(this._t2.x, this._t2.z)), -0.5, 0.5) * aim;
-    }
-    pitch += act.weaponPitch;
-    const dir = this._d;
-    if (pitch !== 0) dir.applyAxisAngle(this._t3.set(1, 0, 0), pitch).normalize();
-    if (act.weaponYaw !== 0) dir.applyAxisAngle(this._up, act.weaponYaw).normalize();
-
-    const wpos = this._t1.copy(this._p).add(this.weaponSway).add(act.weaponPos);
-    const up = this._t2.set(0, 1, 0).addScaledVector(dir, -dir.y).normalize();
-    if (act.weaponRoll !== 0) up.applyAxisAngle(dir, act.weaponRoll).normalize();
-    const right = this._t3.crossVectors(dir, up);
-    this._basisM.makeBasis(dir, up, right).setPosition(wpos);
-
     // The chest frame: a rotation about the chest joint by the carry sway,
     // plus the pelvis bob the chest is standing on. `bobY` used to be absent
     // from the weapon entirely and approximated by the old translational term,
     // which meant the arms were acting as suspension for 5.5 cm of body bob
     // every cycle. Riding it costs the arms nothing and buys back that reach.
+    //
+    // SOLVED BEFORE THE WEAPON DIRECTION NOW, and the order is the whole point:
+    // the direction below is derived from where the grip ends up in the WORLD,
+    // and the grip's world position is this matrix times the pose offset.
     this._eul.set(this.carryAng.x, this.carryAng.y, this.carryAng.z);
     this._qc.setFromEuler(this._eul);
     this._chestM.makeRotationFromQuaternion(this._qc);
     const c = this._chestPivot;
     this._vc.copy(c).applyQuaternion(this._qc);
     this._chestM.setPosition(c.x - this._vc.x, c.y - this._vc.y + this.bobY, c.z - this._vc.z);
-    this._weaponM.multiplyMatrices(ch.root.matrixWorld, this._chestM).multiply(this._basisM);
+    this._parentM.multiplyMatrices(ch.root.matrixWorld, this._chestM);
+
+    const wpos = this._t1.copy(this._p).add(this.weaponSway).add(act.weaponPos);
+    const dir = this._d;
+
+    let pitch = this.torsoAim.y * 0.45;
+    if (aim > 0.01 && this.aimActive) {
+      this._t2.subVectors(this.aimTarget, ch.root.position);
+      pitch = clamp(Math.atan2(this._t2.y - 1.4, Math.hypot(this._t2.x, this._t2.z)), -0.5, 0.5) * aim;
+    }
+    if (pitch !== 0) dir.applyAxisAngle(this._t3.set(1, 0, 0), pitch).normalize();
+
+    // --- POINT THE WEAPON AT THE TARGET ------------------------------------
+    //
+    // Everything above is a POSE — an authored direction in the character's own
+    // frame, nudged by a pitch estimated from the root. That is fine for a
+    // carry and it is not good enough for aiming, and the gap was measured:
+    // with `anim.aimTarget` only 0.00-0.23 deg off the line the dart actually
+    // flies, the barrel came out 8.4-10.9 deg off it — 4.6 deg flat and 9.9 deg
+    // in pitch on the canonical gameplay pose (`probes/r12_ads.js`). Gameplay's
+    // half of the contract was correct and the rig simply did not reach the
+    // target it was handed. A weapon that visibly points ten degrees away from
+    // where the round goes is most of "its not very aligned".
+    //
+    // Why the old estimate could never have been tuned into place:
+    //
+    //   - it had NO YAW TERM AT ALL. The weapon's heading was the character's
+    //     heading plus a fixed 1.7 deg from the authored pose, so every degree
+    //     the body was off the sight line went straight into the barrel.
+    //   - its pitch was measured from the ROOT (feet) at a hardcoded 1.4 m, not
+    //     from the grip, and the grip is neither at 1.4 m nor above the feet.
+    //   - neither term knew about the chest carry rotation applied above it,
+    //     which is still 18% of its amplitude at full aim.
+    //
+    // Solving it exactly costs one matrix inverse on an aiming character. The
+    // barrel is aimed from the GRIP rather than the muzzle deliberately: the
+    // muzzle then lies on the grip-to-target line, so the axis is the line, and
+    // aiming from the muzzle would need the direction it is trying to compute.
+    if (aim > 0.01 && this.aimActive) {
+      this._gripW.copy(wpos).applyMatrix4(this._parentM);
+      this._t4.subVectors(this.aimTarget, this._gripW);
+      if (this._t4.lengthSq() > 1e-6) {
+        this._invM.copy(this._parentM).invert();
+        this._t4.transformDirection(this._invM);
+        // Clamp into a forward cone before blending. A caller that publishes a
+        // stale or wild aimTarget must not be able to rotate the weapon through
+        // the body — the arms are two-bone-IK'd to this matrix, so a bad target
+        // does not produce a bad aim, it produces a dislocated shoulder.
+        // Take the bore offset off the wanted direction rather than off `dir`
+        // afterwards: `up` is world-up projected perpendicular to `dir`, so the
+        // frame has no roll and rotating the wanted BORE direction down by the
+        // bore pitch lands the pose axis exactly where it has to be for the
+        // barrel to end up on the line. Only valid while the frame is roll-free,
+        // which is why act.weaponRoll is applied after this and not before.
+        const y = clamp(Math.atan2(-this._t4.x, -this._t4.z) - this._boreYaw, -1.05, 1.05);
+        const p = clamp(Math.atan2(this._t4.y, Math.hypot(this._t4.x, this._t4.z)) - this._borePitch, -0.85, 0.85);
+        const cp = Math.cos(p);
+        this._t4.set(-Math.sin(y) * cp, Math.sin(p), -Math.cos(y) * cp);
+        dir.lerp(this._t4, aim).normalize();
+      }
+    }
+
+    // The action layer's own kick rides ON TOP of the solve, not instead of it:
+    // the round leaves along the line above, and then the weapon moves.
+    if (act.weaponPitch !== 0) dir.applyAxisAngle(this._t3.set(1, 0, 0), act.weaponPitch).normalize();
+    if (act.weaponYaw !== 0) dir.applyAxisAngle(this._up, act.weaponYaw).normalize();
+
+    const up = this._t2.set(0, 1, 0).addScaledVector(dir, -dir.y).normalize();
+    if (act.weaponRoll !== 0) up.applyAxisAngle(dir, act.weaponRoll).normalize();
+    const right = this._t3.crossVectors(dir, up);
+    this._basisM.makeBasis(dir, up, right).setPosition(wpos);
+
+    this._weaponM.multiplyMatrices(this._parentM, this._basisM);
 
     this._supportSwing();
     this._solveArm('R');

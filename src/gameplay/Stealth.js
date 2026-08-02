@@ -71,6 +71,26 @@ const RECOIL_YAW = 0.30;
 const CONVERGE_FAR = 180;
 /** Seconds of smoothing on the convergence range. See `_solveConverge`. */
 const CONVERGE_TAU = 0.07;
+/**
+ * Furthest range the SIGHT will draw a firing solution for.
+ *
+ * The reticle hangs below the optical axis by the dart's drop at whatever the
+ * sight is convergent on, and that is quadratic in range: at 20 m it is 0.51 m
+ * of drop, at 60 m it is 4.6 m and at CONVERGE_FAR it is 41 m. Point the weapon
+ * at open sky and the honest ballistic answer is a point 41 m below the axis,
+ * which at the round-12 ADS lens is 634 px below the centre of a 1080-line
+ * frame — measured, `probes/r12_film.mjs`. The sight walked off the bottom of
+ * the screen. It did this before the zoom too; 22 degrees is what made it
+ * impossible to miss.
+ *
+ * 60 m is past anything this weapon can realistically reach — a 4.6 m holdover
+ * with a 3.9 m/s sway cone is not a shot anyone takes — so beyond it the box
+ * stops travelling and becomes a maximum-elevation mark. `aimHit.dist`, which
+ * is what the range readout prints, is NOT capped: the player is still told the
+ * true distance to what he is looking at, so a capped sight reads as "further
+ * than this weapon goes" rather than as a lie.
+ */
+const SIGHT_RANGE_MAX = 60;
 
 /**
  * The weapon.
@@ -592,7 +612,18 @@ export class StealthActions {
    * having exactly two sizes.
    */
   get swayScale() {
-    return this.swayAngle / (SWAY_STANCE.stand * 0.6);
+    // MEASURED AGAINST A SHOULDERED REFERENCE, not a hip-fire one. The zoom
+    // steadying added above divides the cone by the tangent ratio of the two
+    // lenses, and with a fixed hip-fire reference in the denominator that came
+    // straight out in the drawn box: 16 px became 9 px the moment the weapon
+    // came up, which is not a sight telling you about spread, it is a sight
+    // shrinking because the lens changed. Putting the same factor in the
+    // reference cancels it, so the box means "how precise is this weapon right
+    // now, against the best this weapon gets" — and it is only ever drawn while
+    // aiming, so a hip-fire reference was measuring against a state the player
+    // cannot see it in anyway.
+    const ref = SWAY_STANCE.stand * 0.6 * (this.cam.lookScale ? this.cam.lookScale() : 1);
+    return this.swayAngle / ref;
   }
 
   /** Eye height for the current stance, world Y. */
@@ -624,7 +655,18 @@ export class StealthActions {
       * steady
       * (0.6 + 0.4 * (1 - this.breath))
       * (1 + speed * SWAY_PER_SPEED)
-      * (1 + Math.min(SWAY_BLOOM_MAX, this.bloom));
+      * (1 + Math.min(SWAY_BLOOM_MAX, this.bloom))
+      // SHOULDERING THE WEAPON STEADIES IT, by exactly the tangent ratio of the
+      // two lenses. Without this the round-12 zoom would have made aiming
+      // HARDER, not easier: the sway is an angle, so magnifying the view 2.13x
+      // magnifies the wobble on screen 2.13x with it, and the reticle would
+      // have swum twice as far across the frame at the moment the player is
+      // trying to hold it on a head. `lookScale()` is the same number the look
+      // sensitivity already uses, so the screen-space sway and the screen-space
+      // mouse speed stay locked to each other through the whole blend rather
+      // than being two constants that drift apart the next time the FOV moves.
+      // Hip fire is untouched — lookScale() is 1.0 at aimBlend 0.
+      * (this.cam.lookScale ? this.cam.lookScale() : 1);
     this.swayAngle = amp;
     const sx = (Math.sin(this._swayT * 1.7) + 0.6 * Math.sin(this._swayT * 0.61 + 1.3)) * amp;
     const sy = (Math.sin(this._swayT * 1.31 + 2.1) + 0.5 * Math.sin(this._swayT * 0.83)) * amp;
@@ -875,7 +917,7 @@ export class StealthActions {
     // monotone in range, and still the honest ballistic answer for the thing
     // the player is actually looking at. `aimHit` keeps the true impact for the
     // range readout and the target highlight.
-    const s = this._hasL ? Math.max(1, this._lp.distanceTo(org)) : 22;
+    const s = Math.min(SIGHT_RANGE_MAX, this._hasL ? Math.max(1, this._lp.distanceTo(org)) : 22);
     const tof = s / DART_SPEED;
     this.sightPoint.copy(org).addScaledVector(dir, s);
     this.sightPoint.y -= 0.5 * DART_GRAVITY * tof * tof;
@@ -942,6 +984,19 @@ export class StealthActions {
    * dart is on.
    */
   muzzlePoint(out, dir) {
+    // THE MODEL'S OWN BARREL TIP, if it will tell us. `anim.muzzleWorld` puts
+    // the rifle's authored muzzle anchor through the weapon matrix the animator
+    // solved this frame, so the flash comes out of the barrel by construction
+    // and follows the model the next time somebody fits a different can.
+    //
+    // The hand-bone path below is a reconstruction and it was measurably off:
+    // it starts at the WRIST and walks a derived reach down the line the DART
+    // is on, which is neither where the barrel starts nor the direction it
+    // points. Measured on the aimed pose, that landed 0.112 m from the real
+    // muzzle — 40-60 px on screen at close range, which is a muzzle flash that
+    // visibly does not come from the gun.
+    const m = this.player?.anim?.muzzleWorld?.(out);
+    if (m) return m;
     const hand = this.player?.rig?.byName?.get?.('handR');
     if (hand) {
       hand.getWorldPosition(out);
