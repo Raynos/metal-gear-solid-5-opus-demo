@@ -363,6 +363,14 @@ export async function install(world) {
         break;
       case 'tranq':
         if (e.point) feedback.impact(e.point, 'body', e.dir);
+        // A CONNECTING ROUND MADE NO SOUND. The shot itself cued `weapon.tranq`
+        // and that was the whole of it, so a dart into a man and a dart into
+        // the sand behind him were audibly identical — at 40 m, with the target
+        // a few pixels tall, that is the difference the player has no other way
+        // to read. `cqc.hit` is src/audio's own name for a body being struck
+        // and is the closest thing in its vocabulary; there is no impact family
+        // to ask for a better one.
+        cue('cqc.hit', { pos: e.point });
         break;
       case 'reload':
         cue('weapon.reload', { pos: controller.position });
@@ -478,7 +486,7 @@ export async function install(world) {
       stealth.lean = 0;
       reticle.hide();
     } else if (e.type === 'tranq') {
-      reticle.confirm();
+      reticle.confirm(e.headshot);
     }
   });
 
@@ -510,7 +518,14 @@ export async function install(world) {
       // Look BEFORE the verbs: the aim ray is built from camera.yaw/pitch, so
       // applying this frame's stick first is what keeps the reticle off a
       // one-frame delay.
-      camera.addLook(input.look.x, input.look.y);
+      //
+      // `lookScale` is the ADS sensitivity term, and it is applied HERE rather
+      // than inside Input because Input has no idea what lens is fitted and
+      // should not learn: sensitivity in rad/px is the device's business, and
+      // what that turns into on screen is the camera's. Without it, aiming made
+      // the mouse 1.40x faster across the frame — see PlayerCamera.lookScale.
+      const ls = camera.lookScale();
+      camera.addLook(input.look.x * ls, input.look.y * ls);
       const cmd = stealth.update(dt, input, camera.yaw);
 
       controller.update(dt, {

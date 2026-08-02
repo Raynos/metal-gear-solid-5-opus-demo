@@ -65,9 +65,19 @@ const CSS = `
   border: 1px solid rgba(233, 237, 230, 0.9); opacity: 0;
 }
 .gp-ret[data-hit="1"] s { animation: gp-ret-hit 320ms ease-out 1; }
+/* A headshot: wider, brighter, held a beat longer. */
+.gp-ret[data-hit="2"] s {
+  animation: gp-ret-head 420ms ease-out 1;
+  border-color: rgba(255, 244, 226, 1);
+  border-width: 2px;
+}
 @keyframes gp-ret-hit {
   from { opacity: 0.95; transform: scale(0.45) rotate(0deg); }
   to   { opacity: 0; transform: scale(1.9) rotate(45deg); }
+}
+@keyframes gp-ret-head {
+  from { opacity: 1; transform: scale(0.35) rotate(0deg); }
+  to   { opacity: 0; transform: scale(2.8) rotate(90deg); }
 }
 `;
 
@@ -99,10 +109,16 @@ export class Reticle {
     (parent ?? document.body).appendChild(el);
   }
 
-  /** Flash the hit tick. Wired to the stealth module's `tranq` event. */
-  confirm() {
-    this._hitT = 0.34;
-    this.el.setAttribute('data-hit', '1');
+  /**
+   * Flash the hit tick. Wired to the stealth module's `tranq` event.
+   *
+   * `strong` is a headshot. The trace has computed that flag since the weapon
+   * was written and nothing read it, so the one thing the simulation knew about
+   * the quality of the shot never reached the person who took it.
+   */
+  confirm(strong = false) {
+    this._hitT = strong ? 0.44 : 0.34;
+    this.el.setAttribute('data-hit', strong ? '2' : '1');
   }
 
   hide() {
@@ -130,7 +146,10 @@ export class Reticle {
     }
 
     const hit = this.stealth.aimHit;
-    const p = this._v.copy(hit?.point ?? this.stealth.aimPoint).project(camera3d);
+    // `sightPoint` is the round's position at the range the sight is convergent
+    // on — see Stealth._predict for why this is not `hit.point`. The fallbacks
+    // are for a build or a frame where the stealth module has not solved one.
+    const p = this._v.copy(this.stealth.sightPoint ?? hit?.point ?? this.stealth.aimPoint).project(camera3d);
     // Behind the camera means the aim point is degenerate; drop the reticle
     // rather than mirroring it to the wrong side of the frame.
     if (p.z > 1) { this.el.style.opacity = '0'; return; }
@@ -142,9 +161,17 @@ export class Reticle {
     this.el.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0)`;
     this.el.style.opacity = (a * 0.94).toFixed(2);
 
-    // Holding your breath tightens the sight, because it tightens the sway.
-    // 16 px open, 12 px steady: the same information, said more precisely.
-    const sz = this.stealth.holdingBreath ? 12 : 16;
+    // THE BOX IS THE CONE. It used to have two sizes — 16 px, or 12 px while
+    // the breath was held — which is a light on a dashboard, not a sight.
+    // Everything that makes the weapon less precise now opens it: the stance,
+    // the breath, how fast the player is moving, and how many rounds have just
+    // left the barrel. `swayScale` is 1.0 for a standing, rested, motionless
+    // shooter, so 16 px still means exactly what it used to mean.
+    //
+    // Quantised to 2 px because this is a CSS custom property write on a
+    // transitioning element, and a fresh value every frame both costs a style
+    // recalc and fights the 70 ms transition that makes the open/close read.
+    const sz = Math.max(9, Math.min(64, Math.round(16 * this.stealth.swayScale / 2) * 2));
     if (sz !== this._sz) { this._sz = sz; this.el.style.setProperty('--sz', `${sz}px`); }
 
     const on = !!hit?.character && !hit.character.downed;

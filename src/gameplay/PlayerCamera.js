@@ -76,6 +76,8 @@ export class PlayerCamera {
     this.stanceDrop = 0;
     this._kick = 0;
     this._kickVel = 0;
+    this._kickYaw = 0;
+    this._kickYawVel = 0;
     /** Fraction of the boom currently in use; 1 is fully extended. */
     this._boom = 1;
 
@@ -87,10 +89,19 @@ export class PlayerCamera {
     this._first = true;
   }
 
+  /** Heading the LENS is on, kick included — what the aim basis has to use. */
+  get viewYaw() {
+    return this.yaw + this._kickYaw;
+  }
+
   /** Point the rig at a heading without a sweep — used when play mode starts. */
   reset(position, yaw) {
     this.yaw = yaw;
     this.pitch = 0;
+    this._kick = 0;
+    this._kickVel = 0;
+    this._kickYaw = 0;
+    this._kickYawVel = 0;
     this.follow.copy(position);
     this.lead.set(0, 0, 0);
     this._boom = 1;
@@ -102,9 +113,45 @@ export class PlayerCamera {
     this.pitch = THREE.MathUtils.clamp(this.pitch + dy, PITCH_MIN, PITCH_MAX);
   }
 
-  /** Weapon kick: a fast upward impulse that settles back over ~0.35 s. */
-  recoil(amount) {
-    this._kickVel += amount;
+  /**
+   * Weapon kick: an impulse into a spring that settles back to where it was.
+   *
+   * TWO AXES NOW. It used to take one number and drive pitch only, so every
+   * round in the game was the identical vertical nudge and a burst drew a
+   * straight line; `yaw` lets the caller alternate the side and give a burst a
+   * shape. Both terms settle fully — the aim the player set is the aim he gets
+   * back, which is the right call for a suppressed tranquilliser and is what
+   * makes the kick readable rather than something to fight.
+   *
+   * The spring was also too slow to read as a weapon. At K = 90 it peaked
+   * 0.117 s after the shot (measured, `probes/r12_aim.js`) — a seventh of a
+   * second is a camera drifting, not a rifle going off.
+   */
+  recoil(pitch, yaw = 0) {
+    this._kickVel += pitch;
+    this._kickYawVel += yaw;
+  }
+
+  /**
+   * Look sensitivity for the lens currently fitted, as a multiplier on raw
+   * mouse travel.
+   *
+   * There was none, and that is a real defect rather than a missing luxury:
+   * `mouseSensitivity` is radians per pixel, so the same hand movement turns
+   * the same ANGLE at every FOV — which means it sweeps further across the
+   * SCREEN the tighter the lens gets. Measured at this rig's own numbers,
+   * 100 px of mouse moved the world 292 px at the hip FOV of 45 and 408 px at
+   * the aimed FOV of 33: aiming made the mouse 1.40x faster at the exact moment
+   * the player is trying to hold a 16 px box on a head. Scaling by the tangent
+   * ratio makes on-screen speed invariant, which is what every shooter does and
+   * what a player's hands already expect.
+   *
+   * Deliberately reads the AIM blend and not the sprint widening: the sprint
+   * FOV kick is a speed cue and neutralising it would erase it.
+   */
+  lookScale() {
+    const fov = THREE.MathUtils.lerp(RIG.fov, AIM.fov, this.aimBlend);
+    return Math.tan(THREE.MathUtils.degToRad(fov) * 0.5) / Math.tan(THREE.MathUtils.degToRad(RIG.fov) * 0.5);
   }
 
   swapShoulder() {
@@ -121,9 +168,16 @@ export class PlayerCamera {
    */
   update(dt, s) {
     // --- spring-damped kick -------------------------------------------------
-    this._kickVel -= this._kick * 90 * dt;
-    this._kickVel *= Math.max(0, 1 - dt * 11);
+    // K = 240 puts the peak ~0.06 s after the shot instead of 0.117 s, and the
+    // heavier damping brings it home in about the same total time. A kick that
+    // takes a seventh of a second to reach its top does not read as a weapon
+    // firing; it reads as the camera being nudged.
+    this._kickVel -= this._kick * 240 * dt;
+    this._kickVel *= Math.max(0, 1 - dt * 17);
     this._kick += this._kickVel * dt;
+    this._kickYawVel -= this._kickYaw * 240 * dt;
+    this._kickYawVel *= Math.max(0, 1 - dt * 17);
+    this._kickYaw += this._kickYawVel * dt;
 
     // --- blends -------------------------------------------------------------
     const ease = (cur, target, tau) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
@@ -224,14 +278,22 @@ export class PlayerCamera {
     if (this._pos.y < gy) this._pos.y = gy;
 
     this.camera.position.copy(this._pos);
-    this._e.set(this.pitch + pitchBase + this._kick, yaw, 0, 'YXZ');
+    // The kick rotates the LENS, not the rig: the boom above is solved on the
+    // player's own yaw, so a recoil swings the view without translating the
+    // camera round the body and dragging the whole world sideways with it.
+    this._e.set(this.pitch + pitchBase + this._kick, yaw + this._kickYaw, 0, 'YXZ');
     this.camera.quaternion.setFromEuler(this._e);
 
     // --- lens ---------------------------------------------------------------
     // A few degrees of extra width at a sprint is the cheapest speed cue there
     // is, and it goes away the moment the weapon comes up.
     const fov = THREE.MathUtils.lerp(RIG.fov + (s.sprint ? 4.5 : 0), AIM.fov, a);
-    this._fov = ease(this._fov ?? fov, fov, 0.12);
+    // 0.12 -> 0.07. This ease sits on TOP of `aimBlend`, which is itself an
+    // 85 ms ease, so the two compounded: measured, the aim blend reached 90% at
+    // 0.200 s and the lens not until 0.400 s. Two tenths of a second of the
+    // pose being shouldered while the frame is still wide is the mushiness in
+    // "the aiming feels bad" that a still frame cannot show.
+    this._fov = ease(this._fov ?? fov, fov, 0.07);
     if (Math.abs(this.camera.fov - this._fov) > 0.02) {
       this.camera.fov = this._fov;
       this.camera.updateProjectionMatrix();
@@ -296,8 +358,9 @@ export class PlayerCamera {
    */
   forward(out = new THREE.Vector3()) {
     const pitch = this.pitch + THREE.MathUtils.lerp(RIG.pitchBase, AIM.pitchBase, this.aimBlend) + this._kick;
+    const yaw = this.yaw + this._kickYaw;
     const cp = Math.cos(pitch);
-    return out.set(-Math.sin(this.yaw) * cp, Math.sin(pitch), -Math.cos(this.yaw) * cp);
+    return out.set(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp);
   }
 }
 
