@@ -1,0 +1,130 @@
+{
+  "RULER_VALID": false,
+  "rulerWarning": "VOID RUN — do not quote any cost from it. The noise floor is 19.9 ms against a 36.3 ms frame (55%), so nothing in this frame is separable. This is what a CONTENDED machine looks like — check `node tools/shot.mjs status` for other authors queued ahead of you and measure again when it is quiet.",
+  "shot": "gameplay",
+  "resolution": "1920x1080 @dpr1",
+  "budget": {
+    "fps60Ms": 16.7,
+    "fps30Ms": 33.3
+  },
+  "frames": {
+    "godmode": {
+      "static": {
+        "ms": 13.5,
+        "fps": 74,
+        "blockSpreadMs": 17.4
+      },
+      "pan60": {
+        "ms": 34.7,
+        "fps": 29,
+        "blockSpreadMs": 1.4
+      },
+      "walk": {
+        "ms": 33.4,
+        "fps": 30,
+        "blockSpreadMs": 1.4
+      },
+      "sprint": {
+        "ms": 34.6,
+        "fps": 29,
+        "blockSpreadMs": 1
+      }
+    },
+    "play": {
+      "standing": {
+        "ms": 39.2,
+        "fps": 26,
+        "blockSpreadMs": 1.2
+      },
+      "walking": {
+        "ms": 39.8,
+        "fps": 25,
+        "blockSpreadMs": 0.7
+      },
+      "sprinting": {
+        "ms": 39.1,
+        "fps": 26,
+        "blockSpreadMs": 1.3
+      },
+      "combat": {
+        "ms": 38.8,
+        "fps": 26,
+        "blockSpreadMs": 1.1
+      }
+    }
+  },
+  "playNote": null,
+  "ruler": {
+    "throughputBlock": "4 warm + 16 timed, x3, median",
+    "pairsPerComparison": 24,
+    "pairing": "adjacent FRAMES, order alternating (ABBA), median of per-pair differences",
+    "noiseFloorMs": 19.9,
+    "noiseFloorBiasMs": 2.15,
+    "note": "noiseFloorMs is the IQR of the same configuration paired against itself. Nothing below it can be reported as a cost. noiseFloorBiasMs should be ~0; if it is not, the pairing is not cancelling the drift and the run is void."
+  },
+  "splitMs": {
+    "totalFrameMs": 36.3,
+    "sceneIntoHdrMs": 8.8,
+    "postChainPaired": "below noise (median 13.27, IQR 19.5)",
+    "ungatedPostPaired": "below noise (median 6.77, IQR 12.63)",
+    "note": "sceneIntoHdr is systems + shadow cascades + the scene rasterised into the pipeline HDR target, with the post chain never invoked. ungatedPost is what post still costs with EVERY enabled[] flag false — the prep blit, the 6-level luminance chain, the adaptation blit, DOF, composite and FXAA have no flag at all, so the old \"sceneAndShadows\" number included all six."
+  },
+  "perPassCost": {
+    "bloom": {
+      "verdict": "29.52 ms (IQR 13.41)",
+      "flags": [
+        "bloom"
+      ],
+      "framesPerGroup": 4
+    },
+    "ssao": {
+      "verdict": "2.59 ms (IQR 1.96)",
+      "flags": [
+        "ssao"
+      ],
+      "framesPerGroup": 4
+    },
+    "motionBlurBranch": {
+      "verdict": "below noise (median 0.6, IQR 5.38)",
+      "flags": [
+        "motionBlur"
+      ],
+      "framesPerGroup": 1
+    },
+    "dofAndMotionBlurPass": {
+      "verdict": "below noise (median -0.35, IQR 2.05)",
+      "flags": [
+        "dof",
+        "motionBlur"
+      ],
+      "framesPerGroup": 4
+    },
+    "autoExposureBranch": {
+      "verdict": "below noise (median -0.5, IQR 4.6)",
+      "flags": [
+        "autoExposure"
+      ],
+      "framesPerGroup": 1
+    }
+  },
+  "flagAudit": {
+    "_selfCheck": "two captures of the unchanged build differ by rms 0.195 / max 24 codes; a flag counts as live above rms 0.342.",
+    "ssao": "live — rms 13.895, max 198 codes",
+    "microAO": "live — rms 5.87, max 89 codes",
+    "contactShadows": "live — rms 3.169, max 128 codes",
+    "bloom": "live — rms 2.388, max 54 codes",
+    "taa": "live — rms 5.808, max 141 codes",
+    "fxaa": "live — rms 5.656, max 129 codes",
+    "aerial": "live — rms 2.129, max 89 codes",
+    "dof": "live — rms 1.587, max 60 codes",
+    "motionBlur": "INERT — rms 0.194, max 24 codes",
+    "autoExposure": "live — rms 0.72, max 25 codes"
+  },
+  "gpuTimer": {
+    "available": false,
+    "reason": "result never became available"
+  },
+  "draws": 552,
+  "triangles": 5715933,
+  "programs": 147
+}
