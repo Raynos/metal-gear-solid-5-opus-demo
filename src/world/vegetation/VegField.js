@@ -118,8 +118,14 @@ export function wetnessOf(flow, accum) {
 }
 
 export class VegField {
-  constructor(terrain) {
+  /**
+   * `wind` is the unit down-valley wind vector in XZ. It is what makes the
+   * shelter channel asymmetric — see `_splatFootprint`. Optional: without it the
+   * drift is a symmetric collar, which is what it was before round 8.
+   */
+  constructor(terrain, wind = null) {
     this.terrain = terrain;
+    this.wind = wind ? { x: wind.x, z: wind.y ?? wind.z ?? 0 } : null;
     const g = resolveGrid(terrain);
     this.grid = g;
     this.n = g.n;
@@ -271,11 +277,26 @@ export class VegField {
     // objects dresses the yard rather than carpeting it.
     if (hy < 0.45 || sx > 70 || sz > 70) return;
     if (Math.min(sx, sz) < 0.28) return;
-    const REACH = 1.35;
+    /**
+     * ROUND 8: 1.35 -> 2.45, and the collar is no longer symmetric.
+     *
+     * "Nothing accumulates against anything" was the round-9 critique's third
+     * finding, and it is right: a wall in a windblown desert has a *drift* on
+     * it, not a fringe. Grit and seed pile up on the face the wind is loaded
+     * against and the lee is comparatively scoured, so the band runs ~2.5 m
+     * windward and ~1.1 m downwind. This channel feeds both the grass masks and
+     * Clast.js, so one bake seats every object in the compound in two materials
+     * at once — which is a far cheaper answer to "nothing is seated" than
+     * modelling contact wear on each of several hundred props.
+     */
+    const REACH = 2.45;
     const n = this.padN;
     const cell = this.padCell;
     const o = this.padOrigin;
     const pad = this.pad;
+    const w = this.wind;
+    const bcx = (b.min.x + b.max.x) * 0.5;
+    const bcz = (b.min.z + b.max.z) * 0.5;
     const i0 = Math.max(0, Math.floor((b.min.x - REACH - o) / cell));
     const i1 = Math.min(n - 1, Math.ceil((b.max.x + REACH - o) / cell));
     const j0 = Math.max(0, Math.floor((b.min.z - REACH - o) / cell));
@@ -287,9 +308,18 @@ export class VegField {
         const wx = o + i * cell;
         const dx = Math.max(b.min.x - wx, wx - b.max.x);
         const d = dx > 0 && dz > 0 ? Math.hypot(dx, dz) : Math.max(dx, dz);
-        if (d > REACH) continue;
+        let reach = REACH;
+        if (w) {
+          // +1 on the face the wind arrives at, -1 in the lee.
+          const ox = wx - bcx;
+          const oz = wz - bcz;
+          const ol = Math.hypot(ox, oz) || 1;
+          const up = -((ox / ol) * w.x + (oz / ol) * w.z);
+          reach = REACH * (0.45 + 0.55 * smooth01(up, -0.9, 0.9));
+        }
+        if (d > reach) continue;
         // Nothing grows *under* the object; the band starts at its edge.
-        const s = smooth01(d, -0.25, 0.12) * (1 - smooth01(d, 0.35, REACH));
+        const s = smooth01(d, -0.25, 0.12) * (1 - smooth01(d, 0.30, reach));
         const c = (j * n + i) * 4 + 2;
         if (s > pad[c]) pad[c] = s;
       }
@@ -371,14 +401,22 @@ export class VegField {
         const i1 = Math.min(n - 1, Math.ceil((x + r - o) / cell));
         const j0 = Math.max(0, Math.floor((z - r - o) / cell));
         const j1 = Math.min(n - 1, Math.ceil((z + r - o) / cell));
+        const w = this.wind;
         for (let j = j0; j <= j1; j++) {
           const dz = o + j * cell - z;
           for (let i = i0; i <= i1; i++) {
             const dx = o + i * cell - x;
             const d = Math.hypot(dx, dz);
-            if (d > r) continue;
+            // Same asymmetry as the structure collar: a boulder in a windblown
+            // desert has grit and seed banked against the face it presents to
+            // the wind and a scoured tail behind it, and the rock module's own
+            // contact/collar system lives on the rock's geometry and never
+            // touches the ground.
+            let rr = r;
+            if (w && d > 1e-4) rr = r * (0.55 + 0.50 * smooth01(-((dx / d) * w.x + (dz / d) * w.z), -0.9, 0.9));
+            if (d > rr) continue;
             // Zero inside the rock itself — nothing grows through granite.
-            const s = smooth01(d, r * 0.42, r * 0.62) * (1 - smooth01(d, r * 0.72, r));
+            const s = smooth01(d, r * 0.42, r * 0.62) * (1 - smooth01(d, rr * 0.72, rr));
             const c = (j * n + i) * 4 + 2;
             if (s > pad[c]) pad[c] = s;
           }
@@ -551,16 +589,19 @@ function applyDevelopment(x, z, d, dev, shelter, slope) {
   // embankment, dev in 0.06 to 0.78, and nowhere else.
   const shoulder = Math.max(0, 1 - Math.abs(dev - 0.42) * 2.8);
   const ok = 1 - smooth01(slope, 0.28, 0.62);
-  let out = d * (1 - yard * 0.985);
+  // ROUND 8: 0.985 -> 0.940, mirrored from vegDevelopment in shaderLib. The
+  // reference frames have dry tussock inside the wire; ours stopped at the
+  // apron because this was a 66x kill rather than a 17x one.
+  let out = d * (1 - yard * 0.940);
   // Shelter *adds* rather than scales: the strip against a wall is fertile
   // regardless of what the fertility noise says about the open ground. It is
   // still broken up by a metre-scale noise, or every object in the compound
   // ends up wearing a continuous fringe and the whole yard reads as a decal.
   const patch = smooth01(fbm2(x * 0.55 - 19, z * 0.55 - 19, 2), 0.30, 0.72);
-  out += shelter * 0.52 * ok * patch;
+  out += shelter * 0.70 * ok * patch;
   // Weeds in the cracks of the hardstand. A perfectly sterile slab is as
   // wrong as a lawn; a graded yard gets a tuft wherever the surface split.
-  out += yard * 0.30 * ok * smooth01(fbm2(x * 1.15 + 55, z * 1.15 + 55, 2), 0.58, 0.90);
+  out += yard * 0.44 * ok * smooth01(fbm2(x * 1.15 + 55, z * 1.15 + 55, 2), 0.52, 0.88);
   out += shoulder * 0.62 * ok;
   return out;
 }

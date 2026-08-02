@@ -221,6 +221,41 @@ export function createTalusMaterial() {
   return mat;
 }
 
+/**
+ * uRockLight — RESOLVED at integration, round 10. Read this before retuning.
+ *
+ * The round-9 critique asked the rock and terrain owners to agree a value:
+ * "uRockLight is 0.198 in Terrain.js and 0.534 in RockMaterial.js, so boulders
+ * render 5.6x brighter than the cliffs they fell off".
+ *
+ * Two answers were authored in parallel and they disagreed:
+ *
+ *   - Terrain (`ROCK` in Terrain.js) made the palette SHARED and made it GREY.
+ *     One export, imported here, three lithologies rather than three tints:
+ *     ROCK.lime is 0.285 at R/B 1.07. A boulder is a piece of the cliff it fell
+ *     off, so it is literally the same constant.
+ *   - This module argued the two are different materials — in-place cliff face
+ *     versus loose, flood-turned clast — and proposed keeping them apart, with
+ *     a single MINERAL=0.84 scale over the old local warm values (ramp top
+ *     0.449 at R/B 1.79) negotiated against Terrain's uGravelClast instead.
+ *
+ * The SHARED GREY PALETTE WON, and the local scale is deleted. The reason is
+ * the one the critique actually raised: the frame's failure was "one hue
+ * octant", 0.934 of its chromatic mass in a single octant against the
+ * reference's 0.542. The local proposal kept every rock constant warm (R/B 1.57
+ * to 2.42) and so kept the mountains the colour of the ground they rise out of.
+ * ROCK.lime at R/B 1.07 is the only genuinely neutral large-area material in
+ * the landscape and it is worth more than the brightness argument.
+ *
+ * The "loose clast is paler than bedrock" observation is still correct and is
+ * still served — but by geometry and shading, not by a second albedo: see
+ * `vegetation/Clast.js`, whose bodies are flat-shaded with per-body lithology
+ * and roughness so a pebble separates from its bed by having a lit face, a dark
+ * face and a contact shadow rather than by being a brighter brown.
+ *
+ * If you want to reopen this, move `ROCK` — do not reintroduce a local scale.
+ */
+
 export function createRockMaterial() {
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,

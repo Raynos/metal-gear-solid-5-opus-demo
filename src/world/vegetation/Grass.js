@@ -167,6 +167,21 @@ const GRASS_VERT_BODY = /* glsl */ `
   float dens = vegDensity(wxz, slope, devK);
 
   float dist = length(wxz - cameraPosition.xz);
+
+  // ROUND 8. Ground cover measured 0.43% of the near band against a reference
+  // that runs 40-50%, and mgi-7 and mgi-9 both carry tufts right up to and
+  // inside the compound wire while ours stops well outside it. Most of that gap
+  // is loose stone (see Clast.js), but the grass half of it is a density that
+  // was tuned while looking at a 200 m vista and is then read at four metres.
+  //
+  // The gain is confined to the near field on purpose. Every round from 2 to 4
+  // was spent pulling distant tufts DOWN — sub-pixel blades lit as translucent
+  // membranes in front of ground lit as diffuse mineral, which is the white
+  // confetti — so past 34 m this multiplies by exactly one and no distant frame
+  // moves. What changes is the band a player's eye is actually in.
+  float nearGain = mix(1.80, 1.0, smoothstep(5.0, 34.0, dist));
+  dens = clamp(dens * nearGain, 0.0, 1.0);
+
   float outer = 1.0 - smoothstep(uRingFadeIn.y, uRing.w, dist);
   float inner = smoothstep(uRing.z, uRingFadeIn.x, dist);
   float ringFade = outer * inner;
@@ -230,6 +245,21 @@ const GRASS_VERT_BODY = /* glsl */ `
     vec2 asp = 0.70 + 0.60 * vegHash22(cellIdx + 41.7);
     p.x *= asp.x;
     p.z *= asp.y;
+    // THREE heights in one stand, which is what every reference frame of dry
+    // Afghan grass shows and what a single log-normal draw cannot produce: a low
+    // grazed mat, the body of the tussock, and a scatter of seed stems standing
+    // well clear of both. A continuous draw gives one blurred population with a
+    // single characteristic height, and a field with one characteristic height
+    // has one silhouette however many rotations you stamp it at.
+    //
+    // The tall class is thinned as it is lengthened. A seed stem is wire: at
+    // full blade width a 1.9x tuft is a bundle of planks, and the tips are the
+    // pixels that alias worst.
+    float hPick = vegHash21(cellIdx + 631.7);
+    float tallK = smoothstep(0.78, 0.96, hPick);
+    float lowK = 1.0 - smoothstep(0.05, 0.28, hPick);
+    p.y *= mix(mix(1.0, 1.90, tallK), 0.52, lowK);
+    p.xz *= mix(1.0, 0.66, tallK);
     p = vec3(cs * p.x - sn * p.z, p.y, sn * p.x + cs * p.z) * scale;
     n = vec3(cs * n.x - sn * n.z, n.y, sn * n.x + cs * n.z);
 
@@ -274,6 +304,21 @@ const GRASS_VERT_BODY = /* glsl */ `
     float family = vegHash21(cellIdx + 77.3);
     vVegTint = mix(vVegTint, vVegTint * vec3(1.22, 0.98, 0.66), smoothstep(0.58, 0.92, family) * 0.85);
     vVegTint = mix(vVegTint, vVegTint * vec3(0.94, 0.90, 0.72), (1.0 - smoothstep(0.08, 0.40, family)) * 0.55);
+    // A fourth family: stands that have gone right over to sun-bleached straw.
+    // The measured brief for this round is that the reference ground band has
+    // 2.8% of its pixels above L* 85 and ours has exactly ZERO — no bleached
+    // highlights anywhere — and dead straw standing in an Afghan summer is one
+    // of the two places that light comes from (the other is broken carbonate,
+    // which Clast.js supplies).
+    //
+    // Held to the near field and to the upper half of the blade. This is ALBEDO,
+    // so a pale tuft at 120 m against a dark hillside would land in precisely
+    // the spot rounds 2 and 3 were pulled up for, and the fact that the
+    // mechanism is different from the translucency gain would not make the pixel
+    // any less of a snowflake.
+    float bleach = smoothstep(0.70, 0.95, vegHash21(cellIdx + 911.3))
+                 * (1.0 - smoothstep(40.0, 95.0, dist)) * (0.30 + 0.70 * t);
+    vVegTint = mix(vVegTint, vec3(0.735, 0.688, 0.545), bleach * 0.78);
     // Root shadow, but lifted: round 1 crushed the blade base to near-black.
     // Capped at 1.0 — the old curve peaked at 1.23, which is a material that
     // reflects more light than lands on it, and it was doing that on the very
