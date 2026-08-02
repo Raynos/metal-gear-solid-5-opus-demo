@@ -392,7 +392,6 @@ function holding(codes, body) {
 }
 
 let playNote = null;
-const playBefore = cam.position.clone();
 g.setMode('play');
 g.settle(10);
 
@@ -569,7 +568,17 @@ g.settle(4);
 
 const fmt = (c) => (c.resolved ? `${c.medianMs} ms (IQR ${c.iqrMs})` : `below noise (median ${c.medianMs}, IQR ${c.iqrMs})`);
 
+// A run whose pairing failed to cancel the drift is not a weaker measurement,
+// it is not a measurement. Say so at the top level so it cannot be skimmed past.
+const rulerValid = Math.abs(noiseFloor.medianMs) < noiseFloor.iqrMs;
+
 return {
+  RULER_VALID: rulerValid,
+  rulerWarning: rulerValid
+    ? undefined
+    : `VOID RUN — the same configuration paired against itself has a median of ${noiseFloor.medianMs} ms, ` +
+      `which is not inside its own IQR of ${noiseFloor.iqrMs} ms. The pairing did not cancel the machine's ` +
+      'drift; do not quote any cost from this run.',
   shot,
   resolution: `${size.x}x${size.y} @dpr${renderer.getPixelRatio()}`,
   budget: { fps60Ms: 16.7, fps30Ms: 33.3 },
