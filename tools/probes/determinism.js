@@ -18,6 +18,10 @@
  *   - every shadow cascade above 0 is on a refresh schedule keyed to a
  *     free-running counter, so which cascades are fresh depends on how many
  *     frames the warm world happened to have drawn
+ *   - and the one that turned out to dominate all of them: every character
+ *     `Animator` (src/characters/anim.js) seeds `t`, `phase` and `breath` from
+ *     `Math.random()` and integrates them with dt forever. Nine soldiers and
+ *     their cast shadows were in a different pose in every run.
  *
  * This probe measures the residual, bisects which of those matter, and reports
  * how many settle frames are needed for a capture to become reproducible. It
