@@ -8,6 +8,7 @@ import { Vitals } from './Vitals.js';
 import { MissionState } from './Mission.js';
 import { Reticle } from './Reticle.js';
 import { resolveSpawn } from './Spawn.js';
+import { Feedback } from './Feedback.js';
 
 /**
  * gameplay — the player.
@@ -185,6 +186,9 @@ export async function install(world) {
   // fire mode nobody can change is a label rather than a mechanic.
   input.rebind('fireMode', ['KeyB', 'Pad9']);
   const reticle = new Reticle(engine.renderer.domElement.parentElement, { camera, stealth });
+  // Muzzle flash, impacts, brass, ground marks. Nothing of it is in the scene
+  // outside play mode — see attach()/detach() below.
+  const feedback = new Feedback({ world, ground });
 
   // --- where the mission starts --------------------------------------------
   // NOT the screenshot pose. See Spawn.js for the measurement that forced this.
@@ -233,6 +237,7 @@ export async function install(world) {
     stealth.rearm();
     mission.begin();
     input.enable();
+    feedback.attach();
     setFocus();
     events.emit({ type: 'modeEnter', spawn });
   }
@@ -243,6 +248,9 @@ export async function install(world) {
     input.disable();
     mission.stop();
     reticle.hide();
+    // Every mesh, the light and every live particle come out of the scene. A
+    // single leftover instanced quad would land in the canonical screenshots.
+    feedback.detach();
     // Let go of anyone being held or dragged. A guard left flagged `held` with
     // nothing driving him is a character the AI will never take back.
     if (stealth.grabbed) {
@@ -306,6 +314,120 @@ export async function install(world) {
     }
   }
 
+  // --- feedback: what a trigger pull looks like and sounds like -------------
+  //
+  // MEASURED BEFORE THIS EXISTED, driving the real page with trusted input:
+  // four trigger pulls took ammo from 20 to 16, called `playAction` zero times,
+  // scheduled zero audio voices and added zero objects to the scene. The code
+  // for all three was already written and simply had nobody calling it.
+  //
+  // Two seams, deliberately separate:
+  //   `feedback`  owns pixels and is driven directly — it is ours.
+  //   `cue(name)` owns sound and is BROADCAST. src/audio already probes this
+  //               module for `onEvent(fn)` and maps the names it receives onto
+  //               its own synthesiser; it just never found one to subscribe to,
+  //               so every weapon sound in the game was unreachable. The names
+  //               below are src/audio's own, verbatim.
+  const _fireDir = new THREE.Vector3();
+  const _fireRight = new THREE.Vector3();
+  const _stepPos = new THREE.Vector3();
+  const UP = new THREE.Vector3(0, 1, 0);
+
+  const audioListeners = new Set();
+  function cue(name, data) {
+    for (const fn of audioListeners) {
+      try {
+        fn(name, data);
+      } catch (err) {
+        console.error('gameplay cue listener failed:', err);
+      }
+    }
+  }
+
+  const stepListeners = new Set();
+
+  events.on((e) => {
+    switch (e.type) {
+      case 'muzzle': {
+        _fireDir.set(e.dir.x, e.dir.y, e.dir.z);
+        feedback.muzzle(e.point, _fireDir, { suppressed: e.suppressed });
+        _fireRight.crossVectors(_fireDir, UP).normalize();
+        feedback.ejectShell(e.point, _fireDir, _fireRight);
+        // The suppressed thwip, not a rifle crack. `weapon.tranq` is what
+        // src/audio calls its four-part vented-gas voice.
+        cue(e.suppressed ? 'weapon.tranq' : 'weapon.shot', { pos: e.point });
+        break;
+      }
+      case 'shot':
+        if (e.point) feedback.impact(e.point, e.surface ?? 'ground', e.dir);
+        break;
+      case 'tranq':
+        if (e.point) feedback.impact(e.point, 'body', e.dir);
+        break;
+      case 'reload':
+        cue('weapon.reload', { pos: controller.position });
+        break;
+      case 'dryFire':
+      case 'reloadRefused':
+        cue('weapon.empty', { pos: controller.position });
+        break;
+      case 'fireMode':
+        cue('weapon.click', { pos: controller.position });
+        break;
+      case 'takedown':
+        cue(e.silent ? 'cqc.hit' : 'cqc.throw', { pos: e.target?.position ?? controller.position });
+        break;
+      case 'grab':
+        cue('cqc.grab', { pos: e.target?.position ?? controller.position });
+        break;
+      default:
+        break;
+    }
+  });
+
+  /**
+   * Footsteps, from the foot that is actually on screen.
+   *
+   * src/audio had to derive steps by accumulating distance travelled, because
+   * nothing published a plant. The animator's gait phase is the real answer and
+   * costs one subtraction a frame: in src/characters/anim.js the RIGHT foot's
+   * stance phase begins at `loco.phase == 0` and the LEFT's at `0.5`, so a
+   * wrap past either of those two marks IS a boot going down. Deriving it makes
+   * the sound land on the frame the foot lands, at every gait, including the
+   * one place distance-accumulation can never get right — a sprint decelerating
+   * into a walk.
+   */
+  let lastPhase = 0;
+  function tickFootsteps() {
+    const loco = player.anim?.loco;
+    if (!loco || !stepListeners.size) return;
+    const ph = loco.phase;
+    if (loco.moving < 0.06 || (controller.stance === 'prone' && controller.speed < 0.05)) {
+      lastPhase = ph;
+      return;
+    }
+    // Two marks per cycle. Compare on a doubled phase so one test covers both.
+    const a = Math.floor(lastPhase * 2);
+    const b = Math.floor(ph * 2);
+    const wrapped = ph < lastPhase;
+    lastPhase = ph;
+    if (!wrapped && a === b) return;
+
+    const stance = controller.stance === 'prone' ? 'prone'
+      : controller.stance === 'crouch' ? 'crouch'
+        : controller.sprinting ? 'sprint'
+          : controller.speed > 3.2 ? 'run' : 'walk';
+    _stepPos.set(controller.position.x, controller.footY ?? controller.position.y, controller.position.z);
+    const ev = { stance, position: _stepPos, level: 1 };
+    for (const fn of stepListeners) {
+      try {
+        fn(ev);
+      } catch (err) {
+        console.error('gameplay footstep listener failed:', err);
+      }
+    }
+  }
+
   // --- taking fire ----------------------------------------------------------
   // src/ai publishes every trigger pull with the cone it was fired into and
   // says, in its own comment, that whether anything is hit is gameplay's
@@ -325,6 +447,19 @@ export async function install(world) {
     ai.onGuardFire((ev) => {
       if (!active || vitals.dead) return;
       vitals.resolveShot(ev, { damage: !aiResolvesHits });
+      // A garrison rifle is not suppressed, and the round has to be seen and
+      // heard coming from a place. `from` is the guard's eye and `impact` is
+      // where it actually went; both are already published, and until now
+      // nothing drew either of them.
+      const dir = _fireDir.subVectors(ev.impact, ev.from);
+      if (dir.lengthSq() > 1e-6) dir.normalize();
+      feedback.muzzle(ev.from, dir, { suppressed: false });
+      // Sand or steel: ask the same obstacle field the dart's own trace asks,
+      // rather than assuming ground. A round hitting the wall the player is
+      // hiding behind should spark, and that is the round he most needs to see.
+      const onStructure = obstacles?.ok && obstacles.heightAt(ev.impact.x, ev.impact.z) > ev.impact.y - 0.15;
+      feedback.impact(ev.impact, onStructure ? 'structure' : 'ground', dir);
+      cue('weapon.shot', { pos: ev.from });
     });
   } else {
     console.warn('gameplay: registry.ai publishes no onGuardFire; the player cannot be shot');
@@ -417,6 +552,11 @@ export async function install(world) {
       // one thing in the game that has to be exact. `deterministic` is the
       // screenshot harness driving, and no DOM of ours may be in that capture.
       reticle.update(dt, engine.camera, !engine.deterministic);
+      // After the camera because every particle in here is a billboard and the
+      // orientation it wants is this frame's, not the previous one's. After the
+      // animator (20) because the foot plant it reads is this frame's pose.
+      tickFootsteps();
+      feedback.update(dt, engine.camera);
     },
   });
 
@@ -523,6 +663,23 @@ export async function install(world) {
     vitals,
     missionState: mission,
     reticle,
+    feedback,
+
+    // --- the audio module's contract ----------------------------------------
+    // These two names are the ones src/audio/index.js already probes this
+    // module for. They existed on its side and not on ours, so every weapon
+    // sound in the game was unreachable and footsteps were being guessed from
+    // distance travelled. `onEvent` carries src/audio's own cue names.
+    /** fn(name, data) for every audible gameplay event. -> unsubscribe */
+    onEvent(fn) {
+      audioListeners.add(fn);
+      return () => audioListeners.delete(fn);
+    },
+    /** fn({stance, position, level}) on every boot that lands. -> unsubscribe */
+    onFootstep(fn) {
+      stepListeners.add(fn);
+      return () => stepListeners.delete(fn);
+    },
 
     /** Hurt the player. `from` is a world position and may be null. */
     damage: (amount, from, cause) => vitals.damage(amount, from, cause),

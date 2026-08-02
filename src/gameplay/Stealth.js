@@ -45,7 +45,13 @@ const WEAPON = {
   name: 'AM MRS-4 TRQ',
   mag: 20,
   reserve: 100,
-  reloadTime: 2.35,
+  // 2.40 s, and that number is not a feel choice: it is the authored length of
+  // the `reload` clip in src/characters/actions.js. The two used to be
+  // independent — a 2.35 s timer against a 2.40 s animation — so the magazine
+  // refilled while the character was still seating it, and a player mashing
+  // fire on the refill saw the weapon fire out of the reload pose. The timer
+  // now IS the animation, and `reload()` starts both from this one value.
+  reloadTime: 2.40,
   modes: ['SEMI', 'AUTO'],
   suppressed: true,
 };
@@ -105,6 +111,7 @@ export class StealthActions {
     this._d = new THREE.Vector3();
     this._ao = new THREE.Vector3();
     this._ad = new THREE.Vector3();
+    this._mz = new THREE.Vector3();
     this._n = new THREE.Vector2();
   }
 
@@ -552,6 +559,14 @@ export class StealthActions {
       return false;
     }
     this.reloading = this.reloadTime;
+    // THE ANIMATION IS THE RELOAD. Before this line the magazine refilled after
+    // a timer and the character did not move: the player pressed R, nothing
+    // happened for 2.4 s, and then the counter jumped. `playAction` drives the
+    // authored clip — weapon out of the shoulder, magazine out, head down to
+    // the well, the seating slap, the charging handle — and it is handed the
+    // SAME duration the timer runs on, so the count comes back on the frame
+    // the bolt goes home rather than at some unrelated moment.
+    this.player.playAction?.('reload', { duration: this.reloadTime });
     // Cover and CQC are fine mid-reload; aiming is not, and `canAim` already
     // reads `reloading`, so the weapon comes down on its own.
     this.emit({ type: 'reload', duration: this.reloadTime });
@@ -592,6 +607,29 @@ export class StealthActions {
       : null;
   }
 
+  /**
+   * Where the flash and the case come from.
+   *
+   * The rifle is skinned into the right hand rather than parented to a node, so
+   * there is no muzzle transform to read; the hand bone is the closest thing
+   * that exists and it moves with the recoil the animator just played. Take its
+   * world position and push a barrel length down the line the dart is on. The
+   * flash lives for two frames, so this being a centimetre out is invisible,
+   * whereas hanging it off the camera instead would put it in mid-air.
+   */
+  muzzlePoint(out, dir) {
+    const hand = this.player?.rig?.byName?.get?.('handR');
+    if (hand) {
+      hand.getWorldPosition(out);
+      // Barrel runs forward from the grip; 0.46 m clears the handguard on this
+      // carbine and lands the flash off the end of the suppressor.
+      return out.addScaledVector(dir, 0.46);
+    }
+    const p = this.ctl.position;
+    const eye = p.y + (this.ctl.stance === 'prone' ? 0.32 : this.ctl.stance === 'crouch' ? 1.10 : 1.42);
+    return out.set(p.x, eye - 0.12, p.z).addScaledVector(dir, 0.55);
+  }
+
   fire() {
     if (this.ammo <= 0) {
       if (this.reloading <= 0 && this.reserve > 0) this.reload();
@@ -606,16 +644,32 @@ export class StealthActions {
     // The spring runs at ~9.5 rad/s, so the impulse is amplitude x omega: 0.30
     // lands about 1.8 degrees of muzzle rise, which is a suppressed pistol.
     this.cam.recoil(0.30);
+    // The BODY takes the shot too. `fire` is an authored clip in
+    // src/characters/actions.js — a decaying oscillator through the weapon, the
+    // clavicle, the chest and the head — and nothing had ever asked for it, so
+    // every round the player fired moved a counter and not a single vertex.
+    this.player.playAction?.('fire');
     // Suppressed, but not silent: a pistol shot is still a 12 m event.
     this.ctl.addNoise(0.22);
+
+    // Published for the muzzle flash, the shell and the report. Built here
+    // rather than in the listener because this is the frame the weapon is on.
+    const muzzle = this.muzzlePoint(this._mz, dir);
+    this.emit({
+      type: 'muzzle',
+      point: muzzle.clone(),
+      dir: { x: dir.x, y: dir.y, z: dir.z },
+      suppressed: WEAPON.suppressed,
+      shooter: this.player,
+    });
 
     const hit = this._trace(origin, dir);
     if (hit?.character) {
       this._putDown(hit.character, 'dart');
       hit.character.tranquillised = true;
-      this.emit({ type: 'tranq', target: hit.character, point: hit.point });
+      this.emit({ type: 'tranq', target: hit.character, point: hit.point, surface: 'body', dir });
     } else {
-      this.emit({ type: 'shot', point: hit?.point ?? null });
+      this.emit({ type: 'shot', point: hit?.point ?? null, surface: hit?.surface ?? null, dir });
     }
     return hit;
   }
@@ -654,9 +708,15 @@ export class StealthActions {
         }
       }
 
-      if (this.ground.heightAt(nx, nz) > ny) return { point: new THREE.Vector3(nx, ny, nz) };
+      // WHAT was hit, not just where. The impact effect is the difference
+      // between a dust puff and a spark, and only the trace knows which surface
+      // stopped the dart: `ground` is the terrain/graded platform, `structure`
+      // is anything in the obstacle field, i.e. every man-made thing there is.
+      if (this.ground.heightAt(nx, nz) > ny) {
+        return { point: new THREE.Vector3(nx, ny, nz), surface: 'ground' };
+      }
       if (this.obstacles?.ok && this.obstacles.heightAt(nx, nz) > ny) {
-        return { point: new THREE.Vector3(nx, ny, nz) };
+        return { point: new THREE.Vector3(nx, ny, nz), surface: 'structure' };
       }
       x = nx;
       y = ny;

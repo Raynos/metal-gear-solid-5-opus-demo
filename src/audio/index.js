@@ -194,11 +194,19 @@ export async function install(world) {
       const ai = registry.ai;
       const sub = ai?.onAlertChange;
       if (typeof sub === 'function') {
-        const u = sub.call(ai, (e) => alert.set(e));
+        // `e.to` FIRST, and that is a bug fix, not a preference. src/ai emits
+        // `{from, to, reason, position}` — no `phase`, no `state`, no `level` —
+        // so `normalisePhase(e)` found nothing it recognised, returned null,
+        // and `Alert.set` returned on its first line. Measured: three real
+        // squad transitions produced three calls into `set` and zero stings and
+        // zero changes of musical intensity. The score sat at 0 for the whole
+        // mission. `normalisePhase` now knows `to` as well, so this is belt and
+        // braces; passing it explicitly is what makes the intent readable.
+        const u = sub.call(ai, (e) => alert.set(e?.to ?? e));
         if (typeof u === 'function') unsubs.push(u);
         bindAi = true;
       } else if (ai?.events?.on) {
-        ai.events.on('alert', (e) => alert.set(e));
+        ai.events.on('alert', (e) => alert.set(e?.to ?? e));
         bindAi = true;
       }
     }
@@ -208,14 +216,26 @@ export async function install(world) {
         // If gameplay emits its own step events, prefer them and stop deriving
         // steps from movement — its animation knows exactly when a foot lands.
         if (typeof gp.onFootstep === 'function') {
-          const u = gp.onFootstep((e) =>
+          const u = gp.onFootstep((e) => {
+            // Resolve the surface HERE when the publisher does not name one.
+            // Passing `undefined` through fell back to Foley's own default of
+            // sand, so adopting a gameplay-published footstep would have made
+            // every step in the compound sound like open desert — a silent
+            // regression that only shows up the moment somebody implements
+            // this hook. Four surfaces exist; ask which one this is.
+            const pos = e?.position ?? null;
+            let surface = e?.surface;
+            if (!surface) surface = pos ? foley.surfaceAt(pos.x, pos.z) : undefined;
             foley.footstep({
               stance: normStance(e?.stance ?? readPlayer()?.stance),
-              surface: e?.surface ?? undefined,
-              pos: e?.position ?? null,
+              surface,
+              // Own feet are ON the listener; a panner at the player's own
+              // position puts them at zero distance and the pan model gets
+              // unstable. Foley's stereo-offset path is the right one.
+              pos: null,
               level: e?.level ?? 1,
-            }),
-          );
+            });
+          });
           if (typeof u === 'function') unsubs.push(u);
           derive = false;
         }
@@ -312,6 +332,8 @@ export async function install(world) {
     'weapon.holster': (o) => foley.weapon('holster', o?.pos ?? o ?? null),
     'weapon.empty': (o) => foley.weapon('empty', o?.pos ?? o ?? null),
     'weapon.tranq': (o) => foley.tranq(o?.pos ?? o ?? null),
+    /** An UNsuppressed rifle — the garrison's, never the player's. */
+    'weapon.shot': (o) => foley.gunshot(o?.pos ?? o ?? null),
     'cqc.hit': (o) => foley.cqc('hit', o?.pos ?? o ?? null),
     'cqc.grab': (o) => foley.cqc('grab', o?.pos ?? o ?? null),
     'cqc.throw': (o) => foley.cqc('throw', o?.pos ?? o ?? null),
@@ -359,11 +381,22 @@ export async function install(world) {
     cloth: (o) => foley.cloth(o ?? {}),
     weapon: (kind, pos) => foley.weapon(kind, pos),
     tranq: (pos) => foley.tranq(pos),
+    gunshot: (pos) => foley.gunshot(pos),
     cqc: (kind, pos) => foley.cqc(kind, pos),
     setAlert: (p) => alert.set(p),
     setAlertLevel: (v) => alert.setLevel(v),
     setWind: (v) => ambience.setWind(v),
     normalisePhase,
+    /**
+     * Render every cue through an OfflineAudioContext and measure it.
+     *
+     * A DYNAMIC import, so `_selftest.js` is a separate chunk that the boot
+     * path never fetches — it costs nothing until a probe asks for it. It used
+     * to require hand-editing this file to run at all, which meant in practice
+     * that nobody ran it, and "does this cue make a signal" is the one question
+     * a headless muted machine cannot answer any other way.
+     */
+    selftest: () => import('./_selftest.js').then((m) => m.run()),
     stats: () => ({
       available: eng.available,
       armed: eng.armed,
