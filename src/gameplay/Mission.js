@@ -111,7 +111,17 @@ export class MissionState {
     this._findT = 0.5;
     const ai = this.registry.ai;
     const direct = ai?.commander ?? (typeof ai?.getCommander === 'function' ? ai.getCommander() : null);
-    let found = direct?.ch ?? direct ?? null;
+    // TAKE THE LIVE ENTITY, NEVER THE DESCRIPTOR.
+    //
+    // `registry.ai.commander` is a GETTER that builds a fresh
+    // `{ guard, character, position, down }` on every read. Storing that object
+    // stores a SNAPSHOT of `down` — taken at resolve time, when it is always
+    // false — and since this method returns early once `this.commander` is set,
+    // it is never re-read. Measured: the commander was shot, `ai.commanderDown`
+    // went true, `characters.commander.downed` went true, and the mission sat
+    // at `active` for the full 60 s of the probe. Reaching for `.ch` first (its
+    // old spelling) missed, because the descriptor spells it `.character`.
+    let found = direct?.character ?? direct?.ch ?? direct ?? null;
     if (!found) {
       for (const g of ai?.guards ?? []) {
         if (looksLikeCommander(g) || looksLikeCommander(g.ch)) { found = g.ch ?? g; break; }
@@ -158,7 +168,11 @@ export class MissionState {
     if (!neutralise.done) {
       if (cmd) {
         neutralise.label = 'NEUTRALISE THE COMMANDER';
-        if (isDown(cmd)) this.accomplish('commander');
+        // Ask the module that owns him as well as the entity itself. `down` and
+        // `downed` are two modules' spellings of the same fact and either one
+        // going true is the win; requiring both is how a win state stays
+        // unreachable while every part of it works.
+        if (isDown(cmd) || this.registry.ai?.commanderDown) this.accomplish('commander');
       } else {
         // Nobody designated. Say so honestly rather than pointing the player at
         // a marker over an empty patch of sand.

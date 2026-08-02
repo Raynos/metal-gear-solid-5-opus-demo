@@ -310,11 +310,21 @@ export async function install(world) {
   // src/ai publishes every trigger pull with the cone it was fired into and
   // says, in its own comment, that whether anything is hit is gameplay's
   // decision. Nothing had ever taken it up on that.
+  //
+  // ONE RESOLVER, NOT TWO. Round 9 landed a second one: src/ai/combat.js now
+  // rolls the hit itself (range, stance, motion, burst index, suppression) and
+  // pushes the result straight into `api.damage`. This module was ALSO rolling
+  // every trigger pull geometrically in `vitals.resolveShot`, so every round
+  // was resolved twice against two different models — and the two disagreed by
+  // 100x on units. src/ai owns whether a round connects, because that is where
+  // the burst and suppression state lives; `resolveShot` stays for the case
+  // where src/ai has no combat model, and for the near-miss half either way.
   const ai = world.registry.ai;
+  const aiResolvesHits = typeof ai?.onPlayerHit === 'function';
   if (typeof ai?.onGuardFire === 'function') {
     ai.onGuardFire((ev) => {
       if (!active || vitals.dead) return;
-      vitals.resolveShot(ev);
+      vitals.resolveShot(ev, { damage: !aiResolvesHits });
     });
   } else {
     console.warn('gameplay: registry.ai publishes no onGuardFire; the player cannot be shot');

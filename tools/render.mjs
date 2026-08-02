@@ -133,7 +133,17 @@ function parseArgs(argv) {
   if (argv[0] === 'eval') {
     o.mode = 'eval';
     o.probe = argv[1];
-    o.probeArgs = argv.slice(2);
+    // Keep parsing: --width/--height matter for a probe too, and returning
+    // early here meant every eval silently ran at the default 1920x1080 no
+    // matter what was asked for — which is exactly how a viewport-dependent
+    // layout bug stays invisible.
+    o.probeArgs = [];
+    for (let i = 2; i < argv.length; i++) {
+      const a = argv[i];
+      if (a === '--width') o.width = +argv[++i];
+      else if (a === '--height') o.height = +argv[++i];
+      else o.probeArgs.push(a);
+    }
     return o;
   }
   for (let i = 0; i < argv.length; i++) {

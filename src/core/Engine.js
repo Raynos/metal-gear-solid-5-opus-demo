@@ -53,6 +53,14 @@ export class Engine {
 
     this._onResize = this._onResize.bind(this);
     window.addEventListener('resize', this._onResize);
+    // A window 'resize' event is not the only way the canvas can change size —
+    // a devtools panel, a zoom change or a CSS layout shift all move #app
+    // without firing it, and the result is a canvas whose aspect no longer
+    // matches its box, which reads as the image being stretched or cropped.
+    if (typeof ResizeObserver !== 'undefined') {
+      this._ro = new ResizeObserver(() => this._onResize());
+      this._ro.observe(container);
+    }
     this._loop = this._loop.bind(this);
   }
 

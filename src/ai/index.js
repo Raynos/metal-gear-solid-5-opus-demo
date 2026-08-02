@@ -551,12 +551,24 @@ export async function install(world) {
    */
   function applyDamage(amount, info) {
     const gp = playerApi();
-    if (gp) {
-      for (const name of ['damage', 'takeDamage', 'hurt', 'applyDamage', 'onHit']) {
-        if (typeof gp[name] === 'function') {
-          try { gp[name](amount, info); return true; } catch (e) { /* keep going */ }
-        }
-      }
+    if (!gp) return false;
+    // UNITS. `BALLISTICS.damage` is points on a HUNDRED-point player — that is
+    // what combat.js's whole "nine rounds to kill" derivation is written in.
+    // The sink that appeared is src/gameplay/Vitals.js and it runs 0..1. Eleven
+    // went into `Math.max(0, health - amount)` and the FIRST round that landed
+    // killed the player outright: measured in the round-9 play harness as
+    // "health 1 -> 0" one sample after the alert went up, at 38 m, while
+    // sprinting — a range and a stance the model says should almost never hit.
+    // The sink publishes its own scale; ask it.
+    const max = typeof gp.maxHealth === 'number' && gp.maxHealth > 0 ? gp.maxHealth : 100;
+    const scaled = amount * (max / 100);
+    for (const name of ['damage', 'takeDamage', 'hurt', 'applyDamage', 'onHit']) {
+      if (typeof gp[name] !== 'function') continue;
+      // `from` is a WORLD POSITION everywhere in this codebase. Handing the
+      // whole info record over as the second argument put `undefined` into a
+      // vector subtraction, so the direction the body plays being hit from was
+      // NaN and the flinch pointed nowhere.
+      try { gp[name](scaled, info?.from ?? null, 'gunfire', info); return true; } catch (e) { /* keep going */ }
     }
     return false;
   }

@@ -139,7 +139,7 @@ export class Vitals {
    * a gaussian tail means a man at 60 m occasionally lands a round he had no
    * business landing, and the player cannot tell that from a bug.
    */
-  resolveShot(ev) {
+  resolveShot(ev, { damage = true } = {}) {
     if (this.dead || !ev?.from || !ev?.at) return null;
     const stance = this.ctl.stance;
     const p = this._p.set(this.ctl.position.x, this.ctl.footY + HIT_HEIGHT[stance], this.ctl.position.z);
@@ -178,6 +178,10 @@ export class Vitals {
     // A round through the edge of the silhouette does less than one through the
     // middle, which stops every exchange resolving in identical 16% steps.
     const solid = 1 - 0.45 * (miss / HIT_RADIUS[stance]);
+    // `damage:false` when src/ai/combat.js is the authority on whether a round
+    // connects. The geometry above still runs, because the near-miss half of it
+    // is what the HUD and the camera react to and nothing else computes it.
+    if (!damage) return 0;
     return this.damage(ROUND_DAMAGE * solid, ev.from, 'gunfire');
   }
 }
