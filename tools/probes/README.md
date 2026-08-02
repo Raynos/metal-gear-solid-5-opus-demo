@@ -38,6 +38,28 @@ and one queue here; a run taken while eight of them are rendering reported a
 minutes later on the same build. Check `node tools/shot.mjs status` — if
 `queued` is more than one or two, your frame times are somebody else's load.
 
+## What it says today (gameplay, 1920x1080, quiet machine, RULER_VALID)
+
+| | |
+| --- | --- |
+| frame time, every scenario | **23.4–23.9 ms (42 FPS)**, block spread 0.3–1.3 ms |
+| budget | 16.7 ms — we are **1.4x over** |
+| scene into the HDR target | **7.7 ms** (reproduced exactly on two separate runs) |
+| noise floor | 2.88 ms |
+| `ssao` | **3.05 ms (IQR 2.2)** — the first per-pass cost this project has resolved |
+| `bloom` | below noise: median 9.69, IQR 20.41 (and 18.05 / 20.18 on an earlier run) |
+| everything else | below noise |
+
+Two things follow. The scene is ~1/3 of the frame and post is ~2/3, measured two
+independent ways that both landed on 7.7 ms, so the premise that post dominates
+is confirmed. And bloom's median is by far the largest of the unresolved passes
+in every run — it is very probably the biggest single pass, but it has never been
+*resolved*, and the difference between those two statements is this whole file.
+
+Frame time is now flat across static, panning, walking and sprinting (23.4–23.9),
+which is itself a finding: the old advice that "panning costs 3x a static pose"
+does not survive an instrument that reports the median of several blocks.
+
 ## Why the numbers before this round were not measurements
 
 Four separate faults, all now fixed, all worth knowing because they will be

@@ -604,18 +604,25 @@ const refB = capture();
 // the frame no more than doing nothing at all does", measured here rather than
 // assumed.
 const selfDiff = pixDiff(refA, refB);
+// THREE verdicts, not two. A straight `<=` against the self-diff decides the
+// close cases by coin flip: two runs an hour apart called `dof` inert then live
+// and `motionBlur` live then inert, on rms 0.356 against a self-diff of 0.357.
+// Anything within 50% of the noise floor is INDISTINGUISHABLE and saying so is
+// the whole point — that is a different claim from "this flag does nothing", and
+// the round this probe replaces made exactly that substitution.
+const LIVE_AT = selfDiff.rms * 1.5 + 0.05;
 const flagAudit = {
   _selfCheck:
-    `two captures of the unchanged build differ by rms ${selfDiff.rms} / max ${selfDiff.maxCode} codes. ` +
-    'A flag is called INERT only if flipping it stays inside that.',
+    `two captures of the unchanged build differ by rms ${selfDiff.rms} / max ${selfDiff.maxCode} codes; ` +
+    `a flag counts as live above rms ${LIVE_AT.toFixed(3)}.`,
 };
 for (const f of FLAGS) {
   restoreFlags(BASE);
   pipe.enabled[f] = !BASE[f];
   const d = pixDiff(refA, capture());
   restoreFlags(BASE);
-  const inert = d.rms <= selfDiff.rms && d.maxCode <= Math.max(selfDiff.maxCode, 2);
-  flagAudit[f] = `${inert ? 'INERT' : 'live'} — rms ${d.rms}, max ${d.maxCode} codes`;
+  const verdict = d.rms > LIVE_AT ? 'live' : d.rms <= selfDiff.rms ? 'INERT' : 'INDISTINGUISHABLE from noise';
+  flagAudit[f] = `${verdict} — rms ${d.rms}, max ${d.maxCode} codes`;
 }
 setBase();
 
