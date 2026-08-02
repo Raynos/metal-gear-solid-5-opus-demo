@@ -230,6 +230,95 @@ function browserPid() {
   }
 }
 
+/**
+ * Installed into every world's page as `window.__pinDeterminism()`, and run
+ * immediately before every `settle()`.
+ *
+ * WHY A SCREENSHOT NEEDS THIS. `settle()` in main.js already rewinds the
+ * pipeline frame counter (TAA jitter phase, AO rotation, grain seed) and
+ * `engine.elapsed` (wind, cloud pan, cloud shadow), and that was a real fix.
+ * It is not sufficient: several things integrate their own clock and survive a
+ * settle, so a shot depended on how many frames the warm world happened to have
+ * drawn before it — a different number in every run, and a different number for
+ * the same shot depending on its position in the batch.
+ *
+ * Measured on one build, two captures of the same shot with a camera excursion
+ * between them (tools/probes/determinism.js, gameplay, 640x360 centre window):
+ *
+ *   nothing pinned                        rms 5.20   max 134 codes   85% of pixels
+ *   what settle() pins today              rms 2.53   max 108         33%
+ *   + character animation clocks          rms 1.10   max  42         28%
+ *   + shadow cascade refresh phase        rms 0.77   max  33         25%
+ *   + TAA and exposure history, 32 frames rms 0.23   max   9          4%
+ *
+ * The dominant term was `src/characters/anim.js`: every `Animator` seeds `t`,
+ * `phase` and `breath` from `Math.random()` and integrates them forever, so
+ * nine soldiers and their cast shadows were in a different pose in every run.
+ * An 11x drop in the noise floor is the difference between "this A/B shows no
+ * visual change" being a finding and being unfalsifiable.
+ *
+ * The right home for the character half of this is a `resetAnimation()` on the
+ * characters module; until that exists the harness does it from outside, which
+ * is why it reaches into `registry.characters`. It is defensive throughout — a
+ * tree where a module failed to install still screenshots.
+ */
+const PIN_SRC = `
+window.__pinDeterminism = function () {
+  const g = window.__GAME;
+  if (!g) return { pinned: false };
+  const eng = g.engine;
+  const pipe = eng.pipeline;
+  const out = { animators: 0, taa: false, exposure: false, shadows: false };
+
+  const list = g.world && g.world.registry && g.world.registry.characters
+    ? g.world.registry.characters.characters : null;
+  if (Array.isArray(list)) {
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i] && list[i].anim;
+      if (!a) continue;
+      // Fixed but per-index, so the crowd does not idle in lockstep.
+      a.t = 7.31 * i + 3.5;
+      a.phase = (0.6180339887 * (i + 1)) % 1;
+      a.breath = 2.17 * i + 1.1;
+      a.hitTime = 1e3;
+      a.smoothSpeed = a.speed || 0;
+      a.stanceBlend = a.stance === 'crouch' ? 1 : 0;
+      a.proneBlend = a.stance === 'prone' ? 1 : 0;
+      a.bobY = 0;
+      if (a.weaponSway && a.weaponSway.set) a.weaponSway.set(0, 0, 0);
+      if (a.weaponSwayVel && a.weaponSwayVel.set) a.weaponSwayVel.set(0, 0, 0);
+      if (a.lookBlend && a.lookBlend.set) a.lookBlend.set(0, 0);
+      out.animators++;
+    }
+  }
+
+  if (pipe) {
+    const r = eng.renderer;
+    // The history flag alone is not enough: it stops the NEXT frame reading
+    // history, but the buffers still hold the previous shot's image and are
+    // read again from frame 2 on.
+    if ('_historyValid' in pipe) { pipe._historyValid = false; out.taa = true; }
+    for (const name of ['taaA', 'taaB', 'adaptA', 'adaptB']) {
+      const rt = pipe[name];
+      if (!rt) continue;
+      r.setRenderTarget(rt);
+      r.clear(true, false, false);
+      if (name === 'adaptA') out.exposure = true;
+    }
+    r.setRenderTarget(null);
+  }
+
+  // Cascades 1+ refresh on a schedule keyed to a free-running counter, so which
+  // ones are fresh depended on the warm world's frame count.
+  const lighting = g.world && g.world.lighting;
+  if (lighting && typeof lighting.invalidateShadows === 'function') {
+    lighting.invalidateShadows();
+    out.shadows = true;
+  }
+  return out;
+};
+`;
+
 // --- worlds ---------------------------------------------------------------
 /** One tree's generated world: its own vite server and its own warm page. */
 class World {
@@ -365,6 +454,7 @@ class World {
       await this.page.goto(`http://127.0.0.1:${this.vite.port}/`, { waitUntil: 'load', timeout: 120000 });
       await this.waitReady();
     }
+    await this.page.evaluate(PIN_SRC);
     this.mtime = stamp;
     log(`world ready for ${this.root} (${reason}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   }
@@ -534,8 +624,11 @@ function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, fr
         ({ name, frames }) => {
           const g = window.__GAME;
           const s = g.applyShot(name);
+          // Pin AFTER the pose is set (invalidateShadows wants the final camera)
+          // and before settle, so the frame is a function of the source alone.
+          const pinned = window.__pinDeterminism ? window.__pinDeterminism() : null;
           const ms = g.settle(frames);
-          return { note: s.note, tod: s.tod, ms: Math.round(ms * 100) / 100, stats: g.stats(), errors: g.errors.slice() };
+          return { note: s.note, tod: s.tod, ms: Math.round(ms * 100) / 100, pinned, stats: g.stats(), errors: g.errors.slice() };
         },
         { name, frames },
       );
@@ -551,18 +644,26 @@ function handleShot({ root, shots, out = 'shots', width = 1280, height = 720, fr
   });
 }
 
-function handleEval({ root, code, shot, width = 1920, height = 1080, out = 'shots/diag' }) {
+function handleEval({ root, code, shot, args, width = 1920, height = 1080, out = 'shots/diag' }) {
   return enqueue(root, async (w) => {
     await w.setViewport(width, height);
     w.errors = [];
-    if (shot) await w.page.evaluate((n) => window.__GAME.applyShot(n), shot);
+    if (shot) {
+      await w.page.evaluate((n) => {
+        window.__GAME.applyShot(n);
+        if (window.__pinDeterminism) window.__pinDeterminism();
+      }, shot);
+    }
 
-    const result = await w.page.evaluate(async (src) => {
-      window.__snaps = {};
-      const g = window.__GAME;
-      const fn = new Function('g', 'THREE', `return (async () => {\n${src}\n})();`);
-      return await fn(g, g.THREE);
-    }, code);
+    const result = await w.page.evaluate(
+      async ({ src, args }) => {
+        window.__snaps = {};
+        const g = window.__GAME;
+        const fn = new Function('g', 'THREE', 'ARGS', `return (async () => {\n${src}\n})();`);
+        return await fn(g, g.THREE, args);
+      },
+      { src: code, args: args ?? [] },
+    );
 
     const outDir = path.resolve(root, out);
     const snaps = await w.page.evaluate(() => Object.keys(window.__snaps || {}));
@@ -728,7 +829,33 @@ async function main() {
         });
       }
       if (url.pathname === '/stop') {
-        send(200, { ok: true, stopping: true });
+        // The daemon is MACHINE-WIDE and nine authors share it. An unconditional
+        // stop kills whatever is mid-render for everyone else: a probe that had
+        // already spent 40 s of GPU time comes back as `fetch failed`, and the
+        // author who typed `stop` never learns they did it. Measured today —
+        // two multi-minute measurement runs were destroyed this way.
+        //
+        // So `stop` DRAINS by default: it stops accepting nothing, waits for the
+        // queue to empty, and only then exits. `?force=1` is the old behaviour,
+        // for a wedged daemon.
+        const force = url.searchParams.get('force') === '1';
+        if (!force && (running || queue.length)) {
+          send(200, { ok: true, stopping: true, draining: true, queued: queue.length });
+          log(`stop requested; draining ${queue.length} queued request(s) first`);
+          const poll = setInterval(() => {
+            if (running || queue.length) return;
+            clearInterval(poll);
+            shutdown('client asked (drained)');
+          }, 500);
+          poll.unref?.();
+          // A drain must not hang forever on a stuck job.
+          setTimeout(() => {
+            clearInterval(poll);
+            shutdown('client asked (drain timed out)');
+          }, 300000).unref?.();
+          return;
+        }
+        send(200, { ok: true, stopping: true, draining: false });
         return setTimeout(() => shutdown('client asked'), 50);
       }
       const body = await readBody(req);

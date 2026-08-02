@@ -1,0 +1,135 @@
+# The measurement tools
+
+Read this before quoting a number from any of them.
+
+```bash
+node tools/shot.mjs probe tools/probes/perf.js          # frame time, honestly
+node tools/shot.mjs probe tools/probes/determinism.js   # is a frame reproducible?
+node tools/shot.mjs probe tools/probes/cascades.js      # what each shadow cascade costs
+node tools/shot.mjs probe tools/probes/casterreach.js   # shadow caster cull sweep
+```
+
+`probe` is an alias for `eval`. Anything after the probe path is handed to the
+probe as `ARGS` — e.g. `probe tools/probes/perf.js vista`.
+
+## The one number that governs every other number
+
+`perf.js` reports `ruler.noiseFloorMs`. It is **measured, not asserted**: the
+probe runs its entire paired-comparison procedure with the *same* configuration
+on both sides, and reports the IQR of the differences. That is the smallest
+effect this machine can resolve today.
+
+Nothing smaller than it may be quoted as a cost. `perf.js` enforces this itself —
+a comparison whose |median| does not exceed its IQR prints `below noise`, never a
+number.
+
+`ruler.noiseFloorBiasMs` should be ~0. If it is not, the pairing is failing to
+cancel the drift and **the whole run is void**.
+
+## Why the numbers before this round were not measurements
+
+Four separate faults, all now fixed, all worth knowing because they will be
+reinvented otherwise:
+
+**1. The baseline was measured once.** This machine's headless GPU drifts more
+than 2x inside one run — four identical baseline blocks in a single probe
+measured 17.84, 23.37, 34.96 and 39.50 ms. Timing `full` once and each variant
+in sequence charges the entire drift to whichever variant ran last. That is how
+"TAA is our most expensive pass" got into `tools/reference/README.md`.
+
+Fixed by **paired adjacent differences**: baseline and variant are timed back to
+back, the order alternates every pair (ABBAABBA…), and the reported cost is the
+median of the per-pair differences.
+
+Pairing at the *block* was not enough — 20-frame blocks sit ~600 ms apart and the
+drift spikes inside that. Measured: same-configuration-against-itself gave an IQR
+of **7.25 ms on a 27 ms frame**, i.e. nothing was resolvable at all. Pairing at
+the **frame** (two frames ~30 ms apart, `gl.finish()` on each) is what made the
+instrument usable. Those are latencies, not throughput, so their absolute value
+runs high; the *difference* is the extra GPU work, which is the question.
+
+**2. Half the ablation flags gate nothing.** `pipe.enabled` has eight keys.
+Verified against `RenderPipeline.render()`:
+
+| flag | what it actually does |
+| --- | --- |
+| `bloom` | gates the 6-level pyramid + 3 anamorphic streak passes — **a real pass** |
+| `ssao` | gates 3 blits (AO + 2 blur) — **a real pass** |
+| `taa` | gates 1 blit and the jitter — **a real pass** |
+| `dof` | **inert alone.** `uEnabled = dof \|\| motionBlur`, so with `motionBlur` on the pass still runs |
+| `motionBlur` | sets `uMotionScale = 0`; the pass still runs — a shader **branch** |
+| `aerial` | sets `uAerialEnabled` in the prep pass, which always runs — a **branch** |
+| `autoExposure` | sets `uAutoExposure` in the composite, which always runs — a **branch** |
+| `fxaa` | sets `uFxaa` in a blit that always runs, **and with TAA on it is forced to 0 anyway** — a literal no-op |
+
+`perf.js` therefore ablates *groups* that correspond to real passes
+(`dofAndMotionBlurPass` turns both flags off together), labels the uniform-only
+ones `…Branch`, and separately **audits** every flag by rendering with it on and
+off and comparing pixel hashes. A flag whose two frames are identical is reported
+`INERT` from evidence, not from someone's reading.
+
+**3. `splitMs.sceneAndShadows` was not the scene.** Turning every flag off still
+runs the prep blit, the 6-level luminance chain, the adaptation blit, the DOF
+blit, the composite and the FXAA blit — six passes with no flag at all. `perf.js`
+now measures the scene by rendering it into the pipeline's own HDR target with
+the post chain never invoked, and reports the always-on remainder as
+`ungatedPost`.
+
+**4. It could not see play mode.** `applyShot()` forces godmode, so every frame
+time ever quoted was for a mode no player runs. `perf.js` now drives
+standing / walking / sprinting / combat with **dispatched keyboard and mouse
+events**, and reports godmode and play side by side. It also *checks* that play
+mode does anything — if holding `KeyW` for 30 frames moves nothing it says so
+instead of reporting the standing frame time four times.
+
+## GPU timer queries
+
+A previous round shipped a probe reading 140 ms against a ~22 ms wall clock and
+the number was quoted anyway. `perf.js` will only report a timer query that has
+passed a **self-test**: a whole-frame `TIME_ELAPSED_EXT` query must land within
+20% of the wall-clock throughput. Otherwise it reports the extension unusable and
+declines to produce a number. On the ANGLE/Metal backend here it has so far never
+passed, and that is the correct outcome.
+
+## Frame reproducibility
+
+`determinism.js` answers "if I change nothing, do I get the same frame?" For
+several rounds the answer was no by rms 0.2–4.9 codes, which is larger than most
+of the effects being A/B'd, so "no visual change" was unfalsifiable.
+
+`settle()` in `main.js` already pins the pipeline frame counter (TAA jitter
+phase, AO temporal rotation, grain seed) and `engine.elapsed` (wind, cloud pan,
+cloud shadow). Necessary, not sufficient. Measured, two captures of one build
+with a camera excursion between them:
+
+| pinned | rms | max code | pixels differing |
+| --- | --- | --- | --- |
+| nothing | 5.20 | 134 | 85% |
+| what `settle()` pins today | 2.53 | 108 | 33% |
+| + character animation clocks | 1.10 | 42 | 28% |
+| + shadow cascade refresh phase | 0.77 | 33 | 25% |
+| + TAA & exposure history, 32 frames | 0.23 | 9 | 4% |
+
+The dominant term is `src/characters/anim.js`: every `Animator` seeds `t`,
+`phase` and `breath` from `Math.random()` and integrates them forever, so nine
+soldiers and their cast shadows were in a different pose in every run.
+
+`tools/shotd.mjs` now installs `window.__pinDeterminism()` into every world and
+runs it immediately before every `settle()`, so **every screenshot the harness
+takes** gets this. The residual (~0.2 rms, 9 codes) is the honest noise floor for
+a same-build pixel diff; treat anything at or below it as "no change".
+
+The character half of this belongs in a `resetAnimation()` on the characters
+module. Until that exists the harness reaches in from outside, defensively.
+
+## Shadow cascades
+
+`cascades.js` produces the per-cascade draw and triangle counts by subtraction:
+freeze every shadow map, render (that is the scene alone), then unfreeze exactly
+one cascade and render again. No instrumentation inside three, and it cannot
+drift.
+
+`casterreach.js` sweeps `Lighting.casterReach` — how far up-sun a caster can be
+and still be drawn — reporting draws, triangles **and the pixel difference
+against the baseline**, so a saving is never bought with a shadow that quietly
+stopped being cast.
