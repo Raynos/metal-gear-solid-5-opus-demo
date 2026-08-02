@@ -78,6 +78,7 @@ export class Input {
     this.bindings = { ...DEFAULT_BINDINGS, ...(opts.bindings ?? {}) };
     this.enabled = false;
     this.pointerLocked = false;
+    this.automation = false;
 
     /** Look sensitivity in radians per pixel of mouse travel. */
     this.mouseSensitivity = opts.mouseSensitivity ?? 0.0022;
@@ -168,7 +169,8 @@ export class Input {
   }
 
   requestLock() {
-    if (!this.enabled || this.pointerLocked) return;
+    if (!this.enabled) return;
+    if (!this.pointerLocked && !this.automation) return;
     // Chromium rejects a lock request that is not user-gesture driven; calling
     // it from a mousedown handler is the only reliable path. Modern Chrome
     // returns a promise for it, and an unhandled rejection is recorded by
@@ -233,6 +235,21 @@ export class Input {
 
   _onMouseUp(e) {
     this._down.delete(`Mouse${e.button}`);
+  }
+
+  /**
+   * Headless chromium refuses pointer lock, and mouse look is gated on holding
+   * it — so an automated run could press keys but never turn the camera. That
+   * single gap is why playtest probes were launching HEADFUL browsers, which
+   * steal focus and pop windows on a machine somebody is using.
+   *
+   * Automation mode accepts raw mousemove deltas as look input without the
+   * lock. It changes nothing for a human: a real player still gets pointer lock
+   * on click, and this flag is only ever set by a test harness.
+   */
+  setAutomation(on) {
+    this.automation = !!on;
+    return this.automation;
   }
 
   _onMouseMove(e) {

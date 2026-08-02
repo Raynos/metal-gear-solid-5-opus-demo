@@ -70,13 +70,18 @@ async function main() {
   bundle();
   const server = await serve();
   const browser = await chromium.launch({
-    // HEADED, DELIBERATELY. Playwright's headless chromium refuses
+    // HEADLESS. This used to be headed because Playwright's headless chromium refuses
     // `requestPointerLock` outright — the request raises `pointerlockerror`,
     // measured — and src/core/Input.js ignores mouse LOOK until it holds the
     // lock. A headless run can press keys but can never turn the camera, so
     // every "I aimed at him" it reports is a lie. Headed plus bringToFront()
     // takes the lock on the first trusted mousedown.
-    headless: false,
+    // pointer lock, and src/core/Input.js gated mouse LOOK on holding it — so a
+    // headless run could press keys but never turn the camera. That is fixed:
+    // __GAME.setAutomation(true) accepts raw mousemove deltas as look with no
+    // lock. A headful window steals focus on a machine somebody is using; see
+    // CLAUDE.md. Call setAutomation(true) after the page is ready.
+    headless: true,
     args: ['--use-gl=angle', '--use-angle=metal', '--ignore-gpu-blocklist', '--force-device-scale-factor=1', '--mute-audio', '--hide-scrollbars'],
   });
   const errors = [];

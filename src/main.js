@@ -166,6 +166,15 @@ window.__GAME = {
   applyShot,
   setTimeOfDay: (n) => lighting.setTimeOfDay(n),
   setFreeFly: (v) => (freeFly = v),
+  /**
+   * Let a headless harness drive mouse look. Headless chromium will not grant
+   * pointer lock, and look input is gated on it, which is the only reason any
+   * probe ever needed a headful browser. Test-only.
+   */
+  setAutomation(on) {
+    const input = registry.gameplay?.input ?? registry.gameplay?.player?.input;
+    return input?.setAutomation ? input.setAutomation(on) : false;
+  },
   gameState,
   setMode,
   /**
