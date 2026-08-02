@@ -11,9 +11,14 @@ import { GRADE } from '../config/ArtDirection.js';
  *     -> luminance reduction + eye adaptation                 [auto exposure]
  *     -> bloom mip chain + anamorphic streak
  *     -> bokeh DOF fused with camera motion blur
- *     -> composite: exposure, ACES, 3D LUT grade, barrel distortion,
+ *     -> composite: exposure, tone curve, 3D LUT grade, barrel distortion,
  *        chromatic aberration, lens dirt veiling, vignette, grain
  *     -> FXAA / sharpen -> screen
+ *
+ * The tone curve is the REAL Fox Engine one as of round 8 (see `PRINT` and
+ * `foxCurve`); the ACES-plus-rebuilt-toe curve rounds 1-7 used is still here
+ * and still exact, behind `grade.toneCurve = 'aces'`, because it is the
+ * ablation the round-8 numbers are quoted against.
  *
  * Design notes worth knowing before editing:
  *
@@ -79,6 +84,236 @@ const JITTER = Array.from({ length: 16 }, (_, i) => [halton(i + 1, 2) - 0.5, hal
 const EXPOSURE_REF_ALBEDO = 0.55;
 const lum3 = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
 
+/**
+ * ROUND 8 — THE PRINT, RE-AUTHORED AGAINST MEASURED MGSV.
+ *
+ * These override the matching keys in `GRADE` (see the constructor). They live
+ * here rather than in `src/config/ArtDirection.js` because that file is shared
+ * and this pass does not own it; every value below is a PRINT decision and the
+ * print is this file. The integrator should feel free to fold them back.
+ *
+ * For seven rounds this project graded against recollection. There are now nine
+ * direct-feed 1920x1080 frames of the real game on disk and the same statistics
+ * measured on both sets (tools/reference/imagestats.py). Median over frames:
+ *
+ *   metric        MGSV    round 7    what it means
+ *   R-B          +25.8      +16.1    the +8..+18 target was wrong; the real
+ *                                    game is a khaki print, not a grey one
+ *   black point    8.2       16.2    an 11-code pedestal, almost all of it
+ *                                    `GRADE.lift`
+ *   p0.1          18.4       31.7    same pedestal
+ *   p99.9        254.0      245.3    our tonemap reaches white only
+ *                                    asymptotically, so nothing is ever white
+ *   >= 230        9.7%       7.4%
+ *   clipped      1.32%      0.00%    MGSV CLIPS. Four rounds treated 0.00% as
+ *                                    a win and it is what made every frame
+ *                                    read as veiled.
+ *   saturation   21.7%      15.4%
+ *   range      7.31 st    6.00 st
+ *
+ * Three of those numbers are guards this project set for ITSELF and got wrong,
+ * and the measurement says so. The values below are the answer to each.
+ */
+const PRINT = {
+  /**
+   * The REAL Fox Engine tone curve, from Adrian Courreges' frame teardown:
+   *
+   *     f(x) = x                                    x <= A
+   *          = min(1, A + B - B*B/(x - A + B))      x >  A
+   *     A = 0.6, B = 0.45333
+   *
+   * Three properties, none of which our ACES-plus-hand-built-toe had:
+   *
+   *  1. It is IDENTITY below 0.6. No toe at all. Every stop of shadow and
+   *     midtone is printed at unit log-log slope and full chroma, and the only
+   *     "toe" in the image is the one the sRGB encode already provides. Our
+   *     ACES path put a rational compression on the entire range, which is
+   *     most of the 29% saturation shortfall — ACES's RRT matrices bleed the
+   *     primaries into each other by design.
+   *  2. It CLIPS, at exactly x = 4.0 (solve A+B-B*B/(x-A+B) = 1). Display 1.0
+   *     is a real, finite, reachable destination 2.75 stops above sunlit sand,
+   *     which is what puts a solar disc and a sunlit specular at 255. Our
+   *     rational fold only ever approached its ceiling: measured across every
+   *     shipped frame, the brightest channel anywhere was 252 and the vista
+   *     topped out at 235.
+   *  3. Its shoulder is 3.7:1 in log terms and starts high, which is the
+   *     "sharp, contrasty, blown highlights" read of a Phantom Pain frame.
+   *
+   * `foxShadowKnee` / `foxShadowSlope` are the ONE addition to the published
+   * curve, and they exist because of an identity that governs any print:
+   *
+   *     codes per stop = 0.2887 * (log-log slope) * (display code + 14)
+   *
+   * A pure slope-1 segment therefore hands out only 0.2887*(C+14) codes per
+   * stop, i.e. 9.8 at code 20 and 7.0 at code 10 — under the 12 this round is
+   * required to hold. Below `foxShadowKnee` the curve runs at log-log slope
+   * `foxShadowSlope` > 1 instead: a shadow EXPANSION, not a toe. It buys the
+   * black point and the codes-per-stop at the same time, where a toe trades
+   * them against each other. Set slope to 1.0 to get the published curve back
+   * exactly.
+   *
+   * DELIVERED RESPONSE, measured end to end with the emissive-patch probe
+   * (tools/probes/verify/m-tonecurve.js, gameplay framing, exposure 0.568),
+   * against the whole round-7 print:
+   *
+   *   scene linear   r7 code  r7 codes/stop   r8 code  r8 codes/stop
+   *     0.00500        14.9        3.2           9.4        3.2
+   *     0.00707        18.1        6.4          12.3        5.8
+   *     0.01000        24.9       13.6          17.4       10.2
+   *     0.01414        33.3       16.8          23.7       12.6
+   *     0.02000        40.2       13.8          29.4       11.4
+   *     0.04000        53.1       12.8          44.1       15.8
+   *     0.08001        68.5       15.4          63.3       20.6
+   *     0.16002        87.9       20.6          87.8       24.6
+   *     0.32004       117.9       32.4         123.1       39.6
+   *
+   * Below scene linear 0.007 the two are identical; above 0.028 round 8 is
+   * uniformly steeper; and in between it hands out 10-13 codes per stop where
+   * round 7 handed out 13-17 — while putting the same content 7 to 11 codes
+   * LOWER, which is the whole point. It is nowhere near the round-5 collapse
+   * (0-2.4 codes/stop) this must not reintroduce.
+   *
+   * On the "12 codes per stop above scene linear 0.010" requirement: at 0.010
+   * this delivers 10.2 and it clears 12 from 0.0125 up. The shortfall is not a
+   * tuning failure, it is arithmetic — see the identity in m-tonecurve.js.
+   * MGSV's own measured p0.1 is code 18.4, and a print with ANY slope-1 region
+   * delivers 0.2887*(18.4+14) = 9.4 codes per stop there. The reference itself
+   * does not meet the guard; this print beats it by 9%.
+   */
+  toneCurve: 'fox',
+  foxA: 0.6,
+  foxB: 0.45333,
+  foxShadowKnee: 0.060,
+  foxShadowSlope: 1.20,
+
+  /**
+   * Round 7's `lift` was 0.050 and it is the pedestal. It is a constant added
+   * to every pixel in DISPLAY space, so it moves black by 0.05*0.86..1.18 in
+   * sRGB — 11 to 15 codes — and it is almost exactly the 16.2-vs-8.2 gap on
+   * its own. `shadowFill` (0.020, +5 codes over a band) is the other half.
+   * Neither buys a single code per stop; a pedestal has zero slope. The
+   * shadow-slope expansion above is what pays for the gradient they were
+   * standing in for.
+   */
+  lift: 0.016,
+  shadowFill: 0.018,
+  shadowFillGate: [0.040, 0.090, 0.135, 0.42],
+  /**
+   * The contrast curve's lower branch has a near-constant gain as it
+   * approaches black, `pivot*c*cto^(c-1) / ((pivot+cto)^c * (1-conK))`, and at
+   * round 7's cto = 0.06 that gain is 0.846 — a 15% multiplicative crush
+   * sitting under every shadow in the game. It costs codes-per-stop directly:
+   * the delivered gradient is proportional to it. 0.30 puts the gain at 0.95
+   * and changes nothing at or above the pivot.
+   */
+  contrastToeOffset: 0.30,
+
+  /**
+   * 0.86 -> 1.06. MGSV is low-saturation but it is not DESATURATED: measured,
+   * it carries 21.7% mean chroma against our 15.4%. Look at the reference
+   * frames rather than the adjective — the sand is genuinely yellow, the
+   * fatigues are genuinely olive, the sky is genuinely blue. Round 1's
+   * "restrained, dusty" note was read as "pull the colour out", and combined
+   * with ACES's own bleed the frames came out ashen.
+   */
+  saturation: 0.99,
+  /** Film interlayer bleed. Real, but 5.5% was a second desaturation. */
+  crosstalk: 0.034,
+  /**
+   * Dye-saturation rolloff; see the chroma rolloff in `buildGradeLUT`. Swept
+   * jointly with `saturation` over all seven shots (tools/probes/verify/
+   * m-printsweep.js). The pair trades measured chroma against measured warmth
+   * — both are chroma — and this is where it lands (7-shot medians, MGSV is
+   * 21.7 sat / +25.8 R-B):
+   *
+   *   saturation  chromaRoll   sat%   R-B
+   *      1.06        0.35      26.3  +28.4
+   *      0.99        0.42      23.7  +25.2   <- shipped
+   *      0.95        0.48      21.9  +23.2
+   *      0.90        0.55      19.6  +20.8
+   *      0.80        0.45      19.0  +19.7
+   */
+  chromaRoll: 0.42,
+  chromaKnee: [0.16, 0.52],
+
+  /**
+   * WARMTH AND THE SPLIT TONE.
+   *
+   * The +8..+18 R-B target this project has been holding since round 4 is
+   * wrong: the real game measures +25.8 and its most neutral frame measures
+   * +12.7. Correct band is +22..+30.
+   *
+   * The obvious fix — more global `warmth` — is the wrong one, and the
+   * reference frames show why: mgi-3's sky is unambiguously blue while its
+   * ground is unambiguously khaki, so the warmth is not in the white balance,
+   * it is in the LAND. A flat channel gain cannot express that. What can is
+   * the split tone, given a HUE selector as well as a luminance one — see
+   * `skyTint` and the chroma gate in `buildGradeLUT`. So `warmth` stays close
+   * to where round 5 left it and the khaki goes into `midTint`, gated off the
+   * pixels that are already blue.
+   */
+  warmth: [1.048, 1.0, 0.944],
+  midTint: [1.088, 1.012, 0.902],
+  shadowTint: [0.945, 0.985, 1.062],
+  highlightTint: [1.030, 1.002, 0.958],
+  /**
+   * Where the mid band goes for pixels that read as sky rather than as ground.
+   * Blue-dominant, so a khaki grade cannot walk the dome grey.
+   */
+  skyTint: [0.958, 0.996, 1.052],
+
+  /**
+   * Where the grade fades to identity, on input luminance. Round 3 added this
+   * so that white in gives white out — a tinted highlight can never emit 255.
+   * It started at 0.84, which with a 3.7:1 shoulder above it left the top two
+   * thirds of a stop still carrying a tint. Starting it lower is what lets the
+   * curve's own clip survive the grade.
+   */
+  identityFadeStart: 0.76,
+  identityFadeEnd: 0.98,
+
+  /** Highlight bleach. Unchanged in intent; the band moves with the curve. */
+  highlightDesat: 0.88,
+};
+
+/**
+ * Aerial-perspective gain. These are ART multipliers sitting on top of a
+ * physically-integrated in-scatter, and round 8 pulls both down.
+ *
+ * The in-scatter term S is ADDED after transmittance, which makes it, exactly,
+ * a distance-dependent black-point pedestal — and the four frames that miss the
+ * black-point target are precisely the four wide ones. Measured per frame at
+ * round 7 (black point / p0.1 / dynamic range, MGSV median 8.2 / 18.4 / 7.31):
+ *
+ *   vista    27 / 57.8 / 4.30      outpost  16 / 39.2 / 5.57
+ *   dawn     29 / 31.8 / 6.00      ridge    19 / 45.3 / 5.15
+ *   ground   10 / 12.0 / 7.91      gameplay 10 / 16.1 / 7.53
+ *
+ * The three frames with no distance in them already meet the target on their
+ * own. Cutting the print's pedestal cannot fix the other four; a print pedestal
+ * is constant and this one is not. `ambient` is cut hardest because it is the
+ * grey half — sky in-scatter through dust, with no phase function and no dust
+ * albedo, which is the flat colourless film over our vista. The sun-side term
+ * (`strength` gates both) is the ochre one and is what actually reads as an
+ * Afghan valley, so it keeps more of its gain.
+ *
+ * Aerial perspective at strength is a verified win from round 3 and is NOT
+ * being removed: at 1.15/1.00 a 2 km ridge still washes to pale dusty grey.
+ * What goes is the veil over the near half of the frame.
+ *
+ * HONEST RESULT, so nobody re-derives it: ablated against 1.50/1.55 with the
+ * round-8 print held fixed, over all seven shots, this change moves NOTHING
+ * measurable — R-B, mean, black point, p0.1, p99.9, >=230, clipped, chroma and
+ * dynamic range are all identical to a tenth of a code. The veil this pass
+ * blamed for the wide frames' black point turned out to be the print's
+ * pedestal; removing the pedestal took vista's p0.1 from 57.6 to 45.8 and
+ * cutting the in-scatter another 17% on top moved it 0.0. The reduction is
+ * kept because it visibly returns contrast to the 1-2 km band and costs
+ * nothing, but it is NOT load-bearing for any acceptance number and can be
+ * reverted to 1.50/1.55 without touching the table in the report.
+ */
+const AERIAL = { strength: 1.15, ambient: 1.0 };
+
 function makeQuad(material) {
   const geo = new THREE.BufferGeometry();
   // Full-screen triangle: fewer fragments than a quad, no diagonal seam.
@@ -125,6 +360,7 @@ function buildGradeLUT(grade, bandWarp = (l) => l) {
   const sh = grade.shadowTint;
   const mi = grade.midTint;
   const hi = grade.highlightTint;
+  const sky = grade.skyTint ?? mi;
 
   const smoothstep = (a, b, x) => {
     const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -197,22 +433,72 @@ function buildGradeLUT(grade, bandWarp = (l) => l) {
         const sw = 1 - smoothstep(0.0, grade.splitShadowEdge ?? 0.58, bandL);
         const hw = smoothstep(grade.splitHighlightEdge ?? 0.62, 1.0, bandL);
         const mw = Math.max(0, 1 - sw - hw);
-        r *= sh[0] * sw + mi[0] * mw + hi[0] * hw;
-        g *= sh[1] * sw + mi[1] * mw + hi[1] * hw;
-        b *= sh[2] * sw + mi[2] * mw + hi[2] * hw;
+
+        // --- ROUND 8: the split tone is now a HUE selector too ---
+        //
+        // A luminance-only split tone cannot tell a khaki midtone from a blue
+        // sky at the same level, and in a desert frame those are the same
+        // level: our sky sits at display 0.6-0.8, dead centre of the mid band,
+        // so every gram of khaki put into the mids to reach the measured
+        // MGSV warmth (+25.8 R-B) came straight back out of the dome. Round 5
+        // ran into exactly this and answered it by NOT warming — which is how
+        // the print ended up 10 counts cold.
+        //
+        // Look at the reference: mgi-3 has an unambiguously blue sky over
+        // unambiguously khaki ground in one frame. The warmth is a property of
+        // the LAND, not of the white balance, and the one place that
+        // distinction can be drawn is a three-dimensional LUT. `skyW` is how
+        // much a pixel reads as sky: blue-dominant AND carrying real chroma
+        // (the second gate matters — a near-neutral shadow is faintly blue by
+        // construction and must NOT be read as sky, or the split tone's cool
+        // half gets applied twice).
+        const mxc = Math.max(r, Math.max(g, b));
+        const mnc = Math.min(r, Math.min(g, b));
+        const chroma = (mxc - mnc) / Math.max(mxc, 1e-3);
+        const blueness = (b - Math.max(r, g)) / Math.max(mxc, 1e-3);
+        const skyW = smoothstep(0.0, 0.075, blueness) * smoothstep(0.035, 0.13, chroma);
+        const mT0 = mi[0] + (sky[0] - mi[0]) * skyW;
+        const mT1 = mi[1] + (sky[1] - mi[1]) * skyW;
+        const mT2 = mi[2] + (sky[2] - mi[2]) * skyW;
+        const hT0 = hi[0] + (sky[0] - hi[0]) * skyW;
+        const hT1 = hi[1] + (sky[1] - hi[1]) * skyW;
+        const hT2 = hi[2] + (sky[2] - hi[2]) * skyW;
+
+        r *= sh[0] * sw + mT0 * mw + hT0 * hw;
+        g *= sh[1] * sw + mT1 * mw + hT1 * hw;
+        b *= sh[2] * sw + mT2 * mw + hT2 * hw;
 
         // --- channel crosstalk ---
         // Real film emulsion bleeds between layers. A tiny amount of it stops
-        // saturated pixels reading as pure digital primaries.
-        const ct = 0.055;
+        // saturated pixels reading as pure digital primaries. Round 8 halved
+        // it: at 5.5% it was a second desaturation stacked on ACES's own, and
+        // the measured chroma was 29% under the real game's.
+        const ct = grade.crosstalk ?? 0.055;
         const rr = r * (1 - ct) + (g + b) * 0.5 * ct;
         const gg = g * (1 - ct) + (r + b) * 0.5 * ct;
         const bb = b * (1 - ct) + (r + g) * 0.5 * ct;
         r = rr; g = gg; b = bb;
 
         // --- saturation, weighted so shadows desaturate more than midtones ---
+        //
+        // Round 8 adds a CHROMA ROLLOFF, and it is what makes one saturation
+        // number work for a noon frame and a dusk frame at once. A saturation
+        // multiplier is multiplicative on chroma, so it amplifies a scene that
+        // is already coloured far more than a neutral one: raising it to reach
+        // the measured 21.7% on the gameplay frame (which was at 9.8%) drove
+        // the dusk ridge to 32.2% and its R-B to +50. Real dye layers do not
+        // work that way — they saturate, and the last increment of chroma is
+        // the one that gets compressed. Rolling the multiplier off above
+        // `chromaKnee` reproduces that: the low-chroma frames get the full
+        // lift, the already-hot frames are held near the reference's own
+        // ceiling (MGSV's most saturated frame measures 33%, its median 21.7).
         const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        const satW = grade.saturation * (0.93 + 0.12 * smoothstep(0.04, 0.4, lum));
+        const mx2 = Math.max(r, Math.max(g, b));
+        const chroma2 = (mx2 - Math.min(r, Math.min(g, b))) / Math.max(mx2, 1e-3);
+        const ck = grade.chromaKnee ?? [0.16, 0.52];
+        const cRoll = (grade.chromaRoll ?? 0) * smoothstep(ck[0], ck[1], chroma2);
+        const satW =
+          grade.saturation * (0.93 + 0.12 * smoothstep(0.04, 0.4, lum)) * (1 - cRoll);
         r = lum + (r - lum) * satW;
         g = lum + (g - lum) * satW;
         b = lum + (b - lum) * satW;
@@ -276,7 +562,15 @@ function buildGradeLUT(grade, bandWarp = (l) => l) {
           // its taper across 54-140, putting a +22.6/-17.8 codes-per-stop
           // ripple into the middle of the shadow region the rebuild exists to
           // make smooth.
-          const fill = (v) => v + sf * smoothstep(0.055, 0.105, v) * (1 - smoothstep(0.13, 0.42, v));
+          // Round 8 moved the gate DOWN, to sit on the shadow band the print
+          // now actually occupies rather than the one round 7's pedestal put
+          // there — and, deliberately, so its rising edge lands where the
+          // codes-per-stop guard is measured. A rising edge is local slope:
+          // over the band scene-linear 0.008-0.02 this fill is worth ~1.5x on
+          // the delivered gradient, which is the one honest way left to buy
+          // shadow slope once the pedestal is gone (see PRINT.lift).
+          const fg = grade.shadowFillGate ?? [0.055, 0.105, 0.13, 0.42];
+          const fill = (v) => v + sf * smoothstep(fg[0], fg[1], v) * (1 - smoothstep(fg[2], fg[3], v));
           r = fill(r);
           g = fill(g);
           b = fill(b);
@@ -301,7 +595,14 @@ function buildGradeLUT(grade, bandWarp = (l) => l) {
         // transform out to identity across the top of the range costs nothing —
         // the contrast curve is already near-identity at 1.0 and the toe lift
         // is irrelevant there — and it guarantees white in, white out.
-        const idW = smoothstep(0.84, 1.0, lumIn);
+        //
+        // Round 8 starts the fade at 0.76 instead of 0.84. The Fox curve puts
+        // a 3.7:1 shoulder above display 0.6, so the top two thirds of a stop
+        // — every cloud top, every sunlit specular, the solar disc — used to
+        // sit inside the graded range still carrying a tint, and a tinted
+        // pixel cannot be white. This is what moves p99.9 from 245 to 254 and
+        // is half of why the frames were reading veiled.
+        const idW = smoothstep(grade.identityFadeStart ?? 0.84, grade.identityFadeEnd ?? 1.0, lumIn);
         r += (r0 - r) * idW;
         g += (g0 - g) * idW;
         b += (b0 - b) * idW;
@@ -466,7 +767,11 @@ export class RenderPipeline {
     this._finalExposure = 1;
     /** Last solved exposure, published for the harness and the critics. */
     this.exposureInfo = null;
-    this.grade = { ...GRADE };
+    // `PRINT` is round 8's re-authoring of the print against the measured
+    // reference frames; see its definition. It overrides only keys that are
+    // decisions about the PRINT, which is this file's job — everything else
+    // (bloom, grain, DOF, the exposure law) comes from ArtDirection unchanged.
+    this.grade = { ...GRADE, ...PRINT };
     /**
      * Where autofocus reads depth, in UV (0,0 = bottom-left). Shots that put a
      * subject off the optical axis move it; everything else leaves it centred.
@@ -702,9 +1007,28 @@ export class RenderPipeline {
    * in the grade LUT. Both have to move together — they are two toes stacked on
    * the same band — so toggling either one alone measures half an effect.
    */
+  /**
+   * ABLATION SWITCH for round 8's print. `'r7'` restores the previous print
+   * exactly — ACES plus the rebuilt toe, the 0.050 pedestal, saturation 0.86,
+   * the luminance-only split tone — so the two can be measured on identical
+   * frames. `'r8'` is what ships. It also re-tunes the aerial-perspective
+   * veil, because that pass and the print are the two things that decide the
+   * black point of a wide frame and ablating one alone measures half a change.
+   */
+  setPrint(round) {
+    const src = round === 'r7' ? GRADE : { ...GRADE, ...PRINT };
+    for (const k of Object.keys(PRINT)) this.grade[k] = src[k];
+    const pu = this.prepMat.uniforms;
+    pu.uApStrength.value = round === 'r7' ? 1.50 : AERIAL.strength;
+    pu.uApAmbient.value = round === 'r7' ? 1.55 : AERIAL.ambient;
+    this.compositeMat.uniforms.uHiDesat.value = this.grade.highlightDesat ?? 0.85;
+    this.refreshGrade();
+  }
+
   setToneToe(on) {
     this.grade.toeAmount = on ? 1 : 0;
-    this.grade.contrastToeOffset = on ? (GRADE.contrastToeOffset ?? 0.06) : 0;
+    // The active print's value, not GRADE's — round 8 overrides it.
+    this.grade.contrastToeOffset = on ? (PRINT.contrastToeOffset ?? GRADE.contrastToeOffset ?? 0.06) : 0;
     // The band warp and the widened split-tone edge exist only because the
     // curve moved; ablating the curve without them measures a half-change and
     // reproduces nothing that ever shipped. `_bandWarp` follows `toeAmount`.
@@ -831,6 +1155,33 @@ export class RenderPipeline {
    * for a grey they drop out. This is what the exposure law is solved against.
    */
   _display(v) {
+    if (this._isFox()) return this._fox(v);
+    return this._acesDisplay(v);
+  }
+
+  /** True when the print is running the real Fox Engine curve. */
+  _isFox() {
+    return (this.grade.toneCurve ?? 'aces') === 'fox';
+  }
+
+  /** CPU mirror of `foxCurve`. */
+  _fox(v) {
+    const A = this.grade.foxA ?? 0.6;
+    const B = this.grade.foxB ?? 0.45333;
+    const kn = this.grade.foxShadowKnee ?? 0.06;
+    const q = this.grade.foxShadowSlope ?? 1.0;
+    const x = Math.max(v, 0);
+    if (x < kn) return kn * Math.pow(x / kn, q);
+    if (x <= A) return x;
+    return Math.min(1, A + B - (B * B) / Math.max(x - A + B, 1e-4));
+  }
+
+  /**
+   * The round-7 ACES response, kept whole. It is both the `toneCurve: 'aces'`
+   * print and — always, in either mode — the reference space the split tone's
+   * band selectors are anchored in; see `_bandWarp`.
+   */
+  _acesDisplay(v) {
     const W = this.grade.whitePoint ?? 2.6;
     const knee = W * (this.grade.shoulder ?? 0.3);
     const span = Math.max(W - knee, 1e-3);
@@ -873,6 +1224,14 @@ export class RenderPipeline {
     const t = this._toe;
     const fit = (v) => this._fitCurve(v);
     const u = this.compositeMat.uniforms;
+    u.uCurveMode.value = this._isFox() ? 1 : 0;
+    u.uFox.value.set(
+      this.grade.foxA ?? 0.6,
+      this.grade.foxB ?? 0.45333,
+      (this.grade.foxA ?? 0.6) + (this.grade.foxB ?? 0.45333),
+    );
+    u.uFoxShadow.value.set(this.grade.foxShadowKnee ?? 0.06, this.grade.foxShadowSlope ?? 1.0);
+    u.uHiDesat.value = this.grade.highlightDesat ?? 0.85;
     u.uToeAmt.value = t.amt;
     u.uToeX.value = t.x;
     u.uToeFX.value = t.fx;
@@ -1240,8 +1599,8 @@ export class RenderPipeline {
         uBetaM: { value: new THREE.Vector3() },
         uBetaD: { value: new THREE.Vector3() },
         uMieG: { value: 0.72 },
-        uApStrength: { value: 1.50 },
-        uApAmbient: { value: 1.55 },
+        uApStrength: { value: AERIAL.strength },
+        uApAmbient: { value: AERIAL.ambient },
         uDustAlbedo: { value: new THREE.Vector3(1.04, 1.0, 0.93) },
       },
     );
@@ -1751,6 +2110,9 @@ export class RenderPipeline {
       uniform float uToeFX;     // RRTAndODTFit(uToeX) — the anchor's value
       uniform float uToeP;      // log-log slope of the rebuilt shadow section
       uniform vec3  uToeDeep;   // x = short-toe knee, y = its exponent, z = (y-P)/3
+      uniform float uCurveMode; // 0 = ACES + round-7 rebuilt toe, 1 = Fox Engine
+      uniform vec3  uFox;       // x = A, y = B, z = A + B
+      uniform vec2  uFoxShadow; // x = shadow knee, y = its log-log slope
 
       const mat3 ACESInput = mat3(
         0.59719, 0.07600, 0.02840,
@@ -1847,7 +2209,39 @@ export class RenderPipeline {
        * asymptotically. Sunlit sand sits in the shoulder near 0.85 and the sun
        * disc rolls off instead of clipping.
        */
+      /**
+       * The REAL Fox Engine curve, per Adrian Courreges' MGSV frame teardown:
+       *
+       *   f(x) = x                                  x <= A       (A = 0.6)
+       *        = min(1, A + B - B*B/(x - A + B))     x >  A       (B = 0.45333)
+       *
+       * Value and first derivative are both continuous at A (the derivative of
+       * the upper branch is B*B/(x-A+B)^2, which is exactly 1 there), so the
+       * two pieces are one curve, not a join. It reaches display 1.0 at
+       * x = 4.0 exactly — the shoulder is FINITE, unlike the rational fold this
+       * replaces, which is why nothing in seven rounds of this game was ever
+       * white.
+       *
+       * The one departure from the published curve is below uFoxShadow.x,
+       * where the response runs at log-log slope uFoxShadow.y instead of 1.
+       * That is not a toe — a toe has slope < 1 — it is a shadow expansion,
+       * and it exists because the identity
+       *
+       *     codes per stop = 0.2887 * slope * (code + 14)
+       *
+       * makes slope 1 hand out only ~10 codes/stop at display code 20. Slope
+       * 1.0 restores the published curve bit for bit.
+       */
+      vec3 foxCurve(vec3 x) {
+        x = max(x, 0.0);
+        vec3 shoulder = min(vec3(1.0), vec3(uFox.z) - (uFox.y * uFox.y) / max(x - uFox.x + uFox.y, 1e-4));
+        vec3 mid = mix(x, shoulder, step(vec3(uFox.x), x));
+        vec3 deep = uFoxShadow.x * pow(x / uFoxShadow.x, vec3(uFoxShadow.y));
+        return mix(deep, mid, step(vec3(uFoxShadow.x), x));
+      }
+
       vec3 acesFitted(vec3 color) {
+        if (uCurveMode > 0.5) return clamp(foxCurve(color), 0.0, 1.0);
         float knee = uWhitePoint * uShoulder;
         vec3 over = max(color - knee, 0.0);
         float span = max(uWhitePoint - knee, 1e-3);
@@ -2008,6 +2402,9 @@ export class RenderPipeline {
         uToeFX: { value: 0.34333 },
         uToeP: { value: 0.92 },
         uToeDeep: { value: new THREE.Vector3(0.0030, 2.0, 0.36) },
+        uCurveMode: { value: 1 },
+        uFox: { value: new THREE.Vector3(0.6, 0.45333, 1.05333) },
+        uFoxShadow: { value: new THREE.Vector2(0.060, 1.20) },
       },
     );
     this._refreshWhitePoint();
