@@ -464,12 +464,38 @@ function defaultClothPalette() {
   // that is what tanned hide and dyed polymer actually are — a uniform hue
   // across every zone is its own kind of tell.
   c[Z.VEST] = new THREE.Vector3(0.148, 0.133, 0.076);
-  c[Z.WEBBING] = new THREE.Vector3(0.115, 0.103, 0.059);
   c[Z.POUCH] = new THREE.Vector3(0.176, 0.158, 0.090);
-  c[Z.BELT] = new THREE.Vector3(0.106, 0.084, 0.050);
-  c[Z.LEATHER] = new THREE.Vector3(0.114, 0.087, 0.049);
-  c[Z.GLOVE] = new THREE.Vector3(0.094, 0.074, 0.048);
-  c[Z.KNEEPAD] = new THREE.Vector3(0.079, 0.068, 0.047);
+  /**
+   * ROUND 8 — the DARK end of the ladder, and this is the other half of "the
+   * character is flat".
+   *
+   * Round 1 authored the whole kit at 0.013-0.05 and every critic called the
+   * result black blobs; round 4 lifted the entire ladder to fix it. What that
+   * left is a soldier whose authored albedo spans 0.102 (webbing) to 0.217
+   * (jacket) — ONE STOP AND A TENTH, end to end, for a figure carrying black
+   * nylon web gear over sun-bleached cotton, which is three and a third stops
+   * in the real world. Everything on him is the same value, so nothing on him
+   * separates from anything else, and no amount of normal-map relief fixes a
+   * missing albedo step.
+   *
+   * The fix is not to undo round 4 — it is that round 1 and round 4 were both
+   * moving the WHOLE ladder when only its ends were wrong. The garment, the
+   * carrier, the pouches and the pack stay exactly where round 4's measurement
+   * put them: they are the large areas, and they are what "black blob" was
+   * actually about. What goes down is only the narrow stuff — 25 mm tape, a
+   * belt, gloves, a holster, an eyepatch, a moulded kneepad — none of which is
+   * more than a few percent of the projected area, and all of which is
+   * genuinely near-black in every reference frame.
+   *
+   * That takes the ladder from 1.09 stops to 2.51, and it WIDENS every value
+   * step the round-4 comment above says the chest rig depends on: vest:webbing
+   * goes 1.29 -> 1.99, pouch:webbing 1.53 -> 2.36.
+   */
+  c[Z.WEBBING] = new THREE.Vector3(0.074, 0.067, 0.038);
+  c[Z.BELT] = new THREE.Vector3(0.062, 0.049, 0.029);
+  c[Z.LEATHER] = new THREE.Vector3(0.071, 0.054, 0.031);
+  c[Z.GLOVE] = new THREE.Vector3(0.047, 0.037, 0.024);
+  c[Z.KNEEPAD] = new THREE.Vector3(0.048, 0.041, 0.029);
   c[Z.PACK] = new THREE.Vector3(0.197, 0.177, 0.101);
   c[Z.HELMCOVER] = new THREE.Vector3(0.177, 0.160, 0.091);
   c[Z.CAP] = new THREE.Vector3(0.162, 0.146, 0.083);
