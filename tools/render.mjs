@@ -197,6 +197,7 @@ function parseArgs(argv) {
     else if (a === '--frames') o.frames = +argv[++i];
     else if (a === '--hide') o.hide = (o.hide ?? []).concat(argv[++i].split(','));
     else if (a === '--cinematic') o.cinematic = true;
+    else if (a === '--aim') { o.aim = true; o.cinematic = true; }
     else if (!a.startsWith('--')) o.shots.push(a);
   }
   return o;
@@ -525,6 +526,16 @@ async function main() {
   // be seen in any image this harness produces. It is applied per shot, after
   // applyShot, because applyShot is what turns them off.
   const cinematic = !!opts.cinematic;
+  // --aim: shoot the AIMED view.
+  //
+  // There has been no way to photograph aiming at all. applyShot() parks the
+  // harness in godmode with a free camera, so every canonical frame is a
+  // third-person idle; the aim pose, the ADS framing, the sight picture and the
+  // weapon's alignment with the shot have never appeared in a single reviewable
+  // image. "Aiming looks ugly" was therefore unfalsifiable — which is a harness
+  // gap, not a rendering one. This drops into play, holds aim until the blend
+  // has actually converged, and shoots that.
+  const aiming = !!opts.aim;
 
   const outDir = path.resolve(ROOT, opts.dir);
   await mkdir(outDir, { recursive: true });
@@ -541,12 +552,24 @@ async function main() {
   for (const name of wanted) {
     const t = Date.now();
     const meta = await page.evaluate(
-      ({ name, frames, cine }) => {
+      ({ name, frames, cine, aim }) => {
         const g = window.__GAME;
         const s = g.applyShot(name);
         if (cine) {
           const pipe = g.engine.pipeline;
           if (pipe?.enabled) { pipe.enabled.dof = true; pipe.enabled.motionBlur = true; }
+        }
+        if (aim) {
+          // Hold the aim key, exactly as a player does. There is no settable
+          // aim flag — `cmd.aiming` is derived from input every frame, so
+          // anything set directly is overwritten on the next update. KeyE is
+          // one of the bindings (Input.js: aim: ['Mouse2','KeyE',...]).
+          g.setMode('play');
+          window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyE', bubbles: true }));
+          // The aim blend reaches 90% at ~0.3 s and the FOV lags it, so step
+          // real frames: a half-blended pose is not what anyone means by "the
+          // aimed view". 45 frames is 0.75 s, past settling on both.
+          for (let k = 0; k < 45; k++) g.engine.step(1 / 60);
         }
         // Pin AFTER the pose is set (invalidateShadows wants the final camera)
         // and before settle, so the frame is a function of the source alone.
@@ -563,7 +586,7 @@ async function main() {
         g.settle(pinned && pinned.volumetrics ? Math.max(frames, 32) : frames);
         return { note: s.note, tod: s.tod, pinned, stats: g.stats() };
       },
-      { name, frames: opts.frames, cine: cinematic },
+      { name, frames: opts.frames, cine: cinematic, aim: aiming },
     );
     const file = path.join(outDir, `${name}.png`);
     await writeFile(file, await page.screenshot({ type: 'png' }));
