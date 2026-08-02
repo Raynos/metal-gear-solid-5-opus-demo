@@ -1,0 +1,81 @@
+{
+  "resolution": "1920x1080",
+  "frameMs": 24,
+  "configs": {
+    "full": {
+      "ms": 24,
+      "runs": [
+        24.25,
+        23.31,
+        24
+      ],
+      "spread": 0.94
+    },
+    "control": {
+      "ms": 23.99,
+      "runs": [
+        23.99,
+        22.06,
+        24.38
+      ],
+      "spread": 2.32
+    },
+    "noDofPass": {
+      "ms": 23.11,
+      "runs": [
+        21.83,
+        23.11,
+        24.43
+      ],
+      "spread": 2.6
+    },
+    "noOcclusion": {
+      "ms": 21.54,
+      "runs": [
+        21.32,
+        21.66,
+        21.54
+      ],
+      "spread": 0.34
+    },
+    "noContactTerms": {
+      "ms": 24.52,
+      "runs": [
+        23.7,
+        24.9,
+        24.52
+      ],
+      "spread": 1.2
+    },
+    "noBloomPyramid": {
+      "ms": 23.22,
+      "runs": [
+        24.78,
+        23.22,
+        22.7
+      ],
+      "spread": 2.08
+    },
+    "noBloom": {
+      "ms": 23.85,
+      "runs": [
+        23,
+        23.85,
+        24.11
+      ],
+      "spread": 1.11
+    }
+  },
+  "nullControlMs": 0.01,
+  "noiseFloorMs": 0.01,
+  "worstBlockSpreadMs": 2.6,
+  "costMs": {
+    "DofPass": "0.89 ms",
+    "Occlusion": "2.46 ms",
+    "ContactTerms": "-0.52 ms",
+    "BloomPyramid": "0.78 ms",
+    "Bloom": "0.15 ms"
+  },
+  "unflaggedPostMs": "= frameMs - sceneIntoHdr - the resolved costs above. The prep blit, the 6-level luminance chain, the adaptation blit, the composite and the present/FXAA blit have NO enabled[] flag, so no ablation can reach them.",
+  "note": "WARM=64 frames per block to absorb the flip stall probes/r11_toggle.js found. The null control is the same config measured twice through the same flip; nothing smaller than it is real."
+}

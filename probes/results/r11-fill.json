@@ -1,0 +1,56 @@
+{
+  "resolution": "1920x1080",
+  "rows": [
+    {
+      "scale": 1,
+      "pixelFraction": 1,
+      "ms": 26.44,
+      "runs": [
+        24.73,
+        26.44,
+        29.54
+      ],
+      "spread": 4.81
+    },
+    {
+      "scale": 0.85,
+      "pixelFraction": 0.722,
+      "ms": 21.05,
+      "runs": [
+        19.4,
+        22.64,
+        21.05
+      ],
+      "spread": 3.24
+    },
+    {
+      "scale": 0.7,
+      "pixelFraction": 0.49,
+      "ms": 16.94,
+      "runs": [
+        16.94,
+        17.14,
+        16.15
+      ],
+      "spread": 0.99
+    },
+    {
+      "scale": 0.55,
+      "pixelFraction": 0.303,
+      "ms": 13.43,
+      "runs": [
+        13.28,
+        14.44,
+        13.43
+      ],
+      "spread": 1.16
+    }
+  ],
+  "model": {
+    "fixedMs": 7.77,
+    "perPixelMsAtNative": 18.67,
+    "reading": "of the 26.44 ms frame, ~18.67 ms scales with the pixel count and ~7.77 ms does not. 60 FPS at native needs the per-pixel half cut to 8.93 ms."
+  },
+  "worstSpreadMs": 4.81,
+  "caveat": "renderScale is a DIAGNOSTIC here and ships at 1.0. A linear fit over two points assumes the per-pixel work is uniform; the middle scales are printed so the assumption is checkable."
+}

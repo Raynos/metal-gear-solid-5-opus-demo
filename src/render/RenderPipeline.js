@@ -803,6 +803,24 @@ export class RenderPipeline {
     this.ablate = { microAO: 1, contactShadows: 1 };
 
     /**
+     * Sub-stage switches for the bloom block, for measurement only.
+     *
+     * `enabled.bloom` is all-or-nothing, and all-or-nothing is 13-20 ms — the
+     * largest single item in the frame, measured two ways (probes/results/
+     * r11-perf-baseline-2.json pairs it at 20.24 ms; probes/r11_bloom.js gets
+     * 13.4 ms by throughput). Neither instrument can say WHICH part of the block
+     * that is, and the obvious model is wrong: 2 mips costs 19.2 ms, 3 mips
+     * costs 27.4 ms and 6 mips costs 25.7, which is not a fragment count.
+     *
+     * So the block is split where its stages are, and each is measurable as an
+     * increment against its neighbour — the only method this project's own perf
+     * probe trusts. All default to on; a probe turns them off. Leaving them here
+     * costs one branch per frame and means the next person does not have to
+     * rediscover the split.
+     */
+    this.bloomStages = { blur: true, upsample: true, streak: true, compositeFetch: true, compositeAdd: true };
+
+    /**
      * Offline per-vertex AO bake, for the geometry owners. Reachable both as an
      * import and off the live pipeline (`world.engine.pipeline.bakeVertexAO`),
      * because half the callers are inside `install(world)` and have the engine
@@ -3084,7 +3102,7 @@ export class RenderPipeline {
       this.brightMat.uniforms.uExposure.value = this._finalExposure;
       this._blit(this.brightMat, this.bloomRTs[0].a);
       const mips = Math.max(2, Math.min(this.bloomMips, this.bloomRTs.length));
-      for (let i = 0; i < mips; i++) {
+      if (this.bloomStages.blur) for (let i = 0; i < mips; i++) {
         const rt = this.bloomRTs[i];
         if (i > 0) {
           this.blurMat.uniforms.tDiffuse.value = this.bloomRTs[i - 1].a.texture;
@@ -3098,7 +3116,7 @@ export class RenderPipeline {
         this.blurMat.uniforms.uDir.value.set(0, 1 / rt.h);
         this._blit(this.blurMat, rt.a);
       }
-      for (let i = mips - 1; i > 0; i--) {
+      if (this.bloomStages.upsample) for (let i = mips - 1; i > 0; i--) {
         this.upsampleMat.uniforms.tLower.value = this.bloomRTs[i].a.texture;
         this.upsampleMat.uniforms.tHigher.value = this.bloomRTs[i - 1].a.texture;
         this.upsampleMat.uniforms.uMix.value = this.grade.bloomRadius + 0.25;
@@ -3118,6 +3136,7 @@ export class RenderPipeline {
       // 2.3x the frame width, so most taps were off the sensor entirely.
       // 1 / 4 / 16 overlaps cleanly and reaches ~0.5 of the frame, which is
       // what a long anamorphic flare actually looks like.
+      if (this.bloomStages.streak) {
       this.streakMat.uniforms.tDiffuse.value = this.bloomRTs[1].a.texture;
       this.streakMat.uniforms.uStep.value = 1.0 / this.streakA.width;
       this.streakMat.uniforms.uAttenuation.value = 0.88;
@@ -3128,6 +3147,7 @@ export class RenderPipeline {
       this.streakMat.uniforms.tDiffuse.value = this.streakB.texture;
       this.streakMat.uniforms.uStep.value = 16.0 / this.streakA.width;
       this._blit(this.streakMat, this.streakA);
+      }
     }
 
     // ---- 7. bokeh DOF + motion blur ----
@@ -3187,12 +3207,19 @@ export class RenderPipeline {
     this._mark('composite');
     const u = this.compositeMat.uniforms;
     u.tDiffuse.value = wantDof ? this.dofRT.texture : resolved.texture;
-    u.tBloom.value = this.enabled.bloom ? this.bloomRTs[0].a.texture : null;
-    u.tStreak.value = this.enabled.bloom ? this.streakA.texture : null;
+    // `compositeFetch` off binds the 1x1 default instead of the half-res
+    // half-float bloom and streak targets, WITHOUT changing anything the bloom
+    // block does. That separates "the composite reads two big textures" from
+    // "the pyramid ran", which `enabled.bloom` conflates — it gates both, and
+    // conflated flags are failure #3 in tools/probes/perf.js's own header.
+    const fetch = this.enabled.bloom && this.bloomStages.compositeFetch;
+    u.tBloom.value = fetch ? this.bloomRTs[0].a.texture : null;
+    u.tStreak.value = fetch ? this.streakA.texture : null;
     u.tAdapt.value = adaptTex;
-    u.uBloomStrength.value = this.enabled.bloom ? this.grade.bloomStrength : 0;
-    u.uStreakStrength.value = this.enabled.bloom ? (this.grade.anamorphic ?? 0.16) : 0;
-    u.uDirtStrength.value = this.enabled.bloom ? (this.grade.lensDirt ?? 0.5) : 0;
+    const add = this.enabled.bloom && this.bloomStages.compositeAdd;
+    u.uBloomStrength.value = add ? this.grade.bloomStrength : 0;
+    u.uStreakStrength.value = add ? (this.grade.anamorphic ?? 0.16) : 0;
+    u.uDirtStrength.value = add ? (this.grade.lensDirt ?? 0.5) : 0;
     u.uExposure.value = this._finalExposure;
     u.uAutoExposure.value = this.enabled.autoExposure ? 1 : 0;
     // What the metered log-average SHOULD be if the frame is a fair sample of
