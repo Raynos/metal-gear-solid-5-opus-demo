@@ -38,7 +38,19 @@ const memory = new Map();
 // Instead the endpoint proves itself: a hit must come back as octet-stream. A
 // dev/preview server with no middleware mounted answers unknown paths with the
 // SPA fallback (index.html, status 200), which would otherwise be read as data.
-const available = typeof fetch === 'function' && typeof window !== 'undefined';
+//
+// Gated on the ORIGIN being local, though, which is the one thing the
+// prove-itself check cannot cover. A failed GET is free, but the PUT that
+// follows a miss is not: the terrain blob is 214 MB, and on a deployed host
+// there is no middleware to receive it, so every single visitor uploaded a
+// fifth of a gigabyte to earn a 405. Dev and `vite preview` are both localhost,
+// so this keeps the cache exactly where it is wired up and skips it everywhere
+// it can only cost bandwidth.
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', '0.0.0.0']);
+const available =
+  typeof fetch === 'function' &&
+  typeof window !== 'undefined' &&
+  LOCAL_HOSTS.has(window.location?.hostname);
 
 /** Cache any ArrayBuffer-backed result. `make()` may be sync or async. */
 export async function cachedBuffer(key, make) {
