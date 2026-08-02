@@ -1492,8 +1492,25 @@ export class RenderPipeline {
         vec3 dx = abs(pxr.z - P.z) < abs(P.z - pxl.z) ? (pxr - P) : (P - pxl);
         vec3 dy = abs(pyu.z - P.z) < abs(P.z - pyd.z) ? (pyu - P) : (P - pyd);
         vec3 N = normalize(cross(dx, dy));
-        if (N.z < 0.0) N = -N;
         vec3 V = normalize(-P);
+        // Face the normal toward the VIEWER, not toward +z.
+        //
+        // This is the black polygons — the defect a player sent nine screenshots
+        // of. "N.z < 0.0" reads as "make it face the camera" and is not the same
+        // test: with the camera near level, a ground normal in view space is
+        // very nearly (0, 1, 0), so N.z sits on zero and its SIGN is decided by
+        // whichever way the surface happens to tilt. The pad is crowned and
+        // carries a 13 cm fbm, so half of it tilts fractionally away, N.z goes
+        // negative, and the normal is flipped to point INTO the ground. The
+        // horizon integral below then measures the underside of the world and
+        // returns near-total occlusion: band/control 0.189 against 0.916 with
+        // the pass off. That is where the hard-edged black shapes come from, and
+        // the edges are hard because the flip is a sign test with no transition.
+        //
+        // dot(N, V) is the criterion that was meant. On the same pixels it is
+        // robustly positive — the surface faces the eye or it would not be in
+        // the depth buffer — so it decides nothing on noise.
+        if (dot(N, V) < 0.0) N = -N;
 
         // Screen-space radius of the world-space sample sphere.
         //
