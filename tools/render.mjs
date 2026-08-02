@@ -190,6 +190,16 @@ async function serve() {
     [path.join(ROOT, 'node_modules/vite/bin/vite.js'), 'preview', '--port', String(port), '--strictPort', '--host', '127.0.0.1'],
     { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], detached: true },
   );
+  // Detached so we can kill the whole group, which means it can also outlive us.
+  // Watchdog: if our pid disappears, the server exits on its own within 10 s.
+  const parent = process.pid;
+  const watchdog = setInterval(() => {
+    try { process.kill(parent, 0); } catch {
+      try { process.kill(-proc.pid, 'SIGKILL'); } catch {}
+      clearInterval(watchdog);
+    }
+  }, 10000);
+  watchdog.unref();
   let log = '';
   proc.stdout.on('data', (d) => (log += d));
   proc.stderr.on('data', (d) => (log += d));
@@ -204,8 +214,40 @@ async function serve() {
   throw new Error(`preview server failed to start:\n${log}`);
 }
 
+/**
+ * Reap orphans before starting.
+ *
+ * render.mjs kills its own process tree on exit, but it cannot do that if IT is
+ * SIGKILLed — and then its vite server and chromium survive with ppid 1, holding
+ * memory forever. Sixteen chromium processes and eight vite servers accumulated
+ * that way in one session, 4.1 GB of a shared machine.
+ *
+ * So every run sweeps first. An orphan is a vite or chromium that (a) belongs to
+ * this project, and (b) has been reparented to init, which means the thing that
+ * started it is gone and nobody is ever coming back for it. That test is safe on
+ * a shared machine: another author's LIVE process still has a live parent.
+ */
+function reapOrphans() {
+  try {
+    const ps = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,args='], { encoding: 'utf8' });
+    let reaped = 0;
+    for (const line of ps.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const [, pid, ppid, args] = m;
+      if (ppid !== '1') continue;                       // has a live parent: not ours to judge
+      if (!/vite\/bin\/vite\.js|chrome-headless-shell/.test(args)) continue;
+      if (!args.includes('metal-gear-solid-5-opus-demo') &&
+          !/chrome-headless-shell/.test(args)) continue;
+      try { process.kill(+pid, 'SIGKILL'); reaped++; } catch { /* already gone */ }
+    }
+    if (reaped) console.error(`reaped ${reaped} orphaned process(es) from a previous run`);
+  } catch { /* ps unavailable: not worth failing a render over */ }
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  reapOrphans();
   const t0 = Date.now();
   const bundleMs = bundle();
 
