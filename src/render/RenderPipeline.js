@@ -749,7 +749,13 @@ export class RenderPipeline {
     this.enabled = {
       ssao: true,
       bloom: true,
-      taa: true,
+      // TAA OFF, FXAA ON — deliberately, and this matches the real Fox Engine,
+      // which ships FXAA. Temporal accumulation needs reprojection to succeed;
+      // ours fails whenever the camera moves, and at 16-29 FPS the per-frame
+      // delta is large enough that it fails constantly. The result was reported
+      // as "tearing and graphic deformity when you move the camera around".
+      // A sharp aliased frame beats a smeared stable one.
+      taa: false,
       fxaa: true,
       aerial: true,
       dof: true,

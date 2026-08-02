@@ -11,6 +11,30 @@
       canvas { display: block; width: 100%; height: 100%; }
       #ui { position: fixed; inset: 0; pointer-events: none; }
 
+      #boot {
+        position: fixed; inset: 0; z-index: 100; background: #0a0b0c;
+        display: flex; align-items: center; justify-content: center;
+        transition: opacity 420ms ease;
+      }
+      #boot.done { opacity: 0; pointer-events: none; }
+      #boot-inner { width: min(420px, 60vw); }
+      #boot h1 {
+        margin: 0 0 22px; font-size: 13px; font-weight: 400;
+        letter-spacing: 0.42em; color: rgba(216,216,208,0.92);
+      }
+      #boot-bar {
+        height: 1px; background: rgba(216,216,208,0.16); overflow: hidden;
+      }
+      #boot-bar i {
+        display: block; height: 100%; width: 0%;
+        background: rgba(216,216,208,0.92);
+        transition: width 260ms ease;
+      }
+      #boot-step {
+        margin: 12px 0 0; font-size: 10px; letter-spacing: 0.22em;
+        color: rgba(216,216,208,0.42); text-transform: uppercase;
+      }
+
       #controls-card {
         position: fixed; left: 20px; top: 20px; z-index: 40;
         /* Never taller than the window. A 315px card is fine at 1080 and runs
@@ -54,6 +78,21 @@
   </head>
   <body>
     <div id="app"></div>
+
+    <!--
+      Boot screen. The world takes 4-12 s to generate — a terrain sim, then nine
+      modules — and until now that was a black rectangle with no explanation.
+      Plain HTML and a plain script so it paints on the FIRST frame, before the
+      module bundle is even fetched: a loader that needs the app to load is not
+      a loader. main.js drives it through window.__BOOT and removes it.
+    -->
+    <div id="boot">
+      <div id="boot-inner">
+        <h1>THE PHANTOM PAIN</h1>
+        <div id="boot-bar"><i></i></div>
+        <p id="boot-step">starting</p>
+      </div>
+    </div>
     <div id="ui"></div>
 
     <!--
@@ -81,6 +120,29 @@
         <dt>Esc</dt><dd>menu</dd>
       </dl>
     </div>
+    <script>
+      // Boot progress. Defined before the bundle so main.js can call into it as
+      // soon as it evaluates, and so a bundle that fails to load still leaves a
+      // readable screen rather than a black one.
+      window.__BOOT = (function () {
+        var el = document.getElementById('boot');
+        var bar = el.querySelector('#boot-bar i');
+        var step = document.getElementById('boot-step');
+        return {
+          set: function (frac, label) {
+            bar.style.width = Math.round(frac * 100) + '%';
+            if (label) step.textContent = label;
+          },
+          fail: function (msg) { step.textContent = 'failed: ' + msg; },
+          done: function () {
+            bar.style.width = '100%';
+            step.textContent = 'ready';
+            el.classList.add('done');
+            setTimeout(function () { el.remove(); }, 460);
+          },
+        };
+      })();
+    </script>
     <script>
       // Plain script, not a module: the controls card must work even if the
       // game bundle fails to boot, which is exactly when you want to read it.

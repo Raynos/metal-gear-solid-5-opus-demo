@@ -283,7 +283,13 @@ const MODULES = [
 ];
 
 async function boot() {
-  for (const [name, install] of MODULES) {
+  const B = window.__BOOT;
+  // The terrain sim and the module installs are the whole 4-12 s; report each so
+  // a slow boot looks like work rather than a hang.
+  B?.set(0.12, 'building world');
+  for (let i = 0; i < MODULES.length; i++) {
+    const [name, install] = MODULES[i];
+    B?.set(0.15 + 0.75 * (i / MODULES.length), name);
     try {
       registry[name] = await install(world);
     } catch (err) {
@@ -293,6 +299,7 @@ async function boot() {
       window.__GAME.errors.push(`module ${name}: ${err?.message ?? err}`);
     }
   }
+  B?.set(0.92, 'compiling shaders');
 
   // Prime shader compilation before declaring ready so the first screenshot is
   // never a half-compiled frame.
@@ -303,6 +310,7 @@ async function boot() {
   engine.render();
   engine.start();
   window.__GAME.ready = true;
+  B?.done();
 }
 
 boot();
