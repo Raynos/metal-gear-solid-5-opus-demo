@@ -1026,7 +1026,24 @@ export class Lighting {
     // before: cascade 0 used to fire on EVERY frame cascade 1 fired, so the
     // 336-draw frame went from one in three to one in six. Cascade 2 at
     // f mod 6 == 3 is always odd and so never collides with cascade 0 at all.
-    this.refreshInterval = [2, 3, 6, 12];
+    // Cascade 0 is back to EVERY frame.
+    //
+    // It was put on a 2-frame schedule for the draw budget: it removes 86 draws
+    // and 0.7 M triangles a frame, 18% of all draws. But it was measured, twice,
+    // to save NO time — 0.30 ms one run and -0.25 ms the next against null
+    // controls of 0.01 and 0.79, with the same instrument seeing the AO pass at
+    // 6.45 ms in 6 of 6 reps. Depth-only raster is close to free on this GPU.
+    //
+    // A change that buys zero milliseconds cannot justify ANY risk, and cascade
+    // 0 is the near band: it is the player's own shadow, the guards' shadows,
+    // and everything within a few metres of the lens. A player reported glitchy
+    // shadows right after it landed. Whether or not this was the cause, holding
+    // it is a bad trade at a price of nothing, so it goes back.
+    //
+    // The instrument (probes/r12_cascade.js) and the finding stay: shadow
+    // re-rasterisation is NOT the 1.75 ms the audit attributed to it, and
+    // anyone hunting draw count rather than frame time can flip this to 2.
+    this.refreshInterval = [1, 3, 6, 12];
     this._refreshPhase = [0, 1, 3, 5];
 
     /**
