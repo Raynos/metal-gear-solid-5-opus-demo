@@ -24,8 +24,8 @@ export const DOOR_W = 1.1;
 // complaint round 2 got, and which no amount of extra noise inside a single
 // material can answer, because the tiling scale is what gives it away.
 const GEO_KEYS = [
-  'concrete', 'concrete2', 'masonry', 'metal', 'corr', 'wood', 'glass', 'glow', 'cloth', 'net',
-  'rubber', 'paint', 'trim', 'paintWarn', 'sign', 'dark', 'mil', 'dado', 'drift', 'steel',
+  'concrete', 'concrete2', 'masonry', 'metal', 'corr', 'wood', 'glass', 'glow', 'cloth', 'canvas',
+  'net', 'rubber', 'paint', 'trim', 'paintWarn', 'sign', 'dark', 'mil', 'dado', 'drift', 'steel',
 ];
 
 /**
@@ -167,9 +167,29 @@ export function mergeBags(dst, src) {
   return dst;
 }
 
-/** Bake weathering on every geometry in a bag against the structure's own extent. */
-function bakeBag(b, y1, wear = 0, y0 = 0) {
-  for (const k of GEO_KEYS) for (const g of b[k]) bakeWeather(g, { y0, y1, wear });
+/**
+ * Bake weathering on every geometry in a bag against the structure's own extent,
+ * and claim ONE object-level `aVar` for the whole structure.
+ *
+ * The palette pick has to be per BUILDING, not per box: a shed clad in six
+ * separate boxes was painted once, so all six agree on which of the three
+ * factory colours it left the works in, while `prep` still breaks the value a
+ * couple of percent per piece. Different buildings then land on different
+ * picks, which is the entire point — see `bakeVar` in geo.js for what was
+ * silently disabled before this existed.
+ */
+function bakeBag(b, y1, wear = 0, y0 = 0, rng = null) {
+  // The wear channel is deliberately a NARROW band. It is additive in the
+  // shader (mat.js: `wear += opv.x * 0.60`), so a wide one would not vary the
+  // compound, it would simply rust all of it — 0..0.34 puts +-0.10 of spread
+  // around a +0.10 mean, which is variation rather than weather.
+  const v = rng ? [rng() * 0.34, rng(), rng()] : null;
+  for (const k of GEO_KEYS) {
+    for (const g of b[k]) {
+      if (v && !g.userData.opVar) g.userData.opVar = v;
+      bakeWeather(g, { y0, y1, wear });
+    }
+  }
   return b;
 }
 
@@ -520,7 +540,7 @@ export function blockhouse({ w = 18, d = 13, storeys = 2, wallT = 0.30, rng, lit
   // the head of the WALL; anything above it clamps to 1.0, which is harmless
   // because the stain is multiplied by the face's verticality and a roof has
   // almost none.
-  return bakeBag(b, roofY + 0.55, 0.15);
+  return bakeBag(b, roofY + 0.55, 0.15, 0, rng);
 }
 
 // ---------------------------------------------------------------- barracks --
@@ -684,7 +704,7 @@ export function barracks({
   b.metal.push(cyl(0.16, 0.09, 8, { x: fx, y: ridgeY + 1.62, z: -d * 0.18 }));
 
   b.lights.push({ pos: new THREE.Vector3(cx + 1.6, DOOR_H + 0.55, d / 2 + 0.2), kind: 'wall' });
-  return bakeBag(b, eaveY + 0.30, 0.3);
+  return bakeBag(b, eaveY + 0.30, 0.3, 0, rng);
 }
 
 /**
@@ -772,7 +792,7 @@ function concreteHut({ w = 22, d = 9.5, wallT = 0.28, rng, litFrac = 0.4, signCe
     }
   }
   b.lights.push({ pos: new THREE.Vector3(door.x - 1.3, DOOR_H + 0.75, d / 2 + 0.25), kind: 'wall' });
-  return bakeBag(b, H + 0.30, 0.34);
+  return bakeBag(b, H + 0.30, 0.34, 0, rng);
 }
 
 /**
@@ -878,13 +898,13 @@ function steelShed({ w = 20, d = 11, rng, litFrac = 0.3, signCell = 1 } = {}) {
 
   b.lights.push({ pos: new THREE.Vector3(-w / 2 + 4.4, 3.6, halfD + 0.2), kind: 'wall' });
   b.interest.push({ pos: new THREE.Vector3(w / 2 + 3.5, 0, 0), kind: 'bay' });
-  return bakeBag(b, eave + 0.55, 0.55);
+  return bakeBag(b, eave + 0.55, 0.55, 0, rng);
 }
 
 // ------------------------------------------------------------- vehicle shed --
 
 /** Open-fronted vehicle shed: portal frame, mono-pitch corrugated roof. */
-export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
+export function vehicleShed({ w = 16, d = 12, bays = 3, rng = null } = {}) {
   const b = newBag();
   const Hf = 4.7;
   const Hb = 3.7;
@@ -926,13 +946,13 @@ export function vehicleShed({ w = 16, d = 12, bays = 3 } = {}) {
   for (let i = 0; i < bays; i++) {
     b.interest.push({ pos: new THREE.Vector3(-w / 2 + (w / bays) * (i + 0.5), 0, d / 2 + 3.0), kind: 'bay' });
   }
-  return bakeBag(b, Hf + 0.20, 0.4);
+  return bakeBag(b, Hf + 0.20, 0.4, 0, rng);
 }
 
 // ------------------------------------------------------------------ bunker --
 
 /** Half-bermed ammunition store: thick concrete, blast door, vent stacks. */
-export function bunker({ w = 12, d = 8 } = {}) {
+export function bunker({ w = 12, d = 8, rng = null } = {}) {
   const b = newBag();
   const H = 3.0;
   // Round 4: the bunker was the one structure on the site with neither a plinth
@@ -953,7 +973,7 @@ export function bunker({ w = 12, d = 8 } = {}) {
     b.metal.push(cyl(0.2, 0.07, 8, { x, y: H + 1.58, z: -d / 4 }));
   }
   b.interest.push({ pos: new THREE.Vector3(0, 0, d / 2 + 2.8), kind: 'door' });
-  return bakeBag(b, H + 0.50, 0.25);
+  return bakeBag(b, H + 0.50, 0.25, 0, rng);
 }
 
 // ------------------------------------------------------------- watchtower ---
@@ -962,7 +982,7 @@ export function bunker({ w = 12, d = 8 } = {}) {
  * Watchtower: braced steel legs, switchback timber stairs, a cabin with a
  * waist-high corrugated screen and a searchlight on the roof.
  */
-export function watchtower({ h = 9 } = {}) {
+export function watchtower({ h = 9, rng = null } = {}) {
   const b = newBag();
   const half = 1.75;
   const cabH = 2.4;
@@ -1018,13 +1038,13 @@ export function watchtower({ h = 9 } = {}) {
   b.metal.push(xform(cyl(0.34, 0.42, 12), { rx: Math.PI / 2, y: h + cabH + 1.1, z: 0.14 }));
   b.lights.push({ pos: new THREE.Vector3(0, h + cabH + 1.1, 0.36), kind: 'searchlight' });
   b.interest.push({ pos: new THREE.Vector3(0, h + 0.2, 0), kind: 'guardpost' });
-  return bakeBag(b, h + cabH + 1.5, 0.45);
+  return bakeBag(b, h + cabH + 1.5, 0.45, 0, rng);
 }
 
 // --------------------------------------------------------------- gatehouse --
 
 /** Main gate: piers, lintel with a stencilled star, sliding leaves, boom barrier. */
-export function gateway({ gap = 9 } = {}) {
+export function gateway({ gap = 9, rng = null } = {}) {
   const b = newBag();
   const pierH = 4.6;
   const pw = 1.35;
@@ -1095,11 +1115,11 @@ export function gateway({ gap = 9 } = {}) {
   b.glow.push(box(1.6, 0.98, 0.05, { x: hx, y: 1.57, z: hd / 2 - 0.04 }));
   b.lights.push({ pos: new THREE.Vector3(hx, hh + 0.32, hd / 2 + 0.1), kind: 'wall' });
   b.interest.push({ pos: new THREE.Vector3(hx + 2.0, 0, hd / 2 + 0.9), kind: 'guardpost' });
-  return bakeBag(b, pierH + 1.5, 0.4);
+  return bakeBag(b, pierH + 1.5, 0.4, 0, rng);
 }
 
 /** Circular concrete helipad with worn markings and edge lights. */
-export function helipad({ r = 9.5 } = {}) {
+export function helipad({ r = 9.5, rng = null } = {}) {
   const b = newBag();
   const slab = new THREE.CylinderGeometry(r, r + 0.22, 0.36, 40, 1, false);
   slab.translate(0, -0.11, 0);
@@ -1116,5 +1136,5 @@ export function helipad({ r = 9.5 } = {}) {
     const a = (i / 8) * Math.PI * 2 + 0.4;
     b.lights.push({ pos: new THREE.Vector3(Math.cos(a) * (r + 0.6), 0.3, Math.sin(a) * (r + 0.6)), kind: 'padlight' });
   }
-  return bakeBag(b, 1.0, 0.55, -3.0);
+  return bakeBag(b, 1.0, 0.55, -3.0, rng);
 }
