@@ -26,6 +26,18 @@ number.
 `ruler.noiseFloorBiasMs` should be ~0. If it is not, the pairing is failing to
 cancel the drift and **the whole run is void**.
 
+`RULER_VALID: false` at the top of the output means exactly that — throw the run
+away. There are two ways to fail it and both matter:
+
+- the bias falls outside its own IQR (the pairing isn't cancelling the drift), or
+- the noise floor exceeds a quarter of the frame time (nothing is separable).
+
+The second is almost always **machine contention**. Nine authors share one GPU
+and one queue here; a run taken while eight of them are rendering reported a
+99.4 ms frame with a 42.8 ms noise floor, against 24.6 ms and 2.95 ms twenty
+minutes later on the same build. Check `node tools/shot.mjs status` — if
+`queued` is more than one or two, your frame times are somebody else's load.
+
 ## Why the numbers before this round were not measurements
 
 Four separate faults, all now fixed, all worth knowing because they will be
