@@ -1,0 +1,129 @@
+{
+  "RULER_VALID": true,
+  "shot": "gameplay",
+  "resolution": "1920x1080 @dpr1",
+  "budget": {
+    "fps60Ms": 16.7,
+    "fps30Ms": 33.3
+  },
+  "frames": {
+    "godmode": {
+      "static": {
+        "ms": 11.2,
+        "fps": 89,
+        "blockSpreadMs": 13.4
+      },
+      "pan60": {
+        "ms": 26.1,
+        "fps": 38,
+        "blockSpreadMs": 1.7
+      },
+      "walk": {
+        "ms": 26.1,
+        "fps": 38,
+        "blockSpreadMs": 0.7
+      },
+      "sprint": {
+        "ms": 23.9,
+        "fps": 42,
+        "blockSpreadMs": 1.7
+      }
+    },
+    "play": {
+      "standing": {
+        "ms": 30,
+        "fps": 33,
+        "blockSpreadMs": 0.5
+      },
+      "walking": {
+        "ms": 29.5,
+        "fps": 34,
+        "blockSpreadMs": 0.2
+      },
+      "sprinting": {
+        "ms": 29.5,
+        "fps": 34,
+        "blockSpreadMs": 0.4
+      },
+      "combat": {
+        "ms": 29.8,
+        "fps": 34,
+        "blockSpreadMs": 0.9
+      }
+    }
+  },
+  "playNote": null,
+  "ruler": {
+    "throughputBlock": "4 warm + 16 timed, x3, median",
+    "pairsPerComparison": 24,
+    "pairing": "adjacent FRAMES, order alternating (ABBA), median of per-pair differences",
+    "noiseFloorMs": 3.1,
+    "noiseFloorBiasMs": 0.8,
+    "note": "noiseFloorMs is the IQR of the same configuration paired against itself. Nothing below it can be reported as a cost. noiseFloorBiasMs should be ~0; if it is not, the pairing is not cancelling the drift and the run is void."
+  },
+  "splitMs": {
+    "totalFrameMs": 31.4,
+    "sceneIntoHdrMs": 6.8,
+    "postChainPaired": "12.5 ms (IQR 11.27)",
+    "ungatedPostPaired": "below noise (median 5.02, IQR 8.12)",
+    "note": "sceneIntoHdr is systems + shadow cascades + the scene rasterised into the pipeline HDR target, with the post chain never invoked. ungatedPost is what post still costs with EVERY enabled[] flag false — the prep blit, the 6-level luminance chain, the adaptation blit, DOF, composite and FXAA have no flag at all, so the old \"sceneAndShadows\" number included all six."
+  },
+  "perPassCost": {
+    "bloom": {
+      "verdict": "20.24 ms (IQR 13.48)",
+      "flags": [
+        "bloom"
+      ],
+      "framesPerGroup": 4
+    },
+    "ssao": {
+      "verdict": "below noise (median 1.94, IQR 2.83)",
+      "flags": [
+        "ssao"
+      ],
+      "framesPerGroup": 4
+    },
+    "motionBlurBranch": {
+      "verdict": "below noise (median 0.55, IQR 4.15)",
+      "flags": [
+        "motionBlur"
+      ],
+      "framesPerGroup": 1
+    },
+    "dofAndMotionBlurPass": {
+      "verdict": "below noise (median 0.52, IQR 6.17)",
+      "flags": [
+        "dof",
+        "motionBlur"
+      ],
+      "framesPerGroup": 4
+    },
+    "autoExposureBranch": {
+      "verdict": "below noise (median -0.05, IQR 3.55)",
+      "flags": [
+        "autoExposure"
+      ],
+      "framesPerGroup": 1
+    }
+  },
+  "flagAudit": {
+    "_selfCheck": "two captures of the unchanged build differ by rms 0.116 / max 20 codes; a flag counts as live above rms 0.224.",
+    "ssao": "live — rms 12.957, max 199 codes",
+    "microAO": "live — rms 5.324, max 80 codes",
+    "contactShadows": "live — rms 2.935, max 132 codes",
+    "bloom": "live — rms 2.632, max 55 codes",
+    "taa": "live — rms 5.794, max 146 codes",
+    "fxaa": "live — rms 5.902, max 140 codes",
+    "aerial": "live — rms 2.306, max 94 codes",
+    "dof": "live — rms 1.703, max 63 codes",
+    "motionBlur": "INERT — rms 0.103, max 8 codes",
+    "autoExposure": "live — rms 0.668, max 20 codes"
+  },
+  "gpuTimer": {
+    "available": false,
+    "reason": "result never became available"
+  },
+  "draws": 548,
+  "triangles": 5495909,
+  "programs": 147
+}

@@ -324,6 +324,16 @@ async function main() {
   const loadMs = Date.now() - tLoad;
   await page.evaluate(PIN_SRC);
 
+  // Take the discoverability card out of the photograph.
+  //
+  // index.html's CONTROLS card demotes itself to a title bar after 12 s, and a
+  // shot lands long before that — so it was burned into all seven canonical
+  // frames, covering ~8% of the image including the top-left of the vista.
+  // Every blind A/B against real MGSV frames so far was run with a debug
+  // overlay in shot, which is a handicap the renderer never earned. It is a
+  // harness concern, not a game one: a player still gets the card.
+  await page.evaluate(() => document.getElementById('controls-card')?.remove());
+
   if (opts.mode === 'eval') {
     const src = await readFile(path.resolve(opts.probe), 'utf8');
     const result = await page.evaluate(
