@@ -102,12 +102,23 @@ export function buildCollar(o = {}) {
   // With the head lifted 19 mm that turns 40 mm of exposed neck into 74 mm —
   // a 43 px column at the gameplay camera's 579 px/m rather than 23 px, which
   // is the difference between a neck you can see and a neck that is a seam.
+  //
+  // ROUND 9 puts the stand back UP, 1.486 -> 1.508, and reverses rounds 5 and 6.
+  // Those two rounds were solving "you cannot see a neck at all"; this one is
+  // solving what they produced, which the reviewer called the worst single
+  // element on the character: a 74 mm column of BARE SKIN, at near-constant
+  // diameter, standing against olive cloth. Skin at 0.364/0.218/0.135 next to a
+  // jacket at 0.239/0.220/0.120 is the highest-contrast edge anywhere on the
+  // upper body, so it is where the eye lands first — and what it finds there is
+  // the least modelled part of the figure. In every reference frame Snake's neck
+  // is mostly hidden by collar and trapezius mass; see `buildNeckGaiter` for the
+  // other half of the fix.
   parts.push({
     surface: loftKeys(
       [
         { p: V(0, 1.446, -0.006), rx: 0.114 * bulk, rz: 0.094 * bulk, n: 2.8, back: 1.04, zone: Z.COLLAR },
-        { p: V(0, 1.468, -0.005), rx: 0.092, rz: 0.081, n: 2.6, back: 1.06, zone: Z.COLLAR },
-        { p: V(0, 1.486, -0.004), rx: 0.077, rz: 0.072, n: 2.5, back: 1.09, zone: Z.COLLAR },
+        { p: V(0, 1.472, -0.005), rx: 0.096, rz: 0.084, n: 2.6, back: 1.06, zone: Z.COLLAR },
+        { p: V(0, 1.508, -0.004), rx: 0.079, rz: 0.074, n: 2.5, back: 1.09, zone: Z.COLLAR },
       ],
       8,
       { radial: 22, capStart: true, capEnd: true },
@@ -121,10 +132,10 @@ export function buildCollar(o = {}) {
   parts.push({
     surface: loftKeys(
       [
-        { p: V(0, 1.485, -0.004), rx: 0.079, rz: 0.074, n: 2.5, back: 1.10, zone: Z.COLLAR },
-        { p: V(0, 1.477, -0.004), rx: 0.103, rz: 0.087, n: 2.7, back: 1.16, zone: Z.COLLAR },
-        { p: V(0, 1.462, -0.005), rx: 0.126, rz: 0.099, n: 2.9, back: 1.22, zone: Z.COLLAR },
-        { p: V(0, 1.446, -0.006), rx: 0.136, rz: 0.104, n: 3.0, back: 1.24, zone: Z.COLLAR },
+        { p: V(0, 1.507, -0.004), rx: 0.081, rz: 0.076, n: 2.5, back: 1.10, zone: Z.COLLAR },
+        { p: V(0, 1.497, -0.004), rx: 0.105, rz: 0.089, n: 2.7, back: 1.16, zone: Z.COLLAR },
+        { p: V(0, 1.476, -0.005), rx: 0.128, rz: 0.101, n: 2.9, back: 1.22, zone: Z.COLLAR },
+        { p: V(0, 1.452, -0.006), rx: 0.138, rz: 0.106, n: 3.0, back: 1.24, zone: Z.COLLAR },
       ],
       10,
       { radial: 22, capStart: false, capEnd: true },
@@ -132,6 +143,43 @@ export function buildCollar(o = {}) {
     mat: 'cloth',
   });
   return parts;
+}
+
+/**
+ * The undershirt's neck, standing inside the jacket collar.
+ *
+ * ROUND 9. The collar above can only be raised so far before the head sits
+ * straight on the shoulders again — that is the failure round 5 was fixing. What
+ * closes the rest of the gap is that the 70 mm above the collar should not be
+ * SKIN. Every reference frame has a dark layer there: mgi-3 shows a near-black
+ * band at Snake's throat between the jaw and the jacket, which is the undershirt
+ * a soldier in the field always has on under his fatigues.
+ *
+ * Being Z.SHIRT it renders at 0.161/0.148/0.081 against a 0.239 jacket — a 1.5x
+ * step, where bare skin against the same jacket is a 3.0x step in red at the
+ * opposite hue. So the junction still reads as three layers (jacket, shirt,
+ * neck) and gains a cut edge and a contact shadow, but it stops being the
+ * loudest thing on the upper body. What is left above it is 40-50 mm of neck
+ * under the jaw, which is what a neck looks like on a man wearing webbing.
+ *
+ * Six millimetres proud of the neck loft at every station INCLUDING the 7.5%
+ * the sternocleidomastoid modulation adds, or the cords poke through the cloth.
+ */
+export function buildNeckGaiter() {
+  return loftKeys(
+    [
+      { p: V(0, 1.438, -0.005), rx: 0.086, rz: 0.088, n: 2.5, zone: Z.SHIRT },
+      { p: V(0, 1.474, -0.007), rx: 0.072, rz: 0.077, n: 2.5, zone: Z.SHIRT },
+      { p: V(0, 1.512, -0.010), rx: 0.063, rz: 0.069, n: 2.4, zone: Z.SHIRT },
+      { p: V(0, 1.552, -0.013), rx: 0.060, rz: 0.065, n: 2.4, zone: Z.SHIRT },
+      // The last two stations pinch IN toward the neck so the top is a cut edge
+      // lying against skin, not a funnel standing off it.
+      { p: V(0, 1.574, -0.015), rx: 0.0575, rz: 0.0625, n: 2.4, zone: Z.SHIRT },
+      { p: V(0, 1.583, -0.015), rx: 0.0555, rz: 0.0605, n: 2.4, zone: Z.SHIRT },
+    ],
+    11,
+    { radial: 18, capStart: true, capEnd: true },
+  );
 }
 
 /**
@@ -177,8 +225,13 @@ export function buildNeck() {
     // Up under the jaw. The last station widens again: the mastoid process and
     // the base of the skull are wider than the middle of the neck, and without
     // that the head looks pinned on.
-    { p: V(0, 1.596, -0.015), rx: 0.051, rz: 0.059, n: 2.4, zone: SZ.NECK },
-    { p: V(0, 1.632, -0.017), rx: 0.057, rz: 0.065, n: 2.5, zone: SZ.NECK },
+    // ROUND 9 opens that flare out from 12% to 24% over the top 80 mm. With the
+    // gaiter covering everything below 1.583, the exposed column is now ONLY the
+    // part where a real neck is turning into a skull — so the one thing it must
+    // not be is a constant diameter, which is precisely what the reviewer
+    // measured on it.
+    { p: V(0, 1.596, -0.015), rx: 0.053, rz: 0.061, n: 2.4, zone: SZ.NECK },
+    { p: V(0, 1.632, -0.017), rx: 0.062, rz: 0.070, n: 2.5, zone: SZ.NECK },
   ];
   return loftKeys(keys, 14, { radial: 20, capStart: true, capEnd: false });
 }
@@ -566,25 +619,45 @@ export function buildPonytail(o = {}) {
   );
   parts.push({ surface: knot, mat: 'cloth' });
 
-  // The tail: aft and down, tapering to a point. `back` fattens the underside
-  // so the section is a teardrop rather than a rod — hair hangs, it does not
-  // stand off.
+  // The tail.
+  //
+  // ROUND 9 splits it into three strand clusters. Round 8's was ONE loft, and
+  // the reviewer's word for it was exact: "a solid extruded horn". A tied tail
+  // is not a rod — it is two or three ropes of hair that separate as they fall,
+  // cross each other, and end at different lengths. The reason that matters more
+  // than it sounds is the SILHOUETTE: one rod contributes one smooth outline and
+  // no interior event at all, while three overlapping clusters give a notched
+  // outline, two internal occlusion edges and a self-shadow, which is the only
+  // detail on the tail that survives past about 10 m.
+  //
+  // Cost is 3 x 9 stations x 9 radial against 1 x 11 x 12, i.e. +110 triangles
+  // on a 44 000-triangle character, and only on the two loadouts that wear one.
   const len = o.length ?? 1;
-  parts.push({
-    surface: loftKeys(
-      [
-        { p: V(0, 1.700, 0.112), rx: 0.028, rz: 0.026, n: 2.4, zone: Z.HAIR },
-        { p: V(0, 1.694, 0.132), rx: 0.021, rz: 0.020, n: 2.4, zone: Z.HAIR },
-        { p: V(0, 1.684, 0.152 * len + 0.004), rx: 0.024, rz: 0.023, n: 2.3, back: 1.1, zone: Z.HAIR },
-        { p: V(0, 1.664, 0.176 * len + 0.004), rx: 0.024, rz: 0.022, n: 2.3, back: 1.12, zone: Z.HAIR },
-        { p: V(0, 1.638, 0.192 * len + 0.004), rx: 0.019, rz: 0.017, n: 2.3, back: 1.1, zone: Z.HAIR },
-        { p: V(0, 1.612, 0.198 * len + 0.004), rx: 0.010, rz: 0.009, n: 2.3, zone: Z.HAIR },
-      ],
-      11,
-      { radial: 12, capStart: true, capEnd: true },
-    ),
-    mat: 'cloth',
-  });
+  const strands = [
+    { dx: 0.000, spread: 1.00, drop: 1.00, r: 1.00, phase: 0.0 },
+    { dx: -0.014, spread: 0.88, drop: 1.16, r: 0.82, phase: 1.7 },
+    { dx: 0.013, spread: 0.93, drop: 0.86, r: 0.74, phase: 3.3 },
+  ];
+  for (const s of strands) {
+    // A hanging rope of hair swings; sampling a sine along its length gives each
+    // cluster its own gentle curve so they cross rather than run parallel.
+    const sway = (t) => Math.sin(s.phase + t * 2.1) * 0.006;
+    parts.push({
+      surface: loftKeys(
+        [
+          { p: V(s.dx * 0.4, 1.700, 0.112), rx: 0.026 * s.r, rz: 0.024 * s.r, n: 2.4, zone: Z.HAIR },
+          { p: V(s.dx * 0.7 + sway(0.2), 1.694, 0.132), rx: 0.020 * s.r, rz: 0.019 * s.r, n: 2.4, zone: Z.HAIR },
+          { p: V(s.dx + sway(0.4), 1.686 - 0.006 * s.drop, (0.150 * len + 0.004) * s.spread + 0.006), rx: 0.023 * s.r, rz: 0.022 * s.r, n: 2.3, back: 1.1, zone: Z.HAIR },
+          { p: V(s.dx * 1.15 + sway(0.7), 1.668 - 0.016 * s.drop, (0.174 * len + 0.004) * s.spread + 0.008), rx: 0.023 * s.r, rz: 0.021 * s.r, n: 2.3, back: 1.12, zone: Z.HAIR },
+          { p: V(s.dx * 1.25 + sway(1.0), 1.644 - 0.026 * s.drop, (0.190 * len + 0.004) * s.spread + 0.009), rx: 0.018 * s.r, rz: 0.016 * s.r, n: 2.3, back: 1.1, zone: Z.HAIR },
+          { p: V(s.dx * 1.3 + sway(1.2), 1.620 - 0.034 * s.drop, (0.196 * len + 0.004) * s.spread + 0.009), rx: 0.008 * s.r, rz: 0.007 * s.r, n: 2.3, zone: Z.HAIR },
+        ],
+        9,
+        { radial: 9, capStart: true, capEnd: true },
+      ),
+      mat: 'cloth',
+    });
+  }
 
   // The tie: a 10 mm band at the root of the tail. One dark ring across a
   // lighter mass is what tells a viewer at any distance that this is BOUND

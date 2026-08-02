@@ -94,6 +94,7 @@ const LOADOUTS = {
     // camera actually frames and the half that had none.
     ponytail: true,
     slung: true,
+    camo: 'tiger',
   },
   // Three enemy variants. Different headgear, sleeves, load and build so a
   // patrol does not read as a row of clones.
@@ -107,6 +108,7 @@ const LOADOUTS = {
     holster: false,
     kneepads: true,
     beltPouches: [-0.12, 0.1],
+    camo: 'duck',
   },
   scout: {
     name: 'scout',
@@ -120,6 +122,7 @@ const LOADOUTS = {
     grenades: false,
     optic: false,
     beltPouches: [-0.1],
+    camo: 'arid',
   },
   officer: {
     name: 'officer',
@@ -132,6 +135,7 @@ const LOADOUTS = {
     kneepads: true,
     beltPouches: [0.12],
     head: { jawWidth: 0.92 },
+    camo: 'plain',
   },
   /**
    * The garrison commander — a GAMEPLAY-LEGIBILITY variant, sized to be told
@@ -192,7 +196,17 @@ const LOADOUTS = {
       13: [0.092, 0.088, 0.048], // COLLAR
       15: [0.209, 0.201, 0.110], // CAP — the shoulder boards share this zone
       3: [0.085, 0.082, 0.045], // VEST
+      // ROUND 9 — the brassard on both upper arms (see buildCommandCoat).
+      // Snake's bandana shares this zone at a faded oxide 0.163/0.072/0.056;
+      // the commander's is deeper and 40% more saturated, so the two saturated
+      // objects in the game are never mistaken for each other. In a frame whose
+      // entire grade lives in one khaki octant this is the only chromatic event
+      // there is, and chroma is the last thing a 40 px figure loses.
+      11: [0.208, 0.048, 0.034], // BANDANA — rank brassard
     },
+    // No print. The dark olive IS his marking, and a pattern would break the
+    // 1.25-stop flat value step the legibility argument above rests on.
+    camo: 'plain',
   },
 };
 
@@ -220,16 +234,56 @@ const SKIN_TONES = [
   [0.413, 0.248, 0.153],
 ];
 
+/**
+ * ROUND 9 — the cast's camouflage patterns.
+ *
+ * "THE CAST SHARES ONE PALETTE, so all shape variation dies past 15 m." Height
+ * and headgear variation, which is what round 8 added, are both SHAPE cues, and
+ * shape is the first thing a 40 px figure loses. What survives to 40 px is
+ * value and pattern period, so this is where the anti-clone budget belongs.
+ *
+ * Tints multiply the zone colour (see makeClothMaterial), so each of these
+ * reads as a different ISSUE of the same uniform rather than a different army —
+ * the value ladder inside a soldier is identical, only the print changes.
+ *
+ *   tiger  — Snake. Narrow, vertically-drawn strokes; the widest light/dark
+ *            step in the set, because he is the figure at 700 px.
+ *   duck   — the garrison's standard: broad, near-isotropic three-colour blotch.
+ *   arid   — a paler, lower-contrast issue with a longer period, so a mixed
+ *            patrol has one man who reads light and one who reads dark.
+ *   plain  — no print at all. Solid olive drab is a real issue and it is also
+ *            the cheapest way to make one figure in a group read as flat.
+ */
+/**
+ * Frequencies are MEASURED, not guessed: each was swept offline against the
+ * mean width of a dark blob (threshold crossings per metre of bind space) until
+ * it landed on the period the reference actually shows. 18 gives 14.8 cm across
+ * and 33.7 cm along; 13 gives 21 x 26; 10 gives 27 x 33.
+ */
+const CAMO = {
+  tiger: { camo: 1.0, camoFreq: 18.0, camoAniso: 0.45, camoDark: [0.30, 0.285, 0.275], camoPale: [1.64, 1.58, 1.72] },
+  duck: { camo: 0.92, camoFreq: 13.0, camoAniso: 0.62, camoDark: [0.38, 0.38, 0.34], camoPale: [1.46, 1.42, 1.52] },
+  arid: { camo: 0.85, camoFreq: 10.0, camoAniso: 0.72, camoDark: [0.50, 0.48, 0.42], camoPale: [1.62, 1.56, 1.58] },
+  plain: { camo: 0.0 },
+};
+
 /** Per-instance uniform variation: different dye lot, dust load and skin. */
 function instanceMaterials(rand, opts = {}) {
   const seed = rand() * 100;
   const tone = SKIN_TONES[Math.floor(rand() * SKIN_TONES.length)];
   const warm = 0.9 + rand() * 0.25;
+  const camo = CAMO[opts.camo ?? 'duck'] ?? CAMO.duck;
   return {
     cloth: {
       seed,
       dust: opts.dust ?? 0.35 + rand() * 0.55,
       palette: opts.palette,
+      ...camo,
+      // A pattern is printed on a roll of cloth and then cut, so two men in the
+      // same issue still have it landing in different places. Perturbing the
+      // frequency 8% per instance costs nothing and stops a squad reading as
+      // one mesh drawn eleven times.
+      camoFreq: (camo.camoFreq ?? 7.0) * (0.94 + rand() * 0.14),
     },
     skin: {
       seed: seed * 1.7,
@@ -387,6 +441,7 @@ export async function install(world) {
       materials: instanceMaterials(rand, {
         palette: lo.palette,
         dust: lo.dust,
+        camo: lo.camo,
         ...opts,
       }),
     });

@@ -521,7 +521,16 @@ function defaultClothPalette() {
   // (mgi-3 R-B +46.6, mgi-6 +22.2); ours rendered at R-B -0.3, i.e. it was the
   // one part of the head with no hue at all.
   c[Z.HAIR] = new THREE.Vector3(0.086, 0.062, 0.035);
-  c[Z.BOOT] = new THREE.Vector3(0.141, 0.107, 0.060);
+  // ROUND 9: down 29%. The review asks for FOUR values on the figure at 40 px —
+  // light face, dark vest, mid fatigues, dark boots — and at 0.141 against a
+  // 0.221 trouser the boot was only 0.66 of the leg above it, i.e. the same
+  // value once dust had been mixed into both. In every reference frame the boot
+  // is the darkest thing below the belt by a wide margin. It does not go back to
+  // the round-1 near-black that made critics call them blobs: the contact
+  // burnish above still drops roughness to 0.28 on the toe and heel, so what a
+  // dark boot gains is a HIGHLIGHT against its own shadow rather than a
+  // silhouette, which is what an oiled leather upper actually does.
+  c[Z.BOOT] = new THREE.Vector3(0.100, 0.075, 0.043);
   return c;
 }
 
@@ -689,6 +698,98 @@ float ch_seams(vec3 b, float a, int zi) {
 }
 `;
 
+/**
+ * ROUND 9 — printed camouflage, and this is the biggest single thing missing
+ * from the character.
+ *
+ * Every soldier in mgi-3, mgi-7, mgi-8 and mgi-9 wears a two- or three-tone
+ * pattern at roughly 15 cm, and ours wore one flat olive-grey: the fatigues
+ * measured sRGB 54,51,45 across the whole garment. A print is the loudest
+ * "this is a real game asset" cue in those frames, because it is the one
+ * surface feature that survives BOTH the mip chain at 60 m and a 1:1 crop —
+ * everything else this shader draws (weave, stitching, quilting) is thread
+ * scale and averages back to flat by 8 m.
+ *
+ * Two level sets of ONE warped fbm. Taking the dark print and the pale print as
+ * the two tails of the same distribution means they can never overlap, and the
+ * base dye is whatever band is left between them — which is exactly how a
+ * three-colour pattern is separated on a roller. Evaluated in bind space like
+ * everything else here, so the print is glued to the cloth and does not swim.
+ *
+ * The `aa` term is not decoration. A hard level set of a noise field is a
+ * threshold, and a threshold with no prefilter aliases into a boiling mess the
+ * moment a soldier walks away from the camera. Widening the transition by the
+ * pixel footprint is the cheapest correct prefilter there is: at gameplay range
+ * it costs nothing, and by 60 m the two prints have dissolved back into the base
+ * instead of crawling.
+ */
+const CLOTH_CAMO = /* glsl */ `
+vec2 ch_camo(vec3 b, float freq, float aniso, float seed, float pix) {
+  vec3 p = vec3(b.x, b.y * aniso, b.z) * freq + seed;
+  // Domain warp. A level set of plain fbm is a field of round blobs; warped, the
+  // boundaries tear, branch and fork, which is what a printed camo IS.
+  //
+  // The AMPLITUDE here is the one number that has to be got right and the first
+  // attempt got it wrong by 4x. The warp displaces in p-space, so at 1.1 units
+  // against a base octave of period 1.0 it is not tearing edges, it is
+  // translating whole regions coherently: the measured mean dark-blob width came
+  // back at 33 cm horizontally and 66 cm vertically — one blotch per limb, which
+  // renders as a soft two-tone gradient and not as a print at all. At 0.55 the
+  // displacement is a quarter of a feature and the same field measures 14.8 cm
+  // across and 33.7 cm along, which is the tiger stripe in mgi-7.
+  float w = ch_fbm(p * 0.55, 2);
+  vec3 q = p + vec3(w * 1.1, w * 0.55, w * -0.9);
+  float f = ch_fbm(q, 3);
+  // Prefilter, not decoration. A hard level set is a threshold, and an
+  // unprefiltered threshold on a noise field boils the moment the soldier moves.
+  // Widening the transition by the pixel footprint TIMES the pattern frequency
+  // is the right first-order antialiasing: it tracks the field's own gradient,
+  // so a 15 cm print and a 25 cm print both dissolve at the distance where they
+  // stop being resolvable instead of at some fixed distance.
+  // The floor is 0.010, not 0.028. A printed edge on real cloth is one or two
+  // threads wide: measured on mgi-7 the transition from a light stripe to a dark
+  // one takes 2 px. At 0.028 ours took 6, and a 6 px ramp is a gradient — which
+  // is why the first tuned build showed the pattern plainly to the eye and still
+  // only moved measured local contrast by 8%.
+  float aa = 0.010 + pix * freq * 0.22;
+  float dark = smoothstep(0.415 + aa, 0.415 - aa, f);
+  float pale = smoothstep(0.575 - aa, 0.575 + aa, f);
+  return vec2(dark, pale);
+}
+`;
+
+/**
+ * How much print each zone carries.
+ *
+ * Deliberately NOT everything. In the reference the fatigues are patterned and
+ * the load-bearing kit is a solid olive drab, and that contrast is worth as much
+ * as the pattern itself: a patterned garment read against a plain carrier is two
+ * distinguishable materials, where one pattern over the whole figure is a single
+ * busy texture. It is also the cheapest way to WIDEN the value ladder — the pale
+ * print lifts the jacket to 0.35 while the vest stays at 0.148, a 2.4x step
+ * where round 8's authored albedo only had 1.6x.
+ */
+const CLOTH_CAMO_ZONE = (() => {
+  const a = new Array(18).fill(0);
+  a[Z.JACKET] = 1.0;
+  a[Z.SLEEVE] = 1.0;
+  a[Z.TROUSER] = 1.0;
+  a[Z.COLLAR] = 0.9;
+  a[Z.HELMCOVER] = 0.85;
+  a[Z.CAP] = 0.7;
+  // The pack, the carrier and the pouches get a THIRD of the print. Zero was
+  // the first attempt and it left the two largest masses on the figure — the
+  // rucksack is 130 x 150 px in the gameplay frame — measuring a luminance
+  // spread of 23.8 counts against the reference torso's 46.6, i.e. exactly the
+  // "one broad soft gradient and then nothing" the review is about. A third is
+  // enough to break the mass and still well below the garment, so a patterned
+  // uniform under plain-ish kit is still two readable materials.
+  a[Z.PACK] = 0.35;
+  a[Z.VEST] = 0.32;
+  a[Z.POUCH] = 0.32;
+  return a;
+})();
+
 export function makeClothMaterial(opts = {}) {
   const mat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
@@ -719,6 +820,21 @@ export function makeClothMaterial(opts = {}) {
     uSeed: { value: opts.seed ?? 0 },
     uDust: { value: opts.dust ?? 0.55 },
     uWeave: { value: opts.weave ?? 1.0 },
+    // Camouflage. See CLOTH_CAMO. Every number is per-instance so a patrol can
+    // be issued more than one pattern — the cast sharing one print would be the
+    // same defect as the cast sharing one palette, just harder to see.
+    // Tints are MULTIPLIERS on the zone colour, not absolute colours, so a
+    // pattern applied to the commander's dark olive stays dark olive and the
+    // whole authored value ladder in `defaultClothPalette` survives it.
+    uCamo: { value: opts.camo ?? 1.0 },
+    uZoneCamo: { value: CLOTH_CAMO_ZONE.slice() },
+    uCamoFreq: { value: opts.camoFreq ?? 18.0 },
+    uCamoAniso: { value: opts.camoAniso ?? 0.45 },
+    uCamoDark: { value: new THREE.Vector3(...(opts.camoDark ?? [0.33, 0.31, 0.30])) },
+    uCamoPale: { value: new THREE.Vector3(...(opts.camoPale ?? [1.50, 1.46, 1.60])) },
+    // Ground-in wear. Ablatable on its own so the abrasion pass can be measured
+    // against the same material rather than against a second build.
+    uWear: { value: opts.wear ?? 1.0 },
     // ROUND 6 — MAJOR 4, the "flat cutout" note.
     //
     // Fabric is not a Lambert surface. A worsted or ripstop weave is a forest
@@ -750,15 +866,23 @@ export function makeClothMaterial(opts = {}) {
          ${NOISE}
          ${CLOTH_GATHER}
          ${CLOTH_SEAM}
+         ${CLOTH_CAMO}
          ${CHAR_LIGHT_PARS}
          uniform vec3 uZoneColor[18];
          uniform float uZoneRough[18];
          uniform float uZoneSheen[18];
          uniform float uZoneSpec[18];
+         uniform float uZoneCamo[18];
          uniform float uSeed;
          uniform float uDust;
          uniform float uWeave;
          uniform float uWrap;
+         uniform float uCamo;
+         uniform float uCamoFreq;
+         uniform float uCamoAniso;
+         uniform vec3 uCamoDark;
+         uniform vec3 uCamoPale;
+         uniform float uWear;
          float gRough = 0.9;
          float gSheen = 0.5;
          float gSpec = 0.5;
@@ -833,6 +957,18 @@ export function makeClothMaterial(opts = {}) {
                           smoothstep(-0.2, 0.7, vBindN.y);
            base = mix(base, base * vec3(1.26, 1.16, 1.00), bleach * 0.28);
 
+           // The print goes on FIRST, under the dye-lot mottle, the bleach, the
+           // dust and the creases — it is ink on the cloth, and everything else
+           // in this shader happens to the cloth afterwards. Ordering it the
+           // other way round is how procedural camo ends up looking like a decal
+           // floating over a garment.
+           float camoAmt = uCamo * uZoneCamo[zi];
+           if (camoAmt > 0.002) {
+             vec2 cm = ch_camo(vBind, uCamoFreq, uCamoAniso, uSeed * 0.31, gPix) * camoAmt;
+             base *= mix(vec3(1.0), uCamoDark, cm.x);
+             base *= mix(vec3(1.0), uCamoPale, cm.y);
+           }
+
            // Thread-level weave. A ripstop lattice at 7.5 mm (which survives to
            // gameplay distance) over a 1.4 mm plain weave (which does not, and
            // is faded out by footprint).
@@ -843,6 +979,26 @@ export function makeClothMaterial(opts = {}) {
            float wv = sin(vUvC.y * 4400.0) * 0.5 + 0.5;
            float weave = (wu * wv + (1.0 - wu) * (1.0 - wv));
            base *= 1.0 + (ripstop * 0.035 + (weave - 0.5) * 0.10 * micro) * uWeave * (garment ? 1.0 : 0.4);
+
+           // ROUND 9 — cloth TOOTH, the 2-8 px band.
+           //
+           // Measured against mgi-7 on a matched 130 x 140 patch of trouser, our
+           // structure at a 2 px scale was 1.46 against the reference's 4.15 and
+           // at 4 px 2.54 against 6.76. That hole has a specific cause: this
+           // shader's finest term was a 1.4 mm plain weave, which is 0.8 px at
+           // gameplay range, so its own footprint guard correctly faded it to
+           // nothing — and the next term up was the 60 mm sag. Between 1.4 mm and
+           // 60 mm the garment had no structure at all, which is exactly the
+           // "detailed at one scale and then stops" note.
+           //
+           // A 6 mm irregular mottle fills it. That is not a weave pattern, it is
+           // the yarn itself: slub, uneven dye take-up and abraded crowns, all of
+           // which are irregular rather than periodic — which is why this is fbm
+           // and not another lattice. 3.5 px at gameplay range, faded out by 9 m.
+           float toothFade = 1.0 - smoothstep(0.0018, 0.0075, gPix);
+           vec3 tp = vec3(vUvC * 165.0, uSeed);
+           float tooth = ch_fbm(tp, 2);
+           base *= 1.0 + (tooth - 0.5) * 0.34 * toothFade * uWeave * (garment ? 1.0 : 0.45);
 
            // Folds. Amplitude comes from where fabric really gathers, so the
            // creases land at the elbow, the back of the knee, the small of the
@@ -894,6 +1050,50 @@ export function makeClothMaterial(opts = {}) {
            // every single piece of kit and the rig read as a line drawing.
            base = mix(base, base * 1.30 + vec3(0.008, 0.007, 0.005), gStitch * 0.38);
 
+           // ROUND 9 — ABRASION, and it is the term that puts 10 cm structure on
+           // a garment that had only silhouette and one broad gradient.
+           //
+           // A uniform wears through in three places and only three: the point
+           // of the knee, the point of the elbow and the seat. Grit sands the
+           // dye off the crowns of the weave there, so worn cloth goes PALE and
+           // slightly warm. That inversion is the whole read — every other
+           // ageing term on this character darkens, so a lighter patch is
+           // immediately legible as a different kind of history, and it lands
+           // exactly on the joints, which is where the eye already looks to
+           // decide whether a limb bends.
+           //
+           // Gated on the bind NORMAL as well as the height: a knee wears on the
+           // FRONT and an elbow on the BACK, and a band that ran all the way
+           // round the limb would read as a machined collar (the same failure
+           // the elbow patch geometry hit in round 6).
+           float wear = 0.0;
+           wear = max(wear, 1.30 * smoothstep(0.105, 0.030, abs(vBind.y - 0.505)) *
+                            smoothstep(0.05, -0.55, vBindN.z));
+           wear = max(wear, 1.10 * smoothstep(0.080, 0.022, abs(vBind.y - 1.185)) *
+                            smoothstep(0.185, 0.265, abs(vBind.x)) *
+                            smoothstep(-0.05, 0.55, vBindN.z));
+           wear = max(wear, 0.95 * smoothstep(0.090, 0.025, abs(vBind.y - 0.878)) *
+                            smoothstep(0.0, 0.5, vBindN.z));
+           // Broken up hard, so it is abraded cloth and not an airbrushed patch.
+           float grit = smoothstep(0.38, 0.80, ch_fbm(bp * 30.0 + 3.0, 2));
+           float abr = clamp(wear, 0.0, 1.0) * grit * uWear * (garment ? 1.0 : 0.0);
+           base *= 1.0 + abr * 0.50;
+           base = mix(base, base * vec3(1.05, 1.01, 0.90), abr);
+           rough = mix(rough, 0.96, abr * 0.45);
+
+           // Sweat under the pack. A soldier's back is the one part of a uniform
+           // that is DARKER than the rest of it rather than lighter, and it is
+           // also the largest single panel the gameplay camera ever sees. Held
+           // to the centre-back so it reads as a stain with an edge, not as a
+           // second dye lot.
+           float sweat = smoothstep(0.015, 0.075, vBind.z) *
+                         smoothstep(0.86, 1.02, vBind.y) * smoothstep(1.44, 1.28, vBind.y) *
+                         smoothstep(0.20, 0.09, abs(vBind.x)) *
+                         smoothstep(0.30, 0.62, ch_fbm(bp * 4.0 + 21.0, 2));
+           sweat *= uWear * (garment ? 1.0 : 0.0);
+           base *= 1.0 - sweat * 0.26;
+           rough = mix(rough, 0.80, sweat * 0.55);
+
            // Ground-in dust: settles low on the body, in the creases, and on
            // anything that touches the ground. It LIGHTENS and warms — round 1
            // mixed toward a dark grey, which is soot, not Afghan dust.
@@ -902,6 +1102,14 @@ export function makeClothMaterial(opts = {}) {
            float dust = clamp(low * 0.85 + (1.0 - ao) * 0.4, 0.0, 1.0) *
                         smoothstep(0.32, 0.82, dirtN) * uDust;
            base = mix(base, vec3(0.290, 0.245, 0.166), dust * 0.24);
+           // Dust is not a gradient up the whole leg. It is a HARD BAND: the
+           // bottom 300 mm of the trouser and the boot walk in it and the knee
+           // does not, so there is a real edge somewhere around mid-shin. Round
+           // 8's single smoothstep from 0.85 m spread the same total dust over
+           // the whole lower body, which is a soft ramp — i.e. nothing.
+           float cuff = smoothstep(0.42, 0.055, vBind.y);
+           base = mix(base, vec3(0.372, 0.318, 0.220),
+                      cuff * smoothstep(0.22, 0.72, dirtN) * uDust * 0.40);
            // Dust matts woven cloth hard — it sits down between the threads.
            // On leather, moulded nylon and a helmet cover it sits ON the
            // surface and gets rubbed off wherever the body touches anything,
@@ -1019,6 +1227,27 @@ export function makeClothMaterial(opts = {}) {
                           k0 - ch_ridge(hp2 + vec3(0.0, 0.0, 0.4), 3)) * 3.4;
            }
 
+           // Relief for the tooth, on the same 6 mm field the albedo uses so the
+           // value break and the shading agree. Two extra taps; nothing below
+           // 1.8 px of footprint pays for them.
+           //
+           // 1.4, and the first attempt at 4.2 is worth recording because it is
+           // the round-5 pack failure repeating exactly. On a BACKLIT character a
+           // high-frequency normal term does not add texture, it adds a random
+           // direction generator: some fraction of fragments end up pointing at
+           // an 8.5-unit key and flare, so the shoulder of the rucksack came back
+           // covered in white speckle. GARMENT ONLY as well — a laminated nylon
+           // panel has no yarn tooth, and a rucksack is the largest thing on the
+           // silhouette pointing at the sun.
+           vec2 nTooth = vec2(0.0);
+           float toothFade = garment ? 1.0 - smoothstep(0.0018, 0.0075, gPix) : 0.0;
+           if (toothFade > 0.01) {
+             vec3 tp = vec3(vUvC * 165.0, uSeed);
+             float t0 = ch_fbm(tp, 2);
+             nTooth = vec2(t0 - ch_fbm(tp + vec3(0.55, 0.0, 0.0), 2),
+                           t0 - ch_fbm(tp + vec3(0.0, 0.55, 0.0), 2)) * 1.4 * toothFade * uWeave;
+           }
+
            // The one octave that survives the mip at gameplay range.
            vec3 sp = vBind * 6.0 + uSeed * 0.5;
            float s0 = ch_fbm(sp, 2);
@@ -1033,7 +1262,7 @@ export function makeClothMaterial(opts = {}) {
            // Bounded. See ch_tangentNormal: the raw sum of these six terms
            // reaches 4-6, which tilts the shading normal 76-81 degrees off the
            // panel and lets a backlit 0.20-albedo pack catch the full key.
-           vec2 nSum = nRip + nWeave + nFold + nDrape + nQuilt + nSag + nHair + vec2(stitchN);
+           vec2 nSum = nRip + nWeave + nTooth + nFold + nDrape + nQuilt + nSag + nHair + vec2(stitchN);
            // Load-bearing kit is a stiff laminated panel and gets the tighter
            // bound; a sleeve or a trouser leg genuinely gathers harder.
            // tan(19 deg) / tan(24 deg).

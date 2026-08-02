@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { Surface, loftKeys, displacedSphere, roundedBox, strap, tube } from './geometry.js';
 import { Z, MZ } from './materials.js';
-import { headSurface, HEAD_CENTRE } from './body.js';
+import { headSurface, HEAD_CENTRE, armPoint } from './body.js';
 
 /**
  * Kit.
@@ -1083,6 +1083,42 @@ export function buildCommandCoat() {
     for (const b of buckle(V(sgn * 0.104, 1.470, -0.036), { w: 0.016, h: 0.012 })) {
       parts.push({ ...b, group: 'rigidChest' });
     }
+  }
+
+  // ROUND 9 — a POSITIVE rank marking.
+  //
+  // Everything above distinguishes the commander by ABSENCE (no helmet, no
+  // carrier) or by shape, and the review is right that neither survives a moving
+  // frame: absence is not something the eye can look FOR, and shape is the first
+  // thing 40 px destroys. What survives is chroma. This whole game is graded to
+  // be desaturated — every soldier, every wall and the ground itself sit inside
+  // one khaki hue octant — so a single genuinely saturated object is the one
+  // thing in the frame that cannot be confused with anything else.
+  //
+  // A brassard, on the OUTBOARD face of both upper arms, 90 mm deep. It is
+  // Z.BANDANA because that is the only saturated zone in the palette and the
+  // commander does not wear a bandana; his loadout re-tints it to a deeper
+  // scarlet than Snake's faded oxide, so the two never read as the same marking.
+  // Between the bicep pocket (t 0.16-0.31) and the elbow patch (t 0.445-0.555),
+  // where the sleeve is 0.052 across — so the band stands 4 mm proud and reads
+  // as a wrapped strip of cloth rather than as a collar clamped round the limb.
+  for (const sgn of [-1, 1]) {
+    const a = armPoint(0.325);
+    const b = armPoint(0.435);
+    parts.push({
+      surface: loftKeys(
+        [
+          { p: V(sgn * a.x, a.y, a.z), rx: 0.0525, rz: 0.0565, n: 4.2, zone: Z.BANDANA },
+          { p: V(sgn * a.x, a.y - 0.003, a.z), rx: 0.0555, rz: 0.0595, n: 4.4, zone: Z.BANDANA },
+          { p: V(sgn * b.x, b.y + 0.003, b.z), rx: 0.0545, rz: 0.0585, n: 4.4, zone: Z.BANDANA },
+          { p: V(sgn * b.x, b.y, b.z), rx: 0.0515, rz: 0.0555, n: 4.2, zone: Z.BANDANA },
+        ],
+        7,
+        { radial: 14, capStart: true, capEnd: true },
+      ),
+      mat: 'cloth',
+      group: sgn > 0 ? 'armR' : 'armL',
+    });
   }
   return parts;
 }
