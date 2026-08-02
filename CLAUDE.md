@@ -58,6 +58,31 @@ Each invocation costs roughly 2 s to bundle plus 4.5 s to build the world, then
 about 0.6 s per shot. **Ask for every shot you want in one command.** Seven
 separate invocations cost seven world builds.
 
+## The render daemon: one, from main, in a herdr pane
+
+There is ONE daemon. It runs from the MAIN tree, in its own herdr pane, where it
+is visible and somebody owns it:
+
+```bash
+node tools/shotd.mjs --idle 600
+```
+
+**Clients never start it.** They connect or they tell you to. That rule exists
+because silent spawning destroyed the previous daemon: whichever checkout ran a
+client first became the daemon's CODE, six of seven worktrees carried stale
+copies, and a concurrency fix, a cap fix and an entire metrics layer were
+silently not running for hours while the logs looked healthy. It was found by
+printing the daemon's own argv.
+
+So the daemon publishes the hash of its own source, and a client whose tree
+differs is refused with a diagnosis rather than served stale behaviour.
+
+It exits after 10 minutes idle, so leaving it running costs nothing. It evicts
+resident worlds on MEASURED memory (`--mem`, default 6 GB) rather than a guessed
+world count — guessing went 3 (continuous eviction, 138 rebuilds in a session),
+then 10 (10.5 GB), then 5, all blind. A world is ~1.7 GB once GPU resources
+count, which its 0.15 GB JS heap does not show.
+
 ## The machine is SHARED. Never blanket-kill.
 
 Several authors run against this machine at once. `pkill -f chrome-headless-shell`,
