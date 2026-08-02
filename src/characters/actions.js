@@ -58,7 +58,15 @@ const V = (x, y, z) => new THREE.Vector3(x, y, z);
  * reload started. Every path below begins and ends here so the override ramps
  * in and out of the pose the arm solver was already holding.
  */
-const HOME = [0.014, 1.055, -0.386];
+/**
+ * ROUND 11 re-measure: [0.014, 1.055, -0.386] -> [0.065, 1.066, -0.344].
+ * `buildRifle`'s foregrip moved 85 mm back along the handguard (it had the
+ * support arm sitting on the solver's reach clamp, i.e. dead straight, with
+ * the hand 8 mm off the gun), so the settled wrist moved with
+ * it. Re-read the same way: `probes/r11_upper.js` steps the world to idle low
+ * ready and pushes `handL`'s world position back through the character matrix.
+ */
+const HOME = [0.065, 1.066, -0.344];
 
 const PATHS = {
   // Magazine change. The hand leaves the handguard, strips the empty, goes to
@@ -76,6 +84,37 @@ const PATHS = {
     [1.96, 0.23, 1.19, -0.19],   // yank back
     [2.12, 0.21, 1.20, -0.30],   // release
     [2.40, ...HOME],             // back on the handguard
+  ],
+  /**
+   * The silent takedown, which until now borrowed the `cqc` path wholesale.
+   *
+   * They are not the same gesture. `cqc` is a throw: you meet a man who has
+   * seen you, take him across your body and put him on the ground in front of
+   * you, so the support hand's work is all lateral. A takedown is done to a man
+   * who has NOT seen you: the arm goes out and AROUND, forward past his throat,
+   * then everything comes BACK — he is pulled onto your own chest, not swept
+   * across it — and you ride him down between your feet.
+   *
+   * That difference is the whole readability of the move from behind, which is
+   * the only camera it is ever performed on. Borrowing the throw meant the one
+   * beat a viewer needs to see, the arm reaching forward past the target's
+   * head, did not exist: `cqc`'s furthest forward waypoint is -0.86 in z, and
+   * measured from the left shoulder that is 0.71 m against a 0.58 m arm, so the
+   * IK clamped it: the wrist never got there and the reach played as a shrug.
+   *
+   * Every waypoint here is checked against the left shoulder at
+   * (-0.190, 1.452, -0.014) with 0.580 m of reach: 85%, 76%, 63%, 88%, and one
+   * deliberate over-reach at the end, because an arm at full stretch pointing
+   * down IS what setting a body on the deck looks like.
+   */
+  takedown: [
+    [0.00, ...HOME],
+    [0.24, -0.10, 1.41, -0.50],  // out and around, past the throat
+    [0.40, -0.03, 1.35, -0.41],  // clamp, forearm across it
+    [0.66, 0.06, 1.25, -0.19],   // haul him back onto your own chest
+    [0.98, -0.02, 1.03, -0.29],  // his weight goes on your hip; ride him down
+    [1.28, -0.16, 0.76, -0.38],  // set him on the deck
+    [1.60, ...HOME],
   ],
   // CQC: step in, grab, haul the target across and put them down.
   cqc: [
@@ -128,11 +167,47 @@ function samplePath(path, t) {
  *   loco    0 free to move, 1 movement is locked out for the duration.
  *   weapon  how much the action pulls the weapon out of its carry/aim pose.
  */
+/**
+ * THE TAKEDOWN IS NOT WIRED UP, AND THIS IS THE CALL THAT WIRES IT.
+ *
+ * `src/gameplay/Stealth.js` (not this module's file) has `cqc()` and
+ * `cqcChoke()` set `this.action = 'takedown'` and an `actionTimer`, freeze the
+ * player, put the victim down — and never ask the player's own body to do
+ * anything. The victim animates, because `_putDown` calls `playAction('tranq')`
+ * on him. The player stands still with a rifle in his hands while a man folds
+ * up in front of him. `reload()` and `fire()` in the same file get this right;
+ * these two were missed.
+ *
+ * Verified from this side with `probes/r11_upper.js`: `playAction('takedown')`
+ * is accepted, runs 1.617 s measured against 1.60 s authored (one frame of
+ * overshoot, which is just the last `t >= dur` step), drives the support wrist
+ * 0.55 m off the weapon along the CQC path, lunges the rig 0.34 m forward
+ * without moving the actor's logical position, and puts 0.30 rad of twist
+ * through the spine. The receiving end works. Nothing calls it.
+ *
+ * What gameplay must add, in Stealth.js:
+ *
+ *   cqc()        this.player.playAction('takedown', { duration: this.actionTimer })
+ *   cqcChoke()   this.player.playAction('takedown', { duration: this.actionTimer })
+ *
+ * `duration` and not the bare name, because `ACTIONS.takedown.dur` is 1.60 s
+ * and those two methods freeze the player for 0.75 / 1.05 / 0.90 s. Left
+ * alone, the clip would still be hauling a body across the chest for most of a
+ * second after the player had control back. `play()` already takes
+ * `opts.duration` and `_path` rescales the authored waypoints by
+ * `dur / authoredDur`, so any of those three lengths plays the whole gesture,
+ * just faster — exactly what `reload()` already does with `WEAPON.reloadTime`.
+ *
+ * The alternative is to make the freeze match the clip (`actionTimer = 1.60`),
+ * which is the same fix from the other end and is a feel decision, so it is
+ * gameplay's to make. `0.75 s` for a silent choke is quick for the gesture
+ * authored here; 1.0-1.2 s would read better.
+ */
 export const ACTIONS = {
   fire: { dur: 0.34, prio: 2, loco: 0, weapon: 0 },
   reload: { dur: 2.40, prio: 4, loco: 0, weapon: 0.85 },
   cqc: { dur: 1.25, prio: 6, loco: 1, weapon: 0.7 },
-  takedown: { dur: 1.60, prio: 6, loco: 1, weapon: 0.7, path: 'cqc' },
+  takedown: { dur: 1.60, prio: 6, loco: 1, weapon: 0.7 },
   throw: { dur: 0.95, prio: 4, loco: 0, weapon: 0.6 },
   hit: { dur: 1.00, prio: 5, loco: 0, weapon: 0 },
   tranq: { dur: 1.70, prio: 9, loco: 1, weapon: 1 },
@@ -252,8 +327,10 @@ export class ActionLayer {
     switch (cur.name) {
       case 'fire': this._fire(t); break;
       case 'reload': this._path(cur, t, 2.40); this._reload(t); break;
-      case 'cqc':
-      case 'takedown': this._path(cur, t, 1.25); this._cqc(t / cur.dur); break;
+      case 'cqc': this._path(cur, t, 1.25); this._cqc(t / cur.dur, 1); break;
+      // Authored at 1.60 s and 25% stronger than the throw: a choke is a
+      // whole-body commitment where a throw is mostly arms and a pivot.
+      case 'takedown': this._path(cur, t, 1.60); this._cqc(t / cur.dur, 1.25); break;
       case 'throw': this._path(cur, t, 0.95); this._throw(t); break;
       case 'hit': this._hit(t); break;
       case 'tranq': this._tranq(u); break;
@@ -333,11 +410,11 @@ export class ActionLayer {
     this.bone.chestX += yank * 0.04;
   }
 
-  _cqc(u) {
+  _cqc(u, k = 1) {
     // Drive in, take the target across the body, put them down, recover.
-    const drive = bump(u, 0.0, 0.5);
-    const twist = seg(u, 0.15, 0.55) * (1 - seg(u, 0.72, 1.0));
-    const down = seg(u, 0.5, 0.78) * (1 - seg(u, 0.85, 1.0));
+    const drive = bump(u, 0.0, 0.5) * k;
+    const twist = seg(u, 0.15, 0.55) * (1 - seg(u, 0.72, 1.0)) * k;
+    const down = seg(u, 0.5, 0.78) * (1 - seg(u, 0.85, 1.0)) * k;
     this.stepZ += drive * 0.34;
     this.bone.rootX += drive * 0.18 + down * 0.2;
     this.bone.rootY += twist * 0.3;
