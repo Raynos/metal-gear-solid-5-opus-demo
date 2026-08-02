@@ -112,6 +112,11 @@ uniform vec3 uF0;
 // Specular ablation, in place: 1 forces roughness 1 / metalness 0 on every
 // outpost surface, which deletes the specular lobe and nothing else.
 uniform float uAbl;
+// Ablation for the per-object variation carried in aVar (see geo.js bakeVar).
+// 0 pins vOPV back to (0,0,0), which is exactly what every merged mesh used to
+// receive, so the palette selector, the per-object wear and the value jitter
+// can all be diffed against their own absence in one build.
+uniform float uVarAmt;
 // The baked lamp pool. Shared by EVERY mode, not just the ground: see the
 // lights_fragment_end injection.
 uniform sampler2D uLampMap;
@@ -130,6 +135,7 @@ uniform vec3 uWearCtl;
 
 /** Shared prologue: fetch the cues every mode needs. */
 const PROLOGUE = /* glsl */ `
+  vec3 opv = vOPV * uVarAmt;
   vec3 wn = normalize(vOPN);
   #ifdef DOUBLE_SIDED
     wn *= (float(gl_FrontFacing) * 2.0 - 1.0);
@@ -143,7 +149,7 @@ const PROLOGUE = /* glsl */ `
   // whole compound the same uniform orange. The baked and per-instance terms are
   // MODULATION, not addition, so they are scaled down: the point of them is that
   // no two objects match, not that everything is maximally corroded.
-  float wear = clamp(uWear + vOPW.y * 0.55 + vOPV.x * 0.60, 0.0, 1.25);
+  float wear = clamp(uWear + vOPW.y * 0.55 + opv.x * 0.60, 0.0, 1.25);
   // Pick the horizontal axis that runs ALONG the face so streaks stay thin.
   float sx = abs(wn.x) > abs(wn.z) ? vOPP.z : vOPP.x;
 
@@ -187,7 +193,7 @@ const EPILOGUE = /* glsl */ `
   // uRgh.w lets steel keep its lobe where flat concrete legitimately loses one.
   gRough = clamp(mix(gRough, 0.96, clamp(dustMask, 0.0, 1.0) * uRgh.w), 0.05, 1.0);
   gMetal = gMetal * (1.0 - clamp(dustMask, 0.0, 1.0) * 0.6 * uRgh.w);
-  c *= 0.90 + 0.19 * vOPV.z;
+  c *= 0.90 + 0.19 * opv.z;
   diffuseColor.rgb *= max(c, vec3(0.0));
   gNorm = normalize(nrm);
   // In-place specular ablation (see uAbl). Last, so it beats every mode.
@@ -354,12 +360,36 @@ const BODY = {
       + vec3(m3 - 0.5, m2 - 0.5, m3 - 0.5) * 0.16 * fail);
   `,
   [MODE.METAL]: /* glsl */ `
-    vec3 pal = vOPV.y < 0.34 ? uBase : (vOPV.y < 0.67 ? uBase2 : uBase3);
+    vec3 pal = opv.y < 0.34 ? uBase : (opv.y < 0.67 ? uBase2 : uBase3);
     vec3 paint = pal * (0.90 + 0.20 * m2);
-    // Thirty summers of UV: paint chalks and lightens, worst on up-facing panels.
-    paint = mix(paint, mix(paint, vec3(dot(paint, vec3(0.33))), 0.45) * 1.30 + 0.02, up * 0.65 + 0.25 * m1);
-    float rustM = smoothstep(0.66 - 0.40 * wear, 0.90 - 0.22 * wear, m1 * 0.55 + m2 * 0.55);
-    rustM = clamp(rustM + streak * 1.05 * wear + splash * 0.75 * wear, 0.0, 1.0);
+    // Thirty summers of UV: paint chalks and lightens, worst on up-facing
+    // panels. Chalking bleaches a coating; it does not turn it grey. Desaturating 45%
+    // of the way to luminance and then adding a flat 0.02 was enough on its own
+    // to take op-mil's authored olive (G/R 1.17) past neutral into R > G — on a
+    // dark paint a flat achromatic lift IS the hue. Both are pulled back, and
+    // what is left is a real fade rather than a wash to primer grey.
+    paint = mix(paint, mix(paint, vec3(dot(paint, vec3(0.33))), 0.34) * 1.30 + 0.012, up * 0.65 + 0.25 * m1);
+    // Rust is a DRAINAGE pattern, not a weather pattern. It starts where water
+    // sits or where the coating was broken — a fixing, a cut edge, the base of
+    // a panel, the tail under a bracket — and creeps out from there. Round 9
+    // thresholded plain fbm at 0.66, which fired on 43-50% of every metal
+    // surface in the compound and painted the whole site one orange: the drums
+    // stopped being olive, blue and grey drums and became rust-coloured
+    // cylinders, and op-corr's pale blue-grey primer flipped from B/R 1.13 to
+    // 0.75, i.e. from the only cool large surface on the site to another warm
+    // one. In mgi-8 and mgi-3 these panels are overwhelmingly PAINT, and the
+    // paint colour is what identifies the object.
+    //
+    // So the field is now weighted by where water actually goes before it is
+    // thresholded, and the threshold sits about a standard deviation above the
+    // field's mean instead of half a one below it.
+    float wetM = m1 * 0.55 + m2 * 0.55 + run * 0.26 + splash * 0.20 + arris * 0.18;
+    // Edges placed by arithmetic, not by taste: wetM has mean ~0.55 and sd
+    // ~0.10, and a mid-edge one sigma above the mean integrates to roughly the
+    // 15-20% coverage the references show. Round 9's 0.66 sat half a sigma
+    // BELOW the mean, which is the whole 43-50%.
+    float rustM = smoothstep(0.79 - 0.30 * wear, 1.00 - 0.20 * wear, wetM);
+    rustM = clamp(rustM + run * 0.50 * wear + splash * 0.26 * wear, 0.0, 1.0);
     vec3 rust = mix(uRust, uRust * 0.45, m3) * (0.82 + 0.42 * m2);
     vec3 c = mix(paint, rust, rustM);
     // Hard runs bleeding down out of every bolt, bracket and seam.
@@ -393,23 +423,47 @@ const BODY = {
     float tl = length(tdir);
     tdir = tl > 0.08 ? tdir / tl : vec3(1.0, 0.0, 0.0);
     float ph = dot(vOPP, tdir) * uCorrFreq;
-    float prof = sin(ph);
-    vec3 pal = vOPV.y < 0.34 ? uBase : (vOPV.y < 0.67 ? uBase2 : uBase3);
+    // A 300 mm rib subtends about 1.4 px at 100 m in a 1920-wide frame — right
+    // at Nyquist, where sin(ph) does not resolve into ribs, it ALIASES into a
+    // wide low-frequency beat. That beat is what turned the shed roof into a
+    // black-and-white barcode once rust stopped filling the valleys and closing
+    // the gap. Below a pixel per rib the rib has to stop existing: everything
+    // the profile drives — the shading swing, the valley mask, the fixing rows
+    // and the normal — is faded out together, leaving a flat painted sheet,
+    // which is exactly what profiled steel looks like from 150 m.
+    float dcorr = length(vOPP - cameraPosition);
+    float corrFade = 1.0 - smoothstep(45.0, 130.0, dcorr);
+    float prof = sin(ph) * corrFade;
+    vec3 pal = opv.y < 0.34 ? uBase : (opv.y < 0.67 ? uBase2 : uBase3);
     vec3 paint = pal * (0.90 + 0.20 * m2);
-    paint = mix(paint, mix(paint, vec3(dot(paint, vec3(0.33))), 0.5) * 1.32 + 0.02, up * 0.7);
-    // Rust pools in the valleys and creeps out of every fixing.
+    paint = mix(paint, mix(paint, vec3(dot(paint, vec3(0.33))), 0.36) * 1.18 + 0.012, up * 0.55);
+    // Rust pools in the valleys and creeps out of every fixing — and nowhere
+    // else. It does not break out in the middle of a crown, which is dry within
+    // a minute of the rain stopping. Round 9 thresholded at 0.58 with only a
+    // 0.22 nudge from the profile, so it fired on ~46% of every sheet and this
+    // shed's pale blue-grey factory primer never reached the screen: the one
+    // genuinely cool large surface in the compound was rendering warm. The
+    // fixing row and the splash zone are now IN the field rather than painted
+    // on afterwards, and the threshold sits above the field's mean.
     float valley = 0.5 - 0.5 * prof;
-    float rustM = smoothstep(0.58 - 0.40 * wear, 0.86 - 0.24 * wear, m1 * 0.5 + m2 * 0.5 + valley * 0.22);
-    rustM = clamp(rustM + streak * 1.1 * wear, 0.0, 1.0);
-    vec3 rust = mix(uRust, uRust * 0.45, m3) * (0.82 + 0.42 * m2);
-    vec3 c = mix(paint, rust, rustM);
-    c *= 0.86 + 0.30 * (0.5 + 0.5 * prof);
-    // Fixings every 6th rib: a bright washer with a rust tail under it.
     float fixRow = 1.0 - smoothstep(0.0, 0.09, abs(fract(vOPP.y / 0.90 + 0.5) - 0.5) * 0.90);
     float fixCol = smoothstep(0.55, 0.95, valley);
-    float fix = fixRow * fixCol * side;
+    float fix = fixRow * fixCol * side * corrFade;
+    float wetC = m1 * 0.5 + m2 * 0.5 + valley * 0.26 + fix * 0.30 + splash * 0.22;
+    float rustM = smoothstep(0.84 - 0.28 * wear, 1.10 - 0.28 * wear, wetC);
+    rustM = clamp(rustM + fix * 0.35 * wear + streak * 0.45 * wear, 0.0, 1.0);
+    vec3 rust = mix(uRust, uRust * 0.45, m3) * (0.82 + 0.42 * m2);
+    vec3 c = mix(paint, rust, rustM);
+    // Profile shading. Round 9 could afford 0.86..1.16 across the corrugation
+    // because rust filled the valleys and closed most of the gap; with the
+    // sheet back to paint the same swing, on top of a chalked crown, turns a
+    // roof at 200 m into a black-and-white barcode. 0.90..1.10 is the same
+    // read at half the amplitude.
+    c *= 0.90 + 0.20 * (0.5 + 0.5 * prof);
+    // Fixings every 6th rib: a bright washer with a rust tail under it.
     c = mix(c, uRust * 1.15 * (0.5 + 0.6 * m2),
-            clamp(smoothstep(0.0, 0.55, y01) * fixCol * smoothstep(0.55, 0.0, fract(vOPP.y / 0.90)) * (0.35 + wear) * 0.9, 0.0, 0.8));
+            clamp(smoothstep(0.0, 0.55, y01) * fixCol * smoothstep(0.55, 0.0, fract(vOPP.y / 0.90))
+                  * (0.35 + wear) * 0.9 * corrFade, 0.0, 0.8));
     c = mix(c, c * 1.5 + 0.02, fix * 0.35);
     c *= 1.0 - 0.20 * topWash;
     c = mix(c, c * 1.18 + vec3(0.02, 0.017, 0.009), southFace * 0.36);
@@ -420,7 +474,7 @@ const BODY = {
     // sheet is a striped painting of a sheet.
     gRough = clamp(mix(uRgh.x, uRgh.y, rustM) + valley * 0.10 - fix * 0.20, 0.08, 1.0);
     gMetal = mix(uMetal, 0.02, rustM);
-    nrm = normalize(wn + tdir * cos(ph) * uCorrAmp);
+    nrm = normalize(wn + tdir * cos(ph) * uCorrAmp * corrFade);
   `,
   [MODE.WOOD]: /* glsl */ `
     // Plank axis: boards run along the face's horizontal, grain along the boards.
@@ -451,10 +505,16 @@ const BODY = {
   `,
   [MODE.CLOTH]: /* glsl */ `
     // Every bag in a revetment was filled by a different pair of hands out of a
-    // different pallet of hessian: vOPV.y picks the bolt of cloth, so no two
+    // different pallet of hessian: opv.y picks the bolt of cloth, so no two
     // adjacent bags are the same value even before the weathering runs.
-    vec3 pal = vOPV.y < 0.30 ? uBase : (vOPV.y < 0.62 ? uBase2 : uBase3);
-    vec3 c = mix(pal, uBase2, clamp(m1 * 1.2 - 0.15, 0.0, 1.0));
+    vec3 pal = opv.y < 0.44 ? uBase : (opv.y < 0.66 ? uBase2 : uBase3);
+    // Fading is UNEVEN, and it is a fade OF THIS BAG — not a crossfade to a
+    // different bolt of cloth. Round 9 mixed up to 100% of the way to uBase2 on
+    // a 2 m noise one line after picking the palette, which threw the pick
+    // straight back away: every bag in the revetment converged on one tone and
+    // the reference's clearly distinguishable per-bag colour (mgi-8) had no
+    // mechanism left to come from.
+    vec3 c = pal * (0.74 + 0.58 * clamp(m1 * 1.15 - 0.06, 0.0, 1.0));
     // Hessian: a real 3mm warp/weft, faded out well before it can alias. Beyond
     // about 12m a woven bag is a smooth bag, and pretending otherwise produces
     // the crawling moire that gives procedural cloth away instantly.
@@ -480,11 +540,15 @@ const BODY = {
     // course read as rounded volumes rather than a printed brick pattern. Kept
     // deliberately restrained — a revetment that ends up brighter than the
     // gravel it stands on reads as polystyrene, which is what the first pass did.
-    c = mix(c, uBase3 * 1.02, clamp(up * 0.34 + smoothstep(0.55, 0.95, m2) * 0.22, 0.0, 0.62));
-    c = mix(c, pal * 0.34, clamp((1.0 - up) * 0.55 * (1.0 - y01 * 0.6), 0.0, 0.72));
+    // Bleaching lifts and desaturates THIS bag's own colour; it does not
+    // replace it with a shared pale one, which is the other half of how the
+    // per-bag pick was being erased.
+    vec3 sunned = mix(c, vec3(dot(c, vec3(0.34, 0.46, 0.20))), 0.36) * 1.62 + 0.010;
+    c = mix(c, sunned, clamp(up * 0.34 + smoothstep(0.55, 0.95, m2) * 0.20, 0.0, 0.58));
+    c = mix(c, c * 0.46, clamp((1.0 - up) * 0.55 * (1.0 - y01 * 0.6), 0.0, 0.72));
     // Ambient occlusion between courses: the crack between two bags never sees
     // the sky, and putting a dark line there is most of what separates them.
-    c *= 0.72 + 0.28 * smoothstep(0.0, 0.35, y01);
+    c *= 0.78 + 0.22 * smoothstep(0.0, 0.35, y01);
     // Split seams weep sand down the face of the course.
     c = mix(c, uDust * 1.25, clamp(run * 0.85 + streak * 0.35 * wear, 0.0, 0.7));
     gRough = uRgh.x;
@@ -944,6 +1008,7 @@ export function createSurface(opts = {}) {
     uRgh: { value: new THREE.Vector4(roughness, roughWorn, roughChip, dustMatt) },
     uF0: { value: toV3(f0) },
     uAbl: { value: 0 },
+    uVarAmt: { value: 1 },
     // A 1x1 black default is a valid *empty* field — no pool anywhere — so a
     // surface renders correctly even if the bake fails to build.
     uLampMap: { value: emptyWear() },

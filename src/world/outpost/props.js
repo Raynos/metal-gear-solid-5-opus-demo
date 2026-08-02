@@ -858,10 +858,10 @@ export function truckGeo({ tilt = true, rng = null } = {}) {
       gp.setXYZ(i, bedX - span / 2 + t * span, 1.86 + Math.sin(a) * rr, -Math.cos(a) * rr);
     }
     gt.computeVertexNormals();
-    b.cloth.push(gt);
+    b.canvas.push(gt);
     // Tail curtain, rolled up and lashed on one side.
-    b.cloth.push(box(0.06, 1.30, 2.44, { x: bedX - 2.18, y: 1.94 }));
-    b.cloth.push(xform(cyl(0.16, 2.30, 8), { rz: Math.PI / 2, x: bedX - 2.20, y: 2.72 }));
+    b.canvas.push(box(0.06, 1.30, 2.44, { x: bedX - 2.18, y: 1.94 }));
+    b.canvas.push(xform(cyl(0.16, 2.30, 8), { rz: Math.PI / 2, x: bedX - 2.20, y: 2.72 }));
     for (let i = 0; i < hoopN; i++) {
       const t = new THREE.TorusGeometry(R0 + 0.015, 0.032, 4, 14, Math.PI);
       t.rotateY(Math.PI / 2);
@@ -1084,7 +1084,7 @@ export function tarpGeo({ w = 2.6, d = 2.0, h = 1.3, seed = 3 }) {
     p.setY(i, Math.max(0.01, y));
   }
   g.computeVertexNormals();
-  b.cloth.push(g);
+  b.canvas.push(g);
   // Lashing rope over the top and a couple of ground pegs.
   for (const rz of ropes) {
     const z = rz * d;

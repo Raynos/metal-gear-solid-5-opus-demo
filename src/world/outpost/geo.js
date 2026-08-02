@@ -10,11 +10,89 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
  * building" and "grey cube" before a single shader runs.
  */
 
-const KEEP = ['position', 'normal', 'uv', 'aWeather'];
+const KEEP = ['position', 'normal', 'uv', 'aWeather', 'aVar'];
+
+/**
+ * Deterministic per-geometry hash off the bounding-box centre and extent.
+ *
+ * Two boxes at the same place with the same size are the same object as far as
+ * anyone can tell, so keying off the box is stable across reloads, independent
+ * of authoring order, and costs nothing to plumb.
+ */
+function pieceHash(g, k) {
+  g.computeBoundingBox();
+  const b = g.boundingBox;
+  const cx = (b.min.x + b.max.x) * 0.5;
+  const cy = (b.min.y + b.max.y) * 0.5;
+  const cz = (b.min.z + b.max.z) * 0.5;
+  const ex = b.max.x - b.min.x + (b.max.z - b.min.z);
+  const s = Math.sin(cx * 127.1 + cy * 311.7 + cz * 74.7 + ex * 19.3 + k * 43.13) * 43758.5453123;
+  return s - Math.floor(s);
+}
+
+/**
+ * Per-OBJECT variation, carried THROUGH the merge.
+ *
+ *   x = extra wear    y = palette pick (0..1)    z = value jitter (0..1)
+ *
+ * `aVar` used to exist only as an InstancedBufferAttribute written by
+ * `instanced()`. Everything that goes through `merge()` — every building, every
+ * fence, every awning and net, i.e. the four largest man-made surfaces in the
+ * frame — reached the shader with the attribute simply ABSENT, and an absent
+ * attribute reads as (0, 0, 0) in GLSL. That silently pinned the three-tone
+ * palette selector (mat.js: `vOPV.y < 0.34 ? uBase : ...`) to slot 0 on every
+ * merged mesh, zeroed the per-object wear term, and froze the value jitter at a
+ * constant x0.90 — so a compound whose whole shading model is "nothing is a
+ * flat colour" was drawing each of its biggest surfaces as exactly one flat
+ * colour, by accident.
+ *
+ * Stored as normalised bytes: it is a tone selector, not a coordinate, and 8
+ * bits of it costs 3 bytes a vertex instead of 12.
+ */
+export function bakeVar(g, v) {
+  const n = g.attributes.position.count;
+  const arr = new Uint8Array(n * 3);
+  const q = (x) => Math.max(0, Math.min(255, Math.round(x * 255)));
+  const a = q(v[0]);
+  const b = q(v[1]);
+  const c = q(v[2]);
+  for (let i = 0; i < n; i++) {
+    arr[i * 3] = a;
+    arr[i * 3 + 1] = b;
+    arr[i * 3 + 2] = c;
+  }
+  g.setAttribute('aVar', new THREE.BufferAttribute(arr, 3, true));
+  return g;
+}
+
+/**
+ * Stamp an object-level variation on every geometry in a bag that has not
+ * already claimed one. The palette pick has to agree across a whole structure —
+ * a shed clad in six boxes is one shed painted once — while the value jitter
+ * stays mostly object-level with a little per-piece break, because two sheets
+ * off the same pallet are not quite the same tone either.
+ */
+export function stampVar(bag, v) {
+  for (const k of Object.keys(bag)) {
+    const list = bag[k];
+    if (!Array.isArray(list)) continue;
+    for (const g of list) if (g && g.isBufferGeometry && !g.userData.opVar) g.userData.opVar = v;
+  }
+  return bag;
+}
 
 /** Normalise a geometry so merges never fail on attribute mismatch. */
 export function prep(g) {
   for (const k of Object.keys(g.attributes)) if (!KEEP.includes(k)) g.deleteAttribute(k);
+  if (!g.attributes.aVar) {
+    const o = g.userData.opVar;
+    const h3 = pieceHash(g, 3);
+    bakeVar(g, [
+      o ? o[0] : pieceHash(g, 1) * 0.34,
+      o ? o[1] : pieceHash(g, 2),
+      o ? o[2] * 0.72 + h3 * 0.28 : h3,
+    ]);
+  }
   if (g.index) g = g.toNonIndexed();
   if (!g.attributes.uv) {
     g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));

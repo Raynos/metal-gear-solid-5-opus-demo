@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { makeRng } from './rng.js';
 import { MODE, createSurface, WIND_RAD } from './mat.js';
-import { merge, instanced, makeVars, xform, bakeWeather, catenary, box, inPoly } from './geo.js';
+import { merge, instanced, makeVars, stampVar, xform, bakeWeather, catenary, box, inPoly } from './geo.js';
 import {
   newBag, placeBag, blockhouse, barracks, vehicleShed, bunker, watchtower, gateway, helipad,
 } from './buildings.js';
@@ -290,7 +290,13 @@ export async function install(world) {
   // aggregate in Kandahar province is not the same grey as one made in Kursk —
   // and `uBounce` (driven from the time of day, below) supplies the warm light
   // reflected up off sunlit gravel that fills a real desert shadow.
-  const DUST = [0.585, 0.480, 0.330];
+  // Round 10: R/B was 1.77, and this film lands on EVERY surface in the
+  // compound — so a single strongly-tinted dust was most of the mechanism
+  // behind "93% of the frame's chromatic mass in one hue octant" against the
+  // reference's 54%. Afghan dust settled on an object is a warm light grey,
+  // not an ochre glaze: R/B 1.59 keeps the site coherent and warm without the
+  // film alone deciding the hue of the olive, the blue and the cream under it.
+  const DUST = [0.560, 0.476, 0.352];
   const M = {
     concrete: createSurface({
       mode: MODE.CONCRETE, name: 'op-concrete', dust: DUST,
@@ -311,7 +317,12 @@ export async function install(world) {
       // 0.36..0.78 where the concrete next door spans 0.30..0.61 and they can no
       // longer be confused at any distance. Tiling scale 1.0 -> 1.75: a lime
       // skim crazes at a much finer pitch than shutter-marked in-situ concrete.
-      color: [0.302, 0.262, 0.196], color2: [0.368, 0.318, 0.242], color3: [0.782, 0.742, 0.646],
+      // Round 10: the limewash was R/B 1.21, i.e. the same khaki octant as the
+      // ground it stands on, so the one pale building on the site did not
+      // separate from the desert — exactly what mgi-8's cream masonry does at a
+      // glance. Lime is chalk: cooler than sand and lighter than it, and the
+      // grey block behind it is cooler still.
+      color: [0.302, 0.268, 0.208], color2: [0.352, 0.330, 0.286], color3: [0.792, 0.768, 0.702],
       rust: [0.34, 0.160, 0.068], wear: 0.55, dustAmt: 0.36, scale: 1.75, roughness: 0.82, envMapIntensity: 1.22,
       roughChip: 0.34, dustMatt: 0.50,
       dado: 0.195, dadoStrength: 0.95, dadoColor: [0.212, 0.132, 0.046],
@@ -366,7 +377,14 @@ export async function install(world) {
     }),
     metal: createSurface({
       mode: MODE.METAL, name: 'op-metal', dust: DUST,
-      color: [0.098, 0.104, 0.062], color2: [0.148, 0.146, 0.126], color3: [0.088, 0.100, 0.106],
+      // Three paints, not three greys. A camp's drums come from three different
+      // depots: olive drab, that faded works blue every Soviet fuel drum on
+      // earth was rolled out in, and a pale grey-green. Round 9 authored all
+      // three within a whisker of neutral, and then rust covered half of each
+      // one anyway, so ~80 drums rendered as ~80 identical rust cylinders. With
+      // the palette selector actually reaching the shader (geo.js bakeVar) and
+      // rust back at ~18%, this is where the frame's colour variety comes from.
+      color: [0.092, 0.108, 0.056], color2: [0.070, 0.090, 0.112], color3: [0.158, 0.162, 0.142],
       rust: [0.240, 0.115, 0.052], wear: 0.34, dustAmt: 0.36, metalness: 0.0, roughness: 0.36, scale: 1.6, envMapIntensity: 1.15,
       roughWorn: 0.90, roughChip: 0.20, dustMatt: 0.20,
     }),
@@ -376,8 +394,17 @@ export async function install(world) {
       // on Soviet profiled sheet was a pale blue-grey primer, not khaki. It is
       // the only genuinely cool-hued large surface in the compound and it is
       // what stops the three barracks reading as one building repeated.
-      color: [0.176, 0.196, 0.198], color2: [0.132, 0.148, 0.132], color3: [0.316, 0.322, 0.300],
-      rust: [0.225, 0.112, 0.056], wear: 0.34, dustAmt: 0.44, metalness: 0.0, roughness: 0.48,
+      // Round 10: authored B/R 1.13, measured on screen at 0.75 — the rust
+      // smoothstep (mat.js) was firing on ~46% of the sheet and flipping it
+      // from cool to warm. With rust confined to valleys and fixings the primer
+      // survives, and it is pushed a little further so the recovery is worth
+      // having: this is the compound's only large genuinely cool surface.
+      // The third slot was 0.30 and then chalked another 18% on an up-facing
+      // panel, which put a shed roof at nearly 0.36 — brighter than the sand.
+      // With rust no longer filling the valleys that made the profile read as a
+      // black-and-white barcode at 150 m rather than as a roof.
+      color: [0.164, 0.196, 0.208], color2: [0.120, 0.140, 0.134], color3: [0.212, 0.228, 0.232],
+      rust: [0.225, 0.112, 0.056], wear: 0.34, dustAmt: 0.32, metalness: 0.0, roughness: 0.48,
       roughWorn: 0.90, roughChip: 0.26, dustMatt: 0.28,
       corrFreq: 21.0, corrAmp: 0.68, scale: 1.2, envMapIntensity: 1.18,
     }),
@@ -388,8 +415,37 @@ export async function install(world) {
     }),
     cloth: createSurface({
       mode: MODE.CLOTH, name: 'op-cloth', dust: DUST,
-      color: [0.150, 0.128, 0.082], color2: [0.098, 0.086, 0.062], color3: [0.245, 0.202, 0.122],
+      // Sandbags, and only sandbags — the tarps and the truck tilts moved to
+      // `canvas` below, because in every reference frame a tarpaulin is olive
+      // and a sandbag is not, and one material could only ever be one of them.
+      // Three bolts of hessian: standard, a darker damper bag, and one that has
+      // stood in the sun for two summers. 2.2x of value across the palette plus
+      // the per-object jitter is what gives the revetment its per-bag tone —
+      // see mgi-8, where no two bags in a course match.
+      // Measured against mgi-8: a revetment there sits at very nearly the value
+      // of the ground it stands on (a pale line across the frame), and ours
+      // measured 72 against the pad's 120 — a dark line. Lifted 30%, which puts
+      // the bags either side of the ground rather than a stop under it, and
+      // still leaves the seam shadows as the darkest thing in the stack.
+      // The three bolts differ in HUE as well as value (B/R 0.60 / 0.74 / 0.54).
+      // Measured: with all three at the same B/R, forcing the palette slots to
+      // red/green/blue classified 193 sampled bags 50/17/33 against the
+      // authored 44/22/34 — the selector was landing per bag exactly as it
+      // should — but its only visible product was a value step, and the
+      // shader's own fade and fold terms are much wider than that, so it read
+      // as noise rather than as different bags. A damp bag is greyer and a
+      // bleached one is warmer, and that is what the eye actually sorts on.
+      color: [0.255, 0.222, 0.152], color2: [0.172, 0.160, 0.128], color3: [0.372, 0.318, 0.202],
       wear: 0.45, dustAmt: 0.24, roughness: 0.97, scale: 1.6, side: THREE.DoubleSide, envMapIntensity: 0.95,
+    }),
+    // Tarpaulin, truck tilt, tentage. Olive drab, faded unevenly and to
+    // different degrees — one of only three genuinely non-khaki hues with any
+    // real area in the frame, and the one that makes a camp read as occupied
+    // rather than abandoned.
+    canvas: createSurface({
+      mode: MODE.CLOTH, name: 'op-canvas', dust: DUST,
+      color: [0.086, 0.106, 0.056], color2: [0.060, 0.072, 0.046], color3: [0.152, 0.152, 0.098],
+      wear: 0.42, dustAmt: 0.26, roughness: 0.96, scale: 1.5, side: THREE.DoubleSide, envMapIntensity: 0.95,
     }),
     rubber: createSurface({
       mode: MODE.CLOTH, name: 'op-rubber', dust: DUST,
@@ -407,8 +463,14 @@ export async function install(world) {
     // truck in a khaki compound reads as untextured placeholder geometry.
     mil: createSurface({
       mode: MODE.METAL, name: 'op-mil', dust: DUST,
-      color: [0.070, 0.082, 0.042], color2: [0.100, 0.104, 0.058], color3: [0.124, 0.118, 0.074],
-      rust: [0.205, 0.098, 0.044], wear: 0.06, dustAmt: 0.34, metalness: 0.0, roughness: 0.34, scale: 1.4,
+      // Round 10: measured 71, 66, 58 on screen — R > G, which is not olive.
+      // Three mechanisms, all of them small on their own: the chalk term's flat
+      // achromatic +0.02, rust over half the panel, and a warm dust film at
+      // 0.34. All three are pulled back (see mat.js) and the drab is pushed
+      // greener and up, because a truck that reads brown in a brown compound is
+      // a truck that is not in the frame at all.
+      color: [0.078, 0.100, 0.046], color2: [0.060, 0.080, 0.042], color3: [0.132, 0.138, 0.086],
+      rust: [0.205, 0.098, 0.044], wear: 0.06, dustAmt: 0.20, metalness: 0.0, roughness: 0.34, scale: 1.4,
       envMapIntensity: 0.80, roughWorn: 0.86, roughChip: 0.20, dustMatt: 0.26,
     }),
     // The painted socle. Deliberately the most saturated thing on any building:
@@ -434,8 +496,12 @@ export async function install(world) {
     }),
     net: createSurface({
       mode: MODE.CLOTH, name: 'op-net', map: netTex, alphaTest: 0.26, side: THREE.DoubleSide, dust: DUST,
-      color: [0.482, 0.418, 0.258], color2: [0.328, 0.292, 0.186], color3: [0.412, 0.400, 0.232],
-      wear: 0.25, dustAmt: 0.48, roughness: 0.97, scale: 1.0, envMapIntensity: 1.35,
+      // Round 10: this was a pale warm sand and it read as a beige awning. Real
+      // scrim is DARK — it is shade you can see through, and in mgi-8 it is the
+      // darkest large thing in the compound. Olive strip over a drab net, with
+      // one faded-tan bolt so the three canopies are not the same net repeated.
+      color: [0.185, 0.205, 0.115], color2: [0.118, 0.120, 0.078], color3: [0.262, 0.232, 0.148],
+      wear: 0.25, dustAmt: 0.30, roughness: 0.97, scale: 1.0, envMapIntensity: 1.35,
     }),
     // Stencilled unit markings. Weathered by the concrete body so a fresh decal
     // never sits on a thirty-year-old wall.
@@ -550,15 +616,15 @@ export async function install(world) {
   put(barracks({ w: 16, d: 9.5, rng, litFrac: 0.30, style: 'steel', signCell: 1 }), -8, 26, 0.72);
   const BLOCK = { u: 1, v: -28, w: 18, d: 13, storeys: 2, ry: -0.13 };
   put(blockhouse({ w: BLOCK.w, d: BLOCK.d, storeys: BLOCK.storeys, rng, litFrac: 0.5 }), BLOCK.u, BLOCK.v, BLOCK.ry);
-  put(vehicleShed({ w: 16, d: 12, bays: 3 }), 29, -5, 0.10);
-  put(bunker({ w: 12, d: 8 }), -39, -31, 0.36);
+  put(vehicleShed({ w: 16, d: 12, bays: 3, rng }), 29, -5, 0.10);
+  put(bunker({ w: 12, d: 8, rng }), -39, -31, 0.36);
   const TOWER_A = { u: 33, v: 26, h: 9.0 };
   const TOWER_B = { u: -42, v: -37, h: 11.5 };
-  put(watchtower({ h: TOWER_A.h }), TOWER_A.u, TOWER_A.v, -2.35);
-  put(watchtower({ h: TOWER_B.h }), TOWER_B.u, TOWER_B.v, 0.75);
-  put(gateway({ gap: GATE.gap }), GATE.u, GATE.v, GATE.ry);
+  put(watchtower({ h: TOWER_A.h, rng }), TOWER_A.u, TOWER_A.v, -2.35);
+  put(watchtower({ h: TOWER_B.h, rng }), TOWER_B.u, TOWER_B.v, 0.75);
+  put(gateway({ gap: GATE.gap, rng }), GATE.u, GATE.v, GATE.ry);
   const PAD = { u: -34, v: 22 };
-  put(helipad({ r: 8.2 }), PAD.u, PAD.v, 0.4);
+  put(helipad({ r: 8.2, rng }), PAD.u, PAD.v, 0.4);
 
   // ------------------------------------------------------------- perimeter --
   const corners = PERIM;
@@ -789,6 +855,9 @@ export async function install(world) {
     const nb = P.camoNet({ w, d, h, sag: 1.05, rng });
     const dst = newBag();
     placeBag(dst, nb, { u, v, y: gy(u, v), ry });
+    // One net, one bolt of scrim: the palette pick and the value have to agree
+    // across the whole canopy or a single net reads as a patchwork quilt.
+    stampVar(dst, [rng() * 0.5, rng(), rng()]);
     netBags.push(dst);
     nets.push({ u, v });
   }
@@ -800,6 +869,7 @@ export async function install(world) {
     const tb = P.tarpGeo({ w: 2.6 + (tarpSeed % 3) * 0.35, d: 2.0 + (tarpSeed % 2) * 0.4, h: 1.25 + (tarpSeed % 4) * 0.12, seed: (tarpSeed += 17) });
     const dst = newBag();
     placeBag(dst, tb, { u, v, y: gy(u, v) + 0.2, ry });
+    stampVar(dst, [rng() * 0.6, rng(), rng()]);
     netBags.push(dst);
     tarps.push({ u, v });
   }
@@ -830,6 +900,7 @@ export async function install(world) {
   addMerged(bag.corr, M.corr, 'op-arch-corr');
   addMerged(bag.wood, M.wood, 'op-arch-wood');
   addMerged(bag.cloth, M.cloth, 'op-arch-cloth');
+  addMerged(bag.canvas, M.canvas, 'op-arch-canvas');
   addMerged(bag.net, M.net, 'op-arch-net', { receive: false });
   addMerged(bag.rubber, M.rubber, 'op-arch-rubber');
   addMerged(bag.glass, M.glass, 'op-arch-glass', { cast: false });
@@ -875,7 +946,7 @@ export async function install(world) {
   // Props.
   const matMap = {
     concrete: M.concrete, concrete2: M.concrete2, masonry: M.masonry, metal: M.metal, corr: M.corr,
-    wood: M.wood, cloth: M.cloth, net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp,
+    wood: M.wood, cloth: M.cloth, canvas: M.canvas, net: M.net, rubber: M.rubber, glass: M.glass, glow: M.lamp,
     paint: M.paint, trim: M.trim, paintWarn: M.paintWarn, sign: M.sign, dark: M.dark, mil: M.mil,
     dado: M.dado, drift: M.drift, steel: M.steel,
   };
