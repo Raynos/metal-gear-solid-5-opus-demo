@@ -123,6 +123,50 @@ before any figure could be trusted, and all three are worth knowing about:
 **The "~12 ms hides in the unflagged passes" theory is dead.** Those five passes
 total ~1.5-2 ms. The missing time was the scene itself.
 
+**Round-12 corrections to the table above, all measured with ballast:**
+
+- **The AO pass is ~6.45 ms, not 2.2-2.9.** Seen in 6 of 6 reps as a positive
+  control while measuring something else. My earlier 2.46 ms was measured
+  WITHOUT ballast, and that is the governor effect in miniature: ablating AO
+  drops the load, the GPU downclocks, and the saving under-reads. **AO is now
+  the largest single post item and the biggest remaining lever** — a half-res
+  broad term with a full-res contact term is worth ~3 ms. The cost is the 2-3
+  pixel contact band the pass comments defend, which was round 9's headline
+  deliverable, so this needs a visual verdict as well as a number.
+- **Shadow cascade re-rasterisation is NOT 1.75 ms.** Putting cascade 0 on a
+  2-frame schedule removes 86 draws and 0.7 M triangles a frame (469.6 -> 383.5
+  draws, 18%) and moves the frame by 0.30 / -0.25 ms against null controls of
+  0.01 and 0.79 — i.e. nothing. Depth-only raster is close to free on this GPU.
+  The cut is KEPT for the draw budget (ARCHITECTURE asks < 350), explicitly not
+  for milliseconds. Visual cost in motion: stale frames differ by 0.18-0.23
+  codes mean where two consecutive frames of the same film differ by 9.08, so
+  ~2.5% of what the image is doing anyway.
+- **Quarter-resolution volumetric march: REJECTED.** It costs 9-18% of local
+  contrast at every scale from 2 to 64 px against a null control of 0.00, and
+  small cumulus visibly lose their turrets. The saving could not even be
+  confirmed. Section 2.10 says the sky beats the real game; it is not for sale
+  at that price. Reprojection and the depth-aware upsample DO hold at quarter
+  res (frame-to-frame 5.36 vs half's 5.48), so the mechanism is fine — the
+  resolution is not.
+
+**A fourth instrument is dead: shadow-pass amplification.** Re-rastering cascade
+0 k extra times and fitting the slope gives 7.21 ms per raster at r-squared
+0.999 — beautifully linear and completely false, against a frame that loses
+0.34 ms when cascade 0 is frozen outright. An extra shadow pass over an EMPTY
+scene with zero draws costs 24.9 ms against a full 160-draw raster's 24.3. It
+prices a render PASS, not its contents — the same command-buffer pathology as
+the GPU timer queries. Do not amplify to measure on this backend.
+
+**Correction to 2.1's clast evidence.** "Clast does not receive the cascaded
+shadow at all" is too strong. Ablating the shadow term brightens shaded ground
+by +40.3 to +42.5 codes and shaded clast by only +9.3 to +12.2 — so clast does
+receive it, at roughly a quarter strength, and a chip in shade still reads 15%
+brighter than the shade it lies in (94.5 against 81.8). The CONCLUSION in 2.1
+stands — chips are worthless as evidence about whether a shadow is present —
+but its mechanism was wrong. The sun-gated ground bounce is ruled out
+(zeroing `uAmbBounce` moves shaded clast -0.24). Remaining candidates: the
+flat-shaded facet normals, and the chips' albedo / envMapIntensity.
+
 **Ranked cuts, with expected savings:**
 1. DOF/MB gather at half res — ~2-2.5 ms. **Done**, see below.
 2. Scene shading + geometry — ~2-3 ms available, never optimised because
