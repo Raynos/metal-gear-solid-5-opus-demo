@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { PALETTE } from '../../config/ArtDirection.js';
+import { ROCK } from '../Terrain.js';
 
 /**
  * Rock surface — MeshStandardMaterial + onBeforeCompile, so it keeps shadows,
@@ -15,12 +16,16 @@ import { PALETTE } from '../../config/ArtDirection.js';
  *     never sparkles.
  *  4. Wind-blown dust settling on up-facing surfaces and pooling at the base —
  *     the single strongest "this rock is standing in a desert" cue.
- *  5. HUE. Measured off round 1, blue exceeded red in every daylight frame and
- *     the rocks were the coldest thing in the shot — colder than the sand they
- *     sat on, which is exactly why a critic read them as debris composited in.
- *     Every constant below is now warmer in R/B than PALETTE.sandLight (1.46).
- *     Afghan limestone is a buff-to-tan carbonate, deeply iron-stained, and it
- *     is never a cool grey outside of a wet cleaved face.
+ *  5. HUE. This file used to carry a rule — "every constant below must be
+ *     warmer in R/B than the sand" — written to fix rocks that read colder than
+ *     the ground in round 1. It is DELETED. Followed to its conclusion it makes
+ *     a boulder the same material as the sand it sits on, which is the loudest
+ *     half of "everything in the map is brown": at R/B 1.79 and albedo 0.534
+ *     this ramp WAS PALETTE.sandLight under a different name, and 2.7x brighter
+ *     than the cliff the boulder fell off. The ramp is now the terrain's own
+ *     `ROCK` — grey limestone, an iron-stained bed, near-black basalt — so a
+ *     boulder and its parent cliff cannot disagree. Separation from the sand is
+ *     now a different colour and a darker one, not a warmer one.
  */
 /**
  * World-space wind, matched to the terrain's blown-sand relief.
@@ -237,106 +242,39 @@ export function createRockMaterial() {
   // reads as near-black on a standalone boulder. These are the sunlit values.
   // R/B ratios in the comments; sand is 1.46, so nothing here may sit below it.
   //
-  // Round 4 raised the whole ramp and, crucially, raised its FLOOR. Measured on
-  // the round-3 field, a shaded rock flank landed at linear luminance 0.024
-  // against sand at 0.19 — eight times darker — and at B/R 0.57-0.70 against
-  // sand's 0.39-0.41, i.e. both far too dark and visibly colder, which is the
-  // "debris composited in" read three critics reported. The albedo could not
-  // survive it: `uRockDeep` at 0.178 is a 3:1 swing away from `uRockLight`, and
-  // the shader was applying it over a 15 cm noise field, so the body was a
-  // black-and-white splotch before a single photon arrived.
-  //
-  // The ramp was then trimmed ~7% back down once the shading was fixed: with
-  // the noise gone the lit face measured brighter than the sand it stands on
-  // (0.61 against 0.34 on a shadowed slope, 0.67 against 0.63 in full sun), and
-  // a rock field brighter than its ground reads as a scatter of sugar cubes.
-  // Limestone is a little darker than quartz sand and a good deal warmer, which
-  // is where these land: 0.508 against PALETTE.sandLight's 0.62, at R/B 1.55
-  // against the sand's 1.46.
-  // Round 4 integration: the whole ramp was rebalanced against the new sand.
-  // "Nothing here may sit below sand's R/B" is still the rule, but sand moved
-  // from 1.46 to 1.28 when the round-1 blue-cast compensation came out of the
-  // palette, and leaving limestone at 1.62-2.57 would have made every boulder
-  // in the valley the reddest object in the frame. Values are the old ones with
-  // the blue channel raised; luminance is unchanged to within half a percent,
-  // so none of the lit/shade calibration above moves.
-  // Round 5 re-derived the whole ramp against a MEASUREMENT of the shipped
-  // frame rather than against the palette. The rule in this file has always been
-  // "never cooler in R/B than the sand", and it was being checked against
-  // PALETTE.sandLight's albedo (R/B 1.28). But the number a critic reads off a
-  // PNG is not albedo, it is albedo times illuminant times grade, and measured
-  // with an ID mask over 6,000 paired pixels the sand comes back at image R/B
-  // 1.79 while the rock came back at 1.65 — 69% of rock pixels COOLER than the
-  // exact ground they covered. Two causes, both fixed: the ground-bounce tint
-  // below was never applied (see uBounce), and the ramp itself was only ~1.45,
-  // which after a shaded facet's sky-dominated fill lands under the sand.
-  // Blue is 7% of luminance, so a 12% blue cut is a 0.8% value change and a
-  // 15% hue change; that is the whole trade and it is why it is done in blue.
-  //
-  // uRockDeep is also lifted 23% in luminance. It is the target of the cavity
-  // mix, and with the round-5 varnish on top of it a third of every clast pixel
-  // was landing under 0.40 of its own ground — charcoal, not limestone.
-  //
-  // ROUND 8 measured the real game instead of arguing from the palette, and the
-  // ramp's chroma turns out to be right — mgi-8's lit rock slab renders at lin
-  // 0.490/0.367/0.204 (R/B 2.40) and mgi-1's far rock at 0.291/0.225/0.131
-  // (2.22), which is exactly this ramp. So the light and dark ends do not move.
-  //
-  // The DEEP end does, by -20%. Round 5's lift was made against a "charcoal, not
-  // limestone" read; the nine reference frames say the failure we are actually in
-  // is the opposite one — black point 16-28 against 8.2, p0.1 32-59 against 18.4,
-  // 6.0 stops against 7.31. uRockDeep is the target of the cavity mix, i.e. it is
-  // the material inside every crack and under every overhang in the near field,
-  // and it is the only thing in this module that can put a genuinely dark pixel
-  // beside a sunlit one at conversational distance. 0.149 luminance is a stained,
-  // shaded limestone cavity; the round-3 disaster value was 0.117 flat across
-  // whole bodies, which is a different mistake at a different scale.
+  // The ramp is `ROCK` from Terrain.js, unmodified. Any local retune here is a
+  // boulder disagreeing with the cliff it broke off, which is exactly what the
+  // 2.7x mismatch this replaces was.
   mat.userData.uniforms = {
-    uRockLight: { value: new THREE.Vector3(0.534, 0.440, 0.299) },  // 1.79 buff
-    uRockDark: { value: new THREE.Vector3(0.370, 0.291, 0.192) },   // 1.93 tan
-    uRockDeep: { value: new THREE.Vector3(0.230, 0.160, 0.086) },   // 2.67 stain
-    uRockRed: { value: new THREE.Vector3(0.48, 0.302, 0.198) },     // 2.42 iron
+    uRockLight: { value: new THREE.Vector3(...ROCK.lime) },
+    uRockDark: { value: new THREE.Vector3(...ROCK.limeDark) },
+    // The cavity end is basalt-dark and NEUTRAL: a crevice that is a warm brown
+    // is a crevice made of the same material as everything else in the frame.
+    uRockDeep: { value: new THREE.Vector3(...ROCK.basalt) },
+    uRockRed: { value: new THREE.Vector3(...ROCK.red) },
     uSand: { value: new THREE.Vector3(...PALETTE.sandLight) },
     // Wind dust is *lighter and warmer* than the sand it came from: the fine
     // fraction is what stays airborne, and fines are pale.
     uDust: { value: new THREE.Vector3(0.588, 0.487, 0.336) },       // 1.75
-    uLichen: { value: new THREE.Vector3(0.245, 0.228, 0.156) },     // 1.57 khaki
+    // Lichen is OLIVE. It was a khaki at R/B 1.57 — the sand again — which
+    // threw away the one genuinely green thing in the landscape. Crustose
+    // lichen on shaded limestone is a low-saturation grey-green, and it is
+    // the only cool hue any rock in the reference frames carries.
+    uLichen: { value: new THREE.Vector3(0.128, 0.152, 0.092) },     // 1.39 olive
     /**
-     * Desert varnish. Round 5: the single term that makes a small clast read as
-     * an object rather than a stain on the sand.
+     * Desert varnish — the term that makes a small clast read as an object
+     * rather than a stain on the sand. Measured on r4/outpost.png with a paired
+     * mask, rock pixels averaged 0.983 of the exact sand pixels they covered,
+     * and a field of objects that measures within 2% of its own background is a
+     * decal, not an object.
      *
-     * Measured on r4/outpost.png with a paired mask (render the frame, render it
-     * with the rock group hidden, difference the two), the rock pixels averaged
-     * display luminance 0.2518 against 0.2562 for the exact sand pixels they
-     * covered — a ratio of 0.983, and 77% of every rock pixel in the frame sat
-     * within +/-12% of the ground behind it. A field of objects that measures
-     * within 2% of its own background is a decal.
-     *
-     * The physical answer is on the ground already: Terrain.js paints its own
-     * near-field lag as varnished clasts on unvarnished sand, with the comment
-     * "desert pavement is mostly DARKER than the matrix it sits on". Manganese
-     * and iron oxide build on stable clast faces over millennia; the sand
-     * between them is turned over constantly and never darkens. This is that
-     * stain. Terrain's own uVarnish is R/B 1.32; this is 2.21, and it has to be,
-     * because the rule is "never cooler than the sand" and the sand MEASURES
-     * R/B 1.91 in the ground shot once the afternoon beam is on it. A stain
-     * that is only as warm as the rock it darkens cannot raise the rock's hue,
-     * and 39% of the clasts came back cooler than their own ground at 1.67.
-     * Manganese-iron desert varnish is genuinely a red-brown-black.
+     * It is now ROCK.basalt — the same manganese black the terrain paints its
+     * own lag pavement with. It used to be a red-brown at R/B 2.76, picked to
+     * satisfy the deleted "never cooler than the sand" rule; a warm stain on
+     * warm rock cannot separate anything, it only moves the whole family
+     * further into the one hue the landscape already had.
      */
-    // Round 5, second pass: 0.175/0.120/0.076 -> 0.138/0.090/0.050, and the
-    // coat weight below 0.38 -> 0.56. Measured by ablation with the exposure
-    // locked, hiding one family at a time and comparing each family's pixels
-    // with the exact ground pixels behind them, the small clasts came back at
-    //   chips   0.4253 against sand 0.4429  = 0.960 (outpost)
-    //   chips   0.4454 against sand 0.4558  = 0.977 (vista)
-    //   chips   0.4296 against sand 0.4004  = 1.073 (ground, i.e. BRIGHTER)
-    // A field of objects that measures within 2-7% of its own background — and
-    // brighter than it at noon — is not a field of objects, it is a stain, which
-    // is precisely the "flat decals" the critique named. Manganese-iron varnish
-    // is a genuinely dark red-brown-black and it is the one term that separates
-    // a stable clast from the sand that is turned over around it.
-    uVarnish: { value: new THREE.Vector3(0.138, 0.090, 0.050) },    // 2.76
+    uVarnish: { value: new THREE.Vector3(...ROCK.basalt) },
     uDetail: { value: 1.0 },
     /**
      * Warm ground-bounce TINT applied to the indirect term on faces that look
@@ -355,7 +293,10 @@ export function createRockMaterial() {
      * hue without moving the brightness the AO calibration above was set
      * against. The values still track LIGHT_TRANSPORT.groundAlbedo's hue.
      */
-    uBounce: { value: new THREE.Vector3(2.35, 1.80, 1.32) },
+    // Round 9: R/B 1.78 -> 1.35. The bounce is real — the ground IS khaki —
+    // but at 1.78 it was a warm filter over the shaded half of every rock in
+    // the game, which is a grade wearing a physics argument.
+    uBounce: { value: new THREE.Vector3(1.62, 1.38, 1.20) },
     uWind: { value: new THREE.Vector2(WIND_DIR[0], WIND_DIR[1]) },
   };
 
@@ -557,12 +498,12 @@ export function createRockMaterial() {
            albedo = mix(albedo, uRockRed, iron * 0.34);
            albedo *= 1.0 - seam * 0.20;
 
-           // calcite veins — thin, pale, cutting across the bedding. Cheap, and
-           // the single detail that most says "limestone" rather than "grey".
-           // Warm: a cool-grey vein on a buff rock is a grey stripe, and grey
-           // stripes are what made the family read cold next to the sand.
+           // Calcite veins — thin, pale, cutting across the bedding. Cheap, and
+           // the single detail that most says "limestone". Calcite is WHITE; the
+           // old warm 0.560/0.505/0.392 was there to stop the vein reading cool,
+           // under the rule this file no longer follows.
            float vein = smoothstep(0.9, 0.99, rfbm(vLPos.xy * 3.4 + vTint.y * 9.0, 3));
-           albedo = mix(albedo, vec3(0.560, 0.505, 0.392), vein * 0.45);
+           albedo = mix(albedo, vec3(0.630, 0.625, 0.605), vein * 0.45);
 
            // mineral grain, close range only (it would alias into fizz further out)
            float gritFade = 1.0 - smoothstep(3.0, 26.0, dist);
@@ -641,8 +582,13 @@ export function createRockMaterial() {
            // least. At 0.60 the pebble was 60% uDust, whose luminance is within
            // 4% of the sand's, which is why it measured a ratio of 0.98 against
            // the ground it sat on.
+           // Round 9: the cap comes down from 0.60 to 0.38 on the big bodies.
+           // At 0.60 a boulder was 60% uDust, and uDust IS the sand — the
+           // comment above says so approvingly, "a dusty rock can never be
+           // colder than the sand". That is a mechanism for making every rock in
+           // the game the colour of the ground, and it worked.
            float clast = clamp(vTint.z, 0.0, 1.0);
-           dust = clamp(dust, 0.0, mix(0.60, 0.20, clast));
+           dust = clamp(dust, 0.0, mix(0.38, 0.16, clast));
            albedo = mix(albedo, uDust, dust);
 
            // --- desert varnish on the clast families -------------------------
@@ -692,8 +638,12 @@ export function createRockMaterial() {
              // because the second half of the same finding is that 46-54% of
              // clast pixels were COOLER in R/B than the ground they sat on and
              // the rule in this file is that they never may be.
+             // The value cut stays; its warm TILT does not. Taking twice as
+             // much out of blue as out of red was there to hold the clast above
+             // the sand's R/B, and that rule is gone — a grey clast on khaki
+             // sand already separates, by hue rather than by warmth.
              float sep = clast * (1.0 - pale * 0.35);
-             albedo *= mix(vec3(1.0), vec3(0.62, 0.55, 0.44), sep);
+             albedo *= mix(vec3(1.0), vec3(0.60, 0.585, 0.55), sep);
            }
 
            // --- the fines apron banked against the base ---

@@ -711,6 +711,25 @@ class Grid {
 const H_MIN = -500;
 const H_RANGE = 1900;
 
+/**
+ * EXPOSED ROCK, linear. The one place it is defined — `rocks/RockMaterial.js`
+ * imports this, because a boulder is a piece of the cliff it fell off and the
+ * two used to disagree by 2.7x (terrain 0.198, boulders 0.534) with the
+ * boulders sitting at the sand's own hue.
+ *
+ * Three lithologies, not three tints. A single frame of Afghanistan carries
+ * pale grey limestone, iron-stained red beds and near-black basalt, and the
+ * rule this replaces — "every rock constant must be warmer in R/B than the
+ * sand" — is precisely what made the mountains the colour of the ground they
+ * rise out of. Rock is GREY and darker than sand; only the iron bed runs hot.
+ */
+export const ROCK = {
+  lime: [0.285, 0.281, 0.267],   // R/B 1.07 — pale grey limestone, sand's 0.51x
+  limeDark: [0.132, 0.130, 0.124],
+  red: [0.268, 0.140, 0.082],    // 3.27 — iron-stained bed
+  basalt: [0.073, 0.076, 0.082], // 0.89 — manganese-black; also the varnish coat
+};
+
 // ---------------------------------------------------------------------------
 
 export class Terrain {
@@ -1353,12 +1372,17 @@ export class Terrain {
         const r0 = Math.hypot(wx, wz);
         // Keep the immediate outpost apron calmer than the open pan.
         const open = smoothstep(150, 700, r0);
-        // Broad swells, braid-scale flutes, then a shallow directional dune set.
+        // Broad swells and braid-scale flutes.
+        //
+        // DELETED: a "shallow directional dune set", sin(linear phase + fbm
+        // warp). A sinusoid with a domain-warped phase is the textbook recipe
+        // for a WOOD GRAIN texture, which is what it drew. It is not the whole
+        // of the swirling paisley the player reported — that survives ablating
+        // every layer in this file (see the report) — but it is a real one, and
+        // it was worth 0.42 m out of the 9 m this function adds.
         let d = fbm2(wx / 230 + 2.0, wz / 230 + 8.0, 2) * 5.4 * open;
         d += fbm2(wx / 74 + 11.0, wz / 74 - 5.0, 2) * 2.9;
         d += fbm2(wx / 21 - 7.0, wz / 21 + 13.0, 2) * 0.85;
-        const t = (wx * 0.82 + wz * 0.57) / 33 + fbm2(wx / 260, wz / 260, 2) * 3.0;
-        d += Math.sin(t) * 0.42;
         // Braided washes: shallow incised channels wandering across the pan.
         // The flow solver then finds them, so the drainage the eye sees and the
         // drainage the material map paints are the same thing.
@@ -2432,18 +2456,6 @@ export class Terrain {
   }
 
   _buildMaterial() {
-    // Terrain-local palette.
-    //
-    // This used to sit ~10% warmer in R/B than PALETTE all through, and the
-    // reason given was a round-1 measurement: blue exceeded red in every
-    // daylight frame, so the ground was pushed warm to compensate. That bug is
-    // gone — round 4 fixed the sky projection, the grade colour space and the
-    // afternoon beam — and the compensation outlived it. Measured on
-    // shots/r4/vista.png the mid-frame bands, which are almost entirely this
-    // material, ran to R-B +43 while the whole frame had to land at +8..+18.
-    // So the ramp is back on PALETTE's ratios: R/B 1.28 on sand, 1.18 on rock,
-    // with the iron-stained variants still allowed to run hot. Warm, khaki,
-    // sunbaked — but no longer carrying a correction for something else.
     const C = (r, g, b) => new THREE.Color(r, g, b);
 
     const u = {
@@ -2463,70 +2475,42 @@ export class Terrain {
       uClipCentre: { value: new THREE.Vector2(0, 0) },
       uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.5) },
       uDip: { value: new THREE.Vector2(DIP_X, DIP_Z) },
-      // ROUND 8 — MEASURED AGAINST THE REAL GAME, not against a target invented
-      // here. Nine direct-feed MGSV frames put the whole print at 21.7% HSV
-      // saturation; ours measured 15.4%, i.e. 29% under, and a grade cannot
-      // invent chroma a grey source never had. Sampling the reference frames'
-      // GROUND specifically is worse than the frame average says:
-      //   mgi-9 bleached sand   lin 0.545/0.438/0.274  R/B 1.99  sat 26.6%
-      //   mgi-8 lit rock slab   lin 0.490/0.367/0.204  R/B 2.40  sat 32.9%
-      //   mgi-1 far rock        lin 0.291/0.225/0.131  R/B 2.22  sat 31.0%
-      //   mgi-3 red dirt slope  lin 0.167/0.107/0.040  R/B 4.20  sat 50.5%
-      // Ours rendered at R/B 1.70 and 21.7% on sunlit sand — and that already
-      // includes the beam's own R/B 1.26, so the ALBEDO was doing almost none of
-      // it. These ratios are ~1.7-2.0 on sand and rock, ~2.8 on the iron stain,
-      // which lands the rendered ground inside the reference's range instead of
-      // two thirds of the way to neutral.
+      // THE PALETTE IS A SET, NOT A FAMILY.
       //
-      // The second axis is RANGE. The frame measured 6.0 stops against 7.31, and
-      // the vista 4.32, because every terrain material sat inside one narrow
-      // band: silt 0.592 down to varnish 0.085 is 2.8 stops of albedo for the
-      // entire landscape. Real desert carries genuinely bright (bleached quartz
-      // sand, gypsum crust) against genuinely dark (manganese varnish, damp
-      // drainage, mineral staining). Silt goes up, the dark ends go down, and the
-      // span is now 3.7 stops. Mean luminance moves about -5%, which is the right
-      // direction anyway: our median printed 129.7 against the reference's 111.
-      uSandLight: { value: C(0.672, 0.560, 0.396) },  // R/B 1.70 sun-bleached
-      uSandMid: { value: C(0.478, 0.398, 0.276) },    // 1.73
-      uSandDark: { value: C(0.286, 0.226, 0.144) },   // 1.99 iron-stained
-      uSilt: { value: C(0.715, 0.628, 0.472) },       // 1.51 the pale end
-      uGravel: { value: C(0.330, 0.272, 0.188) },     // 1.76
-      // Round 5 measured the distant ranges rendering BRIGHTER than the sky
-      // directly above them, which no unlit surface can do. Two owners share
-      // that error: the volumetrics owner is cutting fog extinction, and this
-      // is the albedo half. Bedrock is not pale — dry Afghan limestone and
-      // schist photograph at 0.20-0.28 linear reflectance, and the varnished
-      // faces at half that. Round 5's 0.456 was a fresh-quarry value.
-      // Round 6 took bedrock from 0.456 to 0.318 and the range still measured as
-      // the brightest large object in the outpost frame. 0.318 is a FRESH
-      // limestone value; what a camera sees on a weathered Afghan range is the
-      // varnished, dust-loaded outer millimetre, and that photographs at
-      // 0.14-0.20. This is 0.55x, which is the number the critique asked for and
-      // also where the measurement lands: the ridge stops out-reading the sky it
-      // is silhouetted against without the haze owner having to carry the whole
-      // correction in extinction.
-      // Round 8 holds this luminance (0.168 against 0.164) and spends the change
-      // entirely on chroma: R/B 1.20 -> 1.74. A weathered limestone face is not
-      // grey, it is buff, and at 1.20 the biggest single surface in every wide
-      // shot was contributing almost nothing to the frame's measured saturation.
-      uRockLight: { value: C(0.198, 0.164, 0.114) },  // 1.74  (was 0.175 @ 1.20)
-      // The dark end DOES move now. Round 7 held it up on the argument that
-      // taking it down makes every gorge charcoal — but the frames came back with
-      // a black point of 16-28 against the reference's 8.2, so "charcoal" was
-      // never the failure mode we were actually in. Shadowed limestone with a
-      // manganese wash photographs at 0.09-0.12.
-      uRockDark: { value: C(0.118, 0.094, 0.068) },   // 1.74
-      uRockRed: { value: C(0.276, 0.170, 0.100) },    // 2.76 iron stain
-      // Manganese-black is genuinely black: rock varnish measures 0.04-0.07
-      // reflectance. This is the darkest material in the landscape and it is what
-      // gives a wide shot a deep-shadow tail without crushing a cast shadow.
-      uVarnish: { value: C(0.058, 0.047, 0.042) },    // 1.38
-      // The scree/gravel apron on the PAN is not the same material as a cliff
-      // face and must not follow bedrock down: the pan is loose, dust-coated,
-      // freshly turned-over clasts and it is what the near-field ground is made
-      // of. It used to borrow uRockLight, so the round-7 bedrock cut would have
-      // taken 0.55x out of the valley floor as well.
-      uGravelClast: { value: C(0.372, 0.322, 0.240) },
+      // Every entry here used to be the same hue — R > G > B, khaki, R/B 1.5 to
+      // 2.8 top to bottom — on a rule that said the landscape had to be warm.
+      // One hue at nine values is what "everything is brown" means, and no grade
+      // can undo it. The nine reference frames carry, inside a SINGLE shot: pale
+      // near-white crust, warm sand, grey gravel, grey limestone, red iron soil
+      // and near-black basalt. So this is a set of genuinely different
+      // MATERIALS, still at reference saturation — more hues, not more chroma.
+      //
+      // Sand keeps its khaki. It is one member of the set instead of all of it.
+      uSandLight: { value: C(0.665, 0.560, 0.404) },  // R/B 1.65 sun-bleached
+      uSandMid: { value: C(0.462, 0.382, 0.266) },    // 1.74
+      uSandDark: { value: C(0.268, 0.212, 0.142) },   // 1.89
+      // The pale end is now genuinely pale and near-neutral: gypsum/salt crust
+      // and wind-sorted fines on a deflation surface. The old 0.715/0.628/0.472
+      // was khaki, which is why the ground band had zero pixels over L* 85
+      // against the reference frames' 2.8% — the brightest material in the
+      // landscape was still the same colour as the darkest.
+      uCrust: { value: C(0.800, 0.786, 0.742) },      // 1.08 salt/gypsum crust
+      // Gravel is GREY. A lag pavement is a mineral concentrate — the fines that
+      // carried the iron have blown off it — and grey gravel beside khaki sand
+      // is most of what separates ground from ground in the reference frames.
+      uGravel: { value: C(0.298, 0.292, 0.278) },     // 1.07
+      uGravelClast: { value: C(0.386, 0.380, 0.362) },
+      // Bedrock, shared with the boulders through ROCK above. Grey: a weathered
+      // limestone face is a pale grey-buff, and at R/B 1.74 the biggest surface
+      // in every wide shot was indistinguishable from the pan it stands in.
+      // Luminance 0.278 against sand's 0.572, so it is also darker.
+      uRockLight: { value: C(...ROCK.lime) },
+      uRockDark: { value: C(...ROCK.limeDark) },
+      uRockRed: { value: C(...ROCK.red) },
+      // Manganese-black basalt: the darkest material in the landscape, and the
+      // varnish coat as well — they are the same mineral and there is no reason
+      // to carry two constants for it. (Deleted: uVarnish.)
+      uBasalt: { value: C(...ROCK.basalt) },
       uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
       /**
        * Second ablation hook: (pavement lag layer, mid-field albedo swing,
@@ -2659,12 +2643,12 @@ export class Terrain {
           uniform vec3 uSandLight;
           uniform vec3 uSandMid;
           uniform vec3 uSandDark;
-          uniform vec3 uSilt;
+          uniform vec3 uCrust;
           uniform vec3 uGravel;
           uniform vec3 uRockLight;
           uniform vec3 uRockDark;
           uniform vec3 uRockRed;
-          uniform vec3 uVarnish;
+          uniform vec3 uBasalt;
           // Ablation hook. (strata, grit, mid-relief, varnish), all 1 in the
           // shipped build. Every claim in this file's comments about "measured
           // by ablating X" is measured by setting one of these to 0 from a
@@ -2901,6 +2885,27 @@ export class Terrain {
             float region = TEXDETAIL(rot(vWPos.xz, ROT_R) * (1.0 / 240.0) + vec2(0.19, 0.63)).a;
             float sub    = TEXDETAIL(rot(vWPos.xz, ROT_S) * (1.0 / 82.0) + vec2(0.55, 0.07)).a;
 
+            // --- lithology ----------------------------------------------------
+            // ONE low-frequency selector, off the two taps already read above,
+            // deciding WHICH ROCK a district is made of rather than tinting the
+            // one rock everything used to be. Bedrock zoning is a real map-scale
+            // signal — a limestone range, an iron-stained bed, a basalt flow —
+            // and it is most of why a real desert frame is not monochrome.
+            //
+            // No new fetch and no new fbm stack: this is arithmetic on region
+            // and sub. It replaces the multiplicative buff/ochre tint that used
+            // to sit at the bottom of this shader, which was a filter laid over
+            // every pixel — the exact difference between mineral zoning and a
+            // grade. The bands are set against the fields' MEASURED distribution
+            // (mean 0.612 and 0.594 over the vista's mid band), not against 0.5.
+            // Centred and stretched on the measured mean, or every district
+            // lands mid-band and the three lithologies average back into the
+            // one khaki this is here to break.
+            float lith  = clamp((region * 0.66 + sub * 0.34 - 0.604) * 3.2 + 0.5, 0.0, 1.0);
+            float wPale = 1.0 - smoothstep(0.10, 0.32, lith);   // crust / bleached lag
+            float wRed  = smoothstep(0.40, 0.60, lith) * (1.0 - smoothstep(0.70, 0.90, lith));
+            float wDark = smoothstep(0.72, 0.94, lith);          // basalt
+
             // --- material weights --------------------------------------------
             // Break the boundaries with the mid-scale mottle so nothing reads as
             // a smoothstep on slope.
@@ -2932,15 +2937,30 @@ export class Terrain {
             vec3 sand = mix(mix(uSandDark, uSandMid, clamp(sandT * 2.0, 0.0, 1.0)),
                             mix(uSandMid, uSandLight, clamp(sandT * 2.0 - 1.0, 0.0, 1.0)),
                             step(0.5, sandT));
+            // The soil over an iron-stained district is red EARTH, not tinted
+            // sand — mgi-3's slopes are a different material from its washes.
+            // Same selector, so the ground and the range above it agree.
+            sand = mix(sand, uRockRed * (0.72 + sandT * 0.86), wRed * 0.85);
+            sand = mix(sand, uCrust * (0.58 + sandT * 0.50), wPale * 0.72);
+            // Basalt districts put grey-black grit into the ground as well, not
+            // only into the cliffs above it. Without this the darkest material
+            // in the palette only ever appears on a slope.
+            sand = mix(sand, uBasalt * (2.4 + sandT * 1.6), wDark * 0.55);
 
-            // --- scree / gravel apron: coarser and darker than the sand, but
-            // still iron-warm. Grey gravel is the fastest way to read "quarry".
-            vec3 gravel = mix(uGravel, uSandDark, 0.24 + D.a * 0.38);
-            gravel = mix(gravel, uGravelClast * 0.96, smoothstep(0.22, 0.85, D.g));
+            // --- scree / gravel apron: a grey mineral lag, and deliberately NOT
+            // pulled back toward the sand. The blend that used to do that (a mix
+            // toward uSandDark) existed only to cancel the greyness this
+            // material is for.
+            vec3 gravel = mix(uGravel, uGravelClast, smoothstep(0.22, 0.85, D.g));
             gravel *= 0.80 + D.r * 0.40;
 
-            // --- bedrock: stratified, iron-stained ---------------------------
-            vec3 rockBase = mix(uRockDark, uRockLight, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
+            // --- bedrock ------------------------------------------------------
+            // The lithology chooses between three real end members. Each one's
+            // dark end is the same rock in its own shade, so it scales rather
+            // than being three more constants to keep in sync.
+            vec3 lithHi = mix(mix(uRockLight, uRockRed, wRed), uBasalt * 2.4, wDark);
+            vec3 lithLo = mix(mix(uRockDark, uRockRed * 0.42, wRed), uBasalt, wDark);
+            vec3 rockBase = mix(lithLo, lithHi, clamp(D.a * 0.8 + D.r * 0.35, 0.0, 1.0));
 
             // --- stratigraphy -------------------------------------------------
             // bedV is the STRATIGRAPHIC COORDINATE, counted in beds, and it is
@@ -2986,10 +3006,10 @@ export class Terrain {
             // ledges never does. Without this the beds read as a print.
             gStrataRough = -(bedHard - 0.5) * 0.10 * bedW;
 
-            // Mineral zoning: whole massifs shift warm, which is what stops a
-            // range from reading as one grey material at 2 km.
-            float iron = smoothstep(0.44, 0.86, macro);
-            vec3 rock = mix(rockBase, uRockRed, iron * 0.46);
+            // (Deleted: a second iron mix driven off macro. The lithology
+            // selector above is that layer, done once, on the field whose scale
+            // matches a mineral district.)
+            vec3 rock = rockBase;
             rock *= 1.0 - D.b * 0.40;                    // cracks read dark
             rock *= 0.95 + smoothstep(0.3, 0.9, D.r) * 0.10;
             // Desert varnish — manganese-black rock coatings, and the single
@@ -3021,7 +3041,7 @@ export class Terrain {
                                                  + (D.a - 0.5) * 0.22)
                           * (1.0 - flow) * smoothstep(0.06, 0.40, rockM)
                           * mix(0.70, 1.0, smoothstep(0.86, 0.42, bake));
-            rock = mix(rock, uVarnish, varnish * 0.80 * uDbg.w);
+            rock = mix(rock, uBasalt, varnish * 0.80 * uDbg.w);
             // Measurement hook, not a look. uDbg2.z is 0 in the shipped build;
             // a probe sets it to a threshold and counts the black pixels.
             if (uDbg2.z > 0.0 && varnish >= uDbg2.z) rock = vec3(0.0);
@@ -3044,9 +3064,9 @@ export class Terrain {
             vec3 gully = mix(albedo * 0.56, uGravel * 0.92, 0.50);
             gully *= 0.9 + D.g * 0.28;
             albedo = mix(albedo, gully, flowW * (1.0 - trunkW) * 0.60);
-            albedo = mix(albedo, mix(uSilt, uSandLight, 0.4), trunkW * 0.62);
+            albedo = mix(albedo, mix(uCrust, uSandLight, 0.4), trunkW * 0.62);
             // Concave hollows collect pale wind-blown fines.
-            albedo = mix(albedo, mix(albedo, uSilt, 0.34), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
+            albedo = mix(albedo, mix(albedo, uCrust, 0.34), smoothstep(0.1, 0.75, -curv) * (1.0 - rockW) * 0.45);
 
             // Regional tone, at THREE scales now. macro is the 900 m regional
             // swing; mid is the 11-45 m patchiness that a frame looking at 200 m
@@ -3072,15 +3092,11 @@ export class Terrain {
             albedo *= (0.55 + macro * 0.16 + region * 0.26 + sub * 0.22
                             + mid * 0.24 + (D.a - 0.5) * 0.16) * uDbg2.y
                     + 1.04 * (1.0 - uDbg2.y);
-            // Mineral zoning as HUE, not only as value. Two end members — a cool
-            // grey-buff limestone/marl and a hot iron-oxide ochre — swung by the
-            // 240 m field, so one massif is ochre and the one behind it is buff.
-            // R/B between the ends is 1.53x. The mean of the pair is (1.01, 0.98,
-            // 0.95), i.e. very slightly warm, so this raises the frame's measured
-            // saturation without acting as a filter laid over every pixel — which
-            // is exactly the difference between mineral zoning and a grade.
-            albedo *= mix(vec3(0.92, 0.97, 1.10), vec3(1.10, 0.99, 0.80),
-                          smoothstep(0.25, 0.78, region * 0.78 + sub * 0.22));
+            // (Deleted: a buff/ochre hue tint multiplied over every fragment
+            // here. It was mineral zoning done as a filter, and a filter can
+            // only ever move one hue around — which is what "everything is
+            // brown" is. The lithology selector above does it by choosing a
+            // different MATERIAL, which is the only way to get two hues.)
 
             // Deflation surface: the flat, dry, wind-scoured part of the pan
             // bleaches. mgi-9's open ground reads lin 0.545 against its own
@@ -3098,7 +3114,7 @@ export class Terrain {
             float bleach = smoothstep(0.46, 0.78, sub * 0.50 + region * 0.34 + (D.a - 0.5) * 0.30)
                          * (1.0 - rockW) * (1.0 - flowW)
                          * (1.0 - smoothstep(0.06, 0.20, slope));
-            albedo = mix(albedo, uSilt * 1.16, bleach * 0.62);
+            albedo = mix(albedo, uCrust, bleach * 0.70);
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
@@ -3220,7 +3236,11 @@ export class Terrain {
               // the stones are varnished and the sand between them is not — with
               // a minority of pale quartzy ones. A symmetric spread reads as
               // scattered white confetti.
-              vec3 clastC = mix(uRockDark * 1.18, uSandLight * 0.98, pow(GM.b, 1.7));
+              // The pale end is quartz, not sand: a stone the colour of the
+              // sand it lies on is not a stone. Black basalt chip -> white
+              // quartz pebble, with a red iron-stained minority — three hues of
+              // clast at the range the player is standing at.
+              vec3 clastC = mix(uBasalt * 1.60, uCrust * 0.86, pow(GM.b, 1.7));
               clastC = mix(clastC, uRockRed * 0.94, smoothstep(0.30, 0.72, GM.b) * 0.40);
 
               vec3 fines = mix(uSandMid, uSandLight, clamp(grain * 0.75 + drift * 0.45 - 0.10, 0.0, 1.0));
@@ -3286,7 +3306,7 @@ export class Terrain {
                 // with a pale quartzy minority. Same rule the near grit uses —
                 // a symmetric spread reads as scattered white confetti.
                 float cover = PM.g * 0.85 + QM.g * 0.55;
-                vec3 lagC = mix(uRockDark * 1.10, uSandLight * 0.94, pow(PM.b, 1.8));
+                vec3 lagC = mix(uBasalt * 1.50, uCrust * 0.82, pow(PM.b, 1.8));
                 vec3 pavC = mix(albedo * (0.94 + PM.r * 0.20), lagC,
                                 clamp(cover, 0.0, 1.0) * 0.85);
                 // 0.7-2.4 m patch tone: whole plates of the pan are swept to
@@ -3405,7 +3425,7 @@ export class Terrain {
                 // is the only part of the ripple that survives into shadow, and
                 // the round-4 failure was a detail layer that was ALL albedo.
                 float crest = (RP.b - 0.5) * env * sR + (RC.b - 0.5) * (0.55 + 0.6 * rFar) * sRC;
-                albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.26, 0.26, crest)),
+                albedo = mix(albedo, mix(uCrust, uSandDark, smoothstep(-0.26, 0.26, crest)),
                              rippleW * 0.13);
               }
             }
