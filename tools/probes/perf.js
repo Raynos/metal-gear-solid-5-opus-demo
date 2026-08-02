@@ -80,11 +80,18 @@ const BLOCK_WARM = 4;
 const BLOCK_N = 16;
 // Blocks per scenario, for the throughput headline. Reported as a median so one
 // drift spike cannot become the quoted frame time.
-const BLOCKS = 5;
-// Pairs per comparison. Each pair is two frames, so this is ~80 frames (~2.5 s).
+const BLOCKS = 3;
+// Pairs per comparison. Each pair is two frames, so this is ~50 frames (~2 s).
 // Must be even so each configuration is measured first exactly as often as it
 // is measured second.
-const PAIRS = 40;
+//
+// Kept deliberately modest. Nine authors share one GPU and one queue on this
+// machine; a probe that takes four minutes is a probe that gets killed by
+// somebody else's `stop` before it finishes, which is not a more accurate
+// measurement than one that completes. `--pairs`-style tuning would be nice but
+// the honest lever is the reported IQR: if it is too wide to resolve what you
+// care about, raise PAIRS and pay for it knowingly.
+const PAIRS = 24;
 
 const NOOP = () => {};
 
@@ -213,7 +220,7 @@ const BASE = saveFlags();
 const CAP_W = 480;
 const CAP_H = 270;
 const capBuf = new Uint8Array(CAP_W * CAP_H * 4);
-function capture(frames = 24) {
+function capture(frames = 16) {
   pipe.frame = 0;
   pipe._historyValid = false;
   eng.elapsed = 0;
@@ -438,7 +445,11 @@ const playScenarios = {
   },
 };
 
-for (const name of Object.keys(playScenarios)) {
+// When play mode is inert, measuring four scenarios produces the same static
+// number four times and dressing it up as walking and sprinting. Measure one,
+// and let `playNote` say why there is only one.
+const playToRun = playerMoves ? Object.keys(playScenarios) : ['standing'];
+for (const name of playToRun) {
   const s = playScenarios[name];
   frames.play[name] = holding(s.keys, () => throughputOf(s.mutate ?? NOOP));
 }
