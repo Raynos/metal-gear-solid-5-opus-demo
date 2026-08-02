@@ -202,6 +202,9 @@ export async function run() {
       fn(f);
     });
   out['weapon.tranq'] = await foleyCue((f) => f.tranq());
+  // The garrison's rifle. It must measure LOUDER than the player's suppressed
+  // shot — that difference is the whole point of the suppressor as a mechanic.
+  out['weapon.shot'] = await foleyCue((f) => f.gunshot(), 1.5);
   out['weapon.reload'] = await foleyCue((f) => f.weapon('reload'), 2.0);
   out['weapon.click'] = await foleyCue((f) => f.weapon('click'));
   out['cqc.hit'] = await foleyCue((f) => f.cqc('hit'));

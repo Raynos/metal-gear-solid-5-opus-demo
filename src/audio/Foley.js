@@ -390,6 +390,71 @@ export class Foley {
   }
 
   /**
+   * An UNSUPPRESSED rifle. The garrison's weapon, and the exact opposite of
+   * `tranq()`: where the tranquilliser is a vent and a slide, this is a crack
+   * and a room.
+   *
+   *   1. the crack  — a very short, very bright transient. This is the part
+   *                   that makes it a rifle and not a firework, so it is
+   *                   deliberately harsh: 6 ms, wide open, full level.
+   *   2. the body   — a fast pitch drop, 320 -> 70 Hz in 90 ms, which is the
+   *                   muzzle blast rather than the projectile.
+   *   3. the tail   — filtered noise falling away over 260 ms, sent HARD into
+   *                   the reverb. In a compound the tail is most of what you
+   *                   actually hear at range, and it is what tells the player
+   *                   the shot came from somewhere rather than from the HUD.
+   *   4. the action — the bolt at +65 ms, quiet under all of it.
+   *
+   * Nothing else in the module is allowed to be this loud; a rifle going off is
+   * the single most important thing that can happen in a stealth game's mix.
+   */
+  gunshot(pos = null) {
+    const e = this.eng;
+    if (!this.enabled || !e.hasVoice) return;
+    const rng = this.rng;
+    const nodes = [];
+    // High reverb send: this is the cue whose SPACE carries the information.
+    const dest = this._dest(pos, nodes, 0.5, 0);
+    const t0 = e.now + 0.006;
+
+    let end = burst(e, dest, {
+      filter: 'highpass',
+      freq: rand(rng, 1500, 2100),
+      q: 0.5,
+      // The highpass OPENS across the 6 ms: 1.8k down to 300 lets the whole
+      // spectrum through by the end, which is the crack widening.
+      sweep: 300,
+      peak: 0.75,
+      attack: 0.0004,
+      decay: 0.006,
+      when: t0,
+      nodes,
+    });
+    end = Math.max(end, ring(e, dest, rand(rng, 300, 345), { peak: 0.5, decay: 0.09, bend: 70, attack: 0.001, when: t0, nodes }));
+    end = Math.max(
+      end,
+      burst(e, dest, {
+        type: 'pink',
+        filter: 'lowpass',
+        freq: 2600,
+        q: 0.7,
+        sweep: 420,
+        peak: 0.32,
+        attack: 0.002,
+        decay: 0.26,
+        when: t0 + 0.004,
+        rate: rand(rng, 0.9, 1.1),
+        nodes,
+      }),
+    );
+    end = Math.max(
+      end,
+      burst(e, dest, { filter: 'bandpass', freq: 1900, q: 6, peak: 0.14, attack: 0.0006, decay: 0.022, when: t0 + 0.065, nodes }),
+    );
+    e.keep(nodes, end + 0.5);
+  }
+
+  /**
    * CQC. `kind`: 'hit' (a strike landing), 'grab', 'throw' (body meets ground),
    * 'knife'.
    */

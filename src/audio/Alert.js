@@ -44,7 +44,12 @@ export function normalisePhase(v) {
     if (v >= 0.1) return 'suspicious';
     return 'calm';
   }
-  const raw = typeof v === 'string' ? v : v.phase ?? v.state ?? v.level ?? v.alert ?? v.value;
+  // `to` is src/ai's field name. Its `onAlertChange` payload is
+  // `{from, to, reason, position}` and none of the five names this list started
+  // with appear in it, so every real squad transition normalised to null and
+  // `Alert.set` returned before it could play anything or move the score. It is
+  // last so that an explicit `phase`/`state`/`level` still wins.
+  const raw = typeof v === 'string' ? v : v.phase ?? v.state ?? v.level ?? v.alert ?? v.value ?? v.to;
   if (typeof raw === 'number') return normalisePhase(raw);
   const s = String(raw ?? '').toLowerCase();
   if (!s) return null;
@@ -65,6 +70,30 @@ export class Alert {
     /** One trim for every sting, so their balance against foley is one number. */
     this.trim = 1.15;
     this._out = null;
+    /** Last time each cue was played, for `_gate`. */
+    this._played = new Map();
+  }
+
+  /**
+   * TWO PUBLISHERS, ONE STING.
+   *
+   * The stings can arrive from either end: src/ui polls the HUD's alert state
+   * and calls `audio.play('alert.spotted')`, and src/ai pushes a transition
+   * straight into `set()`. Both are legitimate — the module has to make noise
+   * with no UI installed, and the UI has to make noise with no AI installed —
+   * but with both present the same "!" fired twice a few milliseconds apart,
+   * which does not sound like emphasis, it sounds like a bug. Whichever arrives
+   * first wins and the other is dropped inside the window.
+   *
+   * 0.4 s is chosen to be longer than any plausible publisher skew (both run on
+   * the same frame) and far shorter than any real re-escalation.
+   */
+  _gate(name, gap = 0.4) {
+    const t = this.eng.now;
+    const last = this._played.get(name);
+    if (last !== undefined && t - last < gap) return false;
+    this._played.set(name, t);
+    return true;
   }
 
   _bus() {
@@ -105,7 +134,7 @@ export class Alert {
    */
   spotted() {
     const e = this.eng;
-    if (!e.running) return;
+    if (!e.running || !this._gate('spotted')) return;
     const t0 = e.now + 0.006;
     const nodes = [];
     const out = e.gain(1, this._bus());
@@ -149,7 +178,7 @@ export class Alert {
   /** Caution: the same gesture, an octave down, soft, with a long tail. */
   caution() {
     const e = this.eng;
-    if (!e.running) return;
+    if (!e.running || !this._gate('caution')) return;
     const t0 = e.now + 0.006;
     const nodes = [];
     const out = e.gain(1, this._bus());
@@ -177,7 +206,7 @@ export class Alert {
   /** A guard half-sees something: a quiet two-tick "?" and nothing else. */
   notice() {
     const e = this.eng;
-    if (!e.hasVoice) return;
+    if (!e.hasVoice || !this._gate('notice')) return;
     const t0 = e.now + 0.006;
     const nodes = [];
     const out = e.gain(1, this._bus());
@@ -191,7 +220,7 @@ export class Alert {
   /** They lost you and are searching: a low pulse, no impact. */
   evade() {
     const e = this.eng;
-    if (!e.hasVoice) return;
+    if (!e.hasVoice || !this._gate('evade')) return;
     const t0 = e.now + 0.006;
     const nodes = [];
     const out = e.gain(1, this._bus());
@@ -211,7 +240,7 @@ export class Alert {
    */
   clear() {
     const e = this.eng;
-    if (!e.running) return;
+    if (!e.running || !this._gate('clear')) return;
     const rng = this.rng;
     const t0 = e.now + 0.01;
     const nodes = [];
