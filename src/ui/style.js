@@ -52,6 +52,12 @@ export const CSS = `
   --alert:   #ce3a26;
   --evasion: #7b93a8;
 
+  /* Non-lethal. Straight off the reference frames: the tranquilliser round's
+     chip in MGSV's weapon block is a pale ice-cyan, and it is the only cool
+     accent the real HUD carries. It exists here for exactly one 3-letter chip,
+     which is the point — a colour that means one thing. */
+  --tranq: #79c2d4;
+
   --inset: clamp(18px, 2.4vw, 44px);
   --gut:   clamp(20px, 3.2vw, 62px);
 
@@ -370,37 +376,85 @@ export const CSS = `
 .alr.cut em { animation: cut 260ms steps(4, end); }
 @keyframes cut { 0%, 49% { opacity: 0.15; } 50%, 100% { opacity: 1; } }
 
-/* --- detection ring ----------------------------------------------------- */
+/* --- detection ring -----------------------------------------------------
+
+   The core feedback loop of the whole genre, so it gets the most structure of
+   anything in the HUD — and still no fills beyond a 45%-black backing plate.
+
+   .mk rotates to the true bearing; .mkl translates out to the ring radius
+   and COUNTER-rotates by the same angle, so the block stands upright wherever
+   it is on the ring. A rotated 8px mono label is unreadable, and the real
+   game's markers are screen-aligned for exactly this reason.
+
+   Reading top to bottom, which is the order the eye needs them in:
+     range  mono, the number you act on
+     glyph  an inverted triangle, MGSV's own hostile marker
+     meter  fills left to right, coloured at the AI's own thresholds
+     reason three or five letters saying what he is reacting to             */
 
 .ring {
   position: absolute; left: 50%; top: 50%;
   width: 0; height: 0;
+  --r: clamp(118px, 21vh, 210px);
 }
 .mk {
   position: absolute; left: 0; top: 0; will-change: transform;
   filter: drop-shadow(0 1px 2px rgba(6, 7, 8, 0.9));
+  color: var(--bone-2);
 }
-/* A chevron pointing away from screen centre — the direction IS the message. */
-.mk s {
-  position: absolute; left: -8px; top: calc(-1 * var(--r, 128px) - 44px);
-  width: 16px; height: 11px; background: currentColor; text-decoration: none;
-  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+.mkl {
+  position: absolute; left: 0; top: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  width: 76px; margin-left: -38px;
+  transform: translateY(calc(-1 * var(--r))) rotate(var(--nr, 0deg));
+  will-change: transform;
 }
-/* The awareness meter, immediately inboard of the chevron: it fills upward as
-   the guard closes on certainty, so a full bar reads as "he has you". */
-.mk i {
-  position: absolute; left: -3px; top: calc(-1 * var(--r, 128px) - 30px);
-  width: 6px; height: 28px;
+/* Range. Mono, small, and it is the only number on the ring. */
+.mkl u {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em;
+  color: currentColor; text-decoration: none;
+}
+/* The hostile glyph: an inverted triangle, apex down at the contact. */
+.mkl s {
+  display: block; width: 13px; height: 9px;
+  background: currentColor; text-decoration: none;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+/* The awareness meter. Horizontal so it reads as a bar filling toward
+   certainty rather than as a second glyph. */
+.mkl i {
+  position: relative; display: block; width: 34px; height: 4px;
   border: 1px solid currentColor; background: rgba(6, 7, 8, 0.45);
   font-style: normal;
 }
-.mk i::after {
-  content: ""; position: absolute; left: 1px; right: 1px; bottom: 1px;
-  height: calc(var(--a, 0) * (100% - 2px)); background: currentColor;
+.mkl i::after {
+  content: ""; position: absolute; inset: 1px auto 1px 1px;
+  width: calc(var(--a, 0) * (100% - 2px)); background: currentColor;
 }
+.mkl em {
+  font-style: normal; font-family: var(--mono); font-size: 8.5px;
+  letter-spacing: 0.18em; color: currentColor; opacity: 0.85;
+}
+
+/* PROGRESSIVE DISCLOSURE, because six fully-labelled markers is a dashboard.
+   Each tier earns one more piece of type, in the order the player needs it:
+
+     trace     glyph + meter, at 42%. Something is happening over there.
+     noticing  + the reason. What he is reacting to is the actionable part —
+               it is the thing you can stop doing.
+     alerted   + the range. Once he is committed, distance is the decision.
+     seen      all of it, in alert red.                                       */
+.mk[data-s="trace"] { opacity: 0.42; }
+.mk[data-s="trace"] .mkl u, .mk[data-s="trace"] .mkl em,
+.mk[data-s="noticing"] .mkl u { visibility: hidden; }
 .mk[data-s="seen"] { color: var(--alert); }
 .mk[data-s="alerted"] { color: var(--caution); }
-.mk[data-s="noticing"] { color: var(--bone-2); }
+.mk[data-s="noticing"] { color: var(--bone); }
+
+/* The one repeating animation in the HUD, spent on the one moment that
+   deserves it: a meter climbing fast that has not filled yet. */
+.mk[data-urgent="1"] .mkl s { animation: mkpulse 620ms steps(2, end) infinite; }
+@keyframes mkpulse { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0.25; } }
 
 /* --- objective ticker --------------------------------------------------- */
 
@@ -420,20 +474,101 @@ export const CSS = `
 .obj u { font-family: var(--mono); font-size: 9px; letter-spacing: 0.12em; color: var(--bone-2); text-decoration: none; }
 .obj[data-done="1"] em { color: var(--bone-3); text-decoration: line-through; text-decoration-thickness: 1px; }
 
-/* --- weapon / stance ---------------------------------------------------- */
+/* --- weapon plate -------------------------------------------------------
+
+   The one place in this UI that carries a fill, and the reference frames are
+   the reason: MGSV's weapon block sits on a translucent dark plate with a pale
+   hairline border, bottom-right, because that corner of the screen is bright
+   sunlit sand and hairline type alone does not survive there. Everything
+   inside the plate is still hairlines and 9px mono.
+
+   THE MAGAZINE COMB is the signature: one tick per round, spent ticks go dark.
+   MGSV never draws a magazine as a number alone and neither does this.        */
 
 .wpn {
   position: absolute; right: 0; bottom: 0; text-align: right;
   opacity: var(--wpn-o, 1); transition: opacity 500ms linear;
 }
-.wnm { font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--bone); }
-.amo { margin-top: 4px; font-family: var(--mono); letter-spacing: 0.04em; color: var(--bone); }
-.amo b { font-size: clamp(20px, 1.9vw, 28px); font-weight: 400; }
-.amo i { font-style: normal; font-size: 13px; color: var(--bone-2); margin: 0 4px; }
-.amo u { font-size: 13px; text-decoration: none; color: var(--bone-2); }
-.wmd { margin-top: 5px; font-family: var(--mono); font-size: 9px; letter-spacing: 0.2em; color: var(--bone-2); }
+.wpl {
+  min-width: 196px;
+  padding: 7px 10px 8px;
+  border: 1px solid rgba(231, 229, 221, 0.30);
+  background: rgba(7, 9, 10, 0.52);
+  /* A cut corner, bottom-left: the plate reads as a machined part rather than
+     a rounded card, and it is the cheapest possible nod to the real block's
+     notched frame. */
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 9px 100%, 0 calc(100% - 9px));
+}
+.wtop { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.wtop em {
+  font-style: normal; font-size: 10.5px; letter-spacing: 0.24em;
+  text-transform: uppercase; color: var(--bone); white-space: nowrap;
+}
+/* Ammo-type chip. MGSV writes the payload, not the calibre: ZZZ, DMG. */
+.wtop i {
+  font-style: normal; font-family: var(--mono); font-size: 8px;
+  letter-spacing: 0.14em; padding: 1px 4px 0; color: var(--void);
+}
+.wtop i:empty { display: none; }
+.wtop i[data-k="tranq"] { background: var(--tranq); }
+.wtop i[data-k="lethal"] { background: var(--alert); color: var(--bone); }
 
-.stn { display: flex; justify-content: flex-end; gap: 7px; margin-bottom: 11px; }
+/* Suppressor durability. A hairline track with a filled hairline over it —
+   the same slider vocabulary the settings panel uses, at instrument scale. */
+.sup { display: flex; align-items: center; gap: 7px; margin-top: 6px; }
+.sup b { font-weight: 400; font-family: var(--mono); font-size: 7.5px; letter-spacing: 0.2em; color: var(--bone-3); }
+.sup i {
+  position: relative; flex: 1; height: 3px;
+  border: 1px solid var(--rule-mid); font-style: normal;
+}
+.sup i::after {
+  content: ""; position: absolute; inset: 0;
+  width: var(--sup, 100%); background: var(--bone-2);
+}
+/* Nothing publishes suppressor wear, so the bar must not claim a full one. A
+   hatch means "fitted, no reading" — an instrument that admits what it cannot
+   measure, which a solid full bar does not. */
+.sup i[data-v="?"]::after {
+  width: 100%;
+  background: repeating-linear-gradient(115deg, var(--bone-3) 0 2px, transparent 2px 5px);
+}
+
+.wbot { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: 7px; }
+
+.mag {
+  position: relative; display: flex; align-items: flex-end; gap: 1.5px;
+  min-height: 12px; padding-bottom: 2px; overflow: hidden;
+}
+.mag s {
+  display: block; width: 2px; height: 11px; text-decoration: none;
+  background: var(--bone); transition: background 90ms linear, height 90ms linear;
+}
+/* A spent round is not removed — it goes dark and stays in the comb, so the
+   magazine's size is always legible and "two left" reads as a shape. */
+.mag s[data-v="0"] { background: rgba(231, 229, 221, 0.17); height: 7px; }
+/* Reloading is indeterminate: gameplay reports a boolean, not a duration, so
+   the comb says "working" with a travelling highlight and does not invent a
+   progress fraction it cannot know. */
+.mag[data-rl="1"] s { background: rgba(231, 229, 221, 0.17); height: 7px; }
+/* The sweep is sized as a fraction of the comb, not in pixels, so it reads the
+   same on a 6-round magazine and a 30-round one. Transform-only: the travel is
+   a percentage of the sweep's own width, so nothing here touches layout. */
+.mag[data-rl="1"]::after {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(231, 229, 221, 0.85), transparent);
+  animation: magload 820ms linear infinite;
+}
+@keyframes magload { from { transform: translateX(-110%); } to { transform: translateX(300%); } }
+
+.amo { font-family: var(--mono); letter-spacing: 0.02em; color: var(--bone); line-height: 1; white-space: nowrap; }
+.amo b { font-size: clamp(17px, 1.5vw, 22px); font-weight: 400; }
+.amo b[data-empty="1"] { color: var(--alert); }
+.amo i { font-style: normal; font-size: 11px; color: var(--bone-3); margin: 0 2px; }
+.amo u { font-size: 11px; text-decoration: none; color: var(--bone-2); }
+.wmd { margin-top: 4px; font-family: var(--mono); font-size: 8px; letter-spacing: 0.2em; color: var(--bone-3); }
+.wmd:empty { display: none; }
+
+.stn { display: flex; justify-content: flex-end; gap: 7px; margin-bottom: 9px; }
 /* Stance glyphs are drawn, not written: a standing bar, a bent bar, a flat bar. */
 .stn u { display: block; width: 13px; height: 15px; position: relative; opacity: 0.22; text-decoration: none; }
 .stn u::before { content: ""; position: absolute; background: var(--bone); }
@@ -443,23 +578,69 @@ export const CSS = `
 .stn u[data-k="prone"]::before { left: 0; top: 12px; width: 13px; height: 1px; }
 .stn u[data-v="1"] { opacity: 1; }
 
-/* --- damage / health at the screen edge --------------------------------- */
+/* --- damage / health at the screen edge ---------------------------------
 
-/* An EDGE treatment, not a wash. The transparent stop sits at 62% so the centre
-   two thirds of the frame stay completely clear even at zero health — you have
-   to be able to see the thing that is shooting you. */
+   No health bar. MGSV does not have one and it would be the single least
+   diegetic thing on screen. Health is legible as three states of the frame
+   itself, which is the instrument the whole game is seen through:
+
+     hurt      a steady red edge, opacity tracking the wound
+     critical  the same edge with a slow double pulse — a heartbeat, and the
+               only looping animation outside the detection ring
+     down      the edge holds at full while the fail card cuts in
+
+   Recovery gets its own gesture rather than just the absence of one: the edge
+   cools to bone and retracts once, so healing is an event you can see.        */
+
 .dmg {
   position: absolute; inset: calc(-1 * var(--inset)); pointer-events: none;
   opacity: var(--hurt, 0);
   background: radial-gradient(ellipse 74% 72% at 50% 52%, rgba(150, 26, 14, 0) 62%, rgba(150, 26, 14, 0.62) 88%, rgba(104, 14, 7, 0.9) 100%);
   transition: opacity 700ms linear;
 }
+.hud[data-hp="critical"] .dmg { animation: pulse 1500ms cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+@keyframes pulse { 0%, 100% { opacity: var(--hurt, 0); } 22% { opacity: 1; } 34% { opacity: calc(var(--hurt, 0) * 0.72); } 48% { opacity: 0.92; } }
+
+.dmg.heal { animation: heal 900ms cubic-bezier(0.2, 0, 0, 1); }
+@keyframes heal {
+  0%   { opacity: 0.5; background: radial-gradient(ellipse 74% 72% at 50% 52%, rgba(168, 192, 182, 0) 58%, rgba(168, 192, 182, 0.34) 88%, rgba(168, 192, 182, 0.42) 100%); }
+  100% { opacity: 0;   background: radial-gradient(ellipse 96% 94% at 50% 52%, rgba(168, 192, 182, 0) 58%, rgba(168, 192, 182, 0.00) 88%, rgba(168, 192, 182, 0.00) 100%); }
+}
+
+/* The frame carries the wound too, so the state is readable even with the
+   player's eye at screen centre. Alert still wins: what the garrison is doing
+   outranks what your health is doing. */
+.ui[data-alert="calm"][data-hp="hurt"] .fr { --fr-col: rgba(178, 44, 30, 0.52); }
+.ui[data-hp="critical"] .fr, .ui[data-hp="down"] .fr { --fr-col: rgba(206, 58, 38, 0.85); }
+
 .hit {
   position: absolute; inset: calc(-1 * var(--inset)); pointer-events: none;
   opacity: 0; background: radial-gradient(120% 90% at 50% 50%, transparent 42%, rgba(196, 44, 26, 0.75) 100%);
 }
 .hit.on { animation: hit 480ms cubic-bezier(0.1, 0, 0.2, 1); }
 @keyframes hit { 0% { opacity: 1; } 100% { opacity: 0; } }
+
+/* --- directional damage -------------------------------------------------
+
+   A wedge at the bearing of whatever hit you. It shares the detection ring's
+   geometry deliberately: the player is already reading bearings off that ring,
+   so a hit lands in a coordinate system they have learnt. One shot, gone in
+   under a second, and never more than four at once.                          */
+
+.dir {
+  position: absolute; left: 50%; top: 50%; width: 0; height: 0;
+  --rd: clamp(118px, 21vh, 210px);
+}
+.dw { position: absolute; left: 0; top: 0; opacity: 0; will-change: transform; }
+.dw::after {
+  content: ""; position: absolute; left: -104px; top: calc(-1 * var(--rd) - 54px);
+  width: 208px; height: 62px;
+  background: radial-gradient(ellipse 50% 100% at 50% 100%, rgba(214, 62, 40, 0.92), rgba(214, 62, 40, 0) 72%);
+}
+.dw[data-k="near"]::after { background: radial-gradient(ellipse 50% 100% at 50% 100%, rgba(231, 229, 221, 0.5), rgba(231, 229, 221, 0) 72%); }
+.dw.on { animation: wedge 760ms cubic-bezier(0.1, 0, 0.3, 1); }
+.dw[data-k="near"].on { animation-duration: 420ms; }
+@keyframes wedge { 0% { opacity: 1; } 18% { opacity: 0.9; } 100% { opacity: 0; } }
 
 /* -------------------------------------------------------- cinematic cards */
 
@@ -483,6 +664,18 @@ export const CSS = `
 @keyframes cardin  { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
 @keyframes cardout { from { opacity: 1; } to { opacity: 0; } }
 
+/* THE BEAT OF SILENCE. On an end card the plate cuts to black on the frame the
+   mission ends and then NOTHING happens for 900 ms. Every delay below is that
+   beat plus a stagger. It is the whole gesture: the flourish games normally
+   put here is what MGSV leaves out, and leaving it out is what makes the words
+   land. Do not shorten these to make the card feel "responsive". */
+.cin[data-card="accomplished"] .card,
+.cin[data-card="failed"] .card { animation: none; opacity: 1; }
+.cin[data-card="accomplished"] .ck, .cin[data-card="failed"] .ck { animation: rise 420ms cubic-bezier(0.2, 0, 0, 1) 900ms both; }
+.cin[data-card="accomplished"] .ct, .cin[data-card="failed"] .ct { animation: track 900ms cubic-bezier(0.2, 0, 0, 1) 1080ms both; }
+.cin[data-card="accomplished"] .cm, .cin[data-card="failed"] .cm { animation: rise 460ms cubic-bezier(0.2, 0, 0, 1) 1620ms both; }
+.cin[data-card="accomplished"] .cp, .cin[data-card="failed"] .cp { animation: fade 500ms linear 2200ms both; }
+
 .ck {
   display: flex; align-items: center; gap: 11px;
   font-family: var(--mono); font-size: 9px; letter-spacing: 0.3em; color: var(--bone-2);
@@ -503,6 +696,22 @@ export const CSS = `
 }
 .cm span i { font-style: normal; color: var(--bone-3); margin-right: 7px; }
 .cin[data-card="failed"] .ct { color: var(--alert); }
+
+/* Key prompts. The end card holds until a decision, so the decisions have to
+   be on it — in the same 9px mono as every other readout, keys boxed the way
+   the settings panel boxes its values. */
+.cp { margin-top: 26px; display: flex; gap: 24px; flex-wrap: wrap; }
+.cp:empty { display: none; }
+.cp span {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.24em;
+  text-transform: uppercase; color: var(--bone-2);
+}
+.cp b {
+  font-weight: 400; padding: 3px 7px 2px;
+  border: 1px solid var(--rule-mid); color: var(--bone);
+  letter-spacing: 0.14em;
+}
 
 /* ------------------------------------------------------------ boot sequence */
 

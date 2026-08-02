@@ -33,12 +33,24 @@ export class Sim {
     this._seenFor = 0;
     this._fwd = new THREE.Vector3();
 
+    this._fireT = 0;
     this.gameplay = {
       player: {
         position: world.engine.camera.position,
         health: 1,
         stance: 'crouch',
-        weapon: { name: 'AM MRS-4', ammo: 30, reserve: 120, mode: 'SEMI', suppressed: true },
+        // The AGREED weapon descriptor, in full, so `?uidemo=1` exercises every
+        // branch of the plate: comb, chip, suppressor row, reserve, reload.
+        weapon: {
+          name: 'WU S.PISTOL',
+          kind: 'tranq',
+          ammo: 6,
+          magSize: 6,
+          reserve: 42,
+          mode: 'SEMI',
+          suppressed: true,
+          reloading: false,
+        },
       },
     };
     this.ai = { alert: 'calm', sensors: [] };
@@ -99,7 +111,15 @@ export class Sim {
       }
       this._aware.set(i, next);
       peak = Math.max(peak, next);
-      out.push({ id: g.name ? `${g.name}-${i}` : i, position: gp, awareness: next });
+      out.push({
+        id: g.name ? `${g.name}-${i}` : i,
+        position: gp,
+        awareness: next,
+        // The real AI publishes these; the stand-in reports the same shape so
+        // the marker's range, reason tag and urgency pulse are all reviewable.
+        vis: { visible: inCone, rate: Math.max(0, gain), dist: d },
+        state: next >= 0.999 ? 'combat' : inCone ? 'hold' : 'investigate',
+      });
     }
 
     this.ai.alert = peak >= 0.999 ? 'alert' : peak > 0.5 ? 'caution' : peak > 0 ? 'evasion' : 'calm';
@@ -109,5 +129,22 @@ export class Sim {
     this._seenFor = peak >= 0.999 ? this._seenFor + dt : 0;
     const p = this.gameplay.player;
     p.health = Math.max(0.15, Math.min(1, p.health + (this._seenFor > 1.2 ? -0.09 : 0.16) * dt));
+
+    // And the magazine has to move, or the comb and the reload sweep are
+    // untestable. Under fire it empties; out of contact it reloads.
+    const w = p.weapon;
+    this._fireT += dt;
+    if (w.reloading) {
+      if (this._fireT > 2.1) {
+        w.reloading = false;
+        w.ammo = w.magSize;
+        w.reserve = Math.max(0, w.reserve - w.magSize);
+        this._fireT = 0;
+      }
+    } else if (this._seenFor > 0.4 && this._fireT > 0.42) {
+      this._fireT = 0;
+      if (w.ammo > 0) w.ammo--;
+      else if (w.reserve > 0) w.reloading = true;
+    }
   }
 }
