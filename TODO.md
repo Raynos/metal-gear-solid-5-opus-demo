@@ -127,6 +127,21 @@ And note `uWearCtl.x` does not gate `WR.g`, while `edgeN` is added to the
 corridor and foot masks outside the ablation — so that switch is not the clean
 control it looks like. Fix that first or you will measure the wrong thing.
 
+**Start by re-testing the shadow hypothesis, which was retired on void
+evidence.** The strongest argument for "not a shadow" was that the pale stone
+chips lying *inside* the band are as bright as the ones outside it. That
+argument is worthless: the vegetation author independently found that **clast
+does not receive the cascaded shadow at all** — `csmSunVis` returns 1.0 over
+every clast fragment, and an unbiased cascade-0 depth compare also returns
+"lit". Chips that cannot receive a shadow tell you nothing about whether one is
+there. Cropped close (`shots/crop-road.png`) the band has hard straight edges,
+sharp vertices and a chevron notch — geometry-shaped, which fits a cast shadow
+at least as well as a mask. The other two arguments (an empty cascade-0 depth
+map at those texels, a raycast up the sun finding no occluder) are stronger and
+may still hold, but they were taken with instruments that have been wrong here
+before, so re-run them before believing them. Fix the clast shadow-receive bug
+first; it may make the whole question answer itself.
+
 ### 2.2 Paisley moiré on the ground — OPEN, never chased
 The "distorted" complaint. **2x supersampling makes it SHARPER**, which rules out
 sampling-rate aliasing outright. Every terrain material layer off, detail albedo

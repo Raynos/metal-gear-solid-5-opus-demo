@@ -117,6 +117,19 @@ function crc32(buf) {
 const [op, ...rest] = process.argv.slice(2);
 if (op === 'crop') {
   const [file, x, y, w, h, s, out] = rest;
+  // Validate before allocating. Called with the arguments in the wrong order —
+  // easy, because `out` is LAST here and first in most tools — `s` parses as
+  // NaN, `Buffer.alloc(NaN)` succeeds with length 0, the loops run to NaN and
+  // do nothing, and the only symptom is an unrelated fs error about an
+  // undefined path several seconds later. Twice. Say what is wrong instead.
+  const nums = { x, y, w, h, s };
+  const bad = Object.entries(nums).filter(([, v]) => !Number.isFinite(+v));
+  if (!file || !out || bad.length) {
+    console.error('usage: pixlocal.mjs crop <file> <x> <y> <w> <h> <scale> <out.png>');
+    if (bad.length) console.error(`  not a number: ${bad.map(([k, v]) => `${k}=${v}`).join(' ')}`);
+    if (!out) console.error('  missing <out.png> — it is the LAST argument, after the scale');
+    process.exit(1);
+  }
   const img = decode(file);
   const X = +x;
   const Y = +y;
