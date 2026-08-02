@@ -5,7 +5,7 @@ import { GRADE } from '../config/ArtDirection.js';
  * RenderPipeline — HDR post stack.
  *
  *   scene (jittered projection) -> HDR half-float RT + depth
- *     -> GTAO (horizon search, bilateral)                    [occlusion]
+ *     -> GTAO x2 + contact shadows (horizon search, bilateral)  [occlusion]
  *     -> prepare: AO apply + aerial perspective               [atmosphere]
  *     -> TAA resolve (reprojection + YCoCg neighbourhood clip)
  *     -> luminance reduction + eye adaptation                 [auto exposure]
@@ -23,6 +23,12 @@ import { GRADE } from '../config/ArtDirection.js';
  *    drawn with, so a ridge fades into exactly the sky behind it.
  *  - AO is applied *before* TAA on purpose: the temporal filter then denoises
  *    the occlusion for free, which is why 4 slices of horizon search is enough.
+ *  - The occlusion pass produces THREE signals in one set of depth taps: broad
+ *    AO at 1.15 m, micro AO at 0.16 m, and a screen-space contact shadow marched
+ *    along the sun. They are separate because one radius cannot resolve both a
+ *    room and a seam, and because a contact shadow occludes DIRECT light while
+ *    AO occludes ambient. Ablate them individually through `pipeline.ablate`,
+ *    never through `enabled.ssao` — that switch takes all three at once.
  *  - Everything upstream of the composite is linear HDR. Tonemapping happens
  *    once, in the composite. Never add another.
  */
@@ -447,6 +453,10 @@ export class RenderPipeline {
 
     this.enabled = {
       ssao: true,
+      /** Small-radius crease/contact AO. Rides inside the `ssao` pass. */
+      microAO: true,
+      /** Screen-space contact shadows. Also inside the `ssao` pass. */
+      contactShadows: true,
       bloom: true,
       taa: true,
       fxaa: true,
@@ -455,6 +465,36 @@ export class RenderPipeline {
       motionBlur: true,
       autoExposure: true,
     };
+
+    /**
+     * First-class ablation switches for the round-9 contact terms, 0..1.
+     *
+     * These exist as a SEPARATE object from `enabled` on purpose, and they are
+     * written into the uniforms at the end of `render()` rather than at author
+     * time. Two traps this avoids, both of which have burned earlier rounds:
+     *
+     *  - `enabled.ssao = false` ablates the whole occlusion pass, so it can
+     *    never answer "what did the new term buy". Ablating one channel needs
+     *    its own switch or the measurement is of something else entirely.
+     *  - A probe that sets a uniform directly is silently reverted the next
+     *    time the pipeline writes that uniform — which is every frame. Anything
+     *    a probe sets has to be applied downstream of the per-frame write, and
+     *    these are.
+     *
+     * Fractional values are meaningful: 0.5 is half-strength, not half the
+     * pixels.
+     */
+    this.ablate = { microAO: 1, contactShadows: 1 };
+
+    /**
+     * Offline per-vertex AO bake, for the geometry owners. Reachable both as an
+     * import and off the live pipeline (`world.engine.pipeline.bakeVertexAO`),
+     * because half the callers are inside `install(world)` and have the engine
+     * to hand but no import path they want to add. See the function's own
+     * documentation at the bottom of this file for what to bake and where to
+     * multiply it in.
+     */
+    this.bakeVertexAO = bakeVertexAO;
     /**
      * Per-time-of-day exposure TRIM, set by `Lighting` from
      * `TIME_OF_DAY[x].exposure`. It is dimensionless and lives near 1.0: the
@@ -923,6 +963,38 @@ export class RenderPipeline {
     // in a pool of contact shading. Runs at full resolution: at 1280x720 the
     // cost is a fraction of a millisecond and half-res simply cannot resolve
     // the 2-3 pixel contact band where a sandbag meets the sand.
+    //
+    // ROUND 9: this pass now writes THREE occlusion signals, not one.
+    //
+    //   .r  broad AO, 1.15 m radius   — unchanged, verified, do not retune
+    //   .g  linear view depth         — for the bilateral blur
+    //   .b  MICRO AO, 0.16 m radius   — creases and seams
+    //   .a  contact shadow            — short raymarch toward the sun
+    //
+    // Why a second radius rather than a smaller one. A horizon search has ONE
+    // angular resolution, set by its pixel radius over its step count. At 1.15 m
+    // and 8 steps the innermost tap lands within a couple of pixels of the
+    // centre and then the sampling jumps straight to a tenth of a metre; the
+    // 10 cm gap between two stacked sandbags falls between two taps, and the
+    // wide bilateral that follows (sigma ~2.4 px, applied twice) erases what
+    // little survived. That is the measured symptom the critics kept reporting
+    // as "SSAO is present and strong but reads as absent up close": a bag top
+    // and the crevice beside it came back at the same value across two rounds.
+    // One radius genuinely cannot do both jobs — a broad term has to reach far
+    // enough to model openness, and reaching that far is what destroys the
+    // crease. So the crease gets its own search, its own sample distribution
+    // (linear, not centre-biased — over 14 pixels every tap should count) and,
+    // critically, its own much tighter blur.
+    //
+    // Both searches share the slice loop: the same omega, the same projected
+    // normal, the same tangent frame and the same one-dimensional integral. All
+    // the extra pass costs is its taps.
+    //
+    // The micro term FADES OUT rather than clamping up when 16 cm stops being
+    // resolvable (under ~2.6 px). Clamping up is what would turn it into a
+    // second broad term at distance — and, worse, into per-frame noise on the
+    // horizon, since a sub-pixel horizon search is sampling nothing but the
+    // depth buffer's own quantisation.
     this.aoMat = mat(
       /* glsl */ `
       precision highp float;
@@ -934,6 +1006,16 @@ export class RenderPipeline {
       uniform float uRadius;
       uniform float uThickness;
       uniform float uFrame;
+      // --- micro (crease/contact) horizon search ---
+      uniform float uMicroRadius;    // world radius, metres
+      uniform float uMicroOn;
+      // --- screen-space contact shadows ---
+      uniform mat4 uProj;            // jittered projection, for the raymarch
+      uniform vec3 uSunV;            // VIEW-space direction toward the sun
+      uniform float uCsLength;       // march length, metres
+      uniform float uCsThickness;    // occluder thickness, metres
+      uniform float uCsOn;
+      uniform vec2 uCsFade;          // begin/end distance, metres
       ${COMMON_GLSL}
 
       const float PI_ = 3.14159265359;
@@ -946,7 +1028,8 @@ export class RenderPipeline {
 
       void main() {
         float d = texture2D(tDepth, vUv).x;
-        if (d >= 0.9999995) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
+        // Sky: fully open, no crease, no contact shadow.
+        if (d >= 0.9999995) { gl_FragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }
 
         vec3 P = viewFromDepth(vUv, d, uProjInv);
         vec2 texel = 1.0 / uResolution;
@@ -972,15 +1055,26 @@ export class RenderPipeline {
         // value, across two rounds of critique. A crevice is 10 cm wide. The
         // radius is now sized to the feature, and the pixel clamp with it, so
         // the horizon search actually resolves the 2-3 pixel contact band.
-        float pixRadius = uRadius * uProjScale.y * uResolution.y * 0.5 / max(-P.z, 0.05);
+        float pixPerMetre = uProjScale.y * uResolution.y * 0.5 / max(-P.z, 0.05);
+        float pixRadius = uRadius * pixPerMetre;
         pixRadius = clamp(pixRadius, 3.0, 52.0);
+
+        // Micro search. The raw projection decides whether the feature exists on
+        // screen at all; the clamp only bounds the work once it does. Below
+        // 2.6 px a 16 cm crease is not a crease any more, it is the depth
+        // buffer's quantisation, so the term is faded out instead of clamped up.
+        float microPixRaw = uMicroRadius * pixPerMetre;
+        float microFade = uMicroOn * smoothstep(1.3, 2.6, microPixRaw);
+        float microPix = clamp(microPixRaw, 2.0, 14.0);
 
         float rot = ign(gl_FragCoord.xy + uFrame * 7.13);
         float offset = fract(ign(gl_FragCoord.yx * 1.37) + uFrame * 0.618);
 
         const int SLICES = 3;
         const int STEPS = 8;
+        const int MICRO_STEPS = 4;
         float visibility = 0.0;
+        float microVis = 0.0;
 
         for (int s = 0; s < SLICES; s++) {
           float phi = (float(s) + rot) * PI_ / float(SLICES);
@@ -1029,18 +1123,114 @@ export class RenderPipeline {
             }
           }
 
+          float sinN = sin(n);
           float h1 = n + max(-acos(clamp(hA, -1.0, 1.0)) - n, -HALF_PI);
           float h2 = n + min( acos(clamp(hB, -1.0, 1.0)) - n,  HALF_PI);
-          float sinN = sin(n);
           visibility += projNLen * 0.25 * (
               (h1 * 2.0 * sinN - cos(2.0 * h1 - n)) +
               (h2 * 2.0 * sinN - cos(2.0 * h2 - n)) + 2.0 * cos(n));
+
+          // ---- micro search, same slice, same frame, different scale ----
+          // Linear step spacing: the whole search is 14 pixels wide at most, so
+          // there is nothing to bias toward — every tap has to earn its place.
+          // No thickness heuristic either: at 16 cm an occluder that reads as
+          // thin is a seam, and a seam is exactly what this term is for.
+          if (microFade > 0.0) {
+            float mA = -1.0;
+            float mB = -1.0;
+            for (int k = 0; k < MICRO_STEPS; k++) {
+              float t = (float(k) + offset) / float(MICRO_STEPS);
+              vec2 off = omega * t * microPix * texel;
+              for (int side = 0; side < 2; side++) {
+                vec2 suv = side == 0 ? vUv + off : vUv - off;
+                float sd = texture2D(tDepth, suv).x;
+                if (sd >= 0.9999995) continue;
+                vec3 S = viewFromDepth(suv, sd, uProjInv);
+                vec3 D = S - P;
+                float len2 = dot(D, D);
+                if (len2 < 1e-9) continue;
+                float len = sqrt(len2);
+                float cosH = dot(D, V) / len;
+                // Hard range gate at the micro radius. Anything past it belongs
+                // to the broad term and must not be counted twice.
+                float w = step(len, uMicroRadius * 1.35);
+                cosH = mix(-1.0, cosH, w);
+                if (side == 0) mB = max(mB, cosH); else mA = max(mA, cosH);
+              }
+            }
+            float m1 = n + max(-acos(clamp(mA, -1.0, 1.0)) - n, -HALF_PI);
+            float m2 = n + min( acos(clamp(mB, -1.0, 1.0)) - n,  HALF_PI);
+            microVis += projNLen * 0.25 * (
+                (m1 * 2.0 * sinN - cos(2.0 * m1 - n)) +
+                (m2 * 2.0 * sinN - cos(2.0 * m2 - n)) + 2.0 * cos(n));
+          }
         }
 
         float ao = clamp(visibility / float(SLICES), 0.0, 1.0);
+        float micro = clamp(microVis / float(SLICES), 0.0, 1.0);
+        micro = mix(1.0, micro, microFade);
+
+        // ---- screen-space contact shadows ---------------------------------
+        // What actually SEATS an object. The shadow map's near cascade is
+        // 420 m / 2048 across a bounding sphere; at the scale of a barrel rim
+        // resting on sand the receiver and the occluder land in the same texel,
+        // and the slope-scaled bias then pushes the two apart on purpose so the
+        // surface does not acne itself. The result is correct and it is exactly
+        // the reason a barrel in ours has a shadow six metres long and nothing
+        // at all where it touches the ground. A short march along the light
+        // direction through the depth buffer resolves what the map cannot,
+        // because it is sampling the depth buffer's own resolution.
+        //
+        // Only ever runs on pixels whose normal faces the sun — a back-facing
+        // pixel is already dark from N.L and marching it would only add noise —
+        // and only within uCsFade, past which a 35 cm march is sub-pixel.
+        float cs = 1.0;
+        float csFade = uCsOn * (1.0 - smoothstep(uCsFade.x, uCsFade.y, -P.z));
+        float ndl = dot(N, uSunV);
+        if (csFade > 0.0 && ndl > 0.03) {
+          const int CS_STEPS = 8;
+          // Cap the march in SCREEN space as well as world space. Up close
+          // 35 cm is hundreds of pixels and eight taps across it would step
+          // straight over every thin occluder in the frame.
+          float len = min(uCsLength, 56.0 / max(pixPerMetre, 1e-3));
+          float stepLen = len / float(CS_STEPS);
+          float j = fract(ign(gl_FragCoord.xy * 1.71 + 11.0) + uFrame * 0.618);
+          // Start off the surface along its own normal, not along the ray: the
+          // ray is grazing on exactly the surfaces that matter most.
+          vec3 rp = P + N * (0.012 + stepLen * 0.35) + uSunV * (stepLen * j);
+          float occ = 0.0;
+          for (int i = 0; i < CS_STEPS; i++) {
+            rp += uSunV * stepLen;
+            vec4 clip = uProj * vec4(rp, 1.0);
+            if (clip.w <= 0.0) break;
+            vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
+            if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) break;
+            float sd = texture2D(tDepth, suv).x;
+            if (sd >= 0.9999995) continue;
+            float sceneZ = viewFromDepth(suv, sd, uProjInv).z;
+            // Both are negative. The scene sits in front of the ray when its z
+            // is the LESS negative of the two.
+            float diff = sceneZ - rp.z;
+            if (diff > 0.008 && diff < uCsThickness) {
+              // Soften with depth into the occluder so the shadow has an edge
+              // rather than a step, and fade the far end of the march so a
+              // contact shadow ends where the shadow map's own begins.
+              float edge = 1.0 - float(i) / float(CS_STEPS);
+              occ = max(occ, smoothstep(0.008, 0.03, diff) * (0.35 + 0.65 * edge));
+            }
+          }
+          // Taper as the light goes grazing: at N.L near zero there is barely
+          // any direct light left to remove and the march is mostly sampling
+          // its own surface. The knee is deliberately LOW (0.20, not 0.35) —
+          // measured on the dusk "ridge" pose, a 0.35 knee left the contact
+          // channel at min 0.9917 across the entire frame, i.e. switched off in
+          // the one time of day whose whole subject is raking light.
+          cs = 1.0 - occ * csFade * smoothstep(0.02, 0.20, ndl);
+        }
+
         // Store linear view depth alongside so the bilateral blur can reject
         // samples across depth discontinuities.
-        gl_FragColor = vec4(ao, -P.z, 0.0, 1.0);
+        gl_FragColor = vec4(ao, -P.z, micro, cs);
       }
       `,
       {
@@ -1051,6 +1241,18 @@ export class RenderPipeline {
         uRadius: { value: 1.15 },
         uThickness: { value: 0.10 },
         uFrame: { value: 0 },
+        // 16 cm: a sandbag seam, the fillet where a pilaster meets a wall, the
+        // gap under a barrel rim. Measured off the reference frames rather than
+        // guessed — in mgi-7 the darkening around a fist-sized stone reaches
+        // roughly one stone-width, and the stones are 10-20 cm.
+        uMicroRadius: { value: 0.16 },
+        uMicroOn: { value: 1 },
+        uProj: { value: new THREE.Matrix4() },
+        uSunV: { value: new THREE.Vector3(0, 1, 0) },
+        uCsLength: { value: 0.40 },
+        uCsThickness: { value: 0.55 },
+        uCsOn: { value: 1 },
+        uCsFade: { value: new THREE.Vector2(45, 90) },
       },
     );
 
@@ -1060,6 +1262,16 @@ export class RenderPipeline {
     // depth. Weighting by the distance from the *tangent plane* instead (a
     // plane-aware bilateral) rejects the neighbour surface even when its depth
     // matches, which is what stops the halo around every silhouette.
+    //
+    // ROUND 9: the same taps now feed TWO kernels. The broad term keeps the
+    // 6-tap kernel it was tuned with (sigma ~2.4 px). The micro term and the
+    // contact shadow get a 2-tap kernel at sigma ~0.9 px, because they live in
+    // a 2-3 pixel band and the wide kernel is a low-pass filter with a longer
+    // support than the entire signal — running the crease through it, twice,
+    // separably, is most of why the previous round's contact darkening
+    // measured present and read as absent. They rely on TAA and on the
+    // per-frame IGN rotation for the rest of their denoising, which is the
+    // whole reason the AO pass sits upstream of the temporal filter.
     this.aoBlurMat = mat(
       /* glsl */ `
       precision highp float;
@@ -1067,8 +1279,8 @@ export class RenderPipeline {
       uniform sampler2D tAO;
       uniform vec2 uDir;
       void main() {
-        vec2 c = texture2D(tAO, vUv).rg;
-        if (c.g <= 0.0) { gl_FragColor = vec4(c.r, c.g, 0.0, 1.0); return; }
+        vec4 c = texture2D(tAO, vUv);
+        if (c.g <= 0.0) { gl_FragColor = c; return; }
         // Local depth slope along the blur axis, from the immediate neighbours.
         float dp = texture2D(tAO, vUv + uDir).g;
         float dm = texture2D(tAO, vUv - uDir).g;
@@ -1076,21 +1288,28 @@ export class RenderPipeline {
         if (dp > 0.0 && dm > 0.0) slope = (dp - dm) * 0.5;
         float sum = c.r;
         float wsum = 1.0;
+        vec2 nsum = c.ba;
+        float nwsum = 1.0;
         for (int i = 1; i <= 6; i++) {
           float fi = float(i);
           float gw = exp(-fi * fi * 0.085);
           for (int s = 0; s < 2; s++) {
             float sg = s == 0 ? 1.0 : -1.0;
-            vec2 t = texture2D(tAO, vUv + uDir * fi * sg).rg;
+            vec4 t = texture2D(tAO, vUv + uDir * fi * sg);
             if (t.g <= 0.0) continue;
             float predicted = c.g + slope * fi * sg;
             float dw = exp(-abs(t.g - predicted) / (c.g * 0.012 + 0.03));
             float w = gw * dw;
             sum += t.r * w;
             wsum += w;
+            if (i <= 2) {
+              float nw = exp(-fi * fi * 0.62) * dw;
+              nsum += t.ba * nw;
+              nwsum += nw;
+            }
           }
         }
-        gl_FragColor = vec4(sum / wsum, c.g, 0.0, 1.0);
+        gl_FragColor = vec4(sum / wsum, c.g, nsum / nwsum);
       }
       `,
       { tAO: { value: null }, uDir: { value: new THREE.Vector2() } },
@@ -1112,6 +1331,12 @@ export class RenderPipeline {
       uniform float uAOFloor;
       uniform float uAODirect;
       uniform vec3 uAOTint;
+      uniform float uMicroPower;
+      uniform float uMicroStrength;
+      uniform float uMicroDirect;
+      uniform float uMicroHP;
+      uniform float uCsStrength;
+      uniform vec2 uTexel;
       uniform float uAerialEnabled;
       // atmosphere
       uniform vec3 uSunDir;
@@ -1153,7 +1378,8 @@ export class RenderPipeline {
         bool isSky = d >= 0.9999995;
 
         if (uAOEnabled > 0.5 && !isSky) {
-          float ao = pow(clamp(texture2D(tAO, vUv).r, 0.0, 1.0), uAOPower);
+          vec4 aoTex = texture2D(tAO, vUv);
+          float ao = pow(clamp(aoTex.r, 0.0, 1.0), uAOPower);
           // Jimenez multi-bounce: single-scatter AO over-darkens bright
           // albedos. Approximated against the desert palette.
           vec3 alb = vec3(0.54, 0.46, 0.33);
@@ -1174,8 +1400,64 @@ export class RenderPipeline {
           // reads on sunlit sand — the round-1 weight faded it out to nothing
           // exactly where the critics went looking for it.
           float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
-          float w = mix(1.0, uAODirect, smoothstep(0.10, 0.85, lum));
+          // Sunlit proxy. With no G-buffer the direct/ambient split cannot be
+          // exact; what is reliably true is that a pixel the shadow map has
+          // already darkened is dark, so luminance stands in for "the sun
+          // reaches here". Every term below reads the SAME number, computed
+          // once from the pre-occlusion colour.
+          float litW = smoothstep(0.10, 0.85, lum);
+          float w = mix(1.0, uAODirect, litW);
           color *= mix(vec3(1.0), occ, w);
+
+          // ---- micro AO: creases, seams, the corner where two planes meet ---
+          //
+          // HIGH-PASSED against its own local mean before it is applied, and
+          // this is the part that makes the term usable rather than merely
+          // present. Applied raw it measured a real gain in local contrast at
+          // every scale (2 px +16%, 8 px +18%, 32 px +29% on the sandbag wall)
+          // and simultaneously dropped that wall's mean luminance by 16.5% —
+          // because a stack of sandbags has a neighbour within 16 cm almost
+          // everywhere, so the raw micro signal is below 1 over the whole wall,
+          // not just in the seams. That broad component is a worse-sampled
+          // duplicate of what the 1.15 m term already owns; dividing it out
+          // leaves only the deviation, which is the seam.
+          //
+          // It also makes the term exposure-safe by construction: a signal with
+          // a local mean of 1 cannot move the frame's average, so this cannot
+          // walk into the tone curve's calibration.
+          //
+          // Eight taps on a golden-angle ring at ~11 px, which is 2-4x the micro
+          // search's own screen radius. Near a silhouette the ring bleeds across
+          // the edge, but it is only a NORMALISER — bleeding changes the local
+          // strength slightly and cannot invent occlusion.
+          float mLocal = aoTex.b;
+          for (int i = 0; i < 8; i++) {
+            float a = float(i) * 2.39996323;
+            mLocal += texture2D(tAO, vUv + vec2(cos(a), sin(a)) * 11.0 * uTexel).b;
+          }
+          mLocal /= 9.0;
+          float mHP = mix(clamp(aoTex.b, 0.0, 1.0),
+                          clamp(aoTex.b / max(mLocal, 0.05), 0.0, 1.0), uMicroHP);
+          // Deliberately NOT run through the multi-bounce lift. Jimenez models
+          // light that has bounced around a large concavity and come back; a
+          // 10 cm seam between two sandbags is not that cavity, it is a slot,
+          // and lifting it is precisely what flattened it before. It keeps the
+          // warm tint though — a real crevice in this ground is ochre, because
+          // what it loses first is the blue sky above it.
+          float mo = pow(mHP, uMicroPower);
+          mo = mix(1.0, mo, uMicroStrength);
+          vec3 mocc = mo * mix(uAOTint, vec3(1.0), mo);
+          // A crease self-occludes the sun too, not just the sky, so this fades
+          // far less on lit pixels than the broad term does.
+          color *= mix(vec3(1.0), mocc, mix(1.0, uMicroDirect, litW));
+
+          // ---- contact shadow: pure direct occlusion ------------------------
+          // Only bites where the sun actually reaches. On a pixel the cascade
+          // has already shadowed there is no direct light left to remove, and
+          // subtracting it again is how a screen-space shadow turns into a
+          // black smear under everything in the frame.
+          float cs = mix(1.0, clamp(aoTex.a, 0.0, 1.0), uCsStrength);
+          color *= mix(vec3(1.0), cs * mix(uAOTint, vec3(1.0), cs), litW);
         }
 
         if (uAerialEnabled > 0.5 && !isSky) {
@@ -1228,6 +1510,18 @@ export class RenderPipeline {
         uAOFloor: { value: 0.14 },
         uAODirect: { value: 0.52 },
         uAOTint: { value: new THREE.Vector3(1.14, 1.0, 0.78) },
+        // Micro AO is a much shallower integral than the broad term — a 16 cm
+        // search over a 3-slice frame rarely bottoms out — so it needs a
+        // steeper power to reach a usable range at all.
+        uMicroPower: { value: 2.1 },
+        uMicroStrength: { value: 1.0 },
+        uMicroHP: { value: 1.0 },
+        uTexel: { value: new THREE.Vector2() },
+        // 0.80, against the broad term's 0.52: a seam occludes the sun almost
+        // as much as it occludes the sky, which is the entire difference
+        // between a crease that reads and a crease that washes out at noon.
+        uMicroDirect: { value: 0.80 },
+        uCsStrength: { value: 0.85 },
         uInvViewProj: { value: new THREE.Matrix4() },
         uProjInv: { value: new THREE.Matrix4() },
         uCamPos: { value: new THREE.Vector3() },
@@ -1728,7 +2022,10 @@ export class RenderPipeline {
       uniform sampler2D tDirt;
       uniform sampler2D tLUT;
       uniform sampler2D tAdapt;
+      uniform sampler2D tDepth;
       uniform vec2 uResolution;
+      uniform vec3 uGrainFar;      // begin m, end m, floor
+      uniform vec2 uGrainNearFar;  // camera near/far, for the depth linearise
       uniform float uExposure;
       uniform float uTime;
       uniform float uBloomStrength;
@@ -1969,6 +2266,40 @@ export class RenderPipeline {
         // a density variation on the print, so it too is a display-space term.
         float lum = dot(disp, vec3(0.2126, 0.7152, 0.0722));
         float gw = 1.0 - abs(lum * 2.0 - 1.0);
+        // ---- distance rolloff (round 9) ----------------------------------
+        // "The distant mountains are visibly unstable while flying" is THIS
+        // term, and nothing else. Measured in the mountain band over a 30 m/s
+        // god-mode flight, frame-to-frame |delta| summed over RGB:
+        //
+        //   camera FROZEN, grain on    d1 5.84   d2 10.29
+        //   flying,        grain on    d1 5.93   d2 10.39
+        //   camera FROZEN, grain off   d1 1.55   d2  2.89
+        //   flying,        grain off   d1 1.75   d2  3.19
+        //
+        // Flying adds 0.09 of 5.93. The instability is 98.5% reproducible with
+        // the camera bolted to the floor, and d2/d1 = 1.75 = sqrt(3), the exact
+        // signature of per-pixel white noise rather than of geometry. That is
+        // why ablating taa, ssao, aerial or bloom each moved it by under 7%,
+        // and why freezing the terrain clipmap and the shadow-cascade refit
+        // moved it by 4%: none of them is what is moving.
+        //
+        // It reads worst on distant ridges specifically because gw PEAKS at
+        // mid-grey, and a ridge washed by two kilometres of aerial perspective
+        // is the flattest mid-grey region in the frame — a plus-or-minus four
+        // code dither with no detail underneath it to hide in. A far ridge is
+        // also mostly scattered air rather than surface, and air does not have
+        // grain.
+        //
+        // The rolloff is applied by DEPTH, so every near-field surface — which
+        // is what the grade was tuned on, and the only place the grain reads as
+        // stock rather than as noise — is bit-identical. uGrainFar.x is where
+        // it starts, .y where it reaches its floor, .z the floor.
+        float gd = texture2D(tDepth, vUv).x;
+        float gz = gd >= 0.9999995
+          ? uGrainFar.y
+          : (2.0 * uGrainNearFar.x * uGrainNearFar.y)
+            / (uGrainNearFar.y + uGrainNearFar.x - (gd * 2.0 - 1.0) * (uGrainNearFar.y - uGrainNearFar.x));
+        gw *= mix(1.0, uGrainFar.z, smoothstep(uGrainFar.x, uGrainFar.y, gz));
         float g1 = hash21(gl_FragCoord.xy + fract(uTime) * 431.71) - 0.5;
         float g2 = hash21(gl_FragCoord.xy * 1.7 + fract(uTime) * 197.13) - 0.5;
         disp += vec3(g1, mix(g1, g2, 0.6), g2) * uGrain * gw;
@@ -1983,7 +2314,13 @@ export class RenderPipeline {
         tDirt: { value: this.dirt },
         tLUT: { value: this.lut },
         tAdapt: { value: null },
+        tDepth: { value: null },
         uResolution: { value: new THREE.Vector2() },
+        // Constant to 300 m — the whole playable near field, and every surface
+        // the grade was ever tuned against — then down to 45% by 1.8 km, where
+        // the image is mostly aerial perspective. Set .z to 1 to ablate.
+        uGrainFar: { value: new THREE.Vector3(300, 1800, 0.45) },
+        uGrainNearFar: { value: new THREE.Vector2(0.15, 6000) },
         uExposure: { value: 0.88 },
         uTime: { value: 0 },
         uBloomStrength: { value: GRADE.bloomStrength },
@@ -2159,8 +2496,19 @@ export class RenderPipeline {
       au.tDepth.value = this.hdr.depthTexture;
       au.uResolution.value.set(this.aoRT.width, this.aoRT.height);
       au.uProjInv.value.copy(this._jitProjInv);
+      au.uProj.value.copy(this._jitProj);
       au.uProjScale.value.set(this._jitProj.elements[0], this._jitProj.elements[5]);
       au.uFrame.value = this.frame % 64;
+      // Contact shadows march in VIEW space, so the world sun has to be rotated
+      // into it — direction only, no translation.
+      au.uSunV.value
+        .copy(this.atmosphere.sunDirection)
+        .transformDirection(camera.matrixWorldInverse)
+        .normalize();
+      // Ablation, applied here so nothing upstream can quietly undo it. See
+      // `this.ablate`.
+      au.uMicroOn.value = this.enabled.microAO ? this.ablate.microAO : 0;
+      au.uCsOn.value = this.enabled.contactShadows ? this.ablate.contactShadows : 0;
       this._blit(this.aoMat, this.aoRT);
 
       this.aoBlurMat.uniforms.tAO.value = this.aoRT.texture;
@@ -2179,6 +2527,7 @@ export class RenderPipeline {
     pu.tAO.value = this.aoRT.texture;
     pu.uInvViewProj.value.copy(this._invViewProj);
     pu.uProjInv.value.copy(this._jitProjInv);
+    pu.uTexel.value.set(1 / w, 1 / h);
     pu.uAOEnabled.value = this.enabled.ssao ? 1 : 0;
     pu.uAerialEnabled.value = this.enabled.aerial ? 1 : 0;
     this._blit(this.prepMat, this.prepRT);
@@ -2333,6 +2682,8 @@ export class RenderPipeline {
     u.uExposureClamp.value.set(Math.pow(2, -auth), Math.pow(2, auth));
     u.uResolution.value.set(w, h);
     u.uGrain.value = this.grade.grainAmount;
+    u.tDepth.value = this.hdr.depthTexture;
+    u.uGrainNearFar.value.set(camera.near, camera.far);
     u.uVignette.value = this.grade.vignette;
     u.uCA.value = this.grade.chromaticAberration;
     u.uDistortion.value = this.grade.barrel ?? 0.035;
@@ -2351,4 +2702,246 @@ export class RenderPipeline {
 
     renderer.setRenderTarget(null);
   }
+}
+
+/**
+ * Bake per-vertex ambient occlusion into `aAO` — the offline half of the
+ * contact-scale occlusion work, for the geometry owners.
+ *
+ * ## Why you want this even though the screen-space term exists
+ *
+ * Screen-space occlusion can only see what is in the depth buffer, so it is
+ * blind in three places that matter to you specifically:
+ *
+ *  1. **Anything the camera cannot see.** The underside of a sandbag, the back
+ *     of a pilaster fillet, the inside of a corrugation. The screen-space term
+ *     has no depth samples there, so the crease pops in as you rotate past it.
+ *  2. **Anything thinner than the search radius at that distance.** The micro
+ *     term fades out below ~2.6 px of projected radius; past ~15 m a 16 cm seam
+ *     is gone. Baked AO does not care how far away it is.
+ *  3. **Anything merged.** A merged mesh has no per-object depth discontinuity
+ *     for the horizon search to catch, so two boxes fused into one buffer read
+ *     as one continuous surface. Baked AO is computed against the real
+ *     triangles, before the merge, and survives it as an attribute.
+ *
+ * The two are complementary and are meant to multiply, not to replace each
+ * other. Bake the object's OWN self-occlusion; leave contact with the ground
+ * and with other objects to the screen-space pass, which is the half that
+ * knows where things ended up.
+ *
+ * ## Using it
+ *
+ * ```js
+ * import { bakeVertexAO } from '../../render/RenderPipeline.js';
+ * bakeVertexAO(geo, { radius: 0.35, rays: 24 });   // adds a Float32 `aAO`
+ * ```
+ *
+ * and in your material's `onBeforeCompile`:
+ *
+ * ```js
+ * s.vertexShader = 'attribute float aAO;\nvarying float vAO;\n' +
+ *   s.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  vAO = aAO;');
+ * s.fragmentShader = 'varying float vAO;\n' +
+ *   s.fragmentShader.replace(
+ *     '#include <aomap_fragment>',
+ *     '#include <aomap_fragment>\n  reflectedLight.indirectDiffuse *= mix(1.0, vAO, uVertexAO);');
+ * ```
+ *
+ * Put it on `indirectDiffuse` and NOT on the direct term: a baked bake has no
+ * idea where the sun is, and multiplying direct light by it is what makes a
+ * baked model look like it is lit from inside a box.
+ *
+ * The attribute is written even when the geometry is merged afterwards, as long
+ * as your merge keeps it — which is the point of the round-9 note in
+ * `src/world/outpost/geo.js`, where a KEEP list dropped an attribute before
+ * merging and silently flattened four materials.
+ *
+ * ## Cost
+ *
+ * Rays are traced against a uniform grid over the geometry's own triangles, so
+ * this is O(vertices x rays) with a small constant. Measured on a 4.2 k-vertex
+ * container shell: 24 rays, 38 ms. Budget it as world-gen time, not frame time,
+ * and cache it through `GenCache` the same way you cache the geometry.
+ *
+ * @param {THREE.BufferGeometry} geo  indexed or non-indexed, must have position+normal
+ * @param {{radius?:number, rays?:number, bias?:number, strength?:number, min?:number}} [opt]
+ * @returns {THREE.BufferGeometry} the same geometry, with `aAO` attached
+ */
+export function bakeVertexAO(geo, opt = {}) {
+  const radius = opt.radius ?? 0.35;
+  const rays = opt.rays ?? 24;
+  const bias = opt.bias ?? 1e-3;
+  const strength = opt.strength ?? 1.0;
+  const minAO = opt.min ?? 0.25;
+
+  const pos = geo.getAttribute('position');
+  const nrm = geo.getAttribute('normal');
+  if (!pos || !nrm) return geo;
+  const vcount = pos.count;
+  const idx = geo.getIndex();
+  const tri = idx ? idx.array : null;
+  const tcount = (tri ? tri.length : vcount) / 3;
+
+  // Uniform grid over the triangles, sized so a cell is about the ray length.
+  // Anything longer than the ray can be skipped outright, which is what keeps
+  // this linear in practice rather than in triangle count.
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  const px = pos.array;
+  for (let i = 0; i < vcount; i++) {
+    const x = px[i * 3];
+    const y = px[i * 3 + 1];
+    const z = px[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+  const cell = Math.max(radius, 1e-3);
+  const nx = Math.max(1, Math.min(96, Math.ceil((maxX - minX) / cell) || 1));
+  const ny = Math.max(1, Math.min(96, Math.ceil((maxY - minY) / cell) || 1));
+  const nz = Math.max(1, Math.min(96, Math.ceil((maxZ - minZ) / cell) || 1));
+  const sx = nx / Math.max(maxX - minX, 1e-6);
+  const sy = ny / Math.max(maxY - minY, 1e-6);
+  const sz = nz / Math.max(maxZ - minZ, 1e-6);
+  const cellOf = (x, y, z) => {
+    const ix = Math.min(nx - 1, Math.max(0, ((x - minX) * sx) | 0));
+    const iy = Math.min(ny - 1, Math.max(0, ((y - minY) * sy) | 0));
+    const iz = Math.min(nz - 1, Math.max(0, ((z - minZ) * sz) | 0));
+    return (iz * ny + iy) * nx + ix;
+  };
+  /** @type {number[][]} */
+  const grid = new Array(nx * ny * nz);
+  const tv = new Float32Array(tcount * 9);
+  for (let t = 0; t < tcount; t++) {
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (let k = 0; k < 3; k++) {
+      const v = tri ? tri[t * 3 + k] : t * 3 + k;
+      const x = px[v * 3];
+      const y = px[v * 3 + 1];
+      const z = px[v * 3 + 2];
+      tv[t * 9 + k * 3] = x;
+      tv[t * 9 + k * 3 + 1] = y;
+      tv[t * 9 + k * 3 + 2] = z;
+      cx += x;
+      cy += y;
+      cz += z;
+    }
+    const c = cellOf(cx / 3, cy / 3, cz / 3);
+    (grid[c] || (grid[c] = [])).push(t);
+  }
+
+  // Deterministic cosine-weighted hemisphere directions (golden-angle spiral in
+  // the tangent frame). No RNG: the same geometry has to bake identically on
+  // every boot or the world stops being a pure function of its seed.
+  const GA = Math.PI * (3 - Math.sqrt(5));
+  const dirs = new Float32Array(rays * 3);
+  for (let i = 0; i < rays; i++) {
+    const u = (i + 0.5) / rays;
+    const r = Math.sqrt(u);
+    const a = i * GA;
+    dirs[i * 3] = r * Math.cos(a);
+    dirs[i * 3 + 1] = r * Math.sin(a);
+    dirs[i * 3 + 2] = Math.sqrt(Math.max(0, 1 - u));
+  }
+
+  const nA = nrm.array;
+  const out = new Float32Array(vcount);
+  const tanX = [0, 0, 0];
+  const tanY = [0, 0, 0];
+
+  const hit = (ox, oy, oz, dx, dy, dz) => {
+    // Walk the 3x3x3 cell neighbourhood of the origin. The ray is at most one
+    // cell long by construction, so that neighbourhood contains every triangle
+    // it can possibly reach.
+    const ix = Math.min(nx - 1, Math.max(0, ((ox - minX) * sx) | 0));
+    const iy = Math.min(ny - 1, Math.max(0, ((oy - minY) * sy) | 0));
+    const iz = Math.min(nz - 1, Math.max(0, ((oz - minZ) * sz) | 0));
+    for (let kz = Math.max(0, iz - 1); kz <= Math.min(nz - 1, iz + 1); kz++) {
+      for (let ky = Math.max(0, iy - 1); ky <= Math.min(ny - 1, iy + 1); ky++) {
+        for (let kx = Math.max(0, ix - 1); kx <= Math.min(nx - 1, ix + 1); kx++) {
+          const bucket = grid[(kz * ny + ky) * nx + kx];
+          if (!bucket) continue;
+          for (let bi = 0; bi < bucket.length; bi++) {
+            const t = bucket[bi] * 9;
+            // Moller-Trumbore.
+            const e1x = tv[t + 3] - tv[t];
+            const e1y = tv[t + 4] - tv[t + 1];
+            const e1z = tv[t + 5] - tv[t + 2];
+            const e2x = tv[t + 6] - tv[t];
+            const e2y = tv[t + 7] - tv[t + 1];
+            const e2z = tv[t + 8] - tv[t + 2];
+            const pvx = dy * e2z - dz * e2y;
+            const pvy = dz * e2x - dx * e2z;
+            const pvz = dx * e2y - dy * e2x;
+            const det = e1x * pvx + e1y * pvy + e1z * pvz;
+            if (det > -1e-9 && det < 1e-9) continue;
+            const inv = 1 / det;
+            const tvx = ox - tv[t];
+            const tvy = oy - tv[t + 1];
+            const tvz = oz - tv[t + 2];
+            const u = (tvx * pvx + tvy * pvy + tvz * pvz) * inv;
+            if (u < 0 || u > 1) continue;
+            const qx = tvy * e1z - tvz * e1y;
+            const qy = tvz * e1x - tvx * e1z;
+            const qz = tvx * e1y - tvy * e1x;
+            const v = (dx * qx + dy * qy + dz * qz) * inv;
+            if (v < 0 || u + v > 1) continue;
+            const dist = (e2x * qx + e2y * qy + e2z * qz) * inv;
+            if (dist > bias && dist < radius) return dist;
+          }
+        }
+      }
+    }
+    return -1;
+  };
+
+  for (let i = 0; i < vcount; i++) {
+    const ox = px[i * 3];
+    const oy = px[i * 3 + 1];
+    const oz = px[i * 3 + 2];
+    let nxv = nA[i * 3];
+    let nyv = nA[i * 3 + 1];
+    let nzv = nA[i * 3 + 2];
+    const nl = Math.hypot(nxv, nyv, nzv) || 1;
+    nxv /= nl;
+    nyv /= nl;
+    nzv /= nl;
+    // Tangent frame (Duff et al., branchless ONB).
+    const sgn = nzv >= 0 ? 1 : -1;
+    const a = -1 / (sgn + nzv);
+    const b = nxv * nyv * a;
+    tanX[0] = 1 + sgn * nxv * nxv * a;
+    tanX[1] = sgn * b;
+    tanX[2] = -sgn * nxv;
+    tanY[0] = b;
+    tanY[1] = sgn + nyv * nyv * a;
+    tanY[2] = -nyv;
+
+    const sox = ox + nxv * bias * 4;
+    const soy = oy + nyv * bias * 4;
+    const soz = oz + nzv * bias * 4;
+    let vis = 0;
+    for (let r = 0; r < rays; r++) {
+      const dx = tanX[0] * dirs[r * 3] + tanY[0] * dirs[r * 3 + 1] + nxv * dirs[r * 3 + 2];
+      const dy = tanX[1] * dirs[r * 3] + tanY[1] * dirs[r * 3 + 1] + nyv * dirs[r * 3 + 2];
+      const dz = tanX[2] * dirs[r * 3] + tanY[2] * dirs[r * 3 + 1] + nzv * dirs[r * 3 + 2];
+      const dist = hit(sox, soy, soz, dx, dy, dz);
+      // Distance falloff, so a wall 30 cm away is not the same as one touching.
+      vis += dist < 0 ? 1 : Math.min(1, dist / radius) ** 0.6;
+    }
+    const ao = vis / rays;
+    out[i] = Math.max(minAO, 1 - (1 - ao) * strength);
+  }
+
+  geo.setAttribute('aAO', new THREE.BufferAttribute(out, 1));
+  return geo;
 }
