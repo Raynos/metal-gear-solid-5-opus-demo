@@ -204,8 +204,9 @@ export class Animator {
     // Measured against the pixel: a 1.86 m soldier standing on a 15-degree
     // slope tilts his crown 0.11 m out of vertical at full strength; at 25 m
     // that is 3.6 px and at 60 m it is 1.5 px, and the sole conform term is a
-    // quarter of that. Beyond `coarseAbove` both are dropped and the root sits
-    // level, which costs 11 of the 15 terrain queries.
+    // quarter of that. Set by the LOD band in index.js; when it is on, both are
+    // dropped and the root sits level, which costs 11 of the 15 terrain
+    // queries per character per frame.
     this.coarse = false;
     this.breath = Math.random() * 10;
     this.weaponSway = new THREE.Vector3();
