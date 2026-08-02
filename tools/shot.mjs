@@ -158,8 +158,14 @@ async function call(endpoint, body, { quiet = false } = {}) {
       if (!r.ok) throw new Error(json.error ?? `daemon returned ${r.status}`);
       return json;
     } catch (err) {
-      if (attempt >= 2 || !isDaemonGone(err)) throw err;
-      await sleep(500);
+      // The daemon dying under us is COMMON, not exceptional: it is shared by
+      // every tree, and until `stop` learned to drain, any author typing it
+      // destroyed everyone else's in-flight work. Three long measurement runs
+      // were lost to that in one session. A retry costs a re-queue; giving up
+      // costs the whole measurement, so retry generously.
+      if (attempt >= 5 || !isDaemonGone(err)) throw err;
+      process.stderr.write(`render daemon went away mid-request; retrying (${attempt + 1}/5)\n`);
+      await sleep(1000);
     }
   }
 }
