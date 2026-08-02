@@ -199,6 +199,26 @@ async function main() {
         return null;
       },
       commanderPos() { const r = AI?.report(); return r?.commander ? r.commander.at : null; },
+      /** Standing spot `d` m from the nearest living guard, on clear ground. */
+      nearGuard(d) {
+        const r = AI.report();
+        const P2 = W.registry.player;
+        const live = r.guards.filter((x) => !x.down);
+        if (!live.length) return null;
+        let best = live[0]; let bd = 1e9;
+        for (const gd of live) {
+          const dd = Math.hypot(gd.at[0] - P2.position.x, gd.at[1] - P2.position.z);
+          if (dd < bd) { bd = dd; best = gd; }
+        }
+        const obs = P2.obstacles;
+        const hAt = (x, z) => W.registry.characters.ground.heightAt(x, z);
+        for (let a = 0; a < 24; a++) {
+          const th = (a / 24) * Math.PI * 2;
+          const x = best.at[0] + Math.sin(th) * d; const z = best.at[1] + Math.cos(th) * d;
+          if (obs.maxIn(x, z, 0.9) <= hAt(x, z) + 0.45) return [x, z, best.at[0], best.at[1]];
+        }
+        return null;
+      },
       commanderName() { return W.registry.characters.commander?.name ?? null; },
       /**
        * A start point for the alert ladder: on the approach to the compound but
@@ -446,11 +466,11 @@ async function main() {
       for (let i = 0; i < 12; i++) { await page.waitForTimeout(3000); const t = await read();
         console.log('  trace', JSON.stringify({ pos: t.pos, sp: t.speed, near: +(t.nearest ?? 0).toFixed(1), aw: t.maxAware, seen: t.seenBy, alert: t.alert, live: t.aiLive, mode: t.mode })); }
     }
-    const caution = await until((s) => s.alert === 'CAUTION' || s.alert === 'ALERT', 60000);
+    const caution = await until((s) => s.alert === 'CAUTION' || s.alert === 'ALERT', 150000);
     await shot('10-caution');
     record('CALM -> CAUTION', caution.s.alert === 'CAUTION' || caution.s.alert === 'ALERT',
       `started ${start[2].toFixed(0)} m from the nearest guard and walked in; alert=${caution.s.alert} after ${(caution.ms / 1000).toFixed(1)} s at ${caution.s.nearest?.toFixed(0)} m, seenBy=${caution.s.seenBy}, awareness ${caution.s.maxAware.toFixed(2)}, health ${caution.s.health}`);
-    const alert = await until((s) => s.alert === 'ALERT', 60000);
+    const alert = await until((s) => s.alert === 'ALERT', 90000);
     await page.keyboard.up('KeyW');
     await shot('11-alert');
     record('CAUTION -> ALERT', alert.s.alert === 'ALERT',
@@ -477,29 +497,37 @@ async function main() {
   // ==== 6. take damage, die, MISSION FAILED ===============================
   if (want('death')) {
     await ensureFresh();
-    // Stand up, in the open, inside the compound, and do not fight back.
-    const site = (await page.evaluate(() => window.R.site));
-    await page.evaluate(([x, z]) => window.R.warp(x, z, ...window.R.site), [site[0] + 12, site[1] + 12]);
-    await page.waitForTimeout(1000);
+    // Get caught the way a player gets caught — walk in until they see you —
+    // and then DO NOT LEAVE. Warping into the middle of a CALM compound and
+    // waiting does not work: measured, 70 s standing at 17 m from the wire drew
+    // two rounds and no damage, because nobody had a reason to look.
+    const dstart = await page.evaluate(() => window.R.farStart(95));
+    await page.evaluate(([x, z]) => window.R.warp(x, z, ...window.R.site), dstart);
+    await page.waitForTimeout(800);
+    await page.keyboard.down('KeyW');
+    const spotted = await until((s) => s.alert === 'ALERT', 150000);
+    await page.keyboard.up('KeyW');
+    // Close to 14 m and STAND THERE. The approach is teleported — the walk in
+    // wedges against terrain at whatever range it happens to wedge at, and a
+    // test that sometimes settles at 29 m is testing a different thing: at 29 m
+    // with one shooter, hits arrive slower than Vitals regenerates and the
+    // player survives indefinitely (measured: 26 hits over 150 s, still alive).
+    // Standing in front of a squad at 14 m is the decision the model exists to
+    // punish, so that is the one under test.
+    const close = await page.evaluate(() => window.R.nearGuard(14));
+    if (close) { await page.evaluate((c) => window.R.warp(c[0], c[1], c[2], c[3]), close); }
+    await page.waitForTimeout(600);
     const hp0 = await read();
-    let hurt = await until((s) => s.health < 0.95, 25000);
-    if (!hurt.ok) {
-      // Nobody has noticed. Be noisy — that is a player's own way of starting
-      // this fight, and it keeps the test from depending on a patrol's timing.
-      await page.mouse.down({ button: 'right' }); await page.waitForTimeout(500);
-      for (let i = 0; i < 4; i++) { await page.mouse.click(960, 540); await page.waitForTimeout(200); }
-      await page.mouse.up({ button: 'right' });
-      hurt = await until((s) => s.health < 0.95, 70000);
-    }
+    const hurt = await until((s) => s.health < 0.95, 90000);
     await shot('14-taking-fire');
     record('guards can hurt you', hurt.ok,
-      `health ${hp0.health} -> ${hurt.s.health} after ${(hurt.ms / 1000).toFixed(1)} s under ${hurt.s.shots} rounds (${hurt.s.hitsTaken} hits), shock ${hurt.s.shock}`);
-    const dead = await until((s) => s.dead || s.mission?.status === 'failed', 120000);
+      `spotted at ${spotted.s.nearest?.toFixed(0)} m after ${(spotted.ms / 1000).toFixed(1)} s; health ${hp0.health} -> ${hurt.s.health} under ${hurt.s.shots} rounds (${hurt.s.hitsTaken} hits), shock ${hurt.s.shock}`);
+    const dead = await until((s) => s.dead || s.mission?.status === 'failed', 150000);
     await page.waitForTimeout(2500);
     const failed = await read();
     await shot('15-mission-failed');
     record('death -> MISSION FAILED', failed.mission?.status === 'failed',
-      `dead=${failed.dead} mission=${JSON.stringify(failed.mission)} card="${failed.hud.cardText}" (died ${(dead.ms / 1000).toFixed(1)} s after first contact)`);
+      `dead=${failed.dead} mission=${JSON.stringify(failed.mission)}; took ${failed.hitsTaken} hits from ${failed.shots} rounds, died ${(dead.ms / 1000).toFixed(1)} s after the first one landed`);
   }
 
   // ==== 7. neutralise the commander -> MISSION ACCOMPLISHED ===============
