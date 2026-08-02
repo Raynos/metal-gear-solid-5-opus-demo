@@ -183,6 +183,18 @@ uniform float uCloudFar;         // distance at which the deck has faded out (m)
 uniform float uCloudStreak;      // 0 = isotropic weather, 1 = full cloud streets
 uniform float uCloudVSquash;     // vertical anisotropy of the cloud shape lookup
 
+// Step budgets, as uniforms rather than literals.
+//
+// Round 11. These are the pass's three raymarch loops and NOTHING had ever
+// measured what any of them cost, because the pass has no ablation switch and
+// the counts were compile-time constants — so "is 96 steps worth it" could only
+// be answered by editing the shader and rebuilding, which nobody had done since
+// the round-5 note that raised it from 64. As uniforms they can be swept in one
+// run against a null control. See probes/r11_volsteps.js.
+uniform float uCloudSteps;       // cumulus march, hard cap 96
+uniform float uLightSteps;       // per-sample self-shadow march, hard cap 6
+uniform float uShaftSteps;       // crepuscular march, hard cap 24
+
 ${COMMON}
 
 // ------------------------------------------------------------------ sky lookup
@@ -382,20 +394,40 @@ vec3 weatherAt(vec2 xz) {
   // only differential motion left is the wind shear with height, which is real.
   vec2 w = (xz + uWindT * vec2(3.1, 1.1)) * (1.0 / 46000.0);
   vec4 s = texture2D(tWeather, w);
-  // Squash across the wind so banks form streets rather than an even sprinkle.
+  // AN EFFECT THAT IS SWITCHED OFF, PAID FOR IN FULL (round 11).
   //
-  // Round 6: the squash is now a uniform and the presets set it near zero.
-  // Parallel lines in a horizontal plane converge on a vanishing point, and a
-  // cloud street IS a parallel line in a horizontal plane, so any anisotropy at
-  // all draws a starburst centred on the downwind horizon. Ablated on
-  // shots/r5-1080/vista.png: setting cloudCoverage to 0 removed the radial
-  // spokes in the upper-left outright, while ablating the cirrus and the shaft
-  // pass left them untouched — the streets, not the shafts, were drawing them.
-  // Round 5 halved the anisotropy and it survived; this removes it as the
-  // default and keeps the knob for a deliberately streeted sky.
-  vec2 sq = mix(vec2(1.0), vec2(0.86, 1.55), uCloudStreak);
-  float streak = texture2D(tWeather, w * sq + 0.27).b;
-  float cov = mix(s.r, mix(s.r, streak, 0.18), uCloudStreak);
+  // uCloudStreak is 0.00 in all five presets — round 6 removed the anisotropy
+  // as a default and kept the knob. But mix(s.r, mix(s.r, streak, 0.18), 0.0)
+  // is s.r for ANY value of streak, and a mix with zero weight does not skip
+  // the texture fetch that feeds it. So every weather lookup in this shader was
+  // doing a second, entirely discarded fetch of tWeather.
+  // (No backticks in here: this whole shader is a JS template literal.)
+  //
+  // That is not a rounding error. weatherAt() runs once per cumulus march step
+  // (up to 96), once per self-shadow step (up to 6 per lit sample) and once per
+  // ground cloud-shadow probe, so it is the most-executed texture fetch in the
+  // pass by a wide margin. A uniform branch is coherent across the whole draw,
+  // so the GPU takes one side and the fetch disappears.
+  //
+  // Exactly the defect commit f2929ff found in the composite's chromatic
+  // aberration and LUT. It is worth assuming there are more.
+  float cov = s.r;
+  if (uCloudStreak > 0.001) {
+    // Squash across the wind so banks form streets rather than an even sprinkle.
+    //
+    // Round 6: the squash is now a uniform and the presets set it near zero.
+    // Parallel lines in a horizontal plane converge on a vanishing point, and a
+    // cloud street IS a parallel line in a horizontal plane, so any anisotropy
+    // at all draws a starburst centred on the downwind horizon. Ablated on
+    // shots/r5-1080/vista.png: setting cloudCoverage to 0 removed the radial
+    // spokes in the upper-left outright, while ablating the cirrus and the shaft
+    // pass left them untouched — the streets, not the shafts, were drawing them.
+    // Round 5 halved the anisotropy and it survived; this removes it as the
+    // default and keeps the knob for a deliberately streeted sky.
+    vec2 sq = mix(vec2(1.0), vec2(0.86, 1.55), uCloudStreak);
+    float streak = texture2D(tWeather, w * sq + 0.27).b;
+    cov = mix(s.r, mix(s.r, streak, 0.18), uCloudStreak);
+  }
   cov = remap(cov, 0.30, 0.86, 0.0, 1.0);
   cov = clamp(cov * uCloudCoverage * 1.9, 0.0, 1.0);
   return vec3(cov, s.g, s.a);
@@ -612,6 +644,7 @@ float cloudLightMarch(vec3 p, float alt0, float jit) {
   float dsum = 0.0;
   float stepLen = 38.0 * (0.7 + 0.6 * jit);
   for (int i = 0; i < 6; i++) {
+    if (float(i) >= uLightSteps) break;
     t += stepLen;
     vec3 q = p + uKeyDir * t;
     float alt = alt0 + uKeyDir.y * t;
@@ -737,6 +770,7 @@ void main() {
     // quantisation showing as banding on a low-contrast shaft.
     float dt = 6.0 * (0.55 + 0.9 * jitA);
     for (int i = 0; i < 24; i++) {
+      if (float(i) >= uShaftSteps) break;
       float a = t;
       float b = min(t + dt, marchEnd);
       t += dt;
@@ -877,7 +911,7 @@ void main() {
       // streaks rather than as an even bank. 96 reaches 2.6*t0. Measured cost
       // of the change on the vista shot: 3.80 ms -> 3.86 ms of an 8 ms budget.
       for (int i = 0; i < 96; i++) {
-        if (t > tEnd || Tcloud < 0.012) break;
+        if (float(i) >= uCloudSteps || t > tEnd || Tcloud < 0.012) break;
         // Constant ANGULAR step: the step length grows with distance so every
         // sample covers the same solid angle. A constant world-space step wastes
         // the whole budget overhead and undersamples the horizon into aliasing.
@@ -1123,6 +1157,7 @@ varying vec2 vUv;
 uniform sampler2D tVol;
 uniform sampler2D tDepth;
 uniform vec2 uTexel;      // texel size of the half-res volumetric buffer
+uniform float uFastUpsample;
 
 void main() {
   // Joint bilateral upsample. The volumetric buffer is half res, so a plain
@@ -1136,22 +1171,58 @@ void main() {
   vec2 f = st - base;
   vec2 uv0 = (base + 0.5) * uTexel;
 
-  vec4 acc = vec4(0.0);
-  float wsum = 0.0;
-  for (int i = 0; i < 4; i++) {
-    vec2 o = vec2(float(i & 1), float(i >> 1));
-    vec2 suv = uv0 + o * uTexel;
-    float bw = (o.x > 0.5 ? f.x : 1.0 - f.x) * (o.y > 0.5 ? f.y : 1.0 - f.y);
-    float sd = texture2D(tDepth, suv).r;
-    // Relative depth difference, so a gently receding slope keeps its full
-    // bilinear weight and only a real silhouette rejects the tap. An absolute
-    // metric produces a visible grid wherever the ground is seen edge-on.
-    float rel = abs(sd - d) / max(d, 1.0);
-    float w = bw * exp(-rel * 26.0) + 1e-4;
-    acc += texture2D(tVol, suv) * w;
-    wsum += w;
+  // FOUR DEPTHS FIRST, AND USUALLY NOTHING ELSE (round 11).
+  //
+  // This is a FULL-RESOLUTION pass — 2.07 M pixels — doing nine texture fetches
+  // each, four of them RGBA16F. Measured at 1.24 ms of the vista frame against
+  // a 0.51 ms null control, which is a third of what the whole pass costs.
+  //
+  // But the bilateral weighting only does anything at a silhouette. Away from
+  // one every tap's depth agrees, exp(-rel * 26) is 1 for all four, the weights
+  // collapse to exactly the bilinear footprint, and the loop below computes —
+  // at four fetches and a divide — precisely what the texture unit computes for
+  // free in one LINEAR fetch. So: read the four depths, and if they agree, take
+  // the hardware bilinear tap and stop. Nine fetches become five, and the
+  // result is the same value, not an approximation of it.
+  //
+  // The 0.006 threshold is on the same relative metric the weights use. At
+  // rel = 0.006 the largest weight error is exp(-0.156) = 0.86 against 1.0 on
+  // ONE of four taps, and that tap's neighbour is within 0.6% of it in depth —
+  // i.e. the two samples the weighting is choosing between are the same sample.
+  // A silhouette is orders of magnitude past this: the vista's ridge against
+  // sky runs rel > 8.
+  //
+  // The branch is DIVERGENT, not uniform, so it only pays off if it is coherent
+  // — which it is: silhouette pixels are a thin fraction of the frame and they
+  // are contiguous, so whole warps take the fast side together.
+  float d0 = texture2D(tDepth, uv0).r;
+  float d1 = texture2D(tDepth, uv0 + vec2(uTexel.x, 0.0)).r;
+  float d2 = texture2D(tDepth, uv0 + vec2(0.0, uTexel.y)).r;
+  float d3 = texture2D(tDepth, uv0 + uTexel).r;
+  float inv = 1.0 / max(d, 1.0);
+  float dev = max(max(abs(d0 - d), abs(d1 - d)), max(abs(d2 - d), abs(d3 - d))) * inv;
+
+  vec4 v;
+  if (uFastUpsample > 0.5 && dev < 0.006) {
+    v = texture2D(tVol, vUv);
+  } else {
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < 4; i++) {
+      vec2 o = vec2(float(i & 1), float(i >> 1));
+      vec2 suv = uv0 + o * uTexel;
+      float bw = (o.x > 0.5 ? f.x : 1.0 - f.x) * (o.y > 0.5 ? f.y : 1.0 - f.y);
+      float sd = i == 0 ? d0 : (i == 1 ? d1 : (i == 2 ? d2 : d3));
+      // Relative depth difference, so a gently receding slope keeps its full
+      // bilinear weight and only a real silhouette rejects the tap. An absolute
+      // metric produces a visible grid wherever the ground is seen edge-on.
+      float rel = abs(sd - d) * inv;
+      float w = bw * exp(-rel * 26.0) + 1e-4;
+      acc += texture2D(tVol, suv) * w;
+      wsum += w;
+    }
+    v = acc / max(wsum, 1e-5);
   }
-  vec4 v = acc / max(wsum, 1e-5);
   gl_FragColor = vec4(max(v.rgb, 0.0), clamp(v.a, 0.0, 1.0));
 }
 `;

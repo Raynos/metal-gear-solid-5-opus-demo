@@ -313,6 +313,51 @@ export class VolumetricPass {
     this._height = 0;
     this.ownsHaze = false;
 
+    /**
+     * The pass's OWN clock, and the whole of its determinism story.
+     *
+     * Everything time-varying in here — the deck's advection (`uWindT`), its
+     * evolution through the shape volume's third axis (`uEvolveT`), the
+     * per-frame sample jitter (`uFrame`) and the particle layer — used to read
+     * `engine.elapsed` and `engine.frame` directly. Both are free-running over
+     * the life of the page and NEITHER is rewound by `settle()`, despite the
+     * doc comment sitting above it in main.js claiming otherwise. So the deck's
+     * position was a function of how long the page had been alive when the shot
+     * was taken: different in every run, and different for the same shot
+     * depending on where it sat in a batch.
+     *
+     * `_t0`/`_frames` make the clock relative to the last pin instead, so a
+     * pinned shot always photographs the same sky. See `pin()`.
+     *
+     * HONESTY NOTE. Commit f2929ff guessed this clock was the cause of the
+     * vista shot's 7% swing, and it is NOT — the swing was a CSS fade in
+     * index.html, measured and proved elsewhere in this round. Pinning the
+     * clock changed no measured number. It is still right: a screenshot harness
+     * that cannot say what the sky is doing has a latent 12 m/s of advection
+     * under every A/B, and the fix costs one subtraction per frame. But it is a
+     * hole closed on principle, not a defect observed.
+     */
+    this._t0 = null;
+    this._frames = 0;
+    this.time = 0;
+
+    /**
+     * First-class ablation switch — the thing this pass did not have.
+     *
+     * `pipeline.enabled.aerial` looks like one and is the OPPOSITE of one:
+     * `claimHaze()` clears it, so ablating `aerial` hands the distance haze back
+     * to RenderPipeline and turns a SECOND haze on while leaving every cost in
+     * here running. Anything measured through it measured the wrong sign of the
+     * wrong effect.
+     *
+     * `setEnabled(false)` removes the pass's cost outright — the depth
+     * linearise, the raymarch, the temporal resolve and the in-scene composite
+     * quad — and, critically, does NOT touch `enabled.aerial`, so the frame ends
+     * up with NO haze rather than with RenderPipeline's. That is the only
+     * configuration whose difference from `full` is this pass and nothing else.
+     */
+    this.enabled = true;
+
     this._makeMaterials();
     this._resize(1, 1);
 
@@ -341,12 +386,25 @@ export class VolumetricPass {
      */
     this.ablate = {
       haze: false,      // distance haze off entirely: Thaze = 1, no in-scatter
-      clouds: false,    // cumulus deck off
+      clouds: false,    // cumulus deck off — coverage 0, march still walks
+      deck: false,      // cumulus march skipped outright (cloudFar 0)
       cirrus: false,    // high sheet off
       shafts: false,    // crepuscular lobe off
       vsquash: false,   // cloud shape back to a vertical extrusion (round 6)
       apGain: null,     // in-scatter only; extinction still applied
     };
+
+    /**
+     * Raymarch step budgets. Separate from `params` because they are a QUALITY
+     * setting, not a time-of-day one — a night sky does not want fewer steps
+     * than a noon one — and separate from `ablate` because they are shipped
+     * values rather than measurement scaffolding.
+     *
+     * Pushed at the end of `syncTimeOfDay()` for the reason documented on
+     * `ablate`: poking `volMat.uniforms` directly is overwritten on the next
+     * frame, which is how several rounds of "ablations" measured nothing.
+     */
+    this.steps = { cloud: 96, light: 6, shaft: 24 };
   }
 
   _makeMaterials() {
@@ -420,6 +478,9 @@ export class VolumetricPass {
         uCloudFar: { value: 18000 },
         uCloudStreak: { value: 0.15 },
         uCloudVSquash: { value: 3.0 },
+        uCloudSteps: { value: 96 },
+        uLightSteps: { value: 6 },
+        uShaftSteps: { value: 24 },
       },
       depthTest: false,
       depthWrite: false,
@@ -451,6 +512,7 @@ export class VolumetricPass {
         tVol: { value: null },
         tDepth: { value: null },
         uTexel: { value: new THREE.Vector2() },
+        uFastUpsample: { value: 1 },
       },
       transparent: true,
       depthTest: false,
@@ -744,10 +806,18 @@ export class VolumetricPass {
     u.uBetaM.value = 8.0e-6 * ((preset.mieCoefficient ?? 0.0058) / 0.0058);
     u.uApG.value = Math.min(preset.mieDirectionalG ?? 0.8, 0.82);
 
+    u.uCloudSteps.value = this.steps.cloud;
+    u.uLightSteps.value = this.steps.light;
+    u.uShaftSteps.value = this.steps.shaft;
+
     // Ablations last, so they cannot be undone by anything above. See `ablate`.
     const ab = this.ablate;
     if (ab.haze) u.uHazeOwned.value = 0;
     if (ab.clouds) u.uCloudCoverage.value = 0;
+    // cloudFar 0 makes tEnd <= t0, so the march breaks on its first test: the
+    // cumulus loop is skipped rather than walked with nothing in it, which is
+    // what `clouds` does (coverage 0 still costs one weather fetch per step).
+    if (ab.deck) u.uCloudFar.value = 0;
     if (ab.cirrus) u.uCirrus.value = 0;
     if (ab.shafts) u.uSunScatter.value = 0;
     if (ab.vsquash) u.uCloudVSquash.value = 1;
@@ -784,8 +854,20 @@ export class VolumetricPass {
   update(dt, engine) {
     const pipeline = engine.pipeline;
     if (!pipeline || !pipeline.hdr) return;
+    if (!this.enabled) return;
     const cam = engine.camera;
     const lighting = this.world.lighting;
+
+    // Recognise a pin performed from outside.
+    //
+    // tools/render.mjs's `__pinDeterminism` pins this pass by setting `_reset`
+    // and clearing `_lastCamPos`, and that harness is owned elsewhere. That
+    // pair of writes is unique to it — a camera teleport or a preset change
+    // sets `_reset` with `_lastCamPos` still populated — so it can be detected
+    // here and turned into a full `pin()`, which is what also rewinds the
+    // clocks. That means the existing harness gets the fix with no change to
+    // its file; `pin()` is the explicit hook if it ever wants to call one.
+    if (this._reset === 1 && this._lastCamPos === undefined) this.pin();
 
     // Ownership handshake for the distance haze — exactly one of us runs it.
     //
@@ -829,18 +911,23 @@ export class VolumetricPass {
     this._viewProj.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     const invViewProj = this._invViewProj.copy(cam.matrixWorld).multiply(cam.projectionMatrixInverse);
 
-    const frame = engine.frame;
+    // Pinned clocks, not engine.elapsed/engine.frame. See `_t0` in the
+    // constructor: these two are what made the vista shot irreproducible.
+    if (this._t0 === null) this._t0 = engine.elapsed;
+    const T = Math.max(0, engine.elapsed - this._t0);
+    this.time = T;
+    const frame = this._frames++;
     const u = this.volMat.uniforms;
     u.tDepth.value = pipeline.hdr.depthTexture;
     u.tPrevColor.value = pipeline.hdr.texture;
     u.uInvViewProj.value.copy(invViewProj);
     u.uCamPos.value.copy(cam.position);
-    u.uTime.value = engine.elapsed;
+    u.uTime.value = T;
     u.uFrame.value = frame % 64;
     // Clouds are kilometres across; at 1 m/s of apparent drift the deck moves a
     // pixel every few seconds, which is what a real sky does. Decoupled from
     // uTime so the shimmer and the deck do not share a beat frequency.
-    u.uWindT.value = engine.elapsed * 4.0;
+    u.uWindT.value = T * 4.0;
     // How fast the deck moves through the shape volume's third axis, in metres
     // per second — i.e. how fast clouds BUILD AND DISSIPATE as opposed to
     // arriving from upwind. See the long note in `cloudDensity`: advection
@@ -857,7 +944,7 @@ export class VolumetricPass {
     // can only return when all three are simultaneously whole tiles, which for
     // the coarse octave alone is 8.5 ks and for the octaves together is far
     // beyond any session.
-    u.uEvolveT.value = engine.elapsed * 1.0;
+    u.uEvolveT.value = T * 1.0;
 
     const shadow = lighting.sun.shadow;
     if (shadow?.map?.texture) {
@@ -901,6 +988,62 @@ export class VolumetricPass {
     this.compositeMat.uniforms.tDepth.value = this.depthRT.texture;
 
     this.renderer.setRenderTarget(prevTarget);
+  }
+
+  /**
+   * Make the next frame a pure function of the source.
+   *
+   * A screenshot harness has to be able to say "this pass is in state X" and
+   * mean it. Three things in here integrate their own state and none of them
+   * were reachable:
+   *
+   *   the reprojected history   half-res, ping-ponged, converges over ~20 frames
+   *   the deck's clock          advection AND evolution, both off engine.elapsed
+   *   the jitter phase          uFrame = engine.frame % 64, free-running
+   *
+   * Round 11's `__pinDeterminism` reached the first of the three. This reaches
+   * the other two, which is cheap and which closes the hole — at 12.4 m/s of
+   * advection a few seconds is a visibly different sky, and with `uBlend` at 0.3
+   * the last frame's jitter is 30% of what is photographed rather than an
+   * averaged-away dither.
+   *
+   * It is NOT what was making the vista shot irreproducible. That was a CSS
+   * fade over the canvas; see the round-11 commit. Measured with these clocks
+   * pinned and the fade still in place, the same shot still came back at 133.1,
+   * 146.7 and 154.1 — so do not credit this with the fix.
+   *
+   * Called automatically when the harness's own pin is detected (see `update`),
+   * so it needs no change in tools/render.mjs; call it directly from anything
+   * that wants a repeatable frame.
+   */
+  pin() {
+    this._reset = 1;
+    this._lastCamPos = undefined;
+    this._t0 = this.engine.elapsed;
+    this._frames = 0;
+    this.time = 0;
+    return true;
+  }
+
+  /**
+   * Turn the whole pass off, or back on. See `enabled` in the constructor for
+   * why `pipeline.enabled.aerial` is not this and cannot be made into it.
+   *
+   * Off means: no depth linearise, no raymarch, no temporal resolve, no
+   * in-scene composite draw. The render targets stay allocated — freeing and
+   * rebuilding four half-float targets stalls the driver, and a flip stall
+   * charged to a measurement block is the exact mistake round 11 spent a commit
+   * retracting (see probes/r11_post.js). What is measured across this switch is
+   * per-frame work, which is what a frame budget is made of.
+   */
+  setEnabled(on) {
+    const v = !!on;
+    if (v === this.enabled) return v;
+    this.enabled = v;
+    this.compositeMesh.visible = v;
+    // Coming back on, the history is a stale image of a different frame.
+    if (v) this.pin();
+    return v;
   }
 
   /**

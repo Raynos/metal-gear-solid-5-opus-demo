@@ -1,0 +1,142 @@
+{
+  "shot": "vista",
+  "resolution": "1920x1080",
+  "frameMs": 25.09,
+  "configs": {
+    "full": {
+      "ms": 25.09,
+      "runs": [
+        23.3,
+        25.09,
+        25.2,
+        25.42,
+        23.38
+      ],
+      "spread": 2.12
+    },
+    "control": {
+      "ms": 24.46,
+      "runs": [
+        23.38,
+        24.8,
+        24.91,
+        24.23,
+        24.46
+      ],
+      "spread": 1.53
+    },
+    "noVolumetrics": {
+      "ms": 22.13,
+      "runs": [
+        23.42,
+        37.73,
+        22.13,
+        21.25,
+        21.75
+      ],
+      "spread": 16.48
+    },
+    "noPass": {
+      "ms": 22.13,
+      "runs": [
+        23.88,
+        21.38,
+        22.5,
+        22.13,
+        21.64
+      ],
+      "spread": 2.5
+    },
+    "noParticles": {
+      "ms": 26.12,
+      "runs": [
+        27.24,
+        23.32,
+        28.58,
+        26.12,
+        23.72
+      ],
+      "spread": 5.26
+    },
+    "noDeckMarch": {
+      "ms": 25.78,
+      "runs": [
+        34.45,
+        22.61,
+        26.06,
+        25.78,
+        23.25
+      ],
+      "spread": 11.84
+    },
+    "noCloudCover": {
+      "ms": 23.05,
+      "runs": [
+        22.68,
+        22.09,
+        28.98,
+        25.2,
+        23.05
+      ],
+      "spread": 6.89
+    },
+    "noLightMarch": {
+      "ms": 25.79,
+      "runs": [
+        25.79,
+        23.27,
+        30.65,
+        34.66,
+        24.34
+      ],
+      "spread": 11.39
+    },
+    "noShafts": {
+      "ms": 26.5,
+      "runs": [
+        26.82,
+        23.55,
+        46.04,
+        24.06,
+        26.5
+      ],
+      "spread": 22.49
+    },
+    "noCirrus": {
+      "ms": 26.74,
+      "runs": [
+        28.25,
+        27.15,
+        24.66,
+        24.13,
+        26.74
+      ],
+      "spread": 4.12
+    },
+    "noHaze": {
+      "ms": 24.41,
+      "runs": [
+        24.41,
+        24.89,
+        23.94,
+        23.73,
+        33.35
+      ],
+      "spread": 9.62
+    }
+  },
+  "nullControlMs": 0.63,
+  "worstBlockSpreadMs": 22.49,
+  "costMs": {
+    "Volumetrics": "2.96 ms",
+    "Pass": "2.96 ms",
+    "Particles": "-1.03 ms",
+    "DeckMarch": "-0.69 ms",
+    "CloudCover": "2.04 ms",
+    "LightMarch": "-0.7 ms",
+    "Shafts": "-1.41 ms",
+    "Cirrus": "-1.65 ms",
+    "Haze": "0.68 ms"
+  },
+  "note": "WARM=64 N=40 REPS=5. The floor is the null control — the same configuration measured twice through the same flip. Sub-costs do not sum to the whole: turning one loop off lets the others reach further before their own break tests."
+}

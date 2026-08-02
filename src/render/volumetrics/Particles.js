@@ -261,6 +261,10 @@ export class ParticleAtmosphere {
     this.fields = fields;
     this.pass = pass;
     this.order = 420;
+    // First-class ablation switch, matching VolumetricPass.setEnabled. The dust
+    // and sand layers are two instanced draws with a discard-heavy fragment
+    // shader; they are cheap in theory and nothing had ever measured them.
+    this.enabled = true;
 
     this.sprite = buildSpriteAtlas(64);
     this.wind = new THREE.Vector3(0.86, 0, -0.51);
@@ -440,14 +444,19 @@ export class ParticleAtmosphere {
   }
 
   update(dt, engine) {
+    if (!this.enabled) return;
     const cam = engine.camera;
     const s = this.shared;
     s.uCamPos.value.copy(cam.position);
     s.uCamRight.value.setFromMatrixColumn(cam.matrixWorld, 0).normalize();
     s.uCamUp.value.setFromMatrixColumn(cam.matrixWorld, 1).normalize();
     s.uSunDirW.value.copy(this.world.lighting.sunDirection);
-    s.uPTime.value = engine.elapsed;
-    s.uPTimeF.value = engine.elapsed;
+    // The PASS's clock, not engine.elapsed — which nothing rewinds, so every
+    // mote's position depended on how long the page had been alive. See the
+    // `_t0` note in VolumetricPass.
+    const t = this.pass?.time ?? engine.elapsed;
+    s.uPTime.value = t;
+    s.uPTimeF.value = t;
     const pass = this.pass;
     if (pass?.depthRT) {
       s.tSceneDepth.value = pass.depthRT.texture;
@@ -460,6 +469,13 @@ export class ParticleAtmosphere {
     const day = 1.0 - 0.88 * (this.world.lighting.night ?? 0);
     this.dustUniforms.uAmount.value = 0.5 * amt * day;
     this.sandUniforms.uAmount.value = (0.26 + 0.16 * amt) * day;
+  }
+
+  setEnabled(on) {
+    this.enabled = !!on;
+    if (this.dust) this.dust.visible = this.enabled;
+    if (this.sand) this.sand.visible = this.enabled;
+    return this.enabled;
   }
 
   dispose() {

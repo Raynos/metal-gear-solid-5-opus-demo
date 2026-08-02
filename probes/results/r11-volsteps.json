@@ -1,0 +1,136 @@
+{
+  "shot": "vista",
+  "resolution": "1920x1080",
+  "frameMs": 23.882,
+  "configs": {
+    "full": {
+      "ms": 23.882,
+      "runs": [
+        25.62,
+        24.56,
+        23.882,
+        23.542,
+        23.57,
+        23.842,
+        24.12
+      ],
+      "spread": 2.078
+    },
+    "control": {
+      "ms": 24.6,
+      "runs": [
+        25.17,
+        23.428,
+        24.6,
+        27.025,
+        23.665,
+        24.278,
+        26.468
+      ],
+      "spread": 3.597
+    },
+    "slowUpsample": {
+      "ms": 24.025,
+      "runs": [
+        26.677,
+        23.095,
+        24.025,
+        27.523,
+        23.327,
+        23.72,
+        26.575
+      ],
+      "spread": 4.428
+    },
+    "streakFetchBack": {
+      "ms": 24.15,
+      "runs": [
+        27.753,
+        23.695,
+        23.89,
+        27.39,
+        24.15,
+        23.648,
+        32.502
+      ],
+      "spread": 8.854
+    },
+    "noDeckMarch": {
+      "ms": 22.207,
+      "runs": [
+        24.813,
+        21.495,
+        21.653,
+        41.375,
+        21.8,
+        22.207,
+        30.762
+      ],
+      "spread": 19.88
+    },
+    "noLightMarch": {
+      "ms": 22.995,
+      "runs": [
+        27.445,
+        22.473,
+        22.995,
+        22.623,
+        23.468,
+        22.77,
+        33.523
+      ],
+      "spread": 11.05
+    },
+    "noHaze": {
+      "ms": 23.65,
+      "runs": [
+        23.63,
+        25.07,
+        23.348,
+        23.65,
+        23.413,
+        23.792,
+        30.5
+      ],
+      "spread": 7.152
+    },
+    "noComposite": {
+      "ms": 23.407,
+      "runs": [
+        23.18,
+        23.407,
+        23.855,
+        23.318,
+        23.23,
+        23.515,
+        30.325
+      ],
+      "spread": 7.145
+    },
+    "noPass": {
+      "ms": 21.56,
+      "runs": [
+        21.16,
+        21.697,
+        21.275,
+        21.56,
+        21.155,
+        21.755,
+        25.39
+      ],
+      "spread": 4.235
+    }
+  },
+  "nullControlMs": 0.718,
+  "worstBlockSpreadMs": 19.88,
+  "deltaMs": {
+    "slowUpsample": "below noise (-0.143, floor 0.718)",
+    "streakFetchBack": "below noise (-0.268, floor 0.718)",
+    "noDeckMarch": "1.675 ms",
+    "noLightMarch": "0.887 ms",
+    "noHaze": "below noise (0.232, floor 0.718)",
+    "noComposite": "below noise (0.475, floor 0.718)",
+    "noPass": "2.322 ms"
+  },
+  "note": "WARM=64 N=40 REPS=7. slowUpsample and streakFetchBack are the round-11 changes put BACK, so their delta is negative by exactly what was saved."
+}

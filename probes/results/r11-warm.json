@@ -1,0 +1,145 @@
+{
+  "skyLutValid": 1,
+  "skyHorizonRadiance": [
+    1.6334,
+    1.6485,
+    1.388
+  ],
+  "skyLutMean": [
+    0.663,
+    0.6951,
+    0.825
+  ],
+  "dustWarmPreset": 0,
+  "withHaze": {
+    "sky": {
+      "R": 146.69,
+      "G": 164.55,
+      "B": 193.57,
+      "RminusB": -46.88,
+      "RoverB": 0.7578
+    },
+    "skyline": {
+      "R": 163.62,
+      "G": 155.14,
+      "B": 141.02,
+      "RminusB": 22.6,
+      "RoverB": 1.1602
+    },
+    "midField": {
+      "R": 158.42,
+      "G": 134.77,
+      "B": 112.36,
+      "RminusB": 46.06,
+      "RoverB": 1.4099
+    },
+    "near": {
+      "R": 113.42,
+      "G": 100.51,
+      "B": 87.82,
+      "RminusB": 25.6,
+      "RoverB": 1.2916
+    }
+  },
+  "hazeAblated": {
+    "sky": {
+      "R": 146.95,
+      "G": 164.75,
+      "B": 193.65,
+      "RminusB": -46.7,
+      "RoverB": 0.7588
+    },
+    "skyline": {
+      "R": 122.63,
+      "G": 112.48,
+      "B": 102.52,
+      "RminusB": 20.11,
+      "RoverB": 1.1961
+    },
+    "midField": {
+      "R": 114.1,
+      "G": 101.87,
+      "B": 89.86,
+      "RminusB": 24.24,
+      "RoverB": 1.2697
+    },
+    "near": {
+      "R": 104.66,
+      "G": 94.01,
+      "B": 83.2,
+      "RminusB": 21.46,
+      "RoverB": 1.258
+    }
+  },
+  "shaftsAblated": {
+    "sky": {
+      "R": 147.04,
+      "G": 164.83,
+      "B": 193.73,
+      "RminusB": -46.69,
+      "RoverB": 0.759
+    },
+    "skyline": {
+      "R": 163.62,
+      "G": 155.15,
+      "B": 141.03,
+      "RminusB": 22.59,
+      "RoverB": 1.1602
+    },
+    "midField": {
+      "R": 158.4,
+      "G": 134.78,
+      "B": 112.38,
+      "RminusB": 46.02,
+      "RoverB": 1.4095
+    },
+    "near": {
+      "R": 113.56,
+      "G": 100.65,
+      "B": 87.93,
+      "RminusB": 25.63,
+      "RoverB": 1.2915
+    }
+  },
+  "hazeContributionToWarmth": {
+    "sky": {
+      "RminusB": -0.18,
+      "RoverB": -0.001
+    },
+    "skyline": {
+      "RminusB": 2.49,
+      "RoverB": -0.0359
+    },
+    "midField": {
+      "RminusB": 21.82,
+      "RoverB": 0.1402
+    },
+    "near": {
+      "RminusB": 4.14,
+      "RoverB": 0.0336
+    }
+  },
+  "shaftContributionToWarmth": {
+    "sky": {
+      "RminusB": -0.19,
+      "RoverB": -0.0012,
+      "dLuma": -0.28
+    },
+    "skyline": {
+      "RminusB": 0.01,
+      "RoverB": 0,
+      "dLuma": -0.01
+    },
+    "midField": {
+      "RminusB": 0.04,
+      "RoverB": 0.0004,
+      "dLuma": -0.01
+    },
+    "near": {
+      "RminusB": -0.03,
+      "RoverB": 0.0001,
+      "dLuma": -0.14
+    }
+  },
+  "note": "A POSITIVE RoverB delta means the haze is making that band warmer than it would otherwise be. Negative means the haze is COOLING it."
+}
