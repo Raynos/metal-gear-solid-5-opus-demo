@@ -2663,6 +2663,25 @@ export class Terrain {
        * by diffing against a previous one where five things moved at once.
        */
       uDbg3: { value: new THREE.Vector4(1, 1, 0, 0) },
+      /**
+       * COST hook, not a look. All four are 0 in the shipped build and each one
+       * BYPASSES a block rather than zeroing its weight, because a weight of
+       * zero still pays for the arithmetic that produced it — which is exactly
+       * the mistake the distance fades in this shader used to make.
+       *
+       *   x  flat reference path: the whole custom body is skipped, so the
+       *      difference against 0 is what this shader costs above a plain
+       *      MeshStandardMaterial on the same geometry.
+       *   y  skip bedrock + stratigraphy + varnish.
+       *   z  skip every detail-tile fetch that only feeds the shading normal
+       *      (nA/nB/nC/uMicro) and the perturbation built from them.
+       *   w  skip the near-field micro layers (grit, pavement, ripples).
+       *
+       * They are uniform branches, so a warp either takes a block or does not;
+       * there is no divergence to confuse the reading. Drive them from a probe
+       * with WARM >= 64 — see probes/r12_terrcost.js.
+       */
+      uPerf: { value: new THREE.Vector4(0, 0, 0, 0) },
     };
     this.uniforms = u;
 
@@ -2804,6 +2823,7 @@ export class Terrain {
           uniform vec3 uSilt;
           uniform vec4 uDbg2;
           uniform vec4 uDbg3;
+          uniform vec4 uPerf;
           uniform vec3 uSoilA;
           uniform vec3 uSoilB;
           uniform vec3 uSoilC;
@@ -2835,7 +2855,10 @@ export class Terrain {
           float gRough;
           float gAO;
           float gMicroShadow;
-          float gStrataRough;
+          // Initialised, because the bedrock block that writes it is now gated
+          // on rockW and a sand fragment never enters it. An uninitialised
+          // global here would have read as garbage roughness on the pan.
+          float gStrataRough = 0.0;
 
           vec2 gridUV(vec2 wxz, vec4 info) {
             return ((wxz - info.xy) * info.z + 0.5) / info.w;
@@ -2956,7 +2979,25 @@ export class Terrain {
         .replace(
           '#include <map_fragment>',
           /* glsl */ `#include <map_fragment>
-          {
+          // The flat reference path for the cost hook. Not a LOD and not
+          // shippable — it is the "what would a plain standard material cost on
+          // this geometry" arm of the measurement, so it does the one thing that
+          // cannot be skipped (the baked normal, or the lighting has nothing to
+          // work with) and nothing else.
+          if (uPerf.x > 0.5) {
+            bool nfR = abs(vWPos.x) < uNearHalf && abs(vWPos.z) < uNearHalf;
+            vec2 uvR = nfR ? gridUV(vWPos.xz, uNearInfo) : gridUV(vWPos.xz, uFarInfo);
+            vec4 SR = nfR ? texture(uNearS, vec3(uvR, 0.0)) : texture(uFarS, vec3(uvR, 0.0));
+            vec3 nr;
+            nr.x = SR.r * 2.0 - 1.0;
+            nr.z = SR.g * 2.0 - 1.0;
+            nr.y = sqrt(max(1e-4, 1.0 - nr.x * nr.x - nr.z * nr.z));
+            gN = normalize(nr);
+            gAO = SR.a;
+            gRough = 0.94;
+            gMicroShadow = 1.0;
+            diffuseColor.rgb *= vec3(0.30, 0.27, 0.22);
+          } else {
             bool nearField = abs(vWPos.x) < uNearHalf && abs(vWPos.z) < uNearHalf;
             vec2 uvS = nearField ? gridUV(vWPos.xz, uNearInfo) : gridUV(vWPos.xz, uFarInfo);
             vec4 S = nearField ? texture(uNearS, vec3(uvS, 0.0)) : texture(uFarS, vec3(uvS, 0.0));
@@ -3023,10 +3064,33 @@ export class Terrain {
             float sA = sharpness(uvA);
             float sC = sharpness(uvC);
             float sB = sharpness(uvB);
-            vec4 dA = TEXDETAIL(uvA);
+            // Round 12, cost. Five of these taps were unconditional and three of
+            // them are multiplied by a weight that this shader has ALREADY
+            // decided is zero — sA retires the 1.6 m tile by about 90 m and
+            // nearNW retires its normal by 120 m, and past that the fetches were
+            // paid for on every terrain fragment in the frame and then mixed in
+            // at weight 0. A distance fade that reaches zero does not save the
+            // work; only a branch does.
+            //
+            // The gates are the tiles' own fade weights, so the skip happens
+            // exactly where the contribution is already below 0.004 of a mix —
+            // under half a display code against the widest albedo difference in
+            // the palette. Bounds, not eyeballs: dA enters through
+            // mix(dC, dA, 0.55 * sA) and nA through weights nearNW * sA and
+            // nearNW * midNear, all of which are <= 0.0022 at the threshold.
+            //
+            // textureGrad, and the gradients are taken OUTSIDE the branch. An
+            // implicit-LOD fetch inside divergent control flow is undefined in
+            // GLSL ES 3.0, and the failure mode is not a crash — it is the
+            // wrong mip, which is the exact bug the parallax march's own
+            // gradient comment in this file was written about.
+            vec2 dxA = dFdx(uvA), dyA = dFdy(uvA);
+            float nearNW = 1.0 - smoothstep(45.0, 120.0, dist);
+            vec4 dA = vec4(0.5), nA = vec4(0.5);
+            if (sA > 0.004)     dA = textureGrad(uDetail, vec3(uvA, 0.0), dxA, dyA);
+            if (nearNW > 0.004) nA = textureGrad(uDetail, vec3(uvA, 1.0), dxA, dyA);
             vec4 dB = TEXDETAIL(uvB);
             vec4 dC = TEXDETAIL(uvC);
-            vec4 nA = texture(uDetail, vec3(uvA, 1.0));
             vec4 nB = texture(uDetail, vec3(uvB, 1.0));
             // Detail albedo also collapses to its own mean once it stops being
             // resolvable, or the same beat shows up in colour instead of relief.
@@ -3225,6 +3289,21 @@ export class Terrain {
             gravel *= 0.80 + D.r * 0.40;
 
             // --- bedrock ------------------------------------------------------
+            // Everything from here to the varnish mix feeds ONE consumer:
+            // mix(albedo, rock, rockW). Where rockW is zero — which is every
+            // sand pan, wash and pavement fragment in the frame — the whole
+            // block is arithmetic thrown away, so it is gated on its own
+            // consumer's weight. rockW comes off a baked mask plus slope, so it
+            // is coherent over whole hillsides rather than speckled, and a warp
+            // either takes the block or skips it. gStrataRough is already
+            // multiplied by rockW where it is used, so leaving it at zero here
+            // is exact, not an approximation.
+            //
+            // The threshold is 1/256 of a display code's worth of mix weight:
+            // below it the block cannot move the fragment by half a code even
+            // against the largest albedo difference in the palette.
+            vec3 rock = vec3(0.0);
+            if (rockW > 0.004 && uPerf.y < 0.5) {
             // The lithology chooses between three real end members. Each one's
             // dark end is the same rock in its own shade, so it scales rather
             // than being three more constants to keep in sync.
@@ -3279,7 +3358,7 @@ export class Terrain {
             // (Deleted: a second iron mix driven off macro. The lithology
             // selector above is that layer, done once, on the field whose scale
             // matches a mineral district.)
-            vec3 rock = rockBase;
+            rock = rockBase;
             rock *= 1.0 - D.b * 0.40;                    // cracks read dark
             rock *= 0.95 + smoothstep(0.3, 0.9, D.r) * 0.10;
             // Desert varnish — manganese-black rock coatings, and the single
@@ -3315,6 +3394,7 @@ export class Terrain {
             // Measurement hook, not a look. uDbg2.z is 0 in the shipped build;
             // a probe sets it to a threshold and counts the black pixels.
             if (uDbg2.z > 0.0 && varnish >= uDbg2.z) rock = vec3(0.0);
+            }
 
             // --- assemble -----------------------------------------------------
             vec3 albedo = sand;
@@ -3406,7 +3486,7 @@ export class Terrain {
             // a pixel covers — the same question the mip chain asks — so the
             // layer holds on wherever it is still resolvable and goes smoothly
             // and silently where it is not, at any FOV or resolution.
-            float gritW = (1.0 - smoothstep(80.0, 150.0, dist)) * sharpnessK(guv0, 6.0) * uDbg.y;
+            float gritW = (1.0 - smoothstep(80.0, 150.0, dist)) * sharpnessK(guv0, 6.0) * uDbg.y * (1.0 - uPerf.w);
             gMicroShadow = 1.0;
             float gritAO = 1.0;
             vec2 gpert = vec2(0.0);
@@ -3579,7 +3659,7 @@ export class Terrain {
               // and stay off bedrock — a cliff face has its own strata and clast
               // layers and does not carry a pavement.
               float pavReach = (1.0 - smoothstep(200.0, 340.0, dist))
-                             * (1.0 - rockW * 0.72) * uDbg2.x;
+                             * (1.0 - rockW * 0.72) * uDbg2.x * (1.0 - uPerf.w);
               float pavW = pavReach * (1.0 - gritW * 0.80);
               if (pavReach > 0.004 && max(sP, sQ) > 0.004) {
                 vec4 PM = textureGrad(uGrit, vec3(puv, 0.0), pdx, pdy);
@@ -3673,7 +3753,7 @@ export class Terrain {
               // coarse tap is what reaches: at 5.9 m it carries 37 cm crests,
               // which is 3.5 px at 150 m and still 1.7 px at 300 m, and its own
               // footprint fade (sRC) retires it when that stops being true.
-              float rippleW = sandW * (1.0 - smoothstep(150.0, 340.0, dist)) * uDbg.z;
+              float rippleW = sandW * (1.0 - smoothstep(150.0, 340.0, dist)) * uDbg.z * (1.0 - uPerf.w);
               // Weight shifts from the fine train to the coarse one with range,
               // so the total relief stays roughly constant as the near tap dies.
               float rFar = smoothstep(25.0, 110.0, dist);
@@ -3837,21 +3917,24 @@ export class Terrain {
             diffuseColor.rgb *= albedo * 0.80;
 
             // --- normal --------------------------------------------------------
-            vec4 nC = texture(uDetail, vec3(uvC, 1.0));
-            // Round 6: 90-320 m. The 4.6 m tile's features are 14 cm, still a
-            // pixel at 200 m, so its own footprint fade (sC) is the honest
-            // limiter and this is only a backstop. Round 5 ended it at 260 and
-            // round 4 at 105, which took every normal layer off the 100-250 m
-            // band of valley floor that the landscape shots are mostly made of.
+            // Same treatment as dA/nA above: nC only ever enters through
+            // midNear (0.60 * midNear * sC into the perturbation, and midNear
+            // again into the cavity term), so past 320 m it was a fetch whose
+            // result was multiplied by zero.
+            vec4 nC = vec4(0.5);
             float midNear = 1.0 - smoothstep(90.0, 320.0, dist);
-            // The 1.6 m tile's NORMAL used to be gated by nearW (6-42 m), which
-            // is the near-albedo blend weight and has no business deciding how
-            // far a relief layer reaches. Its own footprint fade already retires
-            // it — sA is 0.49 at 50 m and 0.0 by 90 — so gating on range as well
-            // just removed lit micro-geometry from ground that could still
-            // resolve it.
-            float nearNW = 1.0 - smoothstep(45.0, 120.0, dist);
-            vec2 pert = unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.55 * midW * sB)
+            if (midNear > 0.004) nC = textureGrad(uDetail, vec3(uvC, 1.0), dFdx(uvC), dFdy(uvC));
+            // midNear is 90-320 m and nearNW is 45-120 m; both are declared at
+            // the fetches they gate, above. Round 6 on midNear: the 4.6 m tile's
+            // features are 14 cm, still a pixel at 200 m, so its own footprint
+            // fade (sC) is the honest limiter and the range is a backstop. Round
+            // 5 ended it at 260 and round 4 at 105, which took every normal
+            // layer off the 100-250 m band of valley floor that the landscape
+            // shots are mostly made of. nearNW: the 1.6 m tile's NORMAL used to
+            // be gated by nearW (6-42 m), which is the near-albedo blend weight
+            // and has no business deciding how far a relief layer reaches.
+            vec2 pert = uPerf.z > 0.5 ? vec2(0.0)
+                      : unrot(nB.rg * 2.0 - 1.0, ROT_B) * (0.55 * midW * sB)
                       + unrot(nC.rg * 2.0 - 1.0, ROT_C) * (0.60 * midNear * sC)
                       + (nA.rg * 2.0 - 1.0) * (0.85 * nearNW * sA);
             // The mid detail height field is mostly clasts. Wind-packed sand has
@@ -3874,13 +3957,20 @@ export class Terrain {
             // in light. Central difference on the same closed form.
             {
               vec2 muv = vWPos.xz * ${(1 / MICRO_PERIOD).toFixed(8)};
-              vec3 MR = texture2D(uMicro, muv).rgb;
               // Gated on the SAME fade the vertex shader displaces by, not on
               // the near-albedo weight: shading relief that the mesh does not
               // carry (or failing to shade relief it does) is the one way to
               // make real geometry look painted.
+              //
+              // The fade is 38-95 m from the clipmap centre, so beyond 95 m this
+              // was a texture fetch multiplied by zero on every terrain fragment
+              // in the frame — and the far rings are most of the fragments in a
+              // wide shot. The fetch now sits inside the same test.
               float microW = 1.0 - smoothstep(38.0, 95.0, length(vWPos.xz - uClipCentre));
-              pert += -MR.gb * (0.85 * microW * sharpness(muv * 0.5));
+              if (microW > 0.004 && uPerf.z < 0.5) {
+                vec3 MR = textureGrad(uMicro, muv, dFdx(muv), dFdy(muv)).rgb;
+                pert += -MR.gb * (0.85 * microW * sharpness(muv * 0.5));
+              }
             }
 
             // The perturbation is a slope in the *projection's* frame. On a wall
