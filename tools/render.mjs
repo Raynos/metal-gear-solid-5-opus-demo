@@ -591,7 +591,7 @@ async function main() {
         const s = g.applyShot(name);
         if (cine) {
           const pipe = g.engine.pipeline;
-          if (pipe?.enabled) { pipe.enabled.dof = true; pipe.enabled.motionBlur = true; }
+          if (pipe?.enabled) pipe.enabled.dof = true;
         }
         for (const f of abl || []) {
           if (g.engine.pipeline?.enabled && f in g.engine.pipeline.enabled) {

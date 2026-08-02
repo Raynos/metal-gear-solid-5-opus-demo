@@ -23,7 +23,6 @@ export const DEFAULTS = {
   ssao: true,
   bloom: true,
   dof: true,
-  motionBlur: true,
   taa: true,
   sensitivity: 1.0,
   invertY: false,
@@ -59,7 +58,7 @@ export class Settings {
     const live = world?.engine?.pipeline?.enabled ?? null;
     this.baseline = { ...DEFAULTS };
     if (live) {
-      for (const k of ['ssao', 'bloom', 'dof', 'motionBlur', 'taa']) {
+      for (const k of ['ssao', 'bloom', 'dof', 'taa']) {
         if (typeof live[k] === 'boolean') this.baseline[k] = live[k];
       }
     }
@@ -138,7 +137,6 @@ export class Settings {
       case 'ssao':
       case 'bloom':
       case 'dof':
-      case 'motionBlur':
       case 'taa':
         if (pipe?.enabled) pipe.enabled[key] = v;
         break;
@@ -236,7 +234,6 @@ export class Settings {
       seg('ssao', BOOL),
       seg('bloom', BOOL),
       seg('dof', BOOL),
-      seg('motionBlur', BOOL),
       seg('taa', BOOL),
       el('div.grp', { text: 'INPUT' }),
       slider('sensitivity', 0.2, 3.0, 0.05, (v) => `${v.toFixed(2)}x`),
@@ -291,7 +288,6 @@ function labelFor(key) {
       ssao: 'Ambient occlusion',
       bloom: 'Bloom',
       dof: 'Depth of field',
-      motionBlur: 'Motion blur',
       taa: 'Temporal AA',
       sensitivity: 'Mouse sensitivity',
       invertY: 'Invert look',

@@ -82,7 +82,7 @@ window.__STUDIO = {
     // Depth of field and motion blur are the renderer author's to judge; here
     // they only hide the sculpt. Everything else in the stack stays on, because
     // colour has to be judged through the real grade.
-    Object.assign(engine.pipeline.enabled, { dof: false, motionBlur: false, taa: false, autoExposure: true });
+    Object.assign(engine.pipeline.enabled, { dof: false, taa: false, autoExposure: true });
     // Diagnostic: separate "this surface is unlit" from "this surface is in a
     // cast shadow". Without it a self-shadowing bug and a shading bug look
     // identical in a portrait.

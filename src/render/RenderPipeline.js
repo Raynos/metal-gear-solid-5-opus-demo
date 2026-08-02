@@ -769,7 +769,6 @@ export class RenderPipeline {
       fxaa: true,
       aerial: true,
       dof: true,
-      motionBlur: true,
       autoExposure: true,
     };
     /** Internal resolution fraction; see setRenderScale. 1.0 = native. */
@@ -1562,7 +1561,13 @@ export class RenderPipeline {
         float offset = fract(ign(gl_FragCoord.yx * 1.37) + uFrame * 0.618);
 
         const int SLICES = 3;
-        const int STEPS = 8;
+        // 8 -> 5. The broad search is 48 of this pass's 80 depth taps per pixel
+        // and the pass is the largest post item in the frame at ~6.45 ms. Its
+        // samples are already biased toward the centre (t = t*t below), the
+        // whole search is at most 52 px wide, and the result goes through a
+        // 13-tap bilateral: what those last three taps bought was a slightly
+        // smoother estimate of a low-frequency term. 18 taps out of 80.
+        const int STEPS = 5;
         const int MICRO_STEPS = 4;
         float visibility = 0.0;
         float microVis = 0.0;
@@ -2409,7 +2414,6 @@ export class RenderPipeline {
       uniform sampler2D tAdapt;
       uniform vec2 uTexel;
       uniform mat4 uInvViewProjJit;
-      uniform mat4 uPrevViewProj;
       uniform float uNear;
       uniform float uFar;
       uniform float uFocal;      // focal length, metres (derived from the FOV)
@@ -2419,8 +2423,7 @@ export class RenderPipeline {
       uniform float uMaxCoCNear; // hard ceiling on foreground defocus, pixels
       uniform float uCoCFloor;   // CoC below this costs nothing and is dropped
       uniform float uEdgeSoftness;
-      uniform float uMotionScale;
-      uniform float uDofScale;   // 0 leaves motion blur running with no defocus
+      uniform float uDofScale;
       uniform float uFrame;
       uniform float uEnabled;
       ${COMMON_GLSL}
@@ -2476,17 +2479,14 @@ export class RenderPipeline {
         // motion blur out, which is why round 7 could not price either of them.
         coc *= uDofScale;
 
-        // Camera velocity from depth reprojection (static geometry).
-        vec2 vel = vec2(0.0);
-        if (uMotionScale > 0.0) {
-          vec3 wp = worldFromDepth(vUv, d, uInvViewProjJit);
-          vec4 pc = uPrevViewProj * vec4(wp, 1.0);
-          vec2 puv = (pc.xy / pc.w) * 0.5 + 0.5;
-          vel = (vUv - puv) * uMotionScale;
-          float vl = length(vel / uTexel);
-          if (vl > 48.0) vel *= 48.0 / vl;
-        }
-        float velPix = length(vel / uTexel);
+        // MOTION BLUR IS GONE. It was measured inert — high-pass rms 0.103
+        // against a 0.224 liveness threshold, i.e. it did not survive its own
+        // detector — and it was not free. It shared this gather, and the
+        // early-out below is conditional on there being no velocity: under a
+        // moving camera every pixel in the frame had velocity, so every pixel
+        // ran the 24-tap gather whether it was defocused or not. The budget is
+        // measured with the camera MOVING, so that was the case that mattered.
+        // An effect that does nothing, on the frame that counts, at full price.
 
         // Sub-pixel defocus is not defocus, it is a soft filter over a sharp
         // image. Anything under the floor passes through untouched.
@@ -2500,7 +2500,7 @@ export class RenderPipeline {
         // that actually gathered, and the bilinear upsample of a gives a clean
         // ramp across the boundary. Without that, running at half res would
         // soften the in-focus majority of the frame, which is most of it.
-        if (coc < uCoCFloor && velPix < 0.8) { gl_FragColor = vec4(centre, 0.0); return; }
+        if (coc < uCoCFloor) { gl_FragColor = vec4(centre, 0.0); return; }
         coc = max(coc - uCoCFloor * 0.5, 0.0);
 
         float rot = ign(gl_FragCoord.xy + uFrame * 3.7) * 6.2831853;
@@ -2522,7 +2522,7 @@ export class RenderPipeline {
           float hex = 1.0 - 0.055 * cos(6.0 * ang);
           disk *= hex;
 
-          vec2 off = disk * coc * uTexel + vel * (t - 0.5);
+          vec2 off = disk * coc * uTexel;
           vec2 suv = vUv + off;
           vec3 sc = texture2D(tColor, suv).rgb;
           float sz = viewZ(texture2D(tDepth, suv).x);
@@ -2531,7 +2531,6 @@ export class RenderPipeline {
           // otherwise sharp foreground bleeds outward.
           float reach = length(disk) * coc;
           float w = clamp((scoc - reach) * 0.6 + 1.0, 0.0, 1.0);
-          w = max(w, velPix > 1.0 ? 0.85 : 0.0);
           // Energy-preserving highlight response: bokeh discs from bright
           // sources should stay bright, not average into grey.
           float hw = 1.0 + 3.0 * smoothstep(1.2, 8.0, dot(sc, vec3(0.2126, 0.7152, 0.0722)));
@@ -2547,7 +2546,6 @@ export class RenderPipeline {
         tAdapt: { value: null },
         uTexel: { value: new THREE.Vector2() },
         uInvViewProjJit: { value: new THREE.Matrix4() },
-        uPrevViewProj: { value: new THREE.Matrix4() },
         uNear: { value: 0.15 },
         uFar: { value: 6000 },
         uFocal: { value: 0.031 },
@@ -2557,7 +2555,6 @@ export class RenderPipeline {
         uMaxCoCNear: { value: 1.2 },
         uCoCFloor: { value: 0.9 },
         uEdgeSoftness: { value: 0.25 },
-        uMotionScale: { value: 0.55 },
         uDofScale: { value: 1 },
         uFrame: { value: 0 },
         uEnabled: { value: 1 },
@@ -3314,14 +3311,13 @@ export class RenderPipeline {
     // gather off inside it: the ablation was measuring nothing, and a build
     // that wants neither effect was still paying a 2 MP copy every frame.
     this._mark('dof');
-    const wantDof = this.enabled.dof || this.enabled.motionBlur;
+    const wantDof = this.enabled.dof;
     const du = this.dofMat.uniforms;
     du.tColor.value = resolved.texture;
     du.tDepth.value = this.hdr.depthTexture;
     du.tAdapt.value = adaptTex;
     du.uTexel.value.set(1 / w, 1 / h);
     du.uInvViewProjJit.value.copy(this._invViewProj);
-    du.uPrevViewProj.value.copy(this._prevViewProj);
     du.uNear.value = camera.near;
     du.uFar.value = camera.far;
     // Focal length that matches the current FOV on a 35mm-format sensor, so
@@ -3347,20 +3343,6 @@ export class RenderPipeline {
     du.uFrame.value = this.enabled.taa ? this.frame % 64 : 0;
     // Motion blur is a SHUTTER, not a per-frame smear.
     //
-    // This was `0.55 * (per-frame reprojection delta)`, which makes the blur
-    // length proportional to frame time: at 25 FPS the camera moves 2.4x
-    // further between frames than at 60, so the streak is 2.4x longer. The
-    // slower it runs the more it smears, which is a feedback loop that makes a
-    // 25 FPS frame look far worse than 25 FPS actually is — and it is exactly
-    // what "blur and distortion when flying around" is.
-    //
-    // A 180-degree shutter exposes for half a frame at the REFERENCE rate.
-    // Normalise by the real delta so the streak is a fixed duration of motion,
-    // and clamp so a hitch cannot produce an arbitrarily long smear.
-    const refDt = 1 / 60;
-    const dt = Math.max(1e-4, this._lastDt ?? refDt);
-    const shutter = Math.min(1, refDt / dt);
-    du.uMotionScale.value = this.enabled.motionBlur ? 0.55 * shutter : 0.0;
     du.uDofScale.value = this.enabled.dof ? 1 : 0;
     du.uEnabled.value = wantDof ? 1 : 0;
     if (wantDof) this._blit(this.dofMat, this.dofRT);

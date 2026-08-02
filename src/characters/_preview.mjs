@@ -142,7 +142,7 @@ async function main() {
         // current haze/exposure tuning (which other modules own and are still
         // moving). applyShot resets exposure, so this has to come after it.
         Object.assign(G.engine.pipeline.enabled, {
-          aerial: false, dof: false, autoExposure: false, motionBlur: false, taa: false, bloom: false,
+          aerial: false, dof: false, autoExposure: false, taa: false, bloom: false,
         });
         for (const c of G.engine.scene.children) {
           if (/^volumetric/.test(c.name)) c.visible = false;

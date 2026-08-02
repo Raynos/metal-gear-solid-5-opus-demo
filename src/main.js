@@ -96,7 +96,6 @@ function setMode(next) {
   if (pipe?.enabled) {
     const cinematic = next === 'play';
     pipe.enabled.dof = cinematic;
-    pipe.enabled.motionBlur = cinematic;
   }
   for (const fn of modeListeners) {
     try {

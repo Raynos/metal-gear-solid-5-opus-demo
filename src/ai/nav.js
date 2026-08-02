@@ -121,12 +121,15 @@ export class NavGrid {
     const dy = by - ay;
     const len = Math.hypot(dx, dz);
     if (len < NEAR_CLEAR) return true;
+    // Sampling stays at one point per cell length. Two per cell was tried
+    // first, on the theory that a diagonal ray steps over one-cell-thick walls:
+    // it moved 529 scored sight lines by one, which is noise, so it is not here.
     const steps = Math.min(220, Math.max(6, Math.ceil(len * this.inv)));
     const skip = NEAR_CLEAR / len;
     const skipEnd = 1 - FAR_CLEAR / len;
     for (let s = 1; s < steps; s++) {
       const t = s / steps;
-      if (t < skip || t > skipEnd) continue;
+      if (t > skipEnd) continue;
       const x = ax + dx * t;
       const z = az + dz * t;
       const y = ay + dy * t;
@@ -138,6 +141,28 @@ export class NavGrid {
         h = this.top[i] > this.ground[i] ? this.top[i] : this.ground[i];
       } else {
         h = this.groundAt(x, z);
+      }
+      if (t < skip) {
+        // The near zone is a HEIGHT test, not a blanket skip.
+        //
+        // "Enemies keep shooting me through the walls", reported by a human
+        // playing the build. Traced with probes/r13_wallshot.js, which scores
+        // this function against a real Raycaster over 529 guard-to-point sight
+        // lines: 2.8% came back clear where the scene says blocked, and 11 of
+        // those 15 were stopped by op-wall — the compound wall itself. The
+        // worked case is a guard whose eye is 1.8 m from a wall shooting a
+        // target 50 m beyond it. NEAR_CLEAR is 2.6 m, so the wall was never
+        // tested.
+        //
+        // The reason for skipping is real and stays: a sentry's post is inside
+        // cover, so his own cell holds his parapet, and testing it blinds the
+        // whole garrison (measured at a 0.5 m skip: 28 of 28 guard pairs blind,
+        // 0 of 926 sample points visible). But what a man does with a parapet
+        // is look OVER it, and that is a statement about height, not distance.
+        // An occluder below his eye he can see past; one above it is a wall and
+        // stops him. Same exemption, tested against the thing that justifies it.
+        if (h > ay + 0.15) return false;
+        continue;
       }
       if (h > y + 0.04) return false;
     }
