@@ -4,11 +4,12 @@ import { assemble } from './skinning.js';
 import { makeMaterialSet, Z, SZ, MZ } from './materials.js';
 import { frameMatrix } from './geometry.js';
 import {
-  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
+  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildPonytail, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
 } from './body.js';
 import {
   buildChestRig, buildBelt, buildHolster, buildBackpack, buildHelmet, buildCap, buildBoonie,
   buildBandana, buildEyepatch, buildProstheticArm, buildRifle, buildKneepads, buildPockets,
+  buildSlungWeapon, buildPeakedCap, buildCommandCoat,
 } from './gear.js';
 import { Animator } from './anim.js';
 
@@ -22,8 +23,11 @@ const HAND_GRIP_LOCAL = V(0, 0.088, 0.032);
 export function buildCharacterGeometry(loadout) {
   const rig = createRig();
   const parts = [];
+  // A part may name its own bone group; `group` here is only the default. Kit
+  // that spans two bones (the command coat's skirt on the pelvis, its shoulder
+  // boards on the chest) needs the override or one half of it shears.
   const add = (list, group) => {
-    for (const p of list) parts.push({ surface: p.surface, mat: p.mat, group });
+    for (const p of list) parts.push({ surface: p.surface, mat: p.mat, group: p.group ?? group });
   };
   const one = (surface, mat, group) => parts.push({ surface, mat, group });
 
@@ -56,6 +60,9 @@ export function buildCharacterGeometry(loadout) {
   // ended up with the hair cap punched through the cheeks and the entire
   // lower face rendering as a dark mask.
   if (loadout.hair !== false) one(onHead(buildHair({ backOnly: loadout.hairBack ?? false })), 'cloth', 'head');
+  // The tail is skinned to the same bones as the skull, like the hair shell, so
+  // it swings with a head turn instead of hanging off a rigid head bone.
+  if (loadout.ponytail) addHead(buildPonytail(), 'head');
 
   const legR = buildLeg({ bulk });
   one(legR, 'cloth', 'legR');
@@ -103,6 +110,10 @@ export function buildCharacterGeometry(loadout) {
   if (loadout.vest !== false) add(buildChestRig({ bulk, heavy: loadout.grenades !== false }), 'rigidChest');
   add(buildBelt({ pouches: loadout.beltPouches }), 'rigidRoot');
   if (loadout.backpack) add(buildBackpack(), 'rigidChest');
+  // Lies on the pack and rides the ribcage, so it does not shear when the spine
+  // twists through the gait.
+  if (loadout.slung) add(buildSlungWeapon({ sling: loadout.slung !== 'bare' }), 'rigidChest');
+  if (loadout.coat) add(buildCommandCoat(), 'rigidRoot');
   if (loadout.holster) add(buildHolster(1), 'rigidLegR');
   {
     const pk = buildPockets({ cargo: loadout.cargoPockets !== false });
@@ -131,6 +142,9 @@ export function buildCharacterGeometry(loadout) {
       break;
     case 'bandana':
       addHead(buildBandana(), 'rigidHead');
+      break;
+    case 'peaked':
+      addHead(buildPeakedCap(), 'rigidHead');
       break;
     default:
       break;
@@ -236,6 +250,19 @@ export class Character {
 
     this.anim = new Animator(this, opts.terrain ?? null);
     this.anim.stance = opts.stance ?? 'stand';
+
+    // --- animation LOD ----------------------------------------------------
+    // Nine skinned characters are on screen in play and every one of them was
+    // paying full price: a full pose rebuild, four IK chains and FIFTEEN
+    // terrain height queries per frame, whether it was 2 m from the lens or
+    // 90 m away and 20 px tall.
+    //
+    // `lod` is set once per frame from the camera distance by the system in
+    // index.js. It never freezes anyone — `_lodAccum` banks the skipped dt and
+    // hands the whole interval to the animator when it does run, so the gait
+    // advances at exactly the right rate and only its SAMPLING is coarse.
+    this.lod = 0;
+    this._lodAccum = 0;
   }
 
   /** Head/eye world position — handy for AI line-of-sight and camera framing. */
@@ -275,8 +302,32 @@ export class Character {
     }
   }
 
+  /**
+   * Animation update intervals per LOD band, in seconds.
+   *
+   * The bands are chosen from what a skipped frame is WORTH on screen, not from
+   * a round number of hertz. At the gameplay camera's 45-degree lens on a 1080p
+   * frame a point at distance D moves 1 px when it moves D * 0.00121 m; a
+   * walking soldier's fastest-moving surface (the toe through the swing) tops
+   * out near 4 m/s, so a 1/15 s step displaces it 267 mm, which is under one
+   * pixel from 220 m and under two from 110 m. 30 m is therefore already very
+   * conservative for the 15 Hz band; the cost of being wrong is a stutter on a
+   * 25 px figure, and the cost of being right is two thirds of the animation
+   * budget for the whole garrison.
+   */
+  static LOD_STEP = [0, 1 / 30, 1 / 15, 1 / 8];
+
   update(dt) {
-    this.anim.update(dt);
+    const step = Character.LOD_STEP[this.lod] ?? 0;
+    if (step <= 0) {
+      this.anim.update(dt);
+      return;
+    }
+    this._lodAccum += dt;
+    if (this._lodAccum < step) return;
+    const banked = this._lodAccum;
+    this._lodAccum = 0;
+    this.anim.update(banked);
   }
 
   dispose() {

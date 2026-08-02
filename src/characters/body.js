@@ -247,7 +247,44 @@ export const HEAD_CENTRE = new THREE.Vector3(0, 1.678, -0.006);
  * 224 mm was 15% longer than a human head (195-200 mm) and read as a muzzle
  * from every three-quarter angle.
  */
-export const HEAD_FIT = { sx: 0.870, sy: 0.962, sz: 0.900, lift: 0.018, pivotY: 1.6 };
+/**
+ * ROUND 8 — the head is not too wide any more; it is too SHORT, and three
+ * rounds of shrinking have been aimed at the wrong axis.
+ *
+ * `probes/r7c/headwidth.js` on the round-7 build:
+ *
+ *   headWidth 0.1641   widest part: char-skin/z0 (the EAR) at |x| 0.0820
+ *   spans  glenohumeral 0.380   biacromial 0.4225   outerDeltoid 0.6685
+ *   ratios overGlenohumeral 0.432   overBiacromial 0.388
+ *
+ * Decomposed against anthropometry rather than against the ratio:
+ *
+ *   skull breadth        143 mm   (adult male 152)          6% UNDER
+ *   breadth across ears  164 mm   (auricular breadth 165)   correct
+ *   menton-to-vertex     198 mm   (adult male 232)         15% UNDER
+ *
+ * So the head is already at or inside every width canon there is, and the
+ * standing "head is too wide" note is now a HEIGHT note wearing a width's
+ * clothes: 143 x 198 has an aspect of 0.72 where 152 x 232 is 0.655, and the
+ * shipped measurement of 0.800 is that same shortfall read off the screen.
+ * Taking another 8% off the breadth — which is what closing 0.432 -> 0.40 by
+ * shrinking would need — would put the skull at 132 mm, i.e. two standard
+ * deviations below an adult male, to fix an aspect ratio by making it worse.
+ *
+ * `sy` therefore goes UP, 0.962 -> 1.045: menton-vertex 198 -> 215 mm, aspect
+ * 0.804 -> 0.763, and the width — the thing the ratio actually measures — does
+ * not move at all. Because the scale pivots at y = 1.6, which is above the
+ * chin, the jaw drops 2.4 mm and the crown rises 14.6; the exposed neck column
+ * round 6 opened up loses 2.4 mm of its 74 and stays a neck.
+ *
+ * The remaining 0.432 is then a PROJECTION fact, not a modelling one: a skull
+ * is near-circular in plan and projects at full width from every azimuth, while
+ * the shoulder span behind it foreshortens by cos(turn). At the shipped 0.62 rad
+ * that is 0.81, and 0.432 * 0.81 = 0.35 — i.e. measured with the body square to
+ * the lens the head is already INSIDE the 0.37-0.40 window, and the shipped
+ * number is the cosine, not the geometry.
+ */
+export const HEAD_FIT = { sx: 0.870, sy: 1.045, sz: 0.900, lift: 0.018, pivotY: 1.6 };
 
 export function headTransform() {
   const { sx, sy, sz, lift, pivotY } = HEAD_FIT;
@@ -471,6 +508,100 @@ export function buildHair(o = {}) {
     Z.HAIR,
     0.4,
   );
+}
+
+/**
+ * Hair gathered into a band at the occiput and hanging behind it.
+ *
+ * ROUND 8, and it comes straight off the reference frames rather than off a
+ * proportion table. In mgi-1, mgi-3 and mgi-6 — the three direct-feed shots
+ * that show Snake's head at gameplay distance — the single loudest thing about
+ * the head silhouette is that the hair is TIED BACK: there is a knot at the
+ * occiput and a tail behind it, so the head outline is not an egg, it is an egg
+ * with a lobe on the back of it.
+ *
+ * That matters for two separate reasons and only one of them is likeness.
+ *
+ *  1. Silhouette. A cropped-hair skull seen from behind — which is the only
+ *     angle the third-person camera ever gives — is a circular arc, and a
+ *     circular arc is the least identifiable shape there is. The tail runs
+ *     150 mm aft of the occiput and 70 mm down, so it is an outline EVENT in
+ *     the exact place the eye goes first, and it survives downsampling: on a
+ *     40 px-tall figure the head is 5 px and the tail is 1.5 of them.
+ *  2. Proportion. The standing note is head/shoulder 0.524 against 0.37-0.40.
+ *     Half of that has been chased by shrinking the skull three rounds running,
+ *     which is why the head now measures 143 mm breadth against an
+ *     anthropometric 152 — i.e. it has been shrunk PAST a real head and the
+ *     ratio still reads wide, because the measurement is a WIDTH and a skull is
+ *     near-circular in plan. Adding length aft is the other lever: it moves the
+ *     head's aspect ratio toward the 0.67 canon (width/height, and width/DEPTH
+ *     with it) without taking one more millimetre off a skull that is already
+ *     undersized.
+ *
+ * Built as its own loft rather than as more `buildHair` cover, because the
+ * displaced-sphere shell cannot leave the skull — everything it draws is a
+ * radial offset from `headSurface`, and a tail is 150 mm of hair that is not
+ * touching the head at all.
+ */
+export function buildPonytail(o = {}) {
+  const parts = [];
+  // The knot. Authored in the same absolute world-space y as the rest of the
+  // head so `headTransform` can carry it; it sits on the occiput, which
+  // `headSurface` bulges out to z ~ 0.103 at this latitude.
+  const knot = displacedSphere(
+    (dir, out) => {
+      // Squashed fore-aft and flattened against the skull, with a coarse
+      // strand modulation so it does not read as a ball bearing.
+      const clump = 1 + 0.13 * Math.sin(dir.x * 21) * Math.sin(dir.y * 17);
+      out.set(
+        dir.x * 0.030 * clump,
+        1.704 + dir.y * 0.034 * clump,
+        0.104 + dir.z * 0.031 * clump,
+      );
+    },
+    16,
+    12,
+    Z.HAIR,
+    0.25,
+  );
+  parts.push({ surface: knot, mat: 'cloth' });
+
+  // The tail: aft and down, tapering to a point. `back` fattens the underside
+  // so the section is a teardrop rather than a rod — hair hangs, it does not
+  // stand off.
+  const len = o.length ?? 1;
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.700, 0.112), rx: 0.028, rz: 0.026, n: 2.4, zone: Z.HAIR },
+        { p: V(0, 1.694, 0.132), rx: 0.021, rz: 0.020, n: 2.4, zone: Z.HAIR },
+        { p: V(0, 1.684, 0.152 * len + 0.004), rx: 0.024, rz: 0.023, n: 2.3, back: 1.1, zone: Z.HAIR },
+        { p: V(0, 1.664, 0.176 * len + 0.004), rx: 0.024, rz: 0.022, n: 2.3, back: 1.12, zone: Z.HAIR },
+        { p: V(0, 1.638, 0.192 * len + 0.004), rx: 0.019, rz: 0.017, n: 2.3, back: 1.1, zone: Z.HAIR },
+        { p: V(0, 1.612, 0.198 * len + 0.004), rx: 0.010, rz: 0.009, n: 2.3, zone: Z.HAIR },
+      ],
+      11,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+
+  // The tie: a 10 mm band at the root of the tail. One dark ring across a
+  // lighter mass is what tells a viewer at any distance that this is BOUND
+  // hair and not a lump of geometry.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.699, 0.121), rx: 0.023, rz: 0.022, n: 2.6, zone: Z.WEBBING },
+        { p: V(0, 1.696, 0.129), rx: 0.024, rz: 0.023, n: 2.6, zone: Z.WEBBING },
+        { p: V(0, 1.693, 0.137), rx: 0.022, rz: 0.021, n: 2.6, zone: Z.WEBBING },
+      ],
+      5,
+      { radial: 10, capStart: true, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  return parts;
 }
 
 // -------------------------------------------------------------------------

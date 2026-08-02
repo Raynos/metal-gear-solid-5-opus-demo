@@ -818,6 +818,276 @@ export function buildBackpack(o = {}) {
 // -------------------------------------------------------------------------
 
 /**
+ * A second weapon slung diagonally across the back, muzzle up past the LEFT
+ * shoulder.
+ *
+ * ROUND 8, and it is the single strongest silhouette cue available on this
+ * character, taken directly off the reference rather than reasoned about. In
+ * mgi-3 — Snake at the wheel, upper body filling ~200 px — the one line in the
+ * frame that is neither vertical nor horizontal is a thin rod running up and to
+ * the left from behind his shoulder, past his ear, well above the crown of his
+ * head. That is his back-slung weapon, and at that distance it is the only part
+ * of the loadout you can positively identify.
+ *
+ * Why it beats anything else that could be added for the same triangles:
+ *
+ *   - A standing figure is an assembly of near-verticals (legs, torso, neck)
+ *     capped by near-horizontals (shoulders, belt, weapon at low ready). A
+ *     63-degree diagonal 0.73 m long is the only element that shares an axis
+ *     with nothing else, so it is what the eye finds first and what survives
+ *     downsampling: at 40 px tall it is a 15 px stroke crossing the body.
+ *   - It breaks the outline ABOVE the shoulder line, which is where the round-7
+ *     silhouette read was a bare curve from the deltoid to the skull.
+ *   - It reads from behind. The canteen, knife and holster this file added in
+ *     round 6 are all below the belt, i.e. in the half of the figure the
+ *     gameplay camera crops.
+ *
+ * Authored to lie ON the assault pack (rear face z = 0.206 at its widest) and
+ * to clear the head, which after HEAD_FIT is |x| <= 0.082: the muzzle passes at
+ * x = -0.16, i.e. 78 mm outboard of the widest thing on the skull.
+ */
+export function buildSlungWeapon(o = {}) {
+  const parts = [];
+  const push = (s, mat = 'metal') => parts.push({ surface: s, mat });
+  // Spine of the weapon, butt (low right) to muzzle (high left).
+  const butt = V(0.178, 1.042, 0.183);
+  const recv = V(0.108, 1.208, 0.222);
+  const fore = V(0.010, 1.398, 0.214);
+  const muzz = V(-0.160, 1.732, 0.148);
+  const at = (a, b, t) => a.clone().lerp(b, t);
+
+  // Stock: butt pad, comb, and the tube that joins it to the receiver.
+  push(
+    loftKeys(
+      [
+        { p: butt, rx: 0.020, rz: 0.043, n: 3.6, zone: MZ.DARKPOLY },
+        { p: at(butt, recv, 0.16), rx: 0.018, rz: 0.036, n: 3.4, zone: MZ.DARKPOLY },
+        { p: at(butt, recv, 0.55), rx: 0.014, rz: 0.020, n: 3.0, zone: MZ.DARKPOLY },
+        { p: at(butt, recv, 0.95), rx: 0.017, rz: 0.023, n: 3.2, zone: MZ.DARKPOLY },
+      ],
+      9,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+  );
+  // Receiver: the boxy mass in the middle of the diagonal, and the one place
+  // the run of the weapon changes WIDTH — without it a slung rifle is a stick.
+  push(
+    loftKeys(
+      [
+        { p: at(recv, fore, -0.04), rx: 0.026, rz: 0.031, n: 4.4, zone: MZ.GUNMETAL },
+        { p: at(recv, fore, 0.18), rx: 0.029, rz: 0.034, n: 4.6, zone: MZ.GUNMETAL },
+        { p: at(recv, fore, 0.40), rx: 0.027, rz: 0.032, n: 4.6, zone: MZ.GUNMETAL },
+      ],
+      7,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+  );
+  // Magazine, standing off the back at right angles to the receiver. This is
+  // the piece that makes the weapon read as a weapon rather than as a strap:
+  // it is a 0.13 m spur off the diagonal, so the outline gains a corner.
+  {
+    const p0 = at(recv, fore, 0.06);
+    const away = V(0.30, 0.28, 0.91).normalize();
+    push(
+      loftKeys(
+        [
+          { p: p0.clone().addScaledVector(away, 0.012), rx: 0.015, rz: 0.032, n: 4.2, zone: MZ.DARKPOLY },
+          { p: p0.clone().addScaledVector(away, 0.070), rx: 0.014, rz: 0.031, n: 4.2, zone: MZ.DARKPOLY },
+          { p: p0.clone().addScaledVector(away, 0.130), rx: 0.012, rz: 0.027, n: 4.2, zone: MZ.DARKPOLY },
+        ],
+        7,
+        { radial: 10, capStart: true, capEnd: true },
+      ),
+    );
+  }
+  // Handguard, then the barrel, then a front sight block at the end of it.
+  push(
+    loftKeys(
+      [
+        { p: at(recv, fore, 0.42), rx: 0.024, rz: 0.025, n: 3.4, zone: MZ.DARKPOLY },
+        { p: at(recv, fore, 0.78), rx: 0.022, rz: 0.023, n: 3.4, zone: MZ.DARKPOLY },
+        { p: fore, rx: 0.020, rz: 0.021, n: 3.4, zone: MZ.DARKPOLY },
+      ],
+      7,
+      { radial: 12, capStart: true, capEnd: true },
+    ),
+  );
+  push(tube(fore, at(fore, muzz, 0.86), 0.0095, 0.0082, 10, MZ.GUNMETAL));
+  push(tube(at(fore, muzz, 0.84), muzz, 0.0135, 0.0125, 10, MZ.GUNMETAL));
+  push(
+    roundedBox(0.024, 0.044, 0.024, 0.004, { zone: MZ.GUNMETAL, radial: 8 }).transform(
+      new THREE.Matrix4().setPosition(...at(fore, muzz, 0.30).toArray()),
+    ),
+  );
+
+  // The sling: a 25 mm tape bowing away from the body between the two swivels.
+  // It is the only soft edge on an assembly of hard ones, and it doubles the
+  // number of times the diagonal crosses the pack's flat back panel.
+  if (o.sling !== false) {
+    const s0 = at(recv, fore, 0.62);
+    const s1 = at(butt, recv, 0.30);
+    const bow = V(0.055, -0.02, 0.075);
+    push(
+      strap(
+        [
+          s0,
+          s0.clone().lerp(s1, 0.33).add(bow),
+          s0.clone().lerp(s1, 0.66).add(bow),
+          s1,
+        ],
+        0.026,
+        0.007,
+        Z.WEBBING,
+        { stations: 10 },
+      ),
+      'cloth',
+    );
+  }
+  return parts;
+}
+
+/**
+ * An officer's peaked service cap.
+ *
+ * The commander has to be told apart from a patrol guard at 60 m, where the
+ * whole figure is ~40 px tall and the head is 4 of them, so headgear alone
+ * cannot carry it (see `buildCommandCoat`). What this does carry is the
+ * 10-25 m read, where the hard straight bill and the flat drum crown are
+ * unmistakably not the dome of a helmet, the slump of a boonie or the soft
+ * curve of a patrol cap.
+ */
+export function buildPeakedCap() {
+  const parts = [];
+  // Band: a stiff 45 mm cylinder round the skull, deliberately NOT following
+  // the cranium taper — that is what makes a service cap look issued.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.606, -0.006), rx: 0.090, rz: 0.099, n: 2.8, zone: Z.LEATHER },
+        { p: V(0, 1.650, -0.007), rx: 0.092, rz: 0.101, n: 2.8, zone: Z.LEATHER },
+      ],
+      5,
+      { radial: 20, capStart: true },
+    ),
+    mat: 'cloth',
+  });
+  // Crown: flares OUT above the band and closes flat. A peaked cap is wider at
+  // the top than at the head, which is the one profile no other headgear here has.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.648, -0.007), rx: 0.093, rz: 0.102, n: 2.8, zone: Z.CAP },
+        { p: V(0, 1.700, -0.014), rx: 0.113, rz: 0.120, n: 3.0, zone: Z.CAP },
+        { p: V(0, 1.742, -0.020), rx: 0.118, rz: 0.124, n: 3.2, zone: Z.CAP },
+        { p: V(0, 1.762, -0.022), rx: 0.112, rz: 0.117, n: 3.4, zone: Z.CAP },
+        { p: V(0, 1.770, -0.022), rx: 0.086, rz: 0.090, n: 3.4, zone: Z.CAP },
+      ],
+      11,
+      { radial: 20, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // Bill: hard, straight, and level rather than curved down — a 60 mm shelf
+  // that throws a black bar across the eyes in any overhead light.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 1.626, -0.086), rx: 0.090, rz: 0.009, n: 4.4, zone: Z.LEATHER },
+        { p: V(0, 1.620, -0.124), rx: 0.088, rz: 0.009, n: 4.4, zone: Z.LEATHER },
+        { p: V(0, 1.612, -0.162), rx: 0.066, rz: 0.008, n: 4.2, zone: Z.LEATHER },
+      ],
+      7,
+      { radial: 14, capStart: true, capEnd: true, forward: V(0, 1, 0) },
+    ),
+    mat: 'cloth',
+  });
+  // Chin cord across the front of the band, on two buttons.
+  parts.push({
+    surface: strap(
+      [V(-0.084, 1.628, -0.052), V(-0.04, 1.622, -0.094), V(0.04, 1.622, -0.094), V(0.084, 1.628, -0.052)],
+      0.010,
+      0.005,
+      Z.BELT,
+      { stations: 9 },
+    ),
+    mat: 'cloth',
+  });
+  return parts;
+}
+
+/**
+ * The commander's coat: a mid-thigh tunic skirt, plus shoulder boards.
+ *
+ * This is a GAMEPLAY-LEGIBILITY part, not an art one, and it is sized from the
+ * distance it has to work at. At 60 m through a 45-degree lens at 1080p a 1.86 m
+ * soldier is 40 px tall and about 13 px wide; a 4 px head cannot carry a read
+ * and neither can a 1 px antenna, which is why this is not a hat and not a whip
+ * aerial. What is legible at 13 px of width is a change in the WIDTH itself.
+ *
+ * The skirt flares the outline from 0.163 m at the waist to 0.243 m at the hem
+ * and holds it there for 300 mm of the figure's height. Against a patrol guard,
+ * whose leg silhouette necks IN below the belt to 0.19 m across two separate
+ * legs with a gap between them, that is a 4 px solid block where every other
+ * soldier in the frame has a 2 px pair of sticks — the same difference, and for
+ * the same reason, as a rook against a pawn.
+ *
+ * It stops at mid-thigh (y 0.66) rather than at the knee so the legs still
+ * swing clear of it: the coat is welded to the pelvis, and a knee-length rigid
+ * skirt would be walked through at every stride.
+ */
+export function buildCommandCoat() {
+  const parts = [];
+  // The skirt. `back` swells the tail so it hangs behind the seat.
+  parts.push({
+    surface: loftKeys(
+      [
+        { p: V(0, 0.960, 0.000), rx: 0.163, rz: 0.126, n: 2.8, zone: Z.JACKET },
+        { p: V(0, 0.900, 0.004), rx: 0.176, rz: 0.136, n: 2.9, back: 1.06, zone: Z.JACKET },
+        { p: V(0, 0.820, 0.008), rx: 0.199, rz: 0.150, n: 3.0, back: 1.10, zone: Z.JACKET },
+        { p: V(0, 0.730, 0.012), rx: 0.224, rz: 0.164, n: 3.1, back: 1.14, zone: Z.JACKET },
+        { p: V(0, 0.672, 0.014), rx: 0.243, rz: 0.176, n: 3.2, back: 1.16, zone: Z.JACKET },
+        // Hem: a 12 mm turned edge, so the bottom of the coat is a lit line and
+        // a shadow rather than a place the geometry stops.
+        { p: V(0, 0.660, 0.014), rx: 0.240, rz: 0.174, n: 3.4, back: 1.16, zone: Z.POUCH },
+      ],
+      13,
+      { radial: 24, capStart: false, capEnd: true },
+    ),
+    mat: 'cloth',
+  });
+  // Front vent: a dark slit down the middle of the skirt. One vertical break
+  // stops the skirt reading as a bell.
+  parts.push({
+    surface: strap(
+      [V(0, 0.955, -0.128), V(0, 0.860, -0.150), V(0, 0.760, -0.168), V(0, 0.672, -0.180)],
+      0.016,
+      0.006,
+      Z.BELT,
+      { stations: 9 },
+    ),
+    mat: 'cloth',
+  });
+  // Shoulder boards: two hard bright rectangles lying fore-and-aft on the
+  // trapezius. Close in they are the rank; at 25 m they are two bright pixels
+  // exactly where every other soldier has a dark strap.
+  for (const sgn of [-1, 1]) {
+    parts.push({
+      surface: roundedBox(0.038, 0.010, 0.098, 0.004, { zone: Z.CAP, radial: 8 }).transform(
+        new THREE.Matrix4().makeRotationY(-sgn * 0.16).setPosition(sgn * 0.104, 1.462, 0.006),
+      ),
+      mat: 'cloth',
+      // Rides the chest, not the pelvis: a shoulder board welded to the root
+      // bone shears off the shoulder the moment the spine bends.
+      group: 'rigidChest',
+    });
+    for (const b of buckle(V(sgn * 0.104, 1.470, -0.036), { w: 0.016, h: 0.012 })) {
+      parts.push({ ...b, group: 'rigidChest' });
+    }
+  }
+  return parts;
+}
+
+/**
  * A modern combat helmet (ACH/MICH pattern).
  *
  * Round 4's was a capped loft with a flat circular bottom edge and no brim, no
