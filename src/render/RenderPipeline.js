@@ -2177,6 +2177,11 @@ export class RenderPipeline {
     u.uCamPos.value.copy(camera.position);
   }
 
+  /** Frame delta, set by the engine, so timed effects are per-second not per-frame. */
+  setDelta(dt) {
+    this._lastDt = dt;
+  }
+
   render(renderer, scene, camera) {
     const w = this.width;
     const h = this.height;
@@ -2395,7 +2400,22 @@ export class RenderPipeline {
     du.uMaxCoCNear.value = (this.grade.maxCoCNear ?? 1.2) * cocScale;
     du.uCoCFloor.value = (this.grade.cocFloor ?? 0.9) * cocScale;
     du.uFrame.value = this.frame % 64;
-    du.uMotionScale.value = this.enabled.motionBlur ? 0.55 : 0.0;
+    // Motion blur is a SHUTTER, not a per-frame smear.
+    //
+    // This was `0.55 * (per-frame reprojection delta)`, which makes the blur
+    // length proportional to frame time: at 25 FPS the camera moves 2.4x
+    // further between frames than at 60, so the streak is 2.4x longer. The
+    // slower it runs the more it smears, which is a feedback loop that makes a
+    // 25 FPS frame look far worse than 25 FPS actually is — and it is exactly
+    // what "blur and distortion when flying around" is.
+    //
+    // A 180-degree shutter exposes for half a frame at the REFERENCE rate.
+    // Normalise by the real delta so the streak is a fixed duration of motion,
+    // and clamp so a hitch cannot produce an arbitrarily long smear.
+    const refDt = 1 / 60;
+    const dt = Math.max(1e-4, this._lastDt ?? refDt);
+    const shutter = Math.min(1, refDt / dt);
+    du.uMotionScale.value = this.enabled.motionBlur ? 0.55 * shutter : 0.0;
     du.uDofScale.value = this.enabled.dof ? 1 : 0;
     du.uEnabled.value = wantDof ? 1 : 0;
     if (wantDof) this._blit(this.dofMat, this.dofRT);

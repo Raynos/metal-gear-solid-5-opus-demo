@@ -27,28 +27,43 @@ const AXIS_BUTTON = 0.55;    // where an axis starts counting as a button press
 const TRIGGER_ON = 0.35;     // analog trigger -> digital
 
 /**
- * The default map. MGSV on a keyboard, near enough that muscle memory carries:
- * hold RMB to aim, LMB to fire, Shift to sprint, Ctrl to crouch, Z to go prone,
- * Space to take cover, F for CQC, E to drag.
+ * The default map. MGSV on a keyboard, near enough that muscle memory carries.
+ *
+ * EVERY ACTION HAS A KEYBOARD BINDING. This is played on laptops with a
+ * trackpad, where holding a two-finger right-click while steering with the same
+ * hand is not something a person can actually do. Mouse buttons stay as the
+ * primary for anyone who has a mouse; the keyboard alternative is not a
+ * fallback, it is a first-class path:
+ *
+ *   aim   right-mouse  or  E
+ *   fire  left-mouse   or  Space
+ *
+ * Arrow keys are look, not movement — on a trackpad, turning is the thing you
+ * cannot do comfortably, and WASD already covers movement.
  */
 export const DEFAULT_BINDINGS = {
-  forward:    ['KeyW', 'ArrowUp'],
-  back:       ['KeyS', 'ArrowDown'],
-  left:       ['KeyA', 'ArrowLeft'],
-  right:      ['KeyD', 'ArrowRight'],
+  forward:    ['KeyW'],
+  back:       ['KeyS'],
+  left:       ['KeyA'],
+  right:      ['KeyD'],
   sprint:     ['ShiftLeft', 'ShiftRight', 'Pad10'],
   walk:       ['AltLeft'],
   crouch:     ['ControlLeft', 'KeyC', 'Pad1'],
   prone:      ['KeyZ', 'Pad2'],
-  aim:        ['Mouse2', 'Pad6', 'Axis6+'],
-  fire:       ['Mouse0', 'Pad7', 'Axis7+'],
+  aim:        ['Mouse2', 'KeyE', 'Pad6', 'Axis6+'],
+  fire:       ['Mouse0', 'Space', 'Pad7', 'Axis7+'],
   steady:     ['ShiftLeft', 'Pad10'],
   cqc:        ['KeyF', 'Pad0'],
-  cover:      ['Space', 'Pad3'],
-  drag:       ['KeyE', 'Pad4'],
+  cover:      ['KeyG', 'Pad3'],
+  drag:       ['KeyR', 'Pad4'],
   stow:       ['KeyQ', 'Pad5'],
   swapShoulder: ['KeyV', 'Pad11'],
-  reload:     ['KeyR', 'Pad8'],
+  reload:     ['KeyT', 'Pad8'],
+  // Keyboard look, for trackpads. Held, not tapped.
+  lookLeft:   ['ArrowLeft'],
+  lookRight:  ['ArrowRight'],
+  lookUp:     ['ArrowUp'],
+  lookDown:   ['ArrowDown'],
 };
 
 /** Which pad buttons behave as analog triggers rather than switches. */

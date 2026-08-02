@@ -10,11 +10,83 @@
       #app { position: fixed; inset: 0; }
       canvas { display: block; width: 100%; height: 100%; }
       #ui { position: fixed; inset: 0; pointer-events: none; }
+
+      #controls-card {
+        position: fixed; left: 24px; bottom: 24px; z-index: 40;
+        padding: 14px 18px 16px; pointer-events: none;
+        background: rgba(8, 10, 12, 0.62);
+        border: 1px solid rgba(216, 216, 208, 0.16);
+        backdrop-filter: blur(6px);
+        font: 11px/1.55 "Helvetica Neue", Helvetica, Arial, sans-serif;
+        letter-spacing: 0.09em; color: rgba(216, 216, 208, 0.78);
+        transition: opacity 240ms ease; opacity: 1;
+      }
+      #controls-card[hidden] { display: block; opacity: 0; }
+      #controls-card h4 {
+        margin: 0 0 10px; font-size: 10px; font-weight: 500;
+        letter-spacing: 0.28em; color: rgba(216, 216, 208, 0.95);
+        display: flex; justify-content: space-between; gap: 24px;
+      }
+      #controls-card h4 span { opacity: 0.4; letter-spacing: 0.14em; }
+      #controls-card dl {
+        margin: 0; display: grid; grid-template-columns: auto 1fr;
+        gap: 3px 14px; align-items: baseline;
+      }
+      #controls-card dt {
+        text-align: right; color: rgba(216, 216, 208, 0.95);
+        font-variant-numeric: tabular-nums; white-space: nowrap;
+      }
+      #controls-card dd { margin: 0; opacity: 0.72; }
+      #controls-card em { font-style: normal; opacity: 0.45; }
     </style>
   </head>
   <body>
     <div id="app"></div>
     <div id="ui"></div>
+
+    <!--
+      Core controls card. The UI module owns the HUD; this is deliberately
+      separate and deliberately dumb, because a player who cannot discover how
+      to shoot has no way to find out that the rest exists. It hides itself if
+      the UI module publishes its own controls panel.
+      Toggle with H or ?.
+    -->
+    <div id="controls-card">
+      <h4>CONTROLS <span>H to hide</span></h4>
+      <dl>
+        <dt>W A S D</dt><dd>move</dd>
+        <dt>Mouse / Arrows</dt><dd>look</dd>
+        <dt>Shift</dt><dd>sprint</dd>
+        <dt>C</dt><dd>crouch</dd>
+        <dt>Z</dt><dd>prone</dd>
+        <dt>E <em>or</em> RMB</dt><dd>aim</dd>
+        <dt>Space <em>or</em> LMB</dt><dd>fire</dd>
+        <dt>F</dt><dd>CQC takedown <em>(behind an unaware guard)</em></dd>
+        <dt>R</dt><dd>drag body</dd>
+        <dt>T</dt><dd>reload</dd>
+        <dt>G</dt><dd>take cover</dd>
+        <dt>V</dt><dd>swap shoulder</dd>
+        <dt>Esc</dt><dd>menu</dd>
+      </dl>
+    </div>
+    <script>
+      // Plain script, not a module: the controls card must work even if the
+      // game bundle fails to boot, which is exactly when you want to read it.
+      (function () {
+        var card = document.getElementById('controls-card');
+        var hidden = false;
+        function toggle(v) { hidden = v; card.toggleAttribute('hidden', hidden); }
+        addEventListener('keydown', function (e) {
+          if (e.code === 'KeyH' || e.key === '?') toggle(!hidden);
+        });
+        // Stand aside for the UI module's own panel if one appears.
+        addEventListener('load', function () {
+          setTimeout(function () {
+            if (document.querySelector('#ui [data-controls]')) card.remove();
+          }, 1200);
+        });
+      })();
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

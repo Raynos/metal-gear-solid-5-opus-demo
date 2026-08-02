@@ -64,6 +64,16 @@ function setMode(next) {
   // Free-fly is godmode's camera; the harness poses the camera itself and must
   // never have it fighting back, so applyShot() also parks us in godmode.
   freeFly = next === 'godmode';
+  // God mode is an INSPECTION camera. Depth of field and motion blur are
+  // cinematic effects for a gameplay camera; on a free-fly they only smear the
+  // thing you are trying to look at, and they are two of the most expensive
+  // passes in the frame. Off here, on in play.
+  const pipe = engine.pipeline;
+  if (pipe?.enabled) {
+    const cinematic = next === 'play';
+    pipe.enabled.dof = cinematic;
+    pipe.enabled.motionBlur = cinematic;
+  }
   for (const fn of modeListeners) {
     try {
       fn(next, prev);

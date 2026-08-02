@@ -99,6 +99,7 @@ export class Engine {
 
   step(dt) {
     this.elapsed += dt;
+    this.pipeline?.setDelta?.(dt);
     for (const s of this.systems) s.update(dt, this);
   }
 
