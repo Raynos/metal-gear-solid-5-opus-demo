@@ -3056,7 +3056,27 @@ export class RenderPipeline {
       au.uProjInv.value.copy(this._jitProjInv);
       au.uProj.value.copy(this._jitProj);
       au.uProjScale.value.set(this._jitProj.elements[0], this._jitProj.elements[5]);
-      au.uFrame.value = this.frame % 64;
+      // FREEZE the AO's temporal rotation when TAA is off.
+      //
+      // GTAO dithers its slice rotation per pixel AND per frame, on the
+      // assumption that a temporal resolve averages the noise away over ~8
+      // frames. TAA was switched off in favour of FXAA because reprojection
+      // smeared whenever the camera moved -- and FXAA is a single-frame edge
+      // filter that cannot average anything over time. So the rotation has been
+      // emitting a fresh noise field every frame with nothing to resolve it.
+      //
+      // Measured with the camera STATIC and dt = 0, where a stable renderer
+      // reads 0.000: the frame changes by 2.423 codes/pixel/frame as shipped,
+      // and turning the occlusion pass off takes it to 0.164 together with
+      // grain. That crawling noise sits in exactly the dark areas AO darkens,
+      // which is why it is reported as "the shadows and blacks are glitchy" --
+      // and it is NOT the shadow map, which ablates to no change at all.
+      //
+      // Frozen, the dither becomes a fixed spatial pattern that the pass's own
+      // depth-aware bilateral blur is already there to smooth. Static noise the
+      // eye reads as texture; noise that changes every frame it reads as a
+      // fault.
+      au.uFrame.value = this.enabled.taa ? this.frame % 64 : 0;
       // Contact shadows march in VIEW space, so the world sun has to be rotated
       // into it — direction only, no translation.
       au.uSunV.value
@@ -3230,7 +3250,13 @@ export class RenderPipeline {
     du.uMaxCoCFar.value = (this.grade.maxCoCFar ?? 2.4) * cocScale;
     du.uMaxCoCNear.value = (this.grade.maxCoCNear ?? 1.2) * cocScale;
     du.uCoCFloor.value = (this.grade.cocFloor ?? 0.9) * cocScale;
-    du.uFrame.value = this.frame % 64;
+    // Same as the occlusion pass above: the bokeh gather rotates its disc by
+    // ign(gl_FragCoord + uFrame * 3.7) expecting a temporal resolve that is not
+    // running. Ablating this pass moved the static-camera flicker by 0.00, so
+    // it is not a measured contributor today -- but it is the same latent bug,
+    // and it would start contributing the moment the defocus covers more of the
+    // frame. Frozen on the same condition rather than left as a trap.
+    du.uFrame.value = this.enabled.taa ? this.frame % 64 : 0;
     // Motion blur is a SHUTTER, not a per-frame smear.
     //
     // This was `0.55 * (per-frame reprojection delta)`, which makes the blur

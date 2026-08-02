@@ -33,6 +33,32 @@ measured 29.5-30.0 ms early in the round and 37.5-39.8 ms later the same day.
 Any before/after must be run back to back, in one sitting. `probes/results/
 r11-perf-ab-pre.json` and `-ab-head.json` are such a pair.
 
+**Amplification does not work on this platform, and it is the fourth dead
+instrument.** The obvious way to measure something too small to see is to do it
+k times and fit a slope. Wrapping `renderer.shadowMap.render` and re-rasterising
+cascade 0 k extra times gave 7.21 ms per raster with r² = 0.999 — a beautiful
+straight line, and impossible, since it puts 7.2 ms of cascade 0 inside a 25.3 ms
+frame that only loses 0.34 ms when cascade 0 is frozen. The arbitration is in
+`probes/r12_shadowcost.js`: an extra shadow pass over an EMPTY scene, zero
+draws in it, costs 24.9 ms against a full 160-draw raster's 24.3 ms. What the
+amplifier prices is a render PASS, not the work inside it — the same
+command-buffer-boundary pathology that made GPU timer queries unusable here.
+Extra passes on this GPU cost about 20-25 ms each regardless of contents.
+
+**Prefer PAIRED differences over differences of medians.** Every earlier probe
+here differenced two configs' medians, which throws the pairing away and lets
+slow drift in as noise. Difference config A and config B *within each rep*, then
+take the median and the SIGN TEST over reps: a real effect is positive in nearly
+every rep (the AO pass, 6/6), a non-effect is positive in about half (the
+cascade schedule, 3/6). On a shared machine that is the difference between a
+result and a coin flip.
+
+**`node tools/shot.mjs status` says "quiet" when it is not.** It trips on
+>4 headless procs or load >0.7×cores. Sitting under both, the same probe on the
+same source measured 25 ms and 49 ms two hours apart, and another author's
+browser can double a frame time without moving either number. Take an absolute
+frame time from it as a factor-of-two figure and rely on within-run controls.
+
 **`node tools/shot.mjs status`** reports headless chromium count, vite count,
 load average against core count and which other worktrees are running. Check it
 before timing anything and say what it said.
@@ -97,13 +123,78 @@ before any figure could be trusted, and all three are worth knowing about:
 **The "~12 ms hides in the unflagged passes" theory is dead.** Those five passes
 total ~1.5-2 ms. The missing time was the scene itself.
 
+**Round-12 corrections to the table above, all measured with ballast:**
+
+- **The AO pass is ~6.45 ms, not 2.2-2.9.** Seen in 6 of 6 reps as a positive
+  control while measuring something else. My earlier 2.46 ms was measured
+  WITHOUT ballast, and that is the governor effect in miniature: ablating AO
+  drops the load, the GPU downclocks, and the saving under-reads. **AO is now
+  the largest single post item and the biggest remaining lever** — a half-res
+  broad term with a full-res contact term is worth ~3 ms. The cost is the 2-3
+  pixel contact band the pass comments defend, which was round 9's headline
+  deliverable, so this needs a visual verdict as well as a number.
+- **Shadow cascade re-rasterisation is NOT 1.75 ms.** Putting cascade 0 on a
+  2-frame schedule removes 86 draws and 0.7 M triangles a frame (469.6 -> 383.5
+  draws, 18%) and moves the frame by 0.30 / -0.25 ms against null controls of
+  0.01 and 0.79 — i.e. nothing. Depth-only raster is close to free on this GPU.
+  The cut is KEPT for the draw budget (ARCHITECTURE asks < 350), explicitly not
+  for milliseconds. Visual cost in motion: stale frames differ by 0.18-0.23
+  codes mean where two consecutive frames of the same film differ by 9.08, so
+  ~2.5% of what the image is doing anyway.
+- **Quarter-resolution volumetric march: REJECTED.** It costs 9-18% of local
+  contrast at every scale from 2 to 64 px against a null control of 0.00, and
+  small cumulus visibly lose their turrets. The saving could not even be
+  confirmed. Section 2.10 says the sky beats the real game; it is not for sale
+  at that price. Reprojection and the depth-aware upsample DO hold at quarter
+  res (frame-to-frame 5.36 vs half's 5.48), so the mechanism is fine — the
+  resolution is not.
+
+**A fourth instrument is dead: shadow-pass amplification.** Re-rastering cascade
+0 k extra times and fitting the slope gives 7.21 ms per raster at r-squared
+0.999 — beautifully linear and completely false, against a frame that loses
+0.34 ms when cascade 0 is frozen outright. An extra shadow pass over an EMPTY
+scene with zero draws costs 24.9 ms against a full 160-draw raster's 24.3. It
+prices a render PASS, not its contents — the same command-buffer pathology as
+the GPU timer queries. Do not amplify to measure on this backend.
+
+**Correction to 2.1's clast evidence.** "Clast does not receive the cascaded
+shadow at all" is too strong. Ablating the shadow term brightens shaded ground
+by +40.3 to +42.5 codes and shaded clast by only +9.3 to +12.2 — so clast does
+receive it, at roughly a quarter strength, and a chip in shade still reads 15%
+brighter than the shade it lies in (94.5 against 81.8). The CONCLUSION in 2.1
+stands — chips are worthless as evidence about whether a shadow is present —
+but its mechanism was wrong. The sun-gated ground bounce is ruled out
+(zeroing `uAmbBounce` moves shaded clast -0.24). Remaining candidates: the
+flat-shaded facet normals, and the chips' albedo / envMapIntensity.
+
 **Ranked cuts, with expected savings:**
 1. DOF/MB gather at half res — ~2-2.5 ms. **Done**, see below.
 2. Scene shading + geometry — ~2-3 ms available, never optimised because
    everyone believed it was 7 ms total. Needs its own round.
 3. AO at half res with depth-aware upsample — ~1.5 ms, costs the 2-3 px contact band.
-4. Shadow cascades on alternate frames — ~0.9 ms, sun is static, low risk.
-5. Volumetric march half to quarter res — ~0.8 ms.
+4. Shadow cascades on alternate frames — **done, and the ~0.9 ms is not there.**
+   Cascade 0 now refreshes every other frame (`refreshInterval[0] = 2`), which
+   takes 86 draws and 0.7 M triangles a frame off the frame — 18% of all draws,
+   469.6 → 383.5. The frame TIME does not move: 0.30 ms median against a 0.01 ms
+   null control on one run and −0.25 ms against 0.79 on another, while the same
+   instrument saw the AO pass in 6 reps out of 6. Freezing cascade 0 outright
+   (160 draws, 1.4 M triangles, every frame) moved the median 25.20 → 24.86.
+   Depth-only raster is close to free on this GPU; the 1.75 ms in the table
+   above has never been isolated from the schedule side and should be treated
+   as unconfirmed. Kept for the draw budget, not for milliseconds; reverting is
+   `refreshInterval[0] = 1`. `probes/r12_cascade.js`.
+5. Volumetric march half to quarter res — **measured and REJECTED.** It costs
+   12-18% of the cloud deck's local contrast at every scale from 2 to 32 px
+   (sky box, vista: 1.52/1.80/2.88/4.87/7.24 → 1.33/1.56/2.36/4.12/6.61) against
+   a null control of 0.00 between two half-res builds, and by eye the small
+   cumulus lose their turrets and go blocky. It does NOT crawl or ghost — the
+   frame-to-frame change under a moving camera is 5.36 against half res's 5.48,
+   i.e. slightly quieter, because the image is simply softer. The saving could
+   not be resolved on a contended machine: 1.44 ms median paired, 4/8 reps
+   positive, against a null control that was itself 2.79. Section 2.10 says the
+   sky is the one thing here that beats the real game; this trades it for a
+   number the instrument cannot even confirm. `probes/r12_volres.js`, which can
+   A/B the resolution inside ONE page via `VolumetricPass.setMarchDiv`.
 6. Fuse composite + present — only ~0.4-0.5 ms. Feeding the luminance chain from
    a bloom mip is worth nothing: the whole chain is 0.3 ms.
 
@@ -162,11 +253,25 @@ control it looks like. Fix that first or you will measure the wrong thing.
 **Start by re-testing the shadow hypothesis, which was retired on void
 evidence.** The strongest argument for "not a shadow" was that the pale stone
 chips lying *inside* the band are as bright as the ones outside it. That
-argument is worthless: the vegetation author independently found that **clast
-does not receive the cascaded shadow at all** — `csmSunVis` returns 1.0 over
-every clast fragment, and an unbiased cascade-0 depth compare also returns
-"lit". Chips that cannot receive a shadow tell you nothing about whether one is
-there. Cropped close (`shots/crop-road.png`) the band has hard straight edges,
+argument is worthless — but **not for the reason round 11 gave**. The claim was
+that clast does not receive the cascaded shadow at all (`csmSunVis` = 1.0 over
+every clast fragment). Measured from outside the shader, that is too strong:
+ablating the shadow term (`shadow.intensity = 0`, a uniform, so nothing
+recompiles) brightens shaded clast by 9.3-12.2 codes, so it does receive one.
+What is real is that the SAME shadow brightens the ground the stones lie on by
+40.3-42.5 codes — clast responds at about a quarter of the ground's magnitude —
+and a shaded chip ends up reading 94.5 against the shaded sand's 81.8, i.e. 15%
+BRIGHTER than the shade it is lying in. So chips inside the band really are as
+bright as the ones outside, and really do tell you nothing about whether a
+shadow is there. The sun-gated ground bounce is NOT the cause (zeroing
+`uAmbBounce` moves shaded clast by −0.24 codes and shaded ground by −1.27, i.e.
+neither is taking it, which is the correct behaviour and kills the obvious
+hypothesis). The remaining candidates are the flat-shaded facet normals — a
+random flake facet has a much smaller N·L than the flat ground, so there is less
+direct light for a shadow to remove — and the chips' own albedo and
+`envMapIntensity` making ambient a larger share of what they return.
+`probes/r12_clastshadow.js` re-runs the whole thing in one command. Owner:
+`src/world/vegetation/Clast.js`. Cropped close (`shots/crop-road.png`) the band has hard straight edges,
 sharp vertices and a chevron notch — geometry-shaped, which fits a cast shadow
 at least as well as a mask. The other two arguments (an empty cascade-0 depth
 map at those texels, a raycast up the sun finding no occluder) are stronger and

@@ -978,10 +978,71 @@ export class Lighting {
     // this saving lands on standing and slow movement, not on a sprint. In a
     // stealth game that is most of the play time.
     //
-    // Phases are chosen so no two cascades above 0 ever land on the same frame:
-    // cascade 1 fires at f mod 3 == 1, cascade 2 at f mod 6 == 3 (which is
-    // always f mod 3 == 0), cascade 3 at f mod 12 == 5 (f mod 3 == 2,
-    // f mod 6 == 5). No frame ever pays for two cascade refits at once.
+    // ROUND 12: cascade 0 joins the schedule at every OTHER frame, and it is by
+    // far the biggest item — re-measured on this build (3 cascades, gameplay)
+    // it is 160 draws / 1.40 M triangles EVERY frame against 249.3 amortised
+    // draws for the whole shadow pass, i.e. 64% of it. The sun is static (only
+    // setTimeOfDay moves it) so an every-frame cascade 0 is rebuilding for
+    // CAMERA motion, and a stale cascade does not smear under camera motion:
+    // the map and the matrix that samples it go stale together, so the shadow
+    // stays welded to the world.
+    //
+    // THE MILLISECONDS ARE NOT THERE, and this comment is the only place that
+    // will be said. The cut was predicted at ~0.9 ms. Measured (probes/
+    // r12_cascade.js, paired configs rotated inside one page, constant ballast,
+    // null control): 86 draws and 0.7 M triangles a frame come off — 469.6 ->
+    // 383.5, an instrument the governor cannot lie to — and the frame time does
+    // not move. 0.30 ms median against a 0.01 ms null control on one run, -0.25
+    // against 0.79 on another, positive in 3 reps of 6. In the same run the AO
+    // pass, ablated as a positive control, was positive in 6 of 6. Freezing
+    // cascade 0 outright moved a 25.20 ms median to 24.86. Depth-only raster is
+    // close to free on this GPU. What this change buys is the draw and triangle
+    // budget (ARCHITECTURE.md asks for < 350 draws; the frame is at 469), and
+    // reverting it is one token: put this back to 1.
+    //
+    // What it does cost is a one-frame-old pose for a MOVING occluder, and that
+    // is bounded by arithmetic rather than by taste. Cascade 0's texel is 2.7 cm
+    // here (56.3 m over 2048); a guard walking at 1.4 m/s moves 2.3 cm in a
+    // frame, which is under one texel. A sprint is the case that would show, and
+    // a sprint moves the camera 3 m in about half a second, which trips the
+    // invalidate-everything guard in update() anyway.
+    //
+    // Filmed and differenced frame by frame against the old schedule (24 frames,
+    // camera trucking and panning, sim running): on the frames where the map is
+    // one frame old the whole image moves 0.18-0.23 codes in the mean, 1.7% of
+    // pixels move more than 4, and the worst 64 px tile is 7.1 — the ground by
+    // the player's feet, where a low afternoon sun projects a couple of
+    // centimetres of occluder motion into several of shadow. For scale, two
+    // CONSECUTIVE frames of the same film differ by 9.08 in the mean with 41% of
+    // pixels over 4, so the staleness is 2.5% of what the image is doing anyway.
+    // At night it is 0.02 in the mean and 0.1% of pixels. The shadow lags, it
+    // never overshoots, so it reads as a shadow updating at half rate rather
+    // than as jitter.
+    //
+    // Phases are chosen so as few frames as possible pay for two refits at once.
+    // With intervals 2 and 3 in the set one collision per 6 frames is forced
+    // (cascade 1's two slots in a 6-frame period differ in parity, so one of
+    // them must land on an even frame), but that is strictly better than
+    // before: cascade 0 used to fire on EVERY frame cascade 1 fired, so the
+    // 336-draw frame went from one in three to one in six. Cascade 2 at
+    // f mod 6 == 3 is always odd and so never collides with cascade 0 at all.
+    // Cascade 0 is back to EVERY frame.
+    //
+    // It was put on a 2-frame schedule for the draw budget: it removes 86 draws
+    // and 0.7 M triangles a frame, 18% of all draws. But it was measured, twice,
+    // to save NO time — 0.30 ms one run and -0.25 ms the next against null
+    // controls of 0.01 and 0.79, with the same instrument seeing the AO pass at
+    // 6.45 ms in 6 of 6 reps. Depth-only raster is close to free on this GPU.
+    //
+    // A change that buys zero milliseconds cannot justify ANY risk, and cascade
+    // 0 is the near band: it is the player's own shadow, the guards' shadows,
+    // and everything within a few metres of the lens. A player reported glitchy
+    // shadows right after it landed. Whether or not this was the cause, holding
+    // it is a bad trade at a price of nothing, so it goes back.
+    //
+    // The instrument (probes/r12_cascade.js) and the finding stay: shadow
+    // re-rasterisation is NOT the 1.75 ms the audit attributed to it, and
+    // anyone hunting draw count rather than frame time can flip this to 2.
     this.refreshInterval = [1, 3, 6, 12];
     this._refreshPhase = [0, 1, 3, 5];
 
@@ -1015,9 +1076,10 @@ export class Lighting {
       l.shadow.bias = -0.0005;
       l.shadow.normalBias = 0.03;
       l.shadow.radius = 1.0;
-      // Driven manually below; three's own per-frame refresh is too eager for
-      // the outer cascades.
-      l.shadow.autoUpdate = i === 0;
+      // Driven manually below, every cascade including the first: three's own
+      // per-frame refresh is too eager for all of them, and leaving cascade 0
+      // on autoUpdate would ignore `refreshInterval[0]` entirely.
+      l.shadow.autoUpdate = false;
       l.shadow.needsUpdate = true;
       l.shadow.camera.updateProjectionMatrix();
       l.target = new THREE.Object3D();
@@ -2034,7 +2096,9 @@ export class Lighting {
       // A cascade that is not being redrawn this frame must not be moved: its
       // shadow matrix is only refreshed inside the shadow pass, so moving the
       // light would desync the stale map from the coordinates sampling it.
-      if (c > 0) {
+      // This is what makes a lagging cascade world-consistent instead of a
+      // smear, and it now covers cascade 0 as well.
+      {
         const due = this._frame % this.refreshInterval[c] === this._refreshPhase[c];
         if (!due && !light.shadow.needsUpdate) continue;
         light.shadow.needsUpdate = true;

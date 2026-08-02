@@ -290,6 +290,37 @@ export async function install(world) {
     af.set(camera.shoulder > 0 ? 0.32 : 0.68, 0.42);
   }
 
+  const _afv = new THREE.Vector3();
+  /**
+   * ...EXCEPT WHILE AIMING, and this was a real part of "its hard to zoom in
+   * and see someone".
+   *
+   * `setFocus` above parks the autofocus probe at UV (0.32, 0.42), which is the
+   * player's own shoulder about 1.6 m from the lens. That is the right choice
+   * for a third-person walk — he is the subject — and it is exactly backwards
+   * the moment the weapon comes up: the lens then meters on the shoulder, so
+   * the SHOULDER is the sharp thing in the frame and the guard the player is
+   * trying to identify at 20-40 m is on the far side of the focus wedge. The
+   * shot the reviewer called ugly has a razor-sharp camo sleeve across the
+   * bottom-left and a soft compound behind it.
+   *
+   * So walk the probe to the sight while the weapon comes up. It rides the aim
+   * blend rather than snapping, and the pipeline's own AF is already smoothed
+   * (0.12 per frame), so the rack is a rack and not a cut. Clamped inside the
+   * frame because `sightPoint` is a ballistic point and can leave it.
+   */
+  function updateFocus() {
+    const af = engine.pipeline?.afPoint;
+    if (!af) return;
+    const a = stealth.aimAmount;
+    const hipX = camera.shoulder > 0 ? 0.32 : 0.68;
+    if (a < 0.01) { af.set(hipX, 0.42); return; }
+    const p = _afv.copy(stealth.sightPoint ?? stealth.aimPoint).project(engine.camera);
+    if (p.z > 1) { af.set(hipX, 0.42); return; }
+    const cl = (v) => THREE.MathUtils.clamp(v * 0.5 + 0.5, 0.06, 0.94);
+    af.set(THREE.MathUtils.lerp(hipX, cl(p.x), a), THREE.MathUtils.lerp(0.42, cl(p.y), a));
+  }
+
   gameState.onModeChange((mode) => {
     if (mode === 'play') enterPlay();
     else exitPlay();
@@ -363,6 +394,14 @@ export async function install(world) {
         break;
       case 'tranq':
         if (e.point) feedback.impact(e.point, 'body', e.dir);
+        // A CONNECTING ROUND MADE NO SOUND. The shot itself cued `weapon.tranq`
+        // and that was the whole of it, so a dart into a man and a dart into
+        // the sand behind him were audibly identical — at 40 m, with the target
+        // a few pixels tall, that is the difference the player has no other way
+        // to read. `cqc.hit` is src/audio's own name for a body being struck
+        // and is the closest thing in its vocabulary; there is no impact family
+        // to ask for a better one.
+        cue('cqc.hit', { pos: e.point });
         break;
       case 'reload':
         cue('weapon.reload', { pos: controller.position });
@@ -478,7 +517,7 @@ export async function install(world) {
       stealth.lean = 0;
       reticle.hide();
     } else if (e.type === 'tranq') {
-      reticle.confirm();
+      reticle.confirm(e.headshot);
     }
   });
 
@@ -510,7 +549,14 @@ export async function install(world) {
       // Look BEFORE the verbs: the aim ray is built from camera.yaw/pitch, so
       // applying this frame's stick first is what keeps the reticle off a
       // one-frame delay.
-      camera.addLook(input.look.x, input.look.y);
+      //
+      // `lookScale` is the ADS sensitivity term, and it is applied HERE rather
+      // than inside Input because Input has no idea what lens is fitted and
+      // should not learn: sensitivity in rad/px is the device's business, and
+      // what that turns into on screen is the camera's. Without it, aiming made
+      // the mouse 1.40x faster across the frame — see PlayerCamera.lookScale.
+      const ls = camera.lookScale();
+      camera.addLook(input.look.x * ls, input.look.y * ls);
       const cmd = stealth.update(dt, input, camera.yaw);
 
       controller.update(dt, {
@@ -549,9 +595,21 @@ export async function install(world) {
       });
       // After the camera, because the reticle is a projection THROUGH it: run
       // it first and the sight sits one frame behind the stick, which is the
-      // one thing in the game that has to be exact. `deterministic` is the
-      // screenshot harness driving, and no DOM of ours may be in that capture.
-      reticle.update(dt, engine.camera, !engine.deterministic);
+      // one thing in the game that has to be exact.
+      //
+      // IT USED TO BE GATED ON `!engine.deterministic` — the screenshot harness
+      // driving — on the argument that no DOM of ours may land in a canonical
+      // capture. That argument was already served twice over by the `!active`
+      // return four lines up: every canonical shot is taken in godmode, where
+      // gameplay is not active and the reticle is hidden anyway. What the gate
+      // actually did was make the sight invisible in the one image that needs
+      // it, `shot.mjs gameplay --aim`, and the frame that went out as evidence
+      // for this round was read as "there is no reticle at all". There is; it
+      // was measured at (6, 48) px from centre with opacity 0.94 in the very
+      // frame it did not appear in.
+      reticle.update(dt, engine.camera, true);
+      // After the reticle, because it focuses on the point the reticle is on.
+      updateFocus();
       // After the camera because every particle in here is a billboard and the
       // orientation it wants is this frame's, not the previous one's. After the
       // animator (20) because the foot plant it reads is this frame's pose.

@@ -29,7 +29,68 @@ import * as THREE from 'three';
 const DART_SPEED = 62;        // m/s. A tranquilliser dart is slow and it drops.
 const DART_GRAVITY = 9.81;
 const DART_LIFE = 1.6;        // seconds of flight before it is spent
-const FIRE_INTERVAL = 0.42;
+
+/**
+ * Cyclic rate, seconds per round. WAS 0.42, and that single number made both
+ * fire modes feel broken: measured with the trigger held for 2.0 s,
+ * `probes/r12_aim.js` reported SEMI 1 round and AUTO 5, i.e. 150 RPM. AUTO at
+ * 150 RPM is not automatic fire — it is SEMI with the clicking done for you —
+ * and because 0.42 s is also exactly the recoil settle time, a burst never
+ * accumulated any muzzle rise at all (peak kick over 3 s of continuous fire:
+ * 1.00x a single shot). The same cap also throttled SEMI, so a player clicking
+ * faster than 2.4 Hz had rounds silently swallowed with no cue of any kind.
+ *
+ * 0.15 s is 400 RPM. SEMI still needs a fresh press per round, so its real
+ * cadence is the player's click rate with a mechanical ceiling; AUTO is now
+ * fast enough that the kick stacks about three deep before the spring catches
+ * up, which is the entire point of having automatic fire.
+ */
+const FIRE_INTERVAL = 0.15;
+
+/**
+ * Recoil impulse, radians/second into the camera's kick spring.
+ *
+ * The old value was 0.30 with a comment claiming "about 1.8 degrees of muzzle
+ * rise". IT WAS 0.81 DEGREES — measured off `PlayerCamera._kick` frame by frame
+ * in `probes/r12_aim.js`, peak 0.81 deg at t=0.117 s. The comment derived the
+ * figure from amplitude x omega, which is the peak VELOCITY, not the peak
+ * angle. So the kick was less than half what its author believed he had
+ * written, on a camera whose aimed half-height is 16.5 degrees: 0.81 degrees is
+ * 26 px of a 1080 px frame, under a reticle that was itself moving further than
+ * that from sway alone.
+ *
+ * The lateral term is new. A kick that is pure pitch is the same gesture every
+ * single round and the eye reads it as the camera bobbing rather than as a
+ * weapon moving; alternating the sign per round is what makes a burst draw a
+ * shape instead of a line.
+ */
+const RECOIL_PITCH = 0.62;
+const RECOIL_YAW = 0.30;
+
+/** Nothing is under the sight: converge the aim on a point this far out. */
+const CONVERGE_FAR = 180;
+/** Seconds of smoothing on the convergence range. See `_solveConverge`. */
+const CONVERGE_TAU = 0.07;
+/**
+ * Furthest range the SIGHT will draw a firing solution for.
+ *
+ * The reticle hangs below the optical axis by the dart's drop at whatever the
+ * sight is convergent on, and that is quadratic in range: at 20 m it is 0.51 m
+ * of drop, at 60 m it is 4.6 m and at CONVERGE_FAR it is 41 m. Point the weapon
+ * at open sky and the honest ballistic answer is a point 41 m below the axis,
+ * which at the round-12 ADS lens is 634 px below the centre of a 1080-line
+ * frame — measured, `probes/r12_film.mjs`. The sight walked off the bottom of
+ * the screen. It did this before the zoom too; 22 degrees is what made it
+ * impossible to miss.
+ *
+ * 60 m is past anything this weapon can realistically reach — a 4.6 m holdover
+ * with a 3.9 m/s sway cone is not a shot anyone takes — so beyond it the box
+ * stops travelling and becomes a maximum-elevation mark. `aimHit.dist`, which
+ * is what the range readout prints, is NOT capped: the player is still told the
+ * true distance to what he is looking at, so a capped sight reads as "further
+ * than this weapon goes" rather than as a lie.
+ */
+const SIGHT_RANGE_MAX = 60;
 
 /**
  * The weapon.
@@ -69,6 +130,19 @@ const STOW_RANGE = 2.6;
 
 const BREATH_DRAIN = 1 / 4.2;   // a full lungful lasts 4.2 s
 const BREATH_RECOVER = 1 / 3.0;
+
+/**
+ * Base sway half-angle by stance, radians. These are the numbers that were
+ * already here; what changed is everything that scales them.
+ */
+const SWAY_STANCE = { stand: 0.0105, crouch: 0.006, prone: 0.0035 };
+/** Sway multiplier added per metre/second of travel. A 5.4 m/s run doubles it. */
+const SWAY_PER_SPEED = 0.185;
+/** Sway multiplier one round adds, and how fast it bleeds off. */
+const SWAY_PER_SHOT = 0.85;
+const SWAY_BLOOM_TAU = 0.30;
+/** However many rounds go downrange, the cone stops opening here. */
+const SWAY_BLOOM_MAX = 2.6;
 
 export class StealthActions {
   constructor({ controller, camera, characters, obstacles, ground, coverPoints, events, ai }) {
@@ -113,11 +187,26 @@ export class StealthActions {
     this.aimPoint = new THREE.Vector3();
     this.aimSway = new THREE.Vector2();
     this._swayT = Math.random() * 20;
+    /** Current sway half-angle in radians — what the reticle draws. */
+    this.swayAngle = SWAY_STANCE.stand;
+    /** Firing bloom, in multiples of the stance amplitude. Decays. */
+    this.bloom = 0;
+    /** Range the aim ray is convergent on, metres. See `_solveConverge`. */
+    this.convergeRange = CONVERGE_FAR;
+    /** Where the reticle goes: the round's position at `convergeRange`. */
+    this.sightPoint = new THREE.Vector3();
+    this._hasL = false;
+    this._recoilSide = 1;
     this._v = new THREE.Vector3();
     this._d = new THREE.Vector3();
     this._ao = new THREE.Vector3();
     this._ad = new THREE.Vector3();
     this._mz = new THREE.Vector3();
+    this._lk = new THREE.Vector3();
+    this._lp = new THREE.Vector3();
+    this._rt = new THREE.Vector3();
+    this._up = new THREE.Vector3();
+    this._cand = [];
     this._n = new THREE.Vector2();
   }
 
@@ -130,6 +219,7 @@ export class StealthActions {
   update(dt, input, camYaw) {
     this._swayT += dt;
     this._fireCooldown = Math.max(0, this._fireCooldown - dt);
+    this.bloom *= Math.exp(-dt / SWAY_BLOOM_TAU);
     if (this.reloading > 0) {
       this.reloading -= dt;
       if (this.reloading <= 0) this._finishReload();
@@ -164,6 +254,13 @@ export class StealthActions {
       this.lean = 0;
     }
     this.aimAmount += ((this.isAiming ? 1 : 0) - this.aimAmount) * (1 - Math.exp(-dt / 0.10));
+    // Where the optical axis actually lands, before anything reads the aim ray
+    // this frame. Every consumer — the trace, the reticle, the animation
+    // channels — has to agree on one convergence or they draw three answers.
+    // Only while the weapon is up: the march is 45 us and there is nothing on a
+    // hip frame that reads it (`_writeAnim` uses the free-look path below 0.01).
+    if (this.aimAmount > 0.01) this._solveConverge(dt);
+    else this._hadConverge = false;
 
     // --- breath -------------------------------------------------------------
     const holding = this.isAiming && input.down('steady') && !this.breathLocked && this.breath > 0;
@@ -509,27 +606,204 @@ export class StealthActions {
   // ----------------------------------------------------------------- weapon --
 
   /**
-   * Where the dart will actually go: down the camera's optical axis, offset by
-   * the sway. Published so the HUD can put a reticle on the same point instead
-   * of guessing one in the middle of the screen.
+   * The current sway cone as a multiple of a standing, rested, motionless one.
+   * 1.0 is "as good as standing up gets"; the reticle draws this directly, so
+   * the sight finally says something about how precise the weapon is instead of
+   * having exactly two sizes.
    */
-  aimRay(outOrigin, outDir) {
-    const p = this.ctl.position;
-    const eye = p.y + (this.ctl.stance === 'prone' ? 0.32 : this.ctl.stance === 'crouch' ? 1.10 : 1.42);
-    // Muzzle is at the weapon, but the SHOT comes from the camera's line so
-    // that what is under the reticle is what is hit. Everything else is a
-    // parallax bug the player experiences as the gun missing.
-    this.cam.forward(outDir);
+  get swayScale() {
+    // MEASURED AGAINST A SHOULDERED REFERENCE, not a hip-fire one. The zoom
+    // steadying added above divides the cone by the tangent ratio of the two
+    // lenses, and with a fixed hip-fire reference in the denominator that came
+    // straight out in the drawn box: 16 px became 9 px the moment the weapon
+    // came up, which is not a sight telling you about spread, it is a sight
+    // shrinking because the lens changed. Putting the same factor in the
+    // reference cancels it, so the box means "how precise is this weapon right
+    // now, against the best this weapon gets" — and it is only ever drawn while
+    // aiming, so a hip-fire reference was measuring against a state the player
+    // cannot see it in anyway.
+    const ref = SWAY_STANCE.stand * 0.6 * (this.cam.lookScale ? this.cam.lookScale() : 1);
+    return this.swayAngle / ref;
+  }
+
+  /** Eye height for the current stance, world Y. */
+  get eyeY() {
+    const s = this.ctl.stance;
+    return this.ctl.position.y + (s === 'prone' ? 0.32 : s === 'crouch' ? 1.10 : 1.42);
+  }
+
+  /**
+   * The optical axis with the sway on it: the line the MIDDLE OF THE SCREEN is
+   * on, as a unit vector. Not the line the dart flies down — see `aimRay`.
+   *
+   * THE SWAY IS IN CAMERA SPACE NOW, and that is a bug fix rather than tidying.
+   * It used to be `outDir.x += sx; outDir.y += sy` on a WORLD-space direction,
+   * so the lateral term was whatever fraction of world X happened to be
+   * perpendicular to the heading. Measured over 900 samples per heading in
+   * `probes/r12_aim.js`: 5.11 mrad rms of lateral sway facing north, 3.73 at 45
+   * degrees, and **0.00 facing east**. Half the aiming difficulty in this game
+   * was a function of which way the player was pointed, and along one axis it
+   * did not exist at all.
+   */
+  _lookDir(out) {
+    const f = this.cam.forward(out);
     const steady = this.holdingBreath ? 0.22 : 1;
-    const amp = (this.ctl.stance === 'prone' ? 0.0035 : this.ctl.stance === 'crouch' ? 0.006 : 0.0105)
-      * steady * (0.6 + 0.4 * (1 - this.breath));
+    const speed = this.ctl.speed ?? 0;
+    // Stance is the floor; the breath, the legs and the last few rounds are
+    // what the player can trade against it.
+    const amp = (SWAY_STANCE[this.ctl.stance] ?? SWAY_STANCE.stand)
+      * steady
+      * (0.6 + 0.4 * (1 - this.breath))
+      * (1 + speed * SWAY_PER_SPEED)
+      * (1 + Math.min(SWAY_BLOOM_MAX, this.bloom))
+      // SHOULDERING THE WEAPON STEADIES IT, by exactly the tangent ratio of the
+      // two lenses. Without this the round-12 zoom would have made aiming
+      // HARDER, not easier: the sway is an angle, so magnifying the view 2.13x
+      // magnifies the wobble on screen 2.13x with it, and the reticle would
+      // have swum twice as far across the frame at the moment the player is
+      // trying to hold it on a head. `lookScale()` is the same number the look
+      // sensitivity already uses, so the screen-space sway and the screen-space
+      // mouse speed stay locked to each other through the whole blend rather
+      // than being two constants that drift apart the next time the FOV moves.
+      // Hip fire is untouched — lookScale() is 1.0 at aimBlend 0.
+      * (this.cam.lookScale ? this.cam.lookScale() : 1);
+    this.swayAngle = amp;
     const sx = (Math.sin(this._swayT * 1.7) + 0.6 * Math.sin(this._swayT * 0.61 + 1.3)) * amp;
     const sy = (Math.sin(this._swayT * 1.31 + 2.1) + 0.5 * Math.sin(this._swayT * 0.83)) * amp;
     this.aimSway.set(sx, sy);
-    outDir.x += sx;
-    outDir.y += sy;
-    outDir.normalize();
-    outOrigin.set(p.x, eye, p.z).addScaledVector(outDir, 0.35);
+    const yaw = this.cam.viewYaw ?? this.cam.yaw;
+    const rt = this._rt.set(Math.cos(yaw), 0, -Math.sin(yaw));
+    const up = this._up.crossVectors(rt, f).normalize();
+    f.addScaledVector(rt, sx).addScaledVector(up, sy);
+    return f.normalize();
+  }
+
+  /**
+   * How far out the aim ray has to converge on the optical axis.
+   *
+   * THIS IS THE FIX FOR THE THING THE PLAYER ACTUALLY FELT. The old `aimRay`
+   * fired from the player's eye along the CAMERA's forward vector, and called
+   * that "the camera's line so that what is under the reticle is what is hit".
+   * It is not the camera's line. The over-the-shoulder rig puts the lens 0.412 m
+   * to the right of that origin, 0.167 m above it and 1.801 m behind it, so the
+   * two lines are PARALLEL and never meet — measured, `probes/r12_aim.js`. The
+   * consequences, all measured on the shipped build:
+   *
+   *   - a round aimed with the centre of the screen landed 1.87 m off at 10 m,
+   *     1.89 m at 20 m and 1.94 m at 40 m. Constant, because parallel.
+   *   - the reticle, which honestly projects the impact point, therefore sat
+   *     176 px from the centre of the frame at 3 m, 79 px at 10 m and 22 px at
+   *     80 m — it SLID across the screen as the range under it changed.
+   *
+   * Converging fixes both at once: the ray still leaves the shooter, but it is
+   * aimed at the point the middle of the screen is on, so the reticle comes
+   * home to the centre and "what is under it is what is hit" becomes true.
+   *
+   * The range is smoothed over 70 ms because the depth under the sight is
+   * discontinuous at every silhouette edge — a guard at 14 m in front of a
+   * ridge at 90 m is a 29 mrad step in the launch angle, which unsmoothed is
+   * the round snapping 0.41 m sideways as the sight crosses his shoulder.
+   */
+  _solveConverge(dt) {
+    const cam = this.cam.camera;
+    // Before the first camera update there is no optical axis to converge on.
+    if (!cam || (cam.position.x === 0 && cam.position.y === 0 && cam.position.z === 0)) return;
+    const dir = this._lookDir(this._lk);
+    const d = this._lookMarch(cam.position, dir);
+    // Snap rather than ease on the frame the weapon comes up: the last value is
+    // from whatever the player was looking at before he raised it, which is not
+    // a pose to interpolate out of.
+    const k = this._hadConverge ? 1 - Math.exp(-dt / CONVERGE_TAU) : 1;
+    this._hadConverge = true;
+    this.convergeRange += (d - this.convergeRange) * k;
+  }
+
+  /**
+   * First thing the optical axis meets, in metres. Straight line, no ballistics
+   * — this answers "what is the player looking at", not "where does the dart
+   * land". Coarse on purpose: it feeds a convergence correction whose whole
+   * magnitude is 0.4 m of lateral, so a 0.35 m sampling step is three orders
+   * more precision than the term needs.
+   */
+  _lookMarch(org, dir) {
+    let best = CONVERGE_FAR;
+    // Characters, analytically against a vertical capsule. Cheaper and exact,
+    // and they are the one thing whose depth the player cares about to a metre.
+    const hl = Math.hypot(dir.x, dir.z) || 1e-6;
+    const hx = dir.x / hl;
+    const hz = dir.z / hl;
+    for (const ch of this.characters) {
+      if (ch === this.player || ch.hidden) continue;
+      const dx = ch.position.x - org.x;
+      const dz = ch.position.z - org.z;
+      const along = dx * hx + dz * hz;
+      if (along <= 0.5 || along >= best) continue;
+      if (Math.abs(dx * hz - dz * hx) > 0.36) continue;
+      const y = org.y + dir.y * (along / hl);
+      const base = ch.groundY ?? 0;
+      const top = base + (ch.anim?.stance === 'prone' ? 0.55 : ch.anim?.stance === 'crouch' ? 1.35 : 1.82);
+      if (y > base && y < top) best = along / hl;
+    }
+    // Terrain and structures: march, then bisect the bracket.
+    //
+    // THE STEP SIZE IS A CORRECTNESS PROBLEM BEFORE IT IS A BUDGET ONE, and I
+    // got that the wrong way round once already. At 0.35 m this cost 593 us a
+    // frame — 3.5% of a 60 Hz frame for a term whose whole magnitude is 0.4 m
+    // of lateral aim — so I took it to 2.0 m on the argument that being 2 m
+    // wrong about the RANGE is 2.2 mrad, which is 4 cm at the target. That
+    // argument is sound and the step was still wrong, because a 2 m step does
+    // not mis-measure a wall, it STEPS OVER IT: `probes/r12_jump.js` caught the
+    // convergence reading 17.4 m one frame and 117.3 m four frames later on a
+    // camera that had moved half a degree, because the coarse samples fell
+    // either side of a compound wall. The obstacle field is a 0.25 m grid; a
+    // sampler that walks it eight texels at a time cannot see anything thin.
+    //
+    // 0.5 m near, coarsening past 40 m where the correction is already under
+    // 10 mrad and no structure is thin compared to the step. ~128 samples worst
+    // case, and it terminates on the first solid thing in almost every pose.
+    const solid = (t) => {
+      const x = org.x + dir.x * t;
+      const y = org.y + dir.y * t;
+      const z = org.z + dir.z * t;
+      if (this.ground.heightAt(x, z) > y) return true;
+      return !!(this.obstacles?.ok && this.obstacles.heightAt(x, z) > y);
+    };
+    let lo = 1.0;
+    let t = lo;
+    while (t < best) {
+      if (solid(t)) {
+        for (let i = 0; i < 4; i++) {
+          const mid = (lo + t) * 0.5;
+          if (solid(mid)) t = mid; else lo = mid;
+        }
+        return t;
+      }
+      lo = t;
+      t += t < 40 ? 0.5 : t < 90 ? 1.5 : 6.0;
+    }
+    return best;
+  }
+
+  /**
+   * Where the dart will actually go. `outOrigin` leaves the shooter,
+   * `outDir` is aimed at the point the middle of the screen is on.
+   *
+   * Published so the HUD can put a reticle on the same point instead of
+   * guessing one in the middle of the screen — the reticle still draws the
+   * BALLISTIC impact, so the drop stays visible and stays the mechanic it was
+   * written to be. What it no longer draws is a lateral parallax error.
+   */
+  aimRay(outOrigin, outDir) {
+    const p = this.ctl.position;
+    const look = this._lookDir(outDir);
+    const cam = this.cam.camera;
+    outOrigin.set(p.x, this.eyeY, p.z).addScaledVector(look, 0.35);
+    this._hasL = !!cam && (cam.position.x !== 0 || cam.position.y !== 0 || cam.position.z !== 0);
+    if (this._hasL) {
+      const L = this._lp.copy(cam.position).addScaledVector(look, this.convergeRange);
+      // `look` is `outDir`; overwrite it in place now that the target is built.
+      outDir.copy(L).sub(outOrigin).normalize();
+    }
     return outDir;
   }
 
@@ -558,6 +832,7 @@ export class StealthActions {
     this.reserve = WEAPON.reserve;
     this.reloading = 0;
     this._fireCooldown = 0;
+    this.bloom = 0;
     this.aimHit = null;
   }
 
@@ -608,18 +883,44 @@ export class StealthActions {
 
   /**
    * Keep `aimHit` current for the reticle: what the dart would hit, and how far
-   * away it is. Throttled to 20 Hz and only while the weapon is up — the trace
-   * integrates 288 steps against every character and there is no reason to pay
-   * for it on a frame where nothing reads it.
+   * away it is.
+   *
+   * THIS USED TO RUN AT 20 Hz, and the reticle is drawn at the point it
+   * produces, so the sight only knew its own depth every third rendered frame.
+   * Measured over a slow 150-frame pan in `probes/r12_aim.js`: the reticle
+   * travelled 1301 px across a sweep whose true angular motion is about 1030 px,
+   * in per-frame steps of 5.7 px median and 34.3 px worst — a sight that
+   * staircased sideways while the world under it moved smoothly. It is now
+   * every frame, which cost nothing measurable once `_trace` stopped testing
+   * all thirteen characters at all 288 integration steps (`_traceCandidates`).
    */
   _predict(dt) {
-    if (this.aimAmount < 0.05) { this.aimHit = null; return; }
-    this._predictT -= dt;
-    if (this._predictT > 0) return;
-    this._predictT = 0.05;
+    if (this.aimAmount < 0.04) { this.aimHit = null; return; }
     const org = this._ao;
     const dir = this._ad;
     this.aimRay(org, dir);
+    // WHERE THE SIGHT IS DRAWN — and it is NOT the impact point any more.
+    //
+    // Drawing the reticle at the traced impact is the obvious choice and it
+    // strobes. The impact RANGE is discontinuous at every silhouette: hold the
+    // sight on a guard's shoulder at 18 m with open ground 40 m behind him and
+    // the trace alternates between the two, so the drop the reticle draws
+    // alternates with it. Filmed, `probes/r12_film.mjs` caught the box stepping
+    // between y = +35 px and y = +110 px on consecutive frames while the player
+    // held still — 75 px of strobe on the one element he is trying to aim with.
+    // It is in the pre-fix build too; it is not something convergence caused.
+    //
+    // So draw the round's position at the range the sight is CONVERGENT on.
+    // That range is smoothed and is by definition the depth of whatever is
+    // under the middle of the screen, so the box sits on the optical axis
+    // laterally and hangs below it by exactly the drop at that range — smooth,
+    // monotone in range, and still the honest ballistic answer for the thing
+    // the player is actually looking at. `aimHit` keeps the true impact for the
+    // range readout and the target highlight.
+    const s = Math.min(SIGHT_RANGE_MAX, this._hasL ? Math.max(1, this._lp.distanceTo(org)) : 22);
+    const tof = s / DART_SPEED;
+    this.sightPoint.copy(org).addScaledVector(dir, s);
+    this.sightPoint.y -= 0.5 * DART_GRAVITY * tof * tof;
     const hit = this._trace(org, dir);
     this.aimHit = hit
       ? {
@@ -683,6 +984,19 @@ export class StealthActions {
    * dart is on.
    */
   muzzlePoint(out, dir) {
+    // THE MODEL'S OWN BARREL TIP, if it will tell us. `anim.muzzleWorld` puts
+    // the rifle's authored muzzle anchor through the weapon matrix the animator
+    // solved this frame, so the flash comes out of the barrel by construction
+    // and follows the model the next time somebody fits a different can.
+    //
+    // The hand-bone path below is a reconstruction and it was measurably off:
+    // it starts at the WRIST and walks a derived reach down the line the DART
+    // is on, which is neither where the barrel starts nor the direction it
+    // points. Measured on the aimed pose, that landed 0.112 m from the real
+    // muzzle — 40-60 px on screen at close range, which is a muzzle flash that
+    // visibly does not come from the gun.
+    const m = this.player?.anim?.muzzleWorld?.(out);
+    if (m) return m;
     const hand = this.player?.rig?.byName?.get?.('handR');
     if (hand) {
       hand.getWorldPosition(out);
@@ -705,10 +1019,28 @@ export class StealthActions {
     this._fireCooldown = FIRE_INTERVAL;
     const origin = this._ao;
     const dir = this._ad;
+    // Before the kick, deliberately: the round that is leaving now goes where
+    // the weapon was pointed when the trigger broke. It still eats the residual
+    // of the previous round, which is what makes a burst walk.
     this.aimRay(origin, dir);
-    // The spring runs at ~9.5 rad/s, so the impulse is amplitude x omega: 0.30
-    // lands about 1.8 degrees of muzzle rise, which is a suppressed pistol.
-    this.cam.recoil(0.30);
+    // Up, and to one side or the other. See RECOIL_PITCH for what the old
+    // single 0.30 actually measured versus what its comment claimed.
+    this._recoilSide = -this._recoilSide;
+    // A burst climbs. The bloom is already a count of how many rounds have gone
+    // downrange in the last third of a second, so tying the impulse to it costs
+    // nothing and keeps one notion of "still shooting" rather than two: with a
+    // flat impulse and a spring that settles in 0.27 s, 3 s of automatic fire
+    // peaked at 1.14x a single round, which a player cannot feel.
+    const burst = 1 + 0.30 * Math.min(SWAY_BLOOM_MAX, this.bloom);
+    this.cam.recoil(
+      RECOIL_PITCH * burst * (0.85 + 0.3 * Math.random()),
+      RECOIL_YAW * burst * this._recoilSide * (0.5 + 0.8 * Math.random()),
+    );
+    // The cone opens on every round and closes over ~0.3 s. Nothing about the
+    // weapon responded to being fired before this: a player could hold the
+    // trigger down and the sight told him the twentieth round was as precise as
+    // the first.
+    this.bloom = Math.min(SWAY_BLOOM_MAX, this.bloom + SWAY_PER_SHOT);
     // The BODY takes the shot too. `fire` is an authored clip in
     // src/characters/actions.js — a decaying oscillator through the weapon, the
     // clavicle, the chest and the head — and nothing had ever asked for it, so
@@ -732,7 +1064,13 @@ export class StealthActions {
     if (hit?.character) {
       this._putDown(hit.character, 'dart');
       hit.character.tranquillised = true;
-      this.emit({ type: 'tranq', target: hit.character, point: hit.point, surface: 'body', dir });
+      // `headshot` was computed by `_trace` from the first commit and read by
+      // nobody, so the one piece of information the trace knew that the player
+      // could not see never left this file.
+      this.emit({
+        type: 'tranq', target: hit.character, point: hit.point, surface: 'body',
+        headshot: !!hit.headshot, dir,
+      });
     } else {
       this.emit({ type: 'shot', point: hit?.point ?? null, surface: hit?.surface ?? null, dir });
     }
@@ -744,6 +1082,32 @@ export class StealthActions {
    * falls 1.2 m, which is the difference between a head and a boot, and it is
    * why the tranquilliser pistol is a stealth weapon and not a rifle.
    */
+  /**
+   * The characters the dart could possibly touch, hoisted out of the
+   * integration loop. Gravity acts on Y alone, so the flight is a STRAIGHT LINE
+   * in plan — a horizontal perpendicular test is exact, not an approximation,
+   * and it turns 288x13 capsule tests into 13 plus 288x(usually zero).
+   */
+  _traceCandidates(origin, dir) {
+    const list = this._cand;
+    list.length = 0;
+    const hl = Math.hypot(dir.x, dir.z);
+    if (hl < 1e-6) return list;
+    const hx = dir.x / hl;
+    const hz = dir.z / hl;
+    const reach = DART_SPEED * DART_LIFE * hl + 1;
+    for (const ch of this.characters) {
+      if (ch === this.player || ch.downed || ch.hidden) continue;
+      const dx = ch.position.x - origin.x;
+      const dz = ch.position.z - origin.z;
+      const along = dx * hx + dz * hz;
+      if (along < -0.4 || along > reach) continue;
+      if (Math.abs(dx * hz - dz * hx) > 0.42) continue;
+      list.push(ch);
+    }
+    return list;
+  }
+
   _trace(origin, dir) {
     const step = 1 / 180;
     let x = origin.x;
@@ -752,6 +1116,7 @@ export class StealthActions {
     let vx = dir.x * DART_SPEED;
     let vy = dir.y * DART_SPEED;
     let vz = dir.z * DART_SPEED;
+    const cand = this._traceCandidates(origin, dir);
 
     for (let t = 0; t < DART_LIFE; t += step) {
       const nx = x + vx * step;
@@ -759,8 +1124,7 @@ export class StealthActions {
       const nz = z + vz * step;
       vy -= DART_GRAVITY * step;
 
-      for (const ch of this.characters) {
-        if (ch === this.player || ch.downed || ch.hidden) continue;
+      for (const ch of cand) {
         const dx = nx - ch.position.x;
         const dz = nz - ch.position.z;
         if (dx * dx + dz * dz > 0.13) continue;   // 0.36 m capsule radius
