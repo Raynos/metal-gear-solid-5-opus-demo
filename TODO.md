@@ -39,12 +39,20 @@ Anyone working on this should watch a recording of the game in motion before
 touching anything, and should verify fixes the same way — comparing consecutive
 frames while the camera moves, not by looking at a still.
 
-### 1.1 The world is brown
-Not the grade — that is fixed and neutral now. The *world* is one material family.
+### 1.1 The world is brown — TERRAIN PART DONE, haze part remains
+The terrain and rock palette is fixed (commit `c931204`). Root cause was a
+written RULE in both files — *"every constant must be warmer in R/B than the
+sand"*, *"a dusty rock can never be colder than the sand"*. Followed to its
+conclusion it makes a mountain the colour of the ground it rises out of. Deleted.
+`uRockLight` turned out to be `PALETTE.sandLight` under another name; both files
+now import one exported `ROCK`. Net -30 lines, RockMaterial -60, exposure
+unmoved. The vista now separates: grey-green far range, grey-brown massifs with
+pale ledges, pale pan.
 
-- Mountains are the same colour as the sand they rise out of.
-- **Bug**: `uRockLight` is `0.198` in `Terrain.js` and `0.534` in
-  `RockMaterial.js`, so boulders render 5.6x brighter than the cliffs they fell off.
+**WHAT REMAINS IS THE HAZE, NOT ALBEDO.** Frame R-B is +24 against a +8..+18
+target while the terrain's own albedo is now neutral-to-grey. The volumetric haze
+reads as warm sepia over everything past ~300 m. **This is now the single biggest
+remaining "brown" contributor** and it belongs to `src/render/volumetrics/`.
 - Measured: 93% of the frame's chromatic mass sits in ONE hue octant; the nine
   reference frames average 54%. Ground band has **zero** pixels above L\* 85;
   the references average 2.8%.
@@ -54,28 +62,47 @@ Not the grade — that is fixed and neutral now. The *world* is one material fam
 - Add distinct classes selected by ONE low-frequency field: pale near-white
   crust, red-brown iron soil, near-black basalt, warm sand as one member of a set.
 
-### 1.2 Swirling paisley moiré on the ground
+### 1.2 Swirling paisley moiré on the ground — NOT ALIASING, and NOT terrain
 Concentric wood-grain swirls across the valley floor, strongest at grazing
 angles, moving with the camera. **This is the "distorted" complaint.**
 
-Not texture filtering — detail textures already have mipmaps and anisotropy 16.
-It is **procedural noise evaluated per-pixel in the fragment shader**, which
-cannot be mip-filtered and aliases exactly like this. Domain-warped fbm produces
-that signature.
+**My original diagnosis was wrong and has been disproved by ablation.** I said it
+was per-pixel procedural noise aliasing. It is not:
 
-Fix by DELETING: fade the noise octaves out with distance before they alias
-(`fwidth()` against the noise period is the honest cutoff), or bake them into a
-texture that can be filtered. Do not add a de-noising pass — more machinery on a
-problem caused by too much machinery.
+- **2x supersampling makes it SHARPER, not weaker** — conclusive: sampling-rate
+  aliasing gets *better* with more samples.
+- Every terrain material layer off together: still there.
+- Detail albedo forced flat AND all normal perturbation forced to the baked
+  normal, simultaneously: still there.
+- Baked-normal anisotropy 16 -> 1: no change.
+- SSAO, DOF, TAA, aerial perspective each off: still there.
+- The baked heightfield is smooth — a high-gain plan view of the pan's own
+  gradient shows no swirls at the 2 m grid.
+- Turning the shadow map off drops its contrast ~40% but does not remove it.
 
-### 1.3 Hard-edged black shadow blobs
-Irregular dark patches with stepped edges on ground and mountain flanks. Shadow
-acne or a cascade-boundary artefact. Check whether terrain normals disagreeing
-with the geometry are the cause.
+One genuine contributor WAS found and deleted: a `sin(linear phase + fbm warp)`
+"dune set" in `_panRelief` — the textbook wood-grain recipe, and it drew one. The
+dominant swirl survived it.
 
-### 1.4 Pale angular shards on the mountains
-Small bright wedges that look like broken LOD or z-fighting slivers. Terrain
-clipmap seams or the rocks module — diagnose which.
+**Conclusion: it is in the shading/lighting path, not in terrain albedo or
+geometry.** Best remaining candidate, untested: **grazing-angle specular on the
+terrain**. `gRough` is ~0.92, and a low afternoon sun near the reflection
+direction amplifies any normal variation enormously — and specular is
+albedo-independent, which is exactly why forcing white albedo did not kill it.
+Owner: `RenderPipeline.js` / `Lighting.js`. Repro pose and probes:
+`probes/tp_moire.js`, `tp_post.js`, `tp_shadow.js`, `tp_plan2.js` (none of the
+canonical shots enter this sampling regime — that is why nine rounds missed it).
+
+### 1.3 Hard-edged black shadow blobs — CONFIRMED shadow map
+They vanish entirely with `renderer.shadowMap.enabled = false`. They are real
+cast shadows with stepped, stippled edges: cascade texel size plus a dithered PCF
+boundary. Terrain normals are NOT the cause — forcing the baked normal changes
+nothing. Owner: `Lighting.js`.
+
+### 1.4 Pale angular shards — CONFIRMED rocks geometry, not LOD
+Flat pale/dark wedges half-buried around boulders. `Scatter.js` / `TalusApron.js`
+place bodies with most of their volume below the surface, so only a facet shows.
+Not LOD, not z-fighting. Needs a geometry pass in `src/world/rocks/`.
 
 ### 1.5 Everything is detailed at exactly one scale
 From a blind comparison against the real game:
