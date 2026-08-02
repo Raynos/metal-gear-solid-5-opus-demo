@@ -169,6 +169,83 @@ export class NavGrid {
     return true;
   }
 
+  /**
+   * CONNECTED COMPONENTS, and why reachability is not an A* question.
+   *
+   * "Can this man walk from here to there" was being answered by running the
+   * pathfinder and looking at what came back, in three places. That is wrong
+   * twice over: `findPath` returns the partial route to the nearest cell it
+   * could reach when the goal is walled off (so a truthy result proves
+   * nothing), and it gives up after `budget` expansions (so a 60 m walk across
+   * a cluttered compound reports as unreachable when it is merely long).
+   * Measured on the built outpost: of ten pairs of guard posts, four were
+   * genuinely unreachable, and of the six that were fine, the verdict flipped
+   * with the budget and even with the DIRECTION the search ran.
+   *
+   * A flood fill answers it exactly, once, for the whole map: two cells are
+   * mutually reachable if and only if they carry the same label. One pass over
+   * 34 k cells at install, then O(1) per query for the rest of the run.
+   *
+   * The neighbour test is a copy of the A*'s, deliberately — blocked cells, no
+   * diagonal cut past a wall corner, the same slope limit. A labelling that
+   * disagreed with the pathfinder would be worse than none.
+   */
+  labelComponents() {
+    const { nx, nz, cell } = this;
+    const comp = new Int32Array(this.n).fill(-1);
+    const sizes = [];
+    const queue = new Int32Array(this.n);
+    let label = 0;
+    for (let start = 0; start < this.n; start++) {
+      if (this.blocked[start] || comp[start] >= 0) continue;
+      let head = 0;
+      let tail = 0;
+      queue[tail++] = start;
+      comp[start] = label;
+      let size = 0;
+      while (head < tail) {
+        const cur = queue[head++];
+        size++;
+        const cxi = cur % nx;
+        const czi = (cur - cxi) / nx;
+        const gy = this.ground[cur];
+        for (let k = 0; k < 8; k++) {
+          const ox = NB[k * 2];
+          const oz = NB[k * 2 + 1];
+          const jx = cxi + ox;
+          const jz = czi + oz;
+          if (jx < 0 || jz < 0 || jx >= nx || jz >= nz) continue;
+          const j = jz * nx + jx;
+          if (this.blocked[j] || comp[j] >= 0) continue;
+          if (ox && oz && (this.blocked[czi * nx + jx] || this.blocked[jz * nx + cxi])) continue;
+          if (Math.abs(this.ground[j] - gy) > MAX_WALK_SLOPE * cell * (ox && oz ? 1.42 : 1)) continue;
+          comp[j] = label;
+          queue[tail++] = j;
+        }
+      }
+      sizes.push(size);
+      label++;
+    }
+    this.comp = comp;
+    this.compSizes = sizes;
+    /** The label of the biggest walkable region: "the map", as far as anyone is concerned. */
+    this.mainComp = sizes.length ? sizes.indexOf(Math.max(...sizes)) : -1;
+    return this;
+  }
+
+  /** Which connected region a world point is in, or -1 off the grid. */
+  compAt(x, z) {
+    if (!this.comp) return -1;
+    const i = this.snap(x, z, 2);
+    return i < 0 ? -1 : this.comp[i];
+  }
+
+  /** True when a man could walk between these two points, however long it takes. */
+  connected(ax, az, bx, bz) {
+    const a = this.compAt(ax, az);
+    return a >= 0 && a === this.compAt(bx, bz);
+  }
+
   /** Nearest walkable cell to a world point, searched in rings. */
   snap(x, z, maxRing = 12) {
     let ix = this.ix(x);
@@ -448,6 +525,11 @@ export function bakeNavGrid({ region, cell = 1.0, groundAt, roots, maxInstances 
   let nb = 0;
   for (let i = 0; i < grid.n; i++) if (grid.blocked[i]) nb++;
   grid.stats.blocked = nb;
+  // One flood fill, so every "can he get there" question after this is a label
+  // comparison instead of a pathfinder call with a budget. See labelComponents.
+  grid.labelComponents();
+  grid.stats.regions = grid.compSizes.length;
+  grid.stats.mainRegion = grid.mainComp >= 0 ? grid.compSizes[grid.mainComp] : 0;
   grid.stats.bakeMs = +(performance.now() - t0).toFixed(1);
   grid.stats.cells = grid.n;
   return grid;

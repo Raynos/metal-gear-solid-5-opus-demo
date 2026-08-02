@@ -5,7 +5,10 @@ import { Guard, SPEED } from './guard.js';
 import { AIDebug } from './debug.js';
 import { AWARE, SIGHT, senseVision, senseNoise, eyeOf, targetPoint } from './perception.js';
 import { BALLISTICS, hitChance, impactPoint, suppressNear } from './combat.js';
-import { RESERVE_N, pickPost, pickStaging, markCommander } from './commander.js';
+import {
+  RESERVE_N, rankPosts, pickPost, pickBastion, pickStaging, markCommander,
+} from './commander.js';
+import { PostRoster } from './roster.js';
 // Read-only: the cloth zone enum, so the commander's kit can be re-toned
 // through the per-instance uniforms `characters` publishes for exactly this.
 import { Z } from '../characters/materials.js';
@@ -40,6 +43,23 @@ import { Z } from '../characters/materials.js';
  *   READABLE DETECTION. Per-guard awareness AND the reason for it are published
  *   every frame in a shape the HUD can draw without knowing anything about this
  *   module — `contacts()` — plus a one-line `detection()` summary.
+ *
+ * ROUND 11 gave the garrison a reason to move and being seen a price:
+ *
+ *   THE COMMANDER WEARS RANK. He spawned as an `officer` with recoloured cloth
+ *   while `characters` put its own peaked-cap-and-coat `commander` loadout on a
+ *   sentry at a perimeter post — so the man who LOOKED like the objective was
+ *   not the objective. He asks for the loadout now. See the spawn, and see
+ *   `rankMarking` for the second one, which is another module's line.
+ *
+ *   THE GARRISON ROTATES. Three patrol loops meant three men could move and
+ *   nine could not. Sentries relieve each other between the posts they already
+ *   stand — no invented routes, every changeover pathfound. See roster.js.
+ *
+ *   ALERTS COST SOMETHING. When the compound goes loud the commander abandons
+ *   the post the player has been watching for a second one chosen by the same
+ *   scorer, and the two nearest men commit to him instead of joining the sweep.
+ *   `harden()` below; `pickBastion` and `escortPoint` in commander.js.
  *
  * Cost control, because "dozens of guards" has to stay near 1 ms:
  *
@@ -140,13 +160,14 @@ export async function install(world) {
 
   const guards = [];
   const _home = new THREE.Vector3();
-  for (const ch of soldiers) {
-    ch.controlled = true; // characters/index.js leaves controlled men alone
-    // Posts are cover: a sandbag horseshoe, a tower's legs, an emplacement.
-    // The cell a man is posted in is therefore usually flagged unwalkable, and
-    // a post you cannot path back to is a man who never goes home after an
-    // investigation. Snap the HOME to standable ground; leave the character
-    // exactly where `characters` put him, so no screenshot moves.
+  const _cell = new THREE.Vector3();
+  /** Where a post has to be reachable FROM to count as connected to the map. */
+  const hub = outpost?.gate
+    ?? (outpost?.bounds ? outpost.bounds.getCenter(new THREE.Vector3()) : new THREE.Vector3());
+  const isolated = [];
+
+  /** Snap to standable ground, and then to ground he can actually walk out of. */
+  function homeFor(ch) {
     _home.copy(ch.position);
     const snapped = grid.snap(_home.x, _home.z, 4);
     if (snapped >= 0) {
@@ -154,12 +175,60 @@ export async function install(world) {
       const iz = (snapped - ix) / grid.nx;
       _home.set(grid.cx(ix), grid.ground[snapped], grid.cz(iz));
     }
-    guards.push(new Guard(ch, {
+    // A WALKABLE CELL IS NOT THE SAME AS A CONNECTED ONE, and the difference is
+    // a man who can never go anywhere. Posts are cover — a sandbag horseshoe,
+    // an emplacement — so `snap` happily lands inside a one-cell pocket with
+    // eight blocked neighbours: `walkable()` says yes, `findPath` returns an
+    // empty route, and every A* to or from that post fails silently for the
+    // whole run. Measured on the built compound: one of the five static
+    // sentries was in exactly that pocket, so all four of his possible
+    // changeovers were rejected and he stood still for a 90 s probe, and the
+    // same pocket is why he could never walk back from an investigation either.
+    if (grid.connected(_home.x, _home.z, hub.x, hub.z)) return { home: _home.clone(), moved: false };
+    let best = null;
+    let bestD = Infinity;
+    // Out to 12 m: the pocket is sometimes a whole walled yard rather than one
+    // cell, and the nearest connected ground is on the other side of it.
+    for (let r = 2; r <= 12 && !best; r += 1) {
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * Math.PI * 2;
+        const x = _home.x + Math.cos(a) * r;
+        const z = _home.z + Math.sin(a) * r;
+        if (!grid.walkable(x, z)) continue;
+        _cell.set(x, grid.heightAt(x, z), z);
+        if (!grid.connected(x, z, hub.x, hub.z)) continue;
+        const d = Math.hypot(x - ch.position.x, z - ch.position.z);
+        if (d < bestD) { bestD = d; best = _cell.clone(); }
+      }
+    }
+    if (!best) {
+      isolated.push({ name: ch.name, at: [+_home.x.toFixed(1), +_home.z.toFixed(1)], stranded: true });
+      return { home: _home.clone(), moved: false };
+    }
+    isolated.push({ name: ch.name, at: [+_home.x.toFixed(1), +_home.z.toFixed(1)], moved: +bestD.toFixed(1) });
+    return { home: best, moved: true };
+  }
+
+  for (const ch of soldiers) {
+    ch.controlled = true; // characters/index.js leaves controlled men alone
+    // Leave the character exactly where `characters` put him, so no screenshot
+    // moves; only his POST is corrected, and he walks to it once the game is
+    // live (see `blindPost` in guard.js tickHold).
+    const h = homeFor(ch);
+    const g = new Guard(ch, {
       role: 'sentry',
-      home: _home,
+      home: h.home,
       yaw: ch.yaw,
       stance: ch.anim?.stance ?? 'stand',
-    }));
+    });
+    if (h.moved) g.blindPost = true;
+    guards.push(g);
+  }
+  if (isolated.length) {
+    console.warn('ai: post(s) walled off from the rest of the map: '
+      + isolated.map((i) => (i.stranded
+        ? `${i.name} at ${i.at} STRANDED (no connected ground within 12 m)`
+        : `${i.name} moved ${i.moved} m to connected ground`)).join(', '));
   }
 
   // Give each patrol loop to the man standing nearest it. A route needs a body
@@ -285,7 +354,14 @@ export async function install(world) {
       const o = openness(x, z, y);
       if (o > bestOpen) { bestOpen = o; bestP = new THREE.Vector3(x, y - 1.6, z); }
     }
-    if (bestP && bestOpen >= 0.25) {
+    // ...and he has to be able to WALK there. `findPath` returns the partial
+    // route to the nearest reachable cell rather than null, so the original
+    // truthy test would have passed anything: measured over 20 s of live AI,
+    // two sentries spent the whole probe in `return`, covering 4.5 m between
+    // them, because the corrected post was on the far side of the thing they
+    // were standing inside. A man grinding into a wall is worse than a man with
+    // a poor view, so an unreachable correction is discarded.
+    if (bestP && bestOpen >= 0.25 && grid.connected(g.ch.position.x, g.ch.position.z, bestP.x, bestP.z)) {
       g.home.copy(bestP);
       g.blindPost = true;
     }
@@ -298,11 +374,29 @@ export async function install(world) {
   // the wire. `pickPost` reads the bake for the deepest defensible ground.
   let commander = null;
   const reserves = [];
+  const postCands = rankPosts(grid, outpost);
   if (typeof chars.spawnSoldier === 'function') {
-    const post = pickPost(grid, outpost);
+    const post = pickPost(grid, outpost, postCands);
     if (post) {
+      // THE MAN WHO LOOKS LIKE THE COMMANDER MUST BE THE COMMANDER.
+      //
+      // This spawned `variant: 'officer'` — a boonie hat and a holster — and
+      // then recoloured his cloth through the published uniforms to tell him
+      // apart. Meanwhile `characters` has a whole `commander` loadout: peaked
+      // cap, command coat that flares the silhouette 4 px wider at 60 m,
+      // shoulder boards, red brassard, written last round for exactly this job.
+      // Nothing asked for it, so the mission objective was a slightly darker
+      // rifleman, and the only man in the compound wearing rank was a sentry on
+      // the wire. Ask for the variant.
+      //
+      // `markCommander` stays for a tree whose characters module predates the
+      // loadout: it is the fallback, not the default, because the loadout
+      // carries its own palette — the CAP zone is shared with the shoulder
+      // boards, so overwriting it with the officer's pale boonie value would
+      // delete the rank marking this is meant to add.
+      const hasVariant = !!chars.variants?.commander;
       const ch = chars.spawnSoldier([post.position.x, 0, post.position.z], {
-        variant: 'officer',
+        variant: hasVariant ? 'commander' : 'officer',
         name: 'commander',
         yaw: post.yaw,
         // A hand taller than the tallest rifleman. Silhouette is the first thing
@@ -310,10 +404,13 @@ export async function install(world) {
         scale: 1.07,
       });
       ch.controlled = true;
+      // Read by src/gameplay's commander search and by anything else looking
+      // for the objective without going through this module's API.
+      ch.role = 'commander';
       // `materials.js` publishes the per-instance cloth uniforms specifically so
       // they can be driven from outside; `Z` is its own zone enum. Read-only use
       // of the characters module's published surface — nothing there is edited.
-      markCommander(ch, Z);
+      if (!hasVariant) markCommander(ch, Z);
       commander = new Guard(ch, {
         role: 'commander',
         home: post.position,
@@ -354,6 +451,34 @@ export async function install(world) {
     }
   }
 
+  // --- how many men are wearing rank? --------------------------------------
+  //
+  // There are two commanders in this build and only one of them is the
+  // mission. `src/characters/index.js` promotes the FIRST garrisoned post
+  // soldier to `variant: 'commander'` and sets `role = 'commander'` on him, so
+  // a man on the wire — the first thing the player sees from the approach —
+  // wears the peaked cap, the command coat, the shoulder boards and the
+  // brassard, while the objective stands deep inside the compound. Now that
+  // this module asks for the same loadout, both of them look like the target.
+  //
+  // That promotion is in a file this author does not own, so it is measured and
+  // published rather than edited: `api.rankMarking` names every man carrying
+  // the marking and says which one the mission is. The fix on the other side is
+  // one line — drop `variant: isCmd ? 'commander' : undefined` at
+  // characters/index.js:557-565 and let the AI place the only commander — and
+  // this flag is here so it can be verified from a probe afterwards rather than
+  // argued about.
+  const decoys = (chars.characters ?? []).filter(
+    (c) => c !== commander?.ch && (c.role === 'commander' || String(c.name ?? '').startsWith('commander')),
+  );
+  if (decoys.length) {
+    console.warn(
+      `ai: ${decoys.length} character(s) besides the objective are marked commander `
+      + `(${decoys.map((c) => c.name).join(', ')}) — src/characters promotes a garrison `
+      + 'sentry. The player cannot tell which one is the mission.',
+    );
+  }
+
   // --- squad, debug --------------------------------------------------------
   const squad = new Squad(rand);
   const debug = new AIDebug(scene);
@@ -371,7 +496,7 @@ export async function install(world) {
       // Never the commander — sending the objective to the player is the exact
       // opposite of the behaviour he exists to have — and never a reserve who
       // has not been called, because that would empty the checkpoint for free.
-      .filter((g) => !g.down && g.role !== 'commander'
+      .filter((g) => !g.down && g.role !== 'commander' && !g.bodyguard
         && !(g.role === 'reserve' && !g.committed)
         && g.state !== 'investigate' && g.state !== 'scan'
         && g.ch.position.distanceToSquared(ev.position) < 45 * 45)
@@ -642,10 +767,57 @@ export async function install(world) {
     return fresh.length;
   }
 
+  // --- the duty roster -----------------------------------------------------
+  // Only three of the twelve men could ever move, because the outpost publishes
+  // three patrol loops. The rest now relieve each other between the posts they
+  // are already standing. See roster.js — it invents no coordinates and no
+  // routes, and it is gated on `live` exactly like patrol is.
+  const roster = new PostRoster(guards, grid);
+
+  // --- the commander hardens -----------------------------------------------
+  /** Bodyguards committed to the commander for the current alert. */
+  let bodyguards = [];
+  /** Where he was posted at install, so a stand-down can put him back. */
+  const commanderPost = commander ? commander.home.clone() : null;
+  const commanderYaw = commander ? commander.homeYaw : 0;
+  const hardening = { relocations: 0, moved: 0, bodyguards: 0 };
+
+  /**
+   * Called once per escalation, from `commandThink`. Two consequences for the
+   * player having been seen, both aimed at the same thing: the objective must
+   * not still be standing where it was when the shooting started.
+   */
+  function harden(g) {
+    const threat = squad.hasLastKnown ? squad.lastKnown : null;
+    const post = pickBastion(grid, postCands, { from: g.ch.position, threat });
+    if (post) {
+      hardening.moved += Math.hypot(post.position.x - g.home.x, post.position.z - g.home.z);
+      hardening.relocations++;
+      g.home.copy(post.position);
+      g.homeYaw = post.yaw;
+    }
+    // Bodyguards: the two nearest men who are not already spoken for. Not the
+    // reserve (they are the answer to a different problem, and pulling them in
+    // free would make the radio call pointless) and never a man who is down.
+    bodyguards = guards
+      .filter((x) => !x.down && x !== g && x.role !== 'commander' && x.role !== 'reserve')
+      .sort((p, q) => p.ch.position.distanceToSquared(g.ch.position)
+        - q.ch.position.distanceToSquared(g.ch.position))
+      .slice(0, 2);
+    for (const b of bodyguards) b.bodyguard = g;
+    hardening.bodyguards = bodyguards.length;
+    squad._emit({
+      type: 'harden',
+      position: g.home.clone(),
+      from: g.id,
+      count: bodyguards.length,
+    });
+  }
+
   // --- context -------------------------------------------------------------
   const ctx = {
     grid, squad, guards, rand, coverPoints, target: null, live: false,
-    night: 0, elapsed: 0, frozen: false, requestPath, onFire, callReserve,
+    night: 0, elapsed: 0, frozen: false, requestPath, onFire, callReserve, harden,
   };
 
   // --- mode ----------------------------------------------------------------
@@ -672,7 +844,17 @@ export async function install(world) {
       // The reserve goes back outside the wire, or leaving play mode and
       // re-entering it would find a compound that had already been reinforced.
       if (g.role === 'reserve') g.committed = false;
+      g.bodyguard = null;
+      g.hardened = false;
       if (!g.down) g.enter('hold', ctx);
+    }
+    bodyguards = [];
+    // The commander goes back to the post every canonical screenshot frames
+    // him at. Hardening is a consequence inside a run, not a permanent change
+    // to where the objective lives.
+    if (commander && commanderPost) {
+      commander.home.copy(commanderPost);
+      commander.homeYaw = commanderYaw;
     }
   }
 
@@ -806,6 +988,10 @@ export async function install(world) {
       }
       stats.sensed = slice;
 
+      // Before think(): a changeover hands a man a new post and a new state,
+      // and he should act on it in the same frame he is given it.
+      roster.update(dt, ctx);
+
       for (const g of guards) {
         g.think(dt, ctx);
         g.apply(dt, ctx);
@@ -909,6 +1095,50 @@ export async function install(world) {
       };
     },
     get commanderDown() { return !!commander?.down; },
+    /**
+     * WHO IS WEARING RANK, and whether that is exactly one man.
+     *
+     * `ok` false means another module has marked a second commander — see the
+     * install-time check above. Published rather than fixed because the other
+     * one is placed in a file this module does not own.
+     */
+    get rankMarking() {
+      return {
+        ok: decoys.length === 0,
+        objective: commander?.ch?.name ?? null,
+        objectiveAt: commander
+          ? [+commander.ch.position.x.toFixed(1), +commander.ch.position.z.toFixed(1)]
+          : null,
+        variant: commander?.ch?.name ? (chars.variants?.commander ? 'commander' : 'officer') : null,
+        decoys: decoys.map((c) => ({
+          name: c.name,
+          at: [+c.position.x.toFixed(1), +c.position.z.toFixed(1)],
+          from: 'src/characters/index.js',
+        })),
+      };
+    },
+    /** What being seen cost: where he moved to, and who stayed with him. */
+    get hardening() {
+      return {
+        ...hardening,
+        moved: +hardening.moved.toFixed(1),
+        hardened: !!commander?.hardened,
+        home: commander ? [+commander.home.x.toFixed(1), +commander.home.z.toFixed(1)] : null,
+        post: commanderPost ? [+commanderPost.x.toFixed(1), +commanderPost.z.toFixed(1)] : null,
+        // Read from the men, not from the array this module handed out: a
+        // bodyguard releases himself when the squad stands down.
+        guarding: guards.filter((g) => g.bodyguard === commander).map((g) => g.id),
+      };
+    },
+    /** The changeover roster: who is standing which post. See roster.js. */
+    roster,
+    /**
+     * Posts that `snap` put in a pocket the pathfinder cannot leave, and what
+     * was done about them. `stranded` means no connected ground was found
+     * within 12 m — that man still cannot walk anywhere, and it is a compound
+     * layout question rather than an AI one.
+     */
+    isolatedPosts: isolated,
     /** Riflemen outside the wire, and whether the commander has called them. */
     get reserve() {
       return { total: reserves.length, committed: reserves.filter((g) => g.committed).length, calls: reserveCalls };
@@ -1034,8 +1264,12 @@ export async function install(world) {
           down: commander.down,
           state: commander.state,
           calls: commander.calls,
+          hardened: commander.hardened,
+          bodyguards: bodyguards.map((g) => g.id),
           at: [+commander.ch.position.x.toFixed(1), +commander.ch.position.z.toFixed(1)],
         } : null,
+        rankMarking: api.rankMarking,
+        roster: roster.stats,
         reserve: { total: reserves.length, committed: reserves.filter((g) => g.committed).length },
         guards: guards.map((g) => ({
           id: g.id,
@@ -1048,6 +1282,8 @@ export async function install(world) {
           dist: Number.isFinite(g.vis.dist) ? +g.vis.dist.toFixed(1) : null,
           rate: +g.vis.rate.toFixed(3),
           at: [+g.ch.position.x.toFixed(1), +g.ch.position.z.toFixed(1)],
+          home: [+g.home.x.toFixed(1), +g.home.z.toFixed(1)],
+          bodyguard: g.bodyguard ? g.bodyguard.id : null,
           path: g.path ? g.path.length : 0,
           rounds: g.rounds,
           sup: +g.suppression.toFixed(2),

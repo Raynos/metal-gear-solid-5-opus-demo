@@ -22,12 +22,17 @@ import * as THREE from 'three';
  *                                     track to answer, which turns a firefight
  *                                     into a clock the player is losing.
  *
- * Kit is coordinated with `characters`: the `officer` loadout (boonie, holster,
- * heavier build) at 1.07 scale, with the cloth palette pushed dark and the
- * headgear pushed pale. At 60 m through this project's aerial perspective the
- * hue is gone and only VALUE survives, so the read has to be a value pattern —
- * a dark body under a light hat — not a colour. Measured against a grunt at
- * 60 m that is a 2.4x luminance step on the torso.
+ * Kit is `characters`' own `commander` loadout — peaked cap, command coat,
+ * shoulder boards, brassard, at 1.07 scale. ROUND 11: it used to be the
+ * `officer` loadout with the cloth palette driven dark from `markCommander`
+ * below, because nobody had asked for the variant that exists; the man wearing
+ * actual rank was a sentry on the perimeter. `markCommander` is kept as the
+ * fallback for a tree without the loadout — see the spawn in index.js.
+ *
+ * The legibility argument behind that loadout is worth repeating, because it is
+ * why the objective is findable at all: at 60 m through this project's aerial
+ * perspective the hue is gone and only VALUE and OUTLINE survive, so the read
+ * has to be a dark block under a pale cap on a taller figure, not a colour.
  */
 
 /** Reserve riflemen posted outside the wire, waiting to be called. */
@@ -42,17 +47,22 @@ export const FALLBACK_R = 16;
 const _v = new THREE.Vector3();
 
 /**
- * Choose the commander's post from the baked grid rather than from a hardcoded
- * coordinate, so it survives the outpost being relaid.
+ * Every defensible command position in the compound, best first.
+ *
+ * One placer, used three times: to post him at install, to re-post him when the
+ * compound goes loud, and by anything else that needs to know where a man would
+ * stand. Round 11 pulled it out of `pickPost` rather than writing a second
+ * scorer for the relocation, because two scorers is how the objective ends up
+ * in a different kind of place depending on which code path put it there.
  *
  * The best post is the one a commander would actually take: deep inside, as far
  * from the gate as the compound allows, with something solid within arm's reach
  * to put his back to, and a clear view of the ground his men are standing on.
  */
-export function pickPost(grid, outpost) {
+export function rankPosts(grid, outpost) {
   const gate = outpost?.gate ?? null;
   const bounds = outpost?.bounds ?? null;
-  if (!bounds) return null;
+  if (!bounds) return [];
   const centre = bounds.getCenter(new THREE.Vector3());
   const gx = gate ? gate.x : centre.x;
   const gz = gate ? gate.z : centre.z;
@@ -102,27 +112,92 @@ export function pickPost(grid, outpost) {
       // much as depth, because a commander who can see nothing is a hostage.
       const depth = Math.min(1, Math.hypot(x - gx, z - gz) / span);
       const score = depth * 40 + clear * 5.5 + walls * 2.0;
-      cands.push({ score, x, z, y: grid.ground[i], clear });
+      cands.push({ score, x, z, y: grid.ground[i], clear, walls });
     }
   }
-  if (!cands.length) return null;
   cands.sort((a, b) => b.score - a.score);
+  cands.gate = gate ?? new THREE.Vector3(gx, 0, gz);
+  return cands;
+}
 
-  // The objective has to be REACHABLE. A post the pathfinder cannot get to from
-  // the gate is a post the player cannot walk to either, and the whole mission
-  // would end at a wall. One A* per candidate, first eight only.
-  const from = gate ?? new THREE.Vector3(gx, 0, gz);
+/** A ranked candidate turned into a post: position, and the way he faces. */
+function toPost(c, faceFrom) {
+  const pos = new THREE.Vector3(c.x, c.y, c.z);
+  return {
+    position: pos,
+    // Face the way the trouble comes from.
+    yaw: Math.atan2(-(faceFrom.x - pos.x), -(faceFrom.z - pos.z)),
+    overwatch: c.clear,
+    score: c.score,
+  };
+}
+
+/**
+ * Choose the commander's post from the baked grid rather than from a hardcoded
+ * coordinate, so it survives the outpost being relaid.
+ */
+export function pickPost(grid, outpost, cands = rankPosts(grid, outpost)) {
+  if (!cands || !cands.length) return null;
+
+  // The objective has to be REACHABLE. A post the player cannot walk to from
+  // the gate is a mission that ends at a wall.
+  //
+  // Connectivity, not pathfinding: `findPath` hands back the partial route to
+  // the nearest cell it could reach when the goal is walled off, so "a path
+  // came back" was never the question this meant to ask. The bake labels its
+  // connected regions — see NavGrid.labelComponents.
+  const from = cands.gate;
   let best = null;
   for (const c of cands.slice(0, 8)) {
-    const p = grid.findPath(from, new THREE.Vector3(c.x, c.y, c.z));
-    if (p && p.length) { best = c; break; }
+    if (grid.connected(from.x, from.z, c.x, c.z)) { best = c; break; }
   }
-  if (!best) best = cands[0];
+  return toPost(best ?? cands[0], from);
+}
 
-  const pos = new THREE.Vector3(best.x, best.y, best.z);
-  // Face the way the trouble comes from: the gate.
-  const yaw = Math.atan2(-(gx - pos.x), -(gz - pos.z));
-  return { position: pos, yaw, overwatch: best.clear };
+/**
+ * WHERE HE GOES WHEN IT GOES LOUD.
+ *
+ * Being seen used to cost the player nothing: `alerts` was counted and printed
+ * on the end card, and the objective stood exactly where he had been standing
+ * since install, so the answer to a failed stealth approach was to shoot the
+ * same man from the same angle a minute later. It costs something now — he
+ * leaves the post the player has been watching and takes a second one, chosen
+ * by the SAME scorer, biased away from wherever the shooting is coming from.
+ *
+ * Reachability is checked from where he is standing, not from the gate: this is
+ * a man walking, not a designer placing a marker.
+ *
+ * @param {object} opts
+ *   from    where he is now — the walk has to exist
+ *   threat  the squad's last known contact, or null
+ *   minMove metres; below this it is not a relocation, it is a fidget
+ */
+export function pickBastion(grid, cands, { from, threat = null, minMove = 10 } = {}) {
+  if (!cands || !cands.length || !from) return null;
+  const span = Math.max(20, minMove * 6);
+  const scored = [];
+  for (const c of cands) {
+    const move = Math.hypot(c.x - from.x, c.z - from.z);
+    if (move < minMove) continue;
+    let bias = 0;
+    if (threat) {
+      const now = Math.hypot(from.x - threat.x, from.z - threat.z);
+      const then = Math.hypot(c.x - threat.x, c.z - threat.z);
+      // Retreating from the contact is worth as much as the post's own quality;
+      // walking TOWARD it disqualifies the candidate outright.
+      if (then < now - 2) continue;
+      bias = Math.min(1, (then - now) / span) * 30;
+    }
+    // Cheap distance penalty: crossing the whole compound under fire is not
+    // hardening, it is a target moving in the open.
+    scored.push({ c, s: c.score + bias - move * 0.35 });
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => b.s - a.s);
+  for (const s of scored.slice(0, 6)) {
+    if (grid.connected(from.x, from.z, s.c.x, s.c.z)) return toPost(s.c, threat ?? cands.gate);
+  }
+  return null;
 }
 
 /**
@@ -193,6 +268,10 @@ export function commandThink(g, dt, ctx) {
 
   if (!loud) {
     g.callT = 0;
+    // Stood down. He is available to be moved again by the NEXT alert — the
+    // cost of being seen has to be payable more than once, or the second half
+    // of a loud mission is free.
+    g.hardened = false;
     // CALM/CAUTION: he holds. An inspection beat every half minute or so —
     // three steps to a corner of his own position and back — so he is not a
     // statue, but never the perimeter and never out of sight of his post.
@@ -215,6 +294,15 @@ export function commandThink(g, dt, ctx) {
 
   // Loud. He does not push and he does not sweep — both of those are jobs he
   // gives to other people. He gets behind something and he gets on the radio.
+  //
+  // First, once per escalation: he abandons the post the player has been
+  // watching. `ctx.harden` is index.js's hook — it owns the ranked post list
+  // and the bodyguards, both of which are garrison-wide facts this file has no
+  // business holding. See pickBastion.
+  if (!g.hardened) {
+    g.hardened = true;
+    ctx.harden?.(g);
+  }
   g.callT += dt;
   if (g.callT > CALL_DELAY && g.calls < MAX_CALLS && ctx.callReserve) {
     g.calls++;
@@ -277,4 +365,45 @@ export function fallbackPoint(g, ctx) {
     }
   }
   return g.home.clone();
+}
+
+/**
+ * WHERE A BODYGUARD STANDS.
+ *
+ * The second half of what an alert costs the player. When the compound goes
+ * loud the nearest men stop being part of the sweep and commit to the
+ * commander: they take station a few metres off him, on the side the shooting
+ * is coming from, and they do not leave to chase a last-known position. The
+ * whole garrison converging on where you were last seen is the behaviour that
+ * makes a loud approach EASIER than a quiet one — you pull every man off the
+ * objective by making a noise on the far side of the compound, then walk in.
+ *
+ * They still fight normally the moment they can actually see the player; this
+ * only replaces the "no eyes on, go and converge" branch.
+ */
+export function escortPoint(g, cmd, threat, ctx) {
+  const c = cmd.ch.position;
+  // Interposed if there is something to interpose against, otherwise fanned
+  // out on his own bearing so two bodyguards do not stand in one spot.
+  let dx;
+  let dz;
+  if (threat) {
+    dx = threat.x - c.x;
+    dz = threat.z - c.z;
+  } else {
+    dx = g.ch.position.x - c.x;
+    dz = g.ch.position.z - c.z;
+  }
+  const len = Math.hypot(dx, dz) || 1;
+  dx /= len;
+  dz /= len;
+  // Fan: one man a third of a radian either side of the bearing, keyed off his
+  // own id so the pair is stable frame to frame.
+  const a = Math.atan2(dz, dx) + (g.id % 2 ? 0.55 : -0.55);
+  for (const r of [4.0, 2.8, 5.5]) {
+    const x = c.x + Math.cos(a) * r;
+    const z = c.z + Math.sin(a) * r;
+    if (ctx.grid.walkable(x, z)) return new THREE.Vector3(x, ctx.grid.heightAt(x, z), z);
+  }
+  return new THREE.Vector3(c.x, c.y, c.z);
 }
