@@ -37,5 +37,28 @@ export async function install(world) {
   const particles = new ParticleAtmosphere(world, fields, pass);
   world.engine.addSystem(particles);
 
-  return { fields, pass, particles, ATMOS };
+  return {
+    fields,
+    pass,
+    particles,
+    ATMOS,
+    /**
+     * The ablation switch for this whole module, and the ONLY honest one.
+     *
+     * `pipeline.enabled.aerial` is not it and is the opposite of it: this module
+     * clears that flag at install, so setting it hands the distance haze back to
+     * RenderPipeline — a SECOND haze — while every cost in here keeps running.
+     * probes/r11_vol.js had to ablate by pulling systems out of `engine.systems`
+     * and hiding meshes by identity, which no other author could be expected to
+     * reinvent. This is that, as one call, and it leaves `aerial` alone so the
+     * off configuration has NO haze rather than somebody else's.
+     */
+    setEnabled(on) {
+      pass.setEnabled(on);
+      particles.setEnabled(on);
+      return !!on;
+    },
+    /** Make the next frame a pure function of the source. See pass.pin(). */
+    pin: () => pass.pin(),
+  };
 }
