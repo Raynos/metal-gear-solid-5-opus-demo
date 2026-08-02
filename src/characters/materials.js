@@ -1479,8 +1479,12 @@ export function makeRubberMaterial(opts = {}) {
     roughness: 0.72,
     metalness: 0.0,
     // Vulcanised rubber is a 0.045 dielectric with a broad but real lobe; a
-    // sole edge catching the sky is one of the few horizontals on a boot.
-    specularIntensity: 1.0,
+    // sole edge catching the sky is one of the few horizontals on a boot. That
+    // is carried by roughness and the default 0.04 F0 here — `specularIntensity`
+    // was set on this material for two rounds and MeshStandardMaterial has no
+    // such property, so three logged "not a property of THREE.MeshStandard
+    // Material" nine times a scene and the line did nothing. It is exactly the
+    // class of dead knob this project keeps mistaking for a control.
     envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
