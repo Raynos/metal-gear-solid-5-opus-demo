@@ -1025,6 +1025,11 @@ void main() {
   }
 
   // ---- heat shimmer over hot ground ---------------------------------------
+  // DELETED IN PRACTICE: uHeatHaze is 0 in every preset. A refraction driven by
+  // last frame's colour needs a stable previous frame to sample; at 16-29 FPS,
+  // with the camera moving, it smears instead of shimmering. It was bought for
+  // realism and read as "everything is blurry". The code is left in place and
+  // dead so the branch is provably off rather than half-on.
   // Refraction needs the scene colour, which is unavailable while we are being
   // drawn into it. Taking the *difference* of last frame's buffer at the warped
   // and unwarped positions and adding it is a stable first-order stand-in.
