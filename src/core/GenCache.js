@@ -46,12 +46,20 @@ export async function cachedBuffer(key, make) {
 
   if (available) {
     try {
+      const t0 = performance.now();
       const res = await fetch(BASE + encodeURIComponent(key));
       const type = res.headers.get('content-type') || '';
       if (res.ok && type.includes('octet-stream')) {
+        const tHead = performance.now();
         const buf = await res.arrayBuffer();
         if (buf.byteLength) {
           stats.hits++;
+          // Split the wait so it is attributable. The terrain blob is 224 MB
+          // and is re-fetched on EVERY page load; before this there was no way
+          // to say whether that time was the server, the transfer or the decode.
+          stats.bytes += buf.byteLength;
+          stats.headerMs += Math.round(tHead - t0);
+          stats.bodyMs += Math.round(performance.now() - tHead);
           if (buf.byteLength < MEMOISE_UNDER_BYTES) memory.set(key, buf);
           return buf;
         }
@@ -83,4 +91,4 @@ export async function cachedFloat32(key, make) {
 }
 
 /** How much time this saved, for reporting in the perf probe. */
-export const stats = { hits: 0, misses: 0 };
+export const stats = { hits: 0, misses: 0, bytes: 0, headerMs: 0, bodyMs: 0 };

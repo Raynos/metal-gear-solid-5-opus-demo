@@ -5,6 +5,7 @@ import { Sky } from './render/Sky.js';
 import { Lighting } from './render/Lighting.js';
 import { Terrain } from './world/Terrain.js';
 import { SHOTS } from './debug/Shots.js';
+import { stats as genCacheStats } from './core/GenCache.js';
 
 // Feature modules. Each is owned by exactly one author and exposes install(world).
 // Order matters: later modules may read handles published by earlier ones.
@@ -24,6 +25,7 @@ const container = document.getElementById('app');
 // wait. The bar sat at "starting" through the entire 4-12 s it was meant to
 // explain, which is exactly the black screen it replaced, only with a label.
 const B = typeof window !== 'undefined' ? window.__BOOT : null;
+const tBootStart = performance.now();
 B?.set(0.04, 'starting renderer');
 
 const engine = new Engine(container);
@@ -49,9 +51,19 @@ engine.addSystem({
 // The long one: a cached bake is ~1 s, a cold sim is ~12 s. Say which, because
 // "generating terrain" sitting still for twelve seconds looks like a hang.
 B?.set(0.14, 'generating terrain', true);
+const tTerrainStart = performance.now();
+// NOT overlapped with the renderer construction above, and that was measured,
+// not assumed. Kicking Terrain.create() off before `new Engine()` and awaiting
+// it here is the obvious win — 362 ms of fetch against GL setup that does not
+// touch it — and it is a PESSIMISATION: median boot went 4762 -> 5578 ms and
+// the fetch itself went 362 -> 774 ms. The cost is not I/O. Materialising a
+// 224 MB arrayBuffer is main-thread work, so overlapping it with renderer
+// construction makes both slower and adds allocation pressure to the moment
+// three.js is building its own buffers.
 const terrain = Terrain.create
   ? await Terrain.create({ size: 4096, segments: 512 })
   : new Terrain({ size: 4096, segments: 512 });
+const tTerrain = performance.now() - tTerrainStart;
 engine.scene.add(terrain.mesh);
 
 /**
@@ -297,10 +309,17 @@ const MODULES = [
 async function boot() {
   // The terrain sim and the module installs are the whole 4-12 s; report each so
   // a slow boot looks like work rather than a hang.
+  //
+  // Every phase is timed and published on `__GAME.bootTiming`. Boot cost has
+  // been quoted for ten rounds as one number ("world 5.0 s") with no breakdown,
+  // so nobody could say which module to attack — and "generating terrain" was
+  // blamed for a wait that is mostly not terrain at all.
+  const T = { terrainMs: Math.round(tTerrain), modules: {}, compileMs: 0, firstFrameMs: 0 };
   B?.set(0.42, 'terrain ready', false);
   for (let i = 0; i < MODULES.length; i++) {
     const [name, install] = MODULES[i];
     B?.set(0.45 + 0.45 * (i / MODULES.length), name);
+    const t = performance.now();
     try {
       registry[name] = await install(world);
     } catch (err) {
@@ -309,6 +328,7 @@ async function boot() {
       console.error(`module "${name}" failed to install:`, err);
       window.__GAME.errors.push(`module ${name}: ${err?.message ?? err}`);
     }
+    T.modules[name] = Math.round(performance.now() - t);
   }
   B?.set(0.92, 'compiling shaders');
 
@@ -316,10 +336,46 @@ async function boot() {
   // never a half-compiled frame.
   engine.camera.position.set(...SHOTS.vista.position);
   engine.camera.lookAt(new THREE.Vector3(...SHOTS.vista.target));
-  engine.renderer.compile(engine.scene, engine.camera);
+  // compileAsync, not compile.
+  //
+  // Measured: `compile()` returned in 64 ms and the first `render()` then took
+  // 2195 ms — 36% of a 6.1 s boot, and the single largest item in it, larger
+  // than the terrain. The priming was not priming anything; it was deferring
+  // the whole cost to the frame it exists to protect.
+  //
+  // `compileAsync` drives the same work through KHR_parallel_shader_compile,
+  // so the driver links programs on its own threads and we await completion
+  // instead of blocking the main thread on each one in turn as it is first
+  // used. Same programs, same frame, off the critical path.
+  //
+  // Kept behind a capability check: a context without the extension falls back
+  // to the synchronous path rather than silently skipping the prime, because a
+  // half-compiled first frame is exactly what this code exists to prevent.
+  let t = performance.now();
+  if (typeof engine.renderer.compileAsync === 'function') {
+    await engine.renderer.compileAsync(engine.scene, engine.camera);
+  } else {
+    engine.renderer.compile(engine.scene, engine.camera);
+  }
+  T.compileMs = Math.round(performance.now() - t);
+  t = performance.now();
   engine.step(0);
+  T.firstStepMs = Math.round(performance.now() - t);
+  t = performance.now();
   engine.render();
+  T.firstFrameMs = Math.round(performance.now() - t);
+  // A second frame, to separate one-off GPU upload from recurring cost. If
+  // frame 2 is cheap, frame 1 is paying for geometry and texture uploads and
+  // the fix is to upload less or upload earlier; if frame 2 is also slow, the
+  // boot number is just the frame time and there is nothing special about it.
+  t = performance.now();
+  engine.step(1 / 60);
+  engine.render();
+  T.secondFrameMs = Math.round(performance.now() - t);
   engine.start();
+  T.totalMs = Math.round(performance.now() - tBootStart);
+  T.genCache = { ...genCacheStats };
+  window.__GAME.bootTiming = T;
   window.__GAME.ready = true;
   B?.done();
 }
