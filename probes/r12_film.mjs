@@ -31,11 +31,12 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
-const opt = { dir: 'shots/r12', width: 1920, height: 1080, legacy: false };
+const opt = { dir: 'shots/r12', width: 1920, height: 1080, legacy: false, range: 16 };
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === '--out') opt.dir = argv[++i];
   else if (argv[i] === '--width') opt.width = +argv[++i];
   else if (argv[i] === '--height') opt.height = +argv[++i];
+  else if (argv[i] === '--range') opt.range = +argv[++i];
   else if (argv[i] === '--legacy') opt.legacy = true;
 }
 
@@ -234,6 +235,31 @@ async function main() {
         if (!m || el.style.opacity === '0') return null;
         return [Math.round(+m[1] - window.innerWidth / 2), Math.round(+m[2] - window.innerHeight / 2)];
       },
+      /**
+       * How big the target's HEAD is, in pixels of frame height.
+       *
+       * "hard to zoom in and see someone" is a resolution complaint and it needs
+       * a resolution number. A 0.22 m sphere at the victim's eye height,
+       * projected through the live camera; the answer is what the player has to
+       * put a 16 px reticle on.
+       */
+      headPx() {
+        const v = window.__VICTIM;
+        if (!v) return 0;
+        const c = eng.camera;
+        const p = new THREE.Vector3(v.position.x, (v.groundY ?? 0) + 1.62, v.position.z);
+        const d = p.distanceTo(c.position);
+        if (d < 0.01) return 0;
+        return +(0.22 / (2 * d * Math.tan(THREE.MathUtils.degToRad(c.fov) * 0.5)) * window.innerHeight).toFixed(1);
+      },
+      /** Is the weapon actually in frame, and where? Screen px from centre. */
+      gunPx() {
+        const a = gp.player?.anim;
+        if (!a?._weaponM) return null;
+        const c = eng.camera;
+        const m = new THREE.Vector3(0.585, 0.012, 0).applyMatrix4(a._weaponM).project(c);
+        return [Math.round(m.x * window.innerWidth * 0.5), Math.round(-m.y * window.innerHeight * 0.5), m.z < 1 ? 1 : 0];
+      },
       state() {
         return {
           ret: this.ret(),
@@ -242,13 +268,15 @@ async function main() {
           fov: +eng.camera.fov.toFixed(1),
           aim: +st.aimAmount.toFixed(2),
           ammo: st.ammo,
+          head: this.headPx(),
+          gun: this.gunPx(),
           down: !!window.__VICTIM?.downed,
         };
       },
     };
   }, opt.legacy);
 
-  const info = await page.evaluate((r) => window.F.setup(r), 16);
+  const info = await page.evaluate((r) => window.F.setup(r), opt.range);
   // WAIT OUT THE BRIEFING CARD. Entering play mode raises the UI's mission
   // plate, which is opaque for 0.2 + 2.4 + 0.85 s of WALL time — and stopping
   // the engine loop does not stop a CSS transition. The first strip filmed
@@ -256,6 +284,20 @@ async function main() {
   // number printed beside them was correct, which is exactly the sort of pair
   // that gets a working build called broken.
   await page.waitForTimeout(4200);
+  // AND THEN TAKE IT OUT OF THE DOM ANYWAY. 4.2 s is longer than the card's own
+  // 0.2 + 2.4 + 0.85 s of transitions and it was still up in a whole strip shot
+  // on a loaded machine — the timings above are wall clock and this box is
+  // contending with two other authors' render jobs. Waiting on a duration is a
+  // race; removing the element is not. Everything below it is the subject.
+  await page.evaluate(() => {
+    for (const s of ['.ui-mission', '[data-card]', '#mission', '.ct']) {
+      for (const n of document.querySelectorAll(s)) {
+        const box = n.closest('div');
+        if (box && box.parentElement && box.parentElement !== document.body) box.parentElement.remove();
+        else n.remove();
+      }
+    }
+  });
   await page.evaluate(() => window.F.tick(1));
   if (opt.legacy) {
     const ok = await page.evaluate(() => window.__GO_LEGACY());
