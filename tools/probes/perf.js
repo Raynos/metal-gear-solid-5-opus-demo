@@ -161,7 +161,7 @@ function timeFrame(mutate, i, render) {
  * DIFFERENCE is the extra GPU work B does, which is the thing being asked for,
  * and it is measured against a machine that has not had time to drift.
  */
-function paired(applyA, applyB, { mutate = NOOP, render = renderFull, pairs = PAIRS } = {}) {
+function paired(applyA, applyB, { mutate = NOOP, render = renderFull, pairs = PAIRS, group = 1 } = {}) {
   // Warm both configurations so neither pays a first-touch cost inside the loop.
   applyB();
   for (let i = 0; i < BLOCK_WARM; i++) render(mutate, i);
@@ -169,19 +169,37 @@ function paired(applyA, applyB, { mutate = NOOP, render = renderFull, pairs = PA
   for (let i = 0; i < BLOCK_WARM; i++) render(mutate, i);
   gl.finish();
 
+  // `group` frames of one configuration, timed together with one finish at each
+  // end. group=1 is the tightest pairing and is right for a flag that only flips
+  // a uniform. It is WRONG for a flag that removes twenty blits: alternating a
+  // whole pass on and off at 60 Hz thrashes driver state, and the thrash is
+  // larger than the pass. Measured with group=1: `autoExposure` (one uniform)
+  // came back with an IQR of 1.93 ms while `bloom` — same instrument, same run —
+  // came back at 20.18 ms and could not be resolved at all. A group of a few
+  // frames lets each configuration settle while keeping the two sides a few
+  // hundred milliseconds apart rather than the ~600 ms of a 20-frame block.
+  let idx = 0;
+  const timeGroup = () => {
+    gl.finish();
+    const t0 = performance.now();
+    for (let i = 0; i < group; i++) render(mutate, idx++);
+    gl.finish();
+    return (performance.now() - t0) / group;
+  };
+
   const diffs = [];
   for (let p = 0; p < pairs; p++) {
     let a, b;
     if (p % 2 === 0) {
       applyA();
-      a = timeFrame(mutate, 2 * p, render);
+      a = timeGroup();
       applyB();
-      b = timeFrame(mutate, 2 * p + 1, render);
+      b = timeGroup();
     } else {
       applyB();
-      b = timeFrame(mutate, 2 * p, render);
+      b = timeGroup();
       applyA();
-      a = timeFrame(mutate, 2 * p + 1, render);
+      a = timeGroup();
     }
     diffs.push(b - a);
   }
@@ -254,7 +272,15 @@ function capture(frames = 16) {
     renderer.setRenderTarget(null);
     W.lighting.invalidateShadows();
   }
+  // The camera MOVES through the capture, and that is not cosmetic: motion blur
+  // and TAA only do anything when there is motion, so a capture from a frozen
+  // pose reports `motionBlur` inert when it is merely idle. Measured — the first
+  // version of this audit did exactly that. A fixed rotation per frame keeps the
+  // capture reproducible while giving the temporal passes something to chew on.
+  cam.quaternion.copy(q0);
   for (let i = 0; i < frames; i++) {
+    cam.quaternion.copy(q0);
+    cam.rotateY((i * 0.35 * Math.PI) / 180);
     eng.step(1 / 60);
     eng.render();
   }
@@ -477,26 +503,33 @@ reset();
 // resolution limit of every number below it.
 const noiseFloor = paired(setBase, setBase, { mutate: costMutate });
 
+// `group` is how many consecutive frames of one configuration are timed
+// together. Flipping a uniform is free, so those pair frame-by-frame. Removing
+// twenty blits is not: alternating a whole pass on and off every frame thrashes
+// driver state harder than the pass costs, and with group=1 `bloom` measured a
+// median of 18.05 ms with an IQR of 20.18 while `autoExposure`, same run, had an
+// IQR of 1.93. Grouping a few frames lets each configuration settle.
+const PASS_GROUP = 4;
 const passGroups = {
   // Real passes, gated by a flag that really does skip work.
-  bloom: ['bloom'],
-  ssao: ['ssao'],
-  taa: ['taa'],
+  bloom: { keys: ['bloom'], group: PASS_GROUP },
+  ssao: { keys: ['ssao'], group: PASS_GROUP },
+  taa: { keys: ['taa'], group: PASS_GROUP },
   // ONE pass behind two flags (uEnabled = dof || motionBlur); ablating either
   // alone leaves the pass running, which is why `dof` used to measure ~0.
-  dofAndMotionBlurPass: ['dof', 'motionBlur'],
+  dofAndMotionBlurPass: { keys: ['dof', 'motionBlur'], group: PASS_GROUP },
   // Uniform-only: the pass runs either way, so this is the cost of the shader
   // BRANCH, not of the pass. Labelled as such in the output.
-  aerialBranch: ['aerial'],
-  autoExposureBranch: ['autoExposure'],
-  motionBlurBranch: ['motionBlur'],
+  aerialBranch: { keys: ['aerial'], group: 1 },
+  autoExposureBranch: { keys: ['autoExposure'], group: 1 },
+  motionBlurBranch: { keys: ['motionBlur'], group: 1 },
 };
 
 const passCost = {};
-for (const [name, keys] of Object.entries(passGroups)) {
+for (const [name, { keys, group }] of Object.entries(passGroups)) {
   if (!keys.every((k) => BASE[k])) continue;
   reset();
-  passCost[name] = { flags: keys, ...paired(setOff(keys), setBase, { mutate: costMutate }) };
+  passCost[name] = { flags: keys, group, ...paired(setOff(keys), setBase, { mutate: costMutate, group }) };
 }
 setBase();
 
@@ -511,20 +544,31 @@ const allOff = Object.fromEntries(FLAGS.map((f) => [f, false]));
  */
 function pairedTwoRenders(renderA, renderB) {
   const diffs = [];
+  let idx = 0;
   const warm = (r) => {
     for (let i = 0; i < BLOCK_WARM; i++) r(costMutate, i);
   };
   warm(renderA);
   warm(renderB);
   gl.finish();
+  // Grouped for the same reason the pass ablations are: the whole post chain is
+  // the largest possible state change, so alternating it every single frame
+  // measures the switch, not the chain.
+  const timeGroup = (r) => {
+    gl.finish();
+    const t0 = performance.now();
+    for (let i = 0; i < PASS_GROUP; i++) r(costMutate, idx++);
+    gl.finish();
+    return (performance.now() - t0) / PASS_GROUP;
+  };
   for (let p = 0; p < PAIRS; p++) {
     let a, b;
     if (p % 2 === 0) {
-      a = timeFrame(costMutate, 2 * p, renderA);
-      b = timeFrame(costMutate, 2 * p + 1, renderB);
+      a = timeGroup(renderA);
+      b = timeGroup(renderB);
     } else {
-      b = timeFrame(costMutate, 2 * p, renderB);
-      a = timeFrame(costMutate, 2 * p + 1, renderA);
+      b = timeGroup(renderB);
+      a = timeGroup(renderA);
     }
     diffs.push(b - a);
   }
@@ -589,15 +633,33 @@ const fmt = (c) => (c.resolved ? `${c.medianMs} ms (IQR ${c.iqrMs})` : `below no
 
 // A run whose pairing failed to cancel the drift is not a weaker measurement,
 // it is not a measurement. Say so at the top level so it cannot be skimmed past.
-const rulerValid = Math.abs(noiseFloor.medianMs) < noiseFloor.iqrMs;
+//
+// TWO conditions, and the second one was learned the hard way. Requiring only
+// that the bias sit inside the IQR passes trivially when the IQR is enormous: a
+// run taken while eight other authors were hammering the same GPU reported a
+// bias of 4.0 ms inside an IQR of 42.8 ms on a 99 ms frame and called itself
+// valid. The noise floor also has to be SMALL relative to the frame, or the
+// instrument resolves nothing worth resolving. A quarter of the frame time is
+// the line: below it the big passes are separable, above it nothing is.
+const biasOk = Math.abs(noiseFloor.medianMs) < noiseFloor.iqrMs;
+const floorOk = noiseFloor.iqrMs < 0.25 * totalMs;
+const rulerValid = biasOk && floorOk;
 
 return {
   RULER_VALID: rulerValid,
   rulerWarning: rulerValid
     ? undefined
-    : `VOID RUN — the same configuration paired against itself has a median of ${noiseFloor.medianMs} ms, ` +
-      `which is not inside its own IQR of ${noiseFloor.iqrMs} ms. The pairing did not cancel the machine's ` +
-      'drift; do not quote any cost from this run.',
+    : 'VOID RUN — do not quote any cost from it. ' +
+      (biasOk
+        ? ''
+        : `The same configuration paired against itself has a median of ${noiseFloor.medianMs} ms, which is not ` +
+          `inside its own IQR of ${noiseFloor.iqrMs} ms: the pairing did not cancel the drift. `) +
+      (floorOk
+        ? ''
+        : `The noise floor is ${noiseFloor.iqrMs} ms against a ${totalMs} ms frame (${Math.round(
+            (noiseFloor.iqrMs / totalMs) * 100,
+          )}%), so nothing in this frame is separable. This is what a CONTENDED machine looks like — ` +
+          'check `node tools/shot.mjs status` for other authors queued ahead of you and measure again when it is quiet.'),
   shot,
   resolution: `${size.x}x${size.y} @dpr${renderer.getPixelRatio()}`,
   budget: { fps60Ms: 16.7, fps30Ms: 33.3 },
@@ -635,7 +697,7 @@ return {
   perPassCost: Object.fromEntries(
     Object.entries(passCost)
       .sort((a, b) => b[1].medianMs - a[1].medianMs)
-      .map(([k, v]) => [k, { verdict: fmt(v), flags: v.flags }]),
+      .map(([k, v]) => [k, { verdict: fmt(v), flags: v.flags, framesPerGroup: v.group }]),
   ),
 
   flagAudit,
