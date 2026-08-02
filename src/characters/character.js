@@ -4,11 +4,12 @@ import { assemble } from './skinning.js';
 import { makeMaterialSet, Z, SZ, MZ } from './materials.js';
 import { frameMatrix, setDetail } from './geometry.js';
 import {
-  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
+  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildPonytail, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
 } from './body.js';
 import {
   buildChestRig, buildBelt, buildHolster, buildBackpack, buildHelmet, buildCap, buildBoonie,
   buildBandana, buildEyepatch, buildProstheticArm, buildRifle, buildKneepads, buildPockets,
+  buildSlungWeapon, buildPeakedCap, buildCommandCoat,
 } from './gear.js';
 import { Animator } from './anim.js';
 import { gateSkeleton } from './lod.js';
@@ -37,8 +38,11 @@ export function buildCharacterGeometry(loadout, opts = {}) {
 function buildCharacterGeometryImpl(loadout) {
   const rig = createRig();
   const parts = [];
+  // A part may name its own bone group; `group` here is only the default. Kit
+  // that spans two bones (the command coat's skirt on the pelvis, its shoulder
+  // boards on the chest) needs the override or one half of it shears.
   const add = (list, group) => {
-    for (const p of list) parts.push({ surface: p.surface, mat: p.mat, group });
+    for (const p of list) parts.push({ surface: p.surface, mat: p.mat, group: p.group ?? group });
   };
   const one = (surface, mat, group) => parts.push({ surface, mat, group });
 
@@ -71,6 +75,9 @@ function buildCharacterGeometryImpl(loadout) {
   // ended up with the hair cap punched through the cheeks and the entire
   // lower face rendering as a dark mask.
   if (loadout.hair !== false) one(onHead(buildHair({ backOnly: loadout.hairBack ?? false })), 'cloth', 'head');
+  // The tail is skinned to the same bones as the skull, like the hair shell, so
+  // it swings with a head turn instead of hanging off a rigid head bone.
+  if (loadout.ponytail) addHead(buildPonytail(), 'head');
 
   const legR = buildLeg({ bulk });
   one(legR, 'cloth', 'legR');
@@ -118,6 +125,10 @@ function buildCharacterGeometryImpl(loadout) {
   if (loadout.vest !== false) add(buildChestRig({ bulk, heavy: loadout.grenades !== false }), 'rigidChest');
   add(buildBelt({ pouches: loadout.beltPouches }), 'rigidRoot');
   if (loadout.backpack) add(buildBackpack(), 'rigidChest');
+  // Lies on the pack and rides the ribcage, so it does not shear when the spine
+  // twists through the gait.
+  if (loadout.slung) add(buildSlungWeapon({ sling: loadout.slung !== 'bare' }), 'rigidChest');
+  if (loadout.coat) add(buildCommandCoat(), 'rigidRoot');
   if (loadout.holster) add(buildHolster(1), 'rigidLegR');
   {
     const pk = buildPockets({ cargo: loadout.cargoPockets !== false });
@@ -146,6 +157,9 @@ function buildCharacterGeometryImpl(loadout) {
       break;
     case 'bandana':
       addHead(buildBandana(), 'rigidHead');
+      break;
+    case 'peaked':
+      addHead(buildPeakedCap(), 'rigidHead');
       break;
     default:
       break;

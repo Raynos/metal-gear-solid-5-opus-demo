@@ -56,7 +56,19 @@ const LOADOUTS = {
   player: {
     name: 'snake',
     bulk: 1.04,
-    sleeves: 'full',
+    // ROUND 8: 'full' -> 'rolled', and it comes off the reference. In mgi-1 and
+    // mgi-6 Snake's right sleeve is rolled above the elbow with bare forearm
+    // beyond it, and that is not a costume note — the upper arm is the largest
+    // unbroken surface on the character, it points straight at the third-person
+    // camera, and three rounds of critique have called it a featureless
+    // bolster. A rolled sleeve puts three things across it that a full sleeve
+    // cannot: a bunched roll standing 5 mm proud at the elbow (a silhouette
+    // step), a hard cut edge (a value step), and 250 mm of SKIN below it, whose
+    // albedo is 0.364/0.218/0.135 against a sleeve's 0.237/0.218/0.118 — a
+    // different hue as well as a different value, in the middle of the limb.
+    //
+    // Only the right arm is affected; the left is the prosthetic.
+    sleeves: 'rolled',
     headgear: 'bandana',
     eyepatch: true,
     hair: true,
@@ -74,6 +86,14 @@ const LOADOUTS = {
     fingerless: true,
     beltPouches: [-0.11, 0.11],
     head: { jawWidth: 1.12 },
+    // ROUND 8 — the two silhouette cues taken straight off mgi-1/3/6. The hair
+    // is TIED BACK (a knot on the occiput and a tail behind it), and there is a
+    // second weapon slung across the back with its muzzle up past the left
+    // shoulder. Between them they put an outline event above the shoulder line
+    // and one behind the skull, which is the half of the figure the gameplay
+    // camera actually frames and the half that had none.
+    ponytail: true,
+    slung: true,
   },
   // Three enemy variants. Different headgear, sleeves, load and build so a
   // patrol does not read as a row of clones.
@@ -113,6 +133,67 @@ const LOADOUTS = {
     beltPouches: [0.12],
     head: { jawWidth: 0.92 },
   },
+  /**
+   * The garrison commander — a GAMEPLAY-LEGIBILITY variant, sized to be told
+   * apart from a patrol guard at 60 m.
+   *
+   * 60 m through the gameplay camera's 45-degree lens at 1080p puts a 1.86 m
+   * soldier at 40 px tall and about 13 px wide. That budget rules out most of
+   * what "distinct kit" normally means: a different hat is 4 px, a radio whip
+   * is sub-pixel and will not even resolve, and a rank patch is a quarter of a
+   * pixel. Three things do survive to 13 px of width, and this loadout is all
+   * three:
+   *
+   *   1. WIDTH. `coat` flares the outline from 0.163 m at the waist to 0.243 m
+   *      at a mid-thigh hem, and holds it for 300 mm of height — 4 px of solid
+   *      block where every guard in the frame necks in to a 2 px pair of legs.
+   *   2. VALUE. The palette override drops the whole uniform from a 0.25 khaki
+   *      to a 0.105 dark olive, a 1.25-stop step over the entire figure. At
+   *      40 px that is the read the eye gets first, before any shape at all.
+   *   3. HEIGHT and headgear mass. Scaled 1.06 with a peaked cap whose crown is
+   *      205 mm across, against a helmet at 168 — the head reads as a wider,
+   *      flatter block on a taller figure.
+   *
+   * `slung: 'bare'` gives him the back weapon too but without the sling tape,
+   * so from behind he is the only other figure in the game carrying the
+   * player's diagonal — an officer with a rifle he does not have in his hands.
+   */
+  commander: {
+    name: 'commander',
+    bulk: 1.06,
+    sleeves: 'full',
+    headgear: 'peaked',
+    hair: true,
+    coat: true,
+    vest: true,
+    backpack: false,
+    holster: true,
+    kneepads: false,
+    grenades: false,
+    optic: false,
+    slung: 'bare',
+    cargoPockets: false,
+    beltPouches: [-0.1, 0.1],
+    head: { jawWidth: 0.88 },
+    // Officers stay out of the dirt: less dust load than the patrol, which
+    // widens the value gap the legibility argument above rests on.
+    dust: 0.22,
+    // Officer's dark olive, against the garrison's sun-bleached khaki. Linear
+    // reflectance, same convention as `defaultClothPalette`; only the garment
+    // zones move, so webbing, leather and boots stay where the rest of the
+    // material work put them and the internal value ladder is preserved.
+    // Held at the same R/B 1.90 / G/R 0.96 the re-tinted khaki uses, so he is a
+    // DARKER soldier and not a differently-coloured one — a hue shift as well
+    // as a value shift would read as a different faction.
+    palette: {
+      0: [0.108, 0.104, 0.057], // JACKET
+      1: [0.106, 0.102, 0.056], // SLEEVE
+      2: [0.098, 0.094, 0.052], // TROUSER
+      13: [0.092, 0.088, 0.048], // COLLAR
+      15: [0.209, 0.201, 0.110], // CAP — the shoulder boards share this zone
+      3: [0.085, 0.082, 0.045], // VEST
+    },
+  },
 };
 
 /**
@@ -121,11 +202,22 @@ const LOADOUTS = {
  * a mottle, a brow shade, a stubble tint and an AO term on top of whatever it
  * is given — so an already-dark base arrives at the frame as a silhouette.
  */
+/**
+ * ROUND 8 re-tints these to R/B 2.70, G/R 0.60 at the SAME luminance.
+ *
+ * Measured on the shipped frame the player's exposed neck came back sRGB
+ * 71.5 / 67.2 / 67.0 — R-B +4.5 — against MGSV's face at 81.4 / 57.1 / 44.2,
+ * R-B +37.2. Skin is the one surface a viewer has a lifelong reference for and
+ * ours was rendering as grey. The authored albedo was part of it: at R/B 2.15
+ * these were already flatter than measured human dermis, which runs 2.5-3.2 in
+ * the red because haemoglobin absorbs hard in the blue. The other part is
+ * `uWarmMix`; see materials.js.
+ */
 const SKIN_TONES = [
-  [0.348, 0.220, 0.162],
-  [0.308, 0.190, 0.136],
-  [0.258, 0.150, 0.103],
-  [0.388, 0.252, 0.188],
+  [0.364, 0.218, 0.135],
+  [0.316, 0.190, 0.117],
+  [0.254, 0.152, 0.094],
+  [0.413, 0.248, 0.153],
 ];
 
 /** Per-instance uniform variation: different dye lot, dust load and skin. */
@@ -281,6 +373,7 @@ export async function install(world) {
 
   function makeCharacter(variantKey, opts = {}) {
     const built = variants[variantKey];
+    const lo = LOADOUTS[variantKey] ?? {};
     const ch = new Character(built, {
       low: variantsLow[variantKey],
       name: opts.name ?? variantKey,
@@ -288,7 +381,14 @@ export async function install(world) {
       scale: opts.scale ?? 1,
       position: opts.position ?? [0, 0, 0],
       yaw: opts.yaw ?? 0,
-      materials: instanceMaterials(rand, opts),
+      // A loadout may carry its own dye lot (the commander's dark olive). The
+      // caller can still override per instance; the loadout is the default, not
+      // a hard-code, so a variant stays reusable.
+      materials: instanceMaterials(rand, {
+        palette: lo.palette,
+        dust: lo.dust,
+        ...opts,
+      }),
     });
     ch.index = characters.length;
     ch.behaviour = new Behaviour(ch, ground, characters.length * 2654435761 + 17);
@@ -389,14 +489,28 @@ export async function install(world) {
   // Garrison the outpost when it published posts and routes; otherwise fall back
   // to a loose cordon around the player so the canonical shots are never empty.
   let garrisoned = 0;
+  let commander = null;
   const MAX_SOLDIERS = 8;
   for (const post of outpost?.guardPosts ?? []) {
     if (garrisoned >= MAX_SOLDIERS) break;
     const p = toVec(post);
     if (!p) continue;
     const facing = Math.atan2(-p.x, -p.z) + Math.PI;
-    const s = spawnSoldier([p.x, 0, p.z], { yaw: facing + (rand() - 0.5) * 1.2 });
-    if (post.kind === 'emplacement' && rand() < 0.5) s.setStance('crouch');
+    // Exactly one commander, standing his post rather than patrolling — the
+    // objective needs a designated target, and a figure that never walks a
+    // route is also the one the player can find twice.
+    const isCmd = !commander;
+    const s = spawnSoldier([p.x, 0, p.z], {
+      yaw: facing + (rand() - 0.5) * 1.2,
+      variant: isCmd ? 'commander' : undefined,
+      scale: isCmd ? 1.06 : undefined,
+    });
+    if (isCmd) {
+      s.role = 'commander';
+      commander = s;
+    } else if (post.kind === 'emplacement' && rand() < 0.5) {
+      s.setStance('crouch');
+    }
     garrisoned++;
   }
   const routes = (outpost?.patrolWaypoints ?? []).filter((r) => Array.isArray(r) && r.length >= 2);
@@ -418,7 +532,17 @@ export async function install(world) {
     { at: [spawn.x - 24.0, spawn.z - 6.0], yaw: 5.6, patrol: true },
   ];
   cordon.forEach((c, i) => {
-    const s = spawnSoldier([c.at[0], 0, c.at[1]], { yaw: c.yaw, variant: soldierVariants[i % 3] });
+    const cmd = !commander && i === 2;
+    const s = spawnSoldier([c.at[0], 0, c.at[1]], {
+      yaw: c.yaw,
+      variant: cmd ? 'commander' : soldierVariants[i % 3],
+      scale: cmd ? 1.06 : undefined,
+    });
+    if (cmd) {
+      s.role = 'commander';
+      commander = s;
+      return;
+    }
     if (c.stance) s.setStance(c.stance);
     if (c.patrol) {
       const a = new THREE.Vector3(c.at[0], 0, c.at[1]);
@@ -442,6 +566,10 @@ export async function install(world) {
         const job = lod.evaluate(ch, dt);
         if (!job) continue;
         if (ambient && !ch.controlled) ch.behaviour.update(job.dt);
+        // The four-tap terrain normal behind the whole-body slope tilt. At the
+        // tier where foot IK is already gone it is worth well under a pixel,
+        // and it is 4 of the 15 terrain queries per character per frame.
+        ch.anim.coarse = job.ik === 0;
         ch.update(job.dt, job.ik);
       }
     },
@@ -479,6 +607,8 @@ export async function install(world) {
     spawnSoldier,
     variants,
     variantsLow,
+    /** The designated objective. `ch.role === 'commander'` also marks him. */
+    commander,
     /** Where the framing solver put the player — handy for camera work. */
     playerSpawn: spawn,
     ground,

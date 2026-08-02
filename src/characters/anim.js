@@ -240,6 +240,19 @@ export class Animator {
     this.bobY = 0;
     this.hipDrop = 0;
     this.lungeZ = 0;
+    // Ground-normal LOD. `_placeRoot` and `_solveFeet` between them ask the
+    // terrain for FIFTEEN heights per character per frame, and eleven of those
+    // are the four-tap finite-difference normals behind two facts that stop
+    // being visible almost immediately: which way the whole figure tilts on the
+    // slope, and how each sole conforms to the ground under it.
+    //
+    // Measured against the pixel: a 1.86 m soldier standing on a 15-degree
+    // slope tilts his crown 0.11 m out of vertical at full strength; at 25 m
+    // that is 3.6 px and at 60 m it is 1.5 px, and the sole conform term is a
+    // quarter of that. Set by the LOD band in index.js; when it is on, both are
+    // dropped and the root sits level, which costs 11 of the 15 terrain
+    // queries per character per frame.
+    this.coarse = false;
     this.weaponSway = new THREE.Vector3();
     this.weaponSwayVel = new THREE.Vector3();
 
@@ -505,7 +518,7 @@ export class Animator {
     this.b.root.position.y -= idleW * 0.012 * (0.5 + 0.5 * Math.sin(this.t * 0.9));
     if (L.proneBlend > 0.001) this.b.root.position.z += L.proneBlend * 0.07;
 
-    if (t) {
+    if (t && !this.coarse) {
       const n = t.normalAt(px, pz, 0.9);
       const fx = -Math.sin(ch.yaw);
       const fz = -Math.cos(ch.yaw);
@@ -645,7 +658,7 @@ export class Animator {
       const sa = Math.sin(ch.yaw + toeOut);
       const axis = foot.userData.axis;
       this._t3.set(axis.x * ca + axis.z * sa, axis.y, -axis.x * sa + axis.z * ca);
-      if (t && ik >= 2 && stancePhase) {
+      if (t && ik >= 2 && stancePhase && !this.coarse) {
         const n = t.normalAt(ft.pos.x, ft.pos.z, 0.6);
         this._qa.setFromUnitVectors(this._up, n);
         this._t3.applyQuaternion(this._qa);

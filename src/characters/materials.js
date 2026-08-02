@@ -277,14 +277,56 @@ const CHAR_RIM = /* glsl */ `
  */
 function lightUniforms(o = {}) {
   return {
-    uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.83, 0.63])) },
+    // ROUND 8: R/B 1.59 -> 1.72. This vector is normalised to unit luminance
+    // before use, so it is purely the HUE of the indirect — and the hue of the
+    // indirect on a soldier standing in a sand valley is the sand. Measured on
+    // this build's own ground, sunlit sand returns linear R/B 1.32 and its
+    // shaded side 1.55; a second bounce off that reflector is warmer again, not
+    // cooler, because each bounce multiplies the reflector's own spectrum.
+    uBounceColor: { value: new THREE.Vector3(...(o.bounceColor ?? [1.0, 0.81, 0.58])) },
     // Round 5: 0.40 -> 0.18. The scene's diffuse ambient is a spherical-harmonic
     // projection of the sky dome that ALREADY carries the ground bounce
     // (Lighting.js `_computeSkySH`), so this term was adding a second copy of it
     // — up to +46% of the total indirect on a downward-facing panel. A real
     // secondary bounce off sand onto a vertical surface is on the order of 15%.
     uBounceAmt: { value: o.bounce ?? 0.11 },
-    uWarmMix: { value: o.warmMix ?? 0.10 },
+    /**
+     * ROUND 8: 0.10 -> 0.35, and this reverses rounds 4 and 5 on measurement
+     * rather than on taste.
+     *
+     * Round 4 cut this from 0.80 to 0.30 on a correct observation — the
+     * character's shade was measuring nine sRGB counts WARMER than every
+     * shadow in the scene around it, and a subject lit by a private orange rig
+     * reads as a pasted cutout however good the sculpt is. Round 5 took it to
+     * 0.10. The mistake was not the observation, it was continuing past the
+     * point where the sign flipped: on the round-7 build the same comparison in
+     * linear now reads
+     *
+     *   player shaded R/B 1.271   vs   ground shaded R/B 1.549
+     *
+     * i.e. the character is 18% COOLER than its own scene, which is the
+     * identical cutout failure with the sign reversed, and in the real game the
+     * two are equal (Snake 1.95, the sand beside him 1.97).
+     *
+     * `probes/r8c/chroma.js` ablated every other candidate on the same build
+     * with no rebuild: rim -> 0 is worth +0.04 of R/B, envMap -> 0 +0.03,
+     * specular ablate +0.05, ground bounce 0.11 -> 0.30 +0.02. This one is
+     * worth +0.38 over 0.10 -> 0.60. Nothing else is close, so nothing else is
+     * the answer.
+     *
+     * 0.35, not 0.60: the target is the SCENE's own chroma, not the reference
+     * frame's. 0.35 plus the re-tinted albedo lands the shaded player near
+     * R/B 1.6 against a shaded ground of 1.55 — level with the world he is
+     * standing in, which is what the reference measures and what neither
+     * round 3's +21 nor round 7's -0.3 achieved. It is also grade-independent:
+     * if the renderer's warmth work moves the frame from +16 to the +25.8
+     * target, the character rides with it instead of staying grey.
+     *
+     * The term itself is luminance-preserving — it rotates the hue of the
+     * indirect and does not add energy — so this cannot re-brighten the
+     * character or undo the pedestal work.
+     */
+    uWarmMix: { value: o.warmMix ?? 0.35 },
     uRimColor: { value: new THREE.Vector3(...(o.rimColor ?? [1.0, 0.94, 0.86])) },
     // ROUND 6: 0.22 -> 0.10, and this is MAJOR 4.
     //
@@ -356,11 +398,60 @@ function defaultClothPalette() {
   // but the result is a figure that is functionally black in every frame where
   // the sun is not on his face. Sun-bleached cotton twill measures 0.30-0.35
   // reflectance; 0.20 was closer to wet slate.
-  c[Z.JACKET] = new THREE.Vector3(0.252, 0.214, 0.140);
-  c[Z.SLEEVE] = new THREE.Vector3(0.250, 0.212, 0.138);
-  c[Z.TROUSER] = new THREE.Vector3(0.234, 0.198, 0.127);
-  c[Z.COLLAR] = new THREE.Vector3(0.220, 0.187, 0.121);
-  c[Z.SHIRT] = new THREE.Vector3(0.168, 0.144, 0.103);
+  /**
+   * ROUND 8 — CHROMA, and this is the biggest measured gap on the character.
+   *
+   * Sampled off the shipped r8 gameplay frame and off the reference frames with
+   * the same boxes, in display sRGB:
+   *
+   *                              R      G      B    R-B    sat
+   *   ours   pack panel, shaded  54.9   55.4   57.1  -2.3   7.4%
+   *   ours   upper arm           61.4   61.9   63.6  -2.3   5.9%
+   *   ours   neck skin           71.5   67.2   67.0  +4.5   6.9%
+   *   MGSV   vest front, shaded  39.5   40.0   26.4 +13.1  36.3%
+   *   MGSV   arm sleeve         102.9   93.7   71.8 +31.0  30.2%
+   *   MGSV   face/jaw            81.4   57.1   44.2 +37.2  43.6%
+   *
+   * Our soldier is ACHROMATIC — literally blue on two of the three samples —
+   * in a frame whose own sunlit ground manages R-B +13.6. He is not merely
+   * "less warm than the reference"; he is the least saturated object in his own
+   * scene.
+   *
+   * `probes/r8c/chroma.js` reads the LINEAR hdr buffer instead of the encoded
+   * PNG (the tone curve's toe compresses a 27% linear ratio into two display
+   * counts down at these levels, which is why the PNG understates it), splits
+   * the player by geometric N.L, and ablates each candidate term in place:
+   *
+   *   population          R/B linear
+   *   player, shaded          1.271     <- 163k px, i.e. most of the character
+   *   player, lit             1.641
+   *   ground, shaded          1.549
+   *   ground, lit             1.317
+   *   MGSV Snake, shaded      1.95   (and MGSV's ground beside him: 1.97)
+   *
+   * Two facts fall out of that table. First, in the real game the character's
+   * shaded chroma and the ground's are the SAME (1.95 vs 1.97) — a soldier is
+   * not a warmer or cooler object than the desert he is standing in. Ours is
+   * 18% cooler than its own ground, which is a character defect and not a grade
+   * defect, and it is fixable here regardless of what the global warmth target
+   * does. Second, the ablations name the cause: rim -> 0 moves R/B by +0.04,
+   * envMap -> 0 by +0.03, specular ablate by +0.05, ground bounce 0.11 -> 0.30
+   * by +0.02, and `uWarmMix` 0.10 -> 0.60 by +0.38. One term carries it, and it
+   * is the one rounds 4 and 5 took from 0.80 to 0.30 to 0.10.
+   *
+   * The albedo is the other half. These were authored brown — G/R 0.85 — where
+   * olive drab and sun-bleached ripstop both measure G/R 0.92-1.02 (MGSV's own
+   * shaded vest is 1.02, i.e. green as much as red), and R/B 1.80 where a dyed
+   * cotton twill is 2.0-2.3. Every zone below is re-tinted to R/B 2.00 and
+   * G/R 0.92 AT CONSTANT LUMINANCE, so the value ladder rounds 4 and 5 measured
+   * and tuned — pouch:vest 1.20, vest:webbing 1.28, pack:pouch 1.12 — is
+   * preserved exactly and only the hue moves.
+   */
+  c[Z.JACKET] = new THREE.Vector3(0.239, 0.220, 0.120);
+  c[Z.SLEEVE] = new THREE.Vector3(0.237, 0.218, 0.118);
+  c[Z.TROUSER] = new THREE.Vector3(0.221, 0.203, 0.111);
+  c[Z.COLLAR] = new THREE.Vector3(0.209, 0.192, 0.104);
+  c[Z.SHIRT] = new THREE.Vector3(0.161, 0.148, 0.081);
   // Round 4 lifted the load-bearing kit by ~40%. Measured on the round-3
   // gameplay frame the entire character sat at sRGB G≈28 while the ground's own
   // cast shadow four metres away sat at G≈55 — i.e. the soldier was rendering
@@ -368,16 +459,46 @@ function defaultClothPalette() {
   // value STEPS between these zones are what break the panel up, so they are
   // held (vest:webbing 1.28, pouch:vest 1.20, pack:pouch 1.12) while the whole
   // ladder moves up.
-  c[Z.VEST] = new THREE.Vector3(0.152, 0.131, 0.087);
-  c[Z.WEBBING] = new THREE.Vector3(0.119, 0.101, 0.068);
-  c[Z.POUCH] = new THREE.Vector3(0.182, 0.155, 0.101);
-  c[Z.BELT] = new THREE.Vector3(0.103, 0.086, 0.059);
-  c[Z.LEATHER] = new THREE.Vector3(0.119, 0.085, 0.055);
-  c[Z.GLOVE] = new THREE.Vector3(0.091, 0.075, 0.055);
-  c[Z.KNEEPAD] = new THREE.Vector3(0.075, 0.067, 0.056);
-  c[Z.PACK] = new THREE.Vector3(0.204, 0.174, 0.112);
-  c[Z.HELMCOVER] = new THREE.Vector3(0.182, 0.157, 0.102);
-  c[Z.CAP] = new THREE.Vector3(0.169, 0.143, 0.093);
+  // Same re-tint at constant luminance: nylon kit to R/B 1.95 / G/R 0.90,
+  // leather and moulded goods left redder (2.1-2.35, G/R 0.71-0.76) because
+  // that is what tanned hide and dyed polymer actually are — a uniform hue
+  // across every zone is its own kind of tell.
+  c[Z.VEST] = new THREE.Vector3(0.148, 0.133, 0.076);
+  c[Z.POUCH] = new THREE.Vector3(0.176, 0.158, 0.090);
+  /**
+   * ROUND 8 — the DARK end of the ladder, and this is the other half of "the
+   * character is flat".
+   *
+   * Round 1 authored the whole kit at 0.013-0.05 and every critic called the
+   * result black blobs; round 4 lifted the entire ladder to fix it. What that
+   * left is a soldier whose authored albedo spans 0.102 (webbing) to 0.217
+   * (jacket) — ONE STOP AND A TENTH, end to end, for a figure carrying black
+   * nylon web gear over sun-bleached cotton, which is three and a third stops
+   * in the real world. Everything on him is the same value, so nothing on him
+   * separates from anything else, and no amount of normal-map relief fixes a
+   * missing albedo step.
+   *
+   * The fix is not to undo round 4 — it is that round 1 and round 4 were both
+   * moving the WHOLE ladder when only its ends were wrong. The garment, the
+   * carrier, the pouches and the pack stay exactly where round 4's measurement
+   * put them: they are the large areas, and they are what "black blob" was
+   * actually about. What goes down is only the narrow stuff — 25 mm tape, a
+   * belt, gloves, a holster, an eyepatch, a moulded kneepad — none of which is
+   * more than a few percent of the projected area, and all of which is
+   * genuinely near-black in every reference frame.
+   *
+   * That takes the ladder from 1.09 stops to 2.51, and it WIDENS every value
+   * step the round-4 comment above says the chest rig depends on: vest:webbing
+   * goes 1.29 -> 1.99, pouch:webbing 1.53 -> 2.36.
+   */
+  c[Z.WEBBING] = new THREE.Vector3(0.074, 0.067, 0.038);
+  c[Z.BELT] = new THREE.Vector3(0.062, 0.049, 0.029);
+  c[Z.LEATHER] = new THREE.Vector3(0.071, 0.054, 0.031);
+  c[Z.GLOVE] = new THREE.Vector3(0.047, 0.037, 0.024);
+  c[Z.KNEEPAD] = new THREE.Vector3(0.048, 0.041, 0.029);
+  c[Z.PACK] = new THREE.Vector3(0.197, 0.177, 0.101);
+  c[Z.HELMCOVER] = new THREE.Vector3(0.177, 0.160, 0.091);
+  c[Z.CAP] = new THREE.Vector3(0.162, 0.146, 0.083);
   // Snake's bandana is the one saturated accent on an otherwise khaki
   // character. Round 4 pulled it toward oxide: at R/G 5.6 it was the single
   // most saturated thing in a frame whose whole grade is built on being
@@ -395,8 +516,12 @@ function defaultClothPalette() {
   // stands 12 mm proud of a correctly-wound head, it has to be hair-coloured:
   // dark brown keratin is 0.05-0.09 diffuse reflectance, and against a 0.152
   // plate carrier that value step is the whole read of the head.
-  c[Z.HAIR] = new THREE.Vector3(0.083, 0.062, 0.043);
-  c[Z.BOOT] = new THREE.Vector3(0.147, 0.105, 0.065);
+  // ROUND 8: R/B 1.93 -> 2.45 at the same luminance. Measured on the reference,
+  // Snake's hair is the WARMEST large area on the character after the face
+  // (mgi-3 R-B +46.6, mgi-6 +22.2); ours rendered at R-B -0.3, i.e. it was the
+  // one part of the head with no hue at all.
+  c[Z.HAIR] = new THREE.Vector3(0.086, 0.062, 0.035);
+  c[Z.BOOT] = new THREE.Vector3(0.141, 0.107, 0.060);
   return c;
 }
 
@@ -1354,8 +1479,12 @@ export function makeRubberMaterial(opts = {}) {
     roughness: 0.72,
     metalness: 0.0,
     // Vulcanised rubber is a 0.045 dielectric with a broad but real lobe; a
-    // sole edge catching the sky is one of the few horizontals on a boot.
-    specularIntensity: 1.0,
+    // sole edge catching the sky is one of the few horizontals on a boot. That
+    // is carried by roughness and the default 0.04 F0 here — `specularIntensity`
+    // was set on this material for two rounds and MeshStandardMaterial has no
+    // such property, so three logged "not a property of THREE.MeshStandard
+    // Material" nine times a scene and the line did nothing. It is exactly the
+    // class of dead knob this project keeps mistaking for a control.
     envMapIntensity: 0.8,
   });
   mat.name = 'char-rubber';
