@@ -754,9 +754,29 @@ const BODY = {
     // which is a tenth of a stop and invisible under a desert sun. Compacted
     // track is soaked in fines, diesel and rubber and it is roughly 0.7x the
     // loose material either side of it — half a stop, and legible from the air.
-    vec3 dirt = uBase * (0.30 + 0.20 * n2) * (0.88 + 0.24 * n3);
+    // ROUND 11: this was 0.40x, and the paragraph above says 0.7x.
+    //
+    // (0.30 + 0.20*n2) * (0.88 + 0.24*n3) spans 0.264-0.56 and means 0.40 --
+    // 1.3 stops under the surround, not the half stop the comment argues for.
+    // Round 5 measured the previous version doing nothing at all (on/off ratio
+    // 1.00) and corrected it, and the correction went straight past the target:
+    // classic fix-forward overshoot, the failure this project's own notes warn
+    // about. Compounding it, the rut then took another 62% off the SAME pixels.
+    //
+    // The result was read as a defect for two rounds under the wrong name.
+    // TODO.md 1.3 filed it as a hard-edged black SHADOW blob and blamed the
+    // cascade texel size and a dithered PCF boundary. It is not a shadow: it
+    // survives ablating the shadow term, the cloud shade and the AO, cascade 0's
+    // depth map is empty at those pixels, a raycast up the sun finds no
+    // occluder, and it vanishes with --hide outpost-pad. It is this road. The
+    // giveaway was in the frame the whole time -- the pale stone chips lying
+    // inside the "shadow" are exactly as bright as the ones outside it.
+    //
+    // Now centred on 0.70x, which is what the reasoning above actually asks
+    // for, with the rut cut to a groove rather than a second darkening pass.
+    vec3 dirt = uBase * (0.60 + 0.20 * n2) * (0.88 + 0.24 * n3);
     c = mix(c, dirt, corridor * 0.78);
-    c *= 1.0 - 0.62 * rut;
+    c *= 1.0 - 0.26 * rut;
     // Spoil pushed up by the tyre and left standing on the rut's outer lip. It
     // is the pale line immediately beside the dark one that makes a rut read as
     // a GROOVE rather than as a painted stripe.
@@ -824,6 +844,11 @@ const BODY = {
 
     // SPILL. Oil, diesel and hydraulic fluid under everything that is parked or
     // decanted here: near-black, and far smoother than the ground it soaks.
+    // NOTE: lifting this floor (0.030 -> 0.086) and its blend (0.86 -> 0.62)
+    // was tried against the black band on the ground shot and moved it by 0.2
+    // of a code, so oil is not what paints that band and the change is reverted
+    // rather than kept on aesthetics I could not demonstrate. See the block
+    // above the vehicle-corridor dirt term for what the band actually is not.
     float oilN = max(spill, smoothstep(0.25, 0.75, oil * (0.55 + 0.9 * n3)));
     c = mix(c, vec3(0.030, 0.028, 0.026), oilN * 0.86);
     // SCORCH. The opposite material to spill — a burn scar is bone dry and

@@ -376,7 +376,31 @@ async function main() {
   // Every blind A/B against real MGSV frames so far was run with a debug
   // overlay in shot, which is a handicap the renderer never earned. It is a
   // harness concern, not a game one: a player still gets the card.
-  await page.evaluate(() => document.getElementById('controls-card')?.remove());
+  await page.evaluate(() => {
+    document.getElementById('controls-card')?.remove();
+    // And the boot overlay, which is the real reason the vista shot has never
+    // been reproducible.
+    //
+    // #boot is a full-screen #0a0b0c panel that fades out over a 420 ms CSS
+    // opacity transition and is NEVER removed from the DOM. `ready` and the
+    // fade start together, so the first screenshot of a run lands inside it.
+    // readPixels reads the CANVAS; page.screenshot() composites the PAGE. That
+    // is the whole discrepancy: in-page readPixels of the identical sequence
+    // gave 154.16 twelve times out of twelve, while six screenshot runs gave
+    // 154.1, 154.1, 133.1, 154.1, 146.7, 154.2 -- always dimmer, never
+    // brighter, a continuum rather than two states. canvas*(1-a) + 10*a
+    // predicts 146.9 / 139.7 / 133.2 at a = 0.05 / 0.10 / 0.145 against 146.7 /
+    // 139.3 / 133.1 measured.
+    //
+    // I diagnosed this wrong first and it is worth recording why: I blamed the
+    // volumetric pass's temporal history, "fixed" it by resetting that history,
+    // and made the 8-frame case WORSE (spread 30 against 8.6) because the reset
+    // starts the haze cold. Every symptom fitted -- it only bit the shots
+    // dominated by distance haze, because those are the ones whose FIRST shot
+    // is the establishing frame. The shot that is dimmed is simply the first
+    // one taken, and vista is first in every batch.
+    document.getElementById('boot')?.remove();
+  });
 
   if (opts.mode === 'eval') {
     const src = await readFile(path.resolve(opts.probe), 'utf8');
