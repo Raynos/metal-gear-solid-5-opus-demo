@@ -169,8 +169,11 @@ export class Input {
   }
 
   requestLock() {
-    if (!this.enabled) return;
-    if (!this.pointerLocked && !this.automation) return;
+    if (!this.enabled || this.pointerLocked) return;
+    // Automation drives look without a lock, so do not even ask for one —
+    // headless chromium answers with pointerlockerror, which main.js records
+    // as a page error and fails the whole run.
+    if (this.automation) return;
     // Chromium rejects a lock request that is not user-gesture driven; calling
     // it from a mousedown handler is the only reliable path. Modern Chrome
     // returns a promise for it, and an unhandled rejection is recorded by
@@ -253,7 +256,11 @@ export class Input {
   }
 
   _onMouseMove(e) {
-    if (!this.pointerLocked) return;
+    // Automation mode accepts deltas without the lock. Headless chromium
+    // refuses requestPointerLock, and gating look on it meant an automated run
+    // could press keys but never turn the camera — which is the entire reason
+    // playtest probes were launching headful windows over somebody's desktop.
+    if (!this.pointerLocked && !this.automation) return;
     this._lookX -= e.movementX * this.mouseSensitivity;
     this._lookY -= e.movementY * this.mouseSensitivity * (this.invertY ? -1 : 1);
   }
