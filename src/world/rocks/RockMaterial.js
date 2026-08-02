@@ -276,10 +276,25 @@ export function createRockMaterial() {
   // uRockDeep is also lifted 23% in luminance. It is the target of the cavity
   // mix, and with the round-5 varnish on top of it a third of every clast pixel
   // was landing under 0.40 of its own ground — charcoal, not limestone.
+  //
+  // ROUND 8 measured the real game instead of arguing from the palette, and the
+  // ramp's chroma turns out to be right — mgi-8's lit rock slab renders at lin
+  // 0.490/0.367/0.204 (R/B 2.40) and mgi-1's far rock at 0.291/0.225/0.131
+  // (2.22), which is exactly this ramp. So the light and dark ends do not move.
+  //
+  // The DEEP end does, by -20%. Round 5's lift was made against a "charcoal, not
+  // limestone" read; the nine reference frames say the failure we are actually in
+  // is the opposite one — black point 16-28 against 8.2, p0.1 32-59 against 18.4,
+  // 6.0 stops against 7.31. uRockDeep is the target of the cavity mix, i.e. it is
+  // the material inside every crack and under every overhang in the near field,
+  // and it is the only thing in this module that can put a genuinely dark pixel
+  // beside a sunlit one at conversational distance. 0.149 luminance is a stained,
+  // shaded limestone cavity; the round-3 disaster value was 0.117 flat across
+  // whole bodies, which is a different mistake at a different scale.
   mat.userData.uniforms = {
     uRockLight: { value: new THREE.Vector3(0.534, 0.440, 0.299) },  // 1.79 buff
     uRockDark: { value: new THREE.Vector3(0.370, 0.291, 0.192) },   // 1.93 tan
-    uRockDeep: { value: new THREE.Vector3(0.280, 0.208, 0.128) },   // 2.19 stain
+    uRockDeep: { value: new THREE.Vector3(0.230, 0.160, 0.086) },   // 2.67 stain
     uRockRed: { value: new THREE.Vector3(0.48, 0.302, 0.198) },     // 2.42 iron
     uSand: { value: new THREE.Vector3(...PALETTE.sandLight) },
     // Wind dust is *lighter and warmer* than the sand it came from: the fine

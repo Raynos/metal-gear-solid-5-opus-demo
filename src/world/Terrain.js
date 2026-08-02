@@ -2349,11 +2349,34 @@ export class Terrain {
       uClipCentre: { value: new THREE.Vector2(0, 0) },
       uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.5) },
       uDip: { value: new THREE.Vector2(DIP_X, DIP_Z) },
-      uSandLight: { value: C(0.605, 0.548, 0.472) },  // R/B 1.28
-      uSandMid: { value: C(0.470, 0.416, 0.352) },    // 1.34
-      uSandDark: { value: C(0.325, 0.282, 0.240) },   // 1.35
-      uSilt: { value: C(0.640, 0.586, 0.510) },       // 1.25
-      uGravel: { value: C(0.372, 0.328, 0.290) },     // 1.28
+      // ROUND 8 — MEASURED AGAINST THE REAL GAME, not against a target invented
+      // here. Nine direct-feed MGSV frames put the whole print at 21.7% HSV
+      // saturation; ours measured 15.4%, i.e. 29% under, and a grade cannot
+      // invent chroma a grey source never had. Sampling the reference frames'
+      // GROUND specifically is worse than the frame average says:
+      //   mgi-9 bleached sand   lin 0.545/0.438/0.274  R/B 1.99  sat 26.6%
+      //   mgi-8 lit rock slab   lin 0.490/0.367/0.204  R/B 2.40  sat 32.9%
+      //   mgi-1 far rock        lin 0.291/0.225/0.131  R/B 2.22  sat 31.0%
+      //   mgi-3 red dirt slope  lin 0.167/0.107/0.040  R/B 4.20  sat 50.5%
+      // Ours rendered at R/B 1.70 and 21.7% on sunlit sand — and that already
+      // includes the beam's own R/B 1.26, so the ALBEDO was doing almost none of
+      // it. These ratios are ~1.7-2.0 on sand and rock, ~2.8 on the iron stain,
+      // which lands the rendered ground inside the reference's range instead of
+      // two thirds of the way to neutral.
+      //
+      // The second axis is RANGE. The frame measured 6.0 stops against 7.31, and
+      // the vista 4.32, because every terrain material sat inside one narrow
+      // band: silt 0.592 down to varnish 0.085 is 2.8 stops of albedo for the
+      // entire landscape. Real desert carries genuinely bright (bleached quartz
+      // sand, gypsum crust) against genuinely dark (manganese varnish, damp
+      // drainage, mineral staining). Silt goes up, the dark ends go down, and the
+      // span is now 3.7 stops. Mean luminance moves about -5%, which is the right
+      // direction anyway: our median printed 129.7 against the reference's 111.
+      uSandLight: { value: C(0.672, 0.560, 0.396) },  // R/B 1.70 sun-bleached
+      uSandMid: { value: C(0.478, 0.398, 0.276) },    // 1.73
+      uSandDark: { value: C(0.286, 0.226, 0.144) },   // 1.99 iron-stained
+      uSilt: { value: C(0.715, 0.628, 0.472) },       // 1.51 the pale end
+      uGravel: { value: C(0.330, 0.272, 0.188) },     // 1.76
       // Round 5 measured the distant ranges rendering BRIGHTER than the sky
       // directly above them, which no unlit surface can do. Two owners share
       // that error: the volumetrics owner is cutting fog extinction, and this
@@ -2368,19 +2391,28 @@ export class Terrain {
       // also where the measurement lands: the ridge stops out-reading the sky it
       // is silhouetted against without the haze owner having to carry the whole
       // correction in extinction.
-      uRockLight: { value: C(0.175, 0.162, 0.146) },  // 1.20  (was 0.318)
-      // The dark end moves less. It is already at limestone-in-shadow and taking
-      // it down by the same factor makes every gorge charcoal, which is the exact
-      // crushed-shadow failure four rounds of light transport exist to prevent.
-      uRockDark: { value: C(0.140, 0.126, 0.113) },   // 1.24  (was 0.198)
-      uRockRed: { value: C(0.238, 0.177, 0.150) },    // 1.59 iron stain
-      uVarnish: { value: C(0.098, 0.082, 0.076) },    // 1.29
+      // Round 8 holds this luminance (0.168 against 0.164) and spends the change
+      // entirely on chroma: R/B 1.20 -> 1.74. A weathered limestone face is not
+      // grey, it is buff, and at 1.20 the biggest single surface in every wide
+      // shot was contributing almost nothing to the frame's measured saturation.
+      uRockLight: { value: C(0.198, 0.164, 0.114) },  // 1.74  (was 0.175 @ 1.20)
+      // The dark end DOES move now. Round 7 held it up on the argument that
+      // taking it down makes every gorge charcoal — but the frames came back with
+      // a black point of 16-28 against the reference's 8.2, so "charcoal" was
+      // never the failure mode we were actually in. Shadowed limestone with a
+      // manganese wash photographs at 0.09-0.12.
+      uRockDark: { value: C(0.118, 0.094, 0.068) },   // 1.74
+      uRockRed: { value: C(0.276, 0.170, 0.100) },    // 2.76 iron stain
+      // Manganese-black is genuinely black: rock varnish measures 0.04-0.07
+      // reflectance. This is the darkest material in the landscape and it is what
+      // gives a wide shot a deep-shadow tail without crushing a cast shadow.
+      uVarnish: { value: C(0.058, 0.047, 0.042) },    // 1.38
       // The scree/gravel apron on the PAN is not the same material as a cliff
       // face and must not follow bedrock down: the pan is loose, dust-coated,
       // freshly turned-over clasts and it is what the near-field ground is made
       // of. It used to borrow uRockLight, so the round-7 bedrock cut would have
       // taken 0.55x out of the valley floor as well.
-      uGravelClast: { value: C(0.318, 0.294, 0.266) },
+      uGravelClast: { value: C(0.372, 0.322, 0.240) },
       uDbg: { value: new THREE.Vector4(1, 1, 1, 1) },
       /**
        * Second ablation hook: (pavement lag layer, mid-field albedo swing,
@@ -2560,6 +2592,10 @@ export class Terrain {
           vec2 unrot(vec2 p, vec2 sc) { return vec2(p.x * sc.x + p.y * sc.y, -p.x * sc.y + p.y * sc.x); }
           #define ROT_C vec2(0.6, 0.8)
           #define ROT_B vec2(-0.28, 0.96)
+          // Round 8. Two more rotations, for the REGIONAL tone taps — the 45 m to
+          // 900 m band that had no field in it at all. See region/sub below.
+          #define ROT_R vec2(0.88, -0.475)
+          #define ROT_S vec2(-0.71, -0.704)
           // Two more rotations for the mid-field pavement taps. They read the
           // same tile as the near-field grit at 3.6x and 11x, and a scaled copy
           // of a field read on the SAME axes beats against its own source into
@@ -2731,6 +2767,26 @@ export class Terrain {
             vec4 D  = mix(dB, mix(dC, dA, 0.55 * sA), (0.34 + 0.55 * max(nearW, sC * 0.86)) * max(sC, sA * 0.5));
             D = mix(vec4(0.5), D, max(sB, max(sC, sA)));
 
+            // --- the regional band --------------------------------------------
+            // Round 8. The tonal fields this shader had were macro (900 m, from
+            // the bake), mid (11-45 m) and D.a (4.6 m). Nothing between 45 m and
+            // 900 m — which is the entire scale a wide shot is COMPOSED of. That
+            // gap is why the vista measured 4.32 stops against the reference's
+            // 7.31 while carrying plenty of texture: the frame had detail at every
+            // scale a pixel could resolve and no VALUE difference between one
+            // hillside and the next. In mgi-3 and mgi-8 adjacent massifs differ by
+            // most of a stop and change hue with it; that is a mineral-zoning and
+            // weathering-history signal, and it is the biggest carrier of range in
+            // a real landscape frame.
+            //
+            // Two taps on the detail tile stretched to 240 m and 82 m, each on its
+            // own rotation (the octave-correlation rule that applies to every other
+            // tap here applies to these). Read off world XZ, not baseUV, because a
+            // regional field belongs to the map and must not climb a cliff face
+            // with the wall projection.
+            float region = TEXDETAIL(rot(vWPos.xz, ROT_R) * (1.0 / 240.0) + vec2(0.19, 0.63)).a;
+            float sub    = TEXDETAIL(rot(vWPos.xz, ROT_S) * (1.0 / 82.0) + vec2(0.55, 0.07)).a;
+
             // --- material weights --------------------------------------------
             // Break the boundaries with the mid-scale mottle so nothing reads as
             // a smoothstep on slope.
@@ -2864,7 +2920,14 @@ export class Terrain {
             // settle where the water slows, so the trunk washes floor out in
             // pale wind-sorted silt while the steep incised heads stay dark and
             // stony. Physically-motivated boundaries, not a noise threshold.
-            vec3 gully = mix(albedo * 0.74, uGravel * 1.05, 0.45);
+            // Round 8: 0.74 -> 0.56. An incised drainage head is the darkest
+            // ground in a desert frame — damp at depth, organically stained, and
+            // permanently shaded by its own walls — and this is the only channel
+            // in the shader whose geometry puts genuinely dark material into the
+            // MID field, where the black point is set. It is a thin, branching,
+            // physically-placed network, so it costs the frame's dark tail
+            // without touching its median.
+            vec3 gully = mix(albedo * 0.56, uGravel * 0.92, 0.50);
             gully *= 0.9 + D.g * 0.28;
             albedo = mix(albedo, gully, flowW * (1.0 - trunkW) * 0.60);
             albedo = mix(albedo, mix(uSilt, uSandLight, 0.4), trunkW * 0.62);
@@ -2879,8 +2942,49 @@ export class Terrain {
             // value; round 6 added mid at half the swing it needed. The mean is
             // unchanged (1.04) — this only widens the spread, so nothing in the
             // exposure calibration moves.
-            albedo *= (0.78 + macro * 0.22 + mid * 0.30 + (D.a - 0.5) * 0.16) * uDbg2.y
+            // Round 8 adds region (240 m) and sub (82 m) and rebalances so the
+            // mean is unchanged at 1.04 — nothing in the exposure calibration
+            // moves — while the SPREAD goes from 0.78-1.38 (0.82 stops) to
+            // 0.55-1.51 (1.46 stops). Every one of those extra stops lands at a
+            // scale a wide shot can actually see.
+            //
+            // The base term is 0.55 and not 0.60 because these two fields do NOT
+            // have a mean of 0.5. Measured with the black/white authority hook
+            // (probes/r8_spread.js), region and sub read a mean of 0.612 and
+            // 0.594 over the vista's mid band, so a 0.60 base put the modulation's
+            // own mean at 1.09 and quietly added 5% of exposure to the entire
+            // landscape. Assuming a noise field is centred is exactly the kind of
+            // thing that has to be measured rather than reasoned about.
+            albedo *= (0.55 + macro * 0.16 + region * 0.26 + sub * 0.22
+                            + mid * 0.24 + (D.a - 0.5) * 0.16) * uDbg2.y
                     + 1.04 * (1.0 - uDbg2.y);
+            // Mineral zoning as HUE, not only as value. Two end members — a cool
+            // grey-buff limestone/marl and a hot iron-oxide ochre — swung by the
+            // 240 m field, so one massif is ochre and the one behind it is buff.
+            // R/B between the ends is 1.53x. The mean of the pair is (1.01, 0.98,
+            // 0.95), i.e. very slightly warm, so this raises the frame's measured
+            // saturation without acting as a filter laid over every pixel — which
+            // is exactly the difference between mineral zoning and a grade.
+            albedo *= mix(vec3(0.92, 0.97, 1.10), vec3(1.10, 0.99, 0.80),
+                          smoothstep(0.25, 0.78, region * 0.78 + sub * 0.22));
+
+            // Deflation surface: the flat, dry, wind-scoured part of the pan
+            // bleaches. mgi-9's open ground reads lin 0.545 against its own
+            // shadowed ground at 0.234, and our vista put only 2.68% of the frame
+            // over 230 against the reference's 9.7%. This is where the bright end
+            // comes from — it is gated off the drainage and off any slope, so it
+            // paints the deflation lag and nothing else.
+            // The shoulder is set against the driving expression's actual
+            // distribution, not against a guess: sub * 0.50 + region * 0.34 +
+            // (D.a - 0.5) * 0.30 has a mean of 0.42 and a maximum of 0.99, so the
+            // 0.60-0.93 shoulder this started at fired on under a tenth of the
+            // pan and the frame's 99th percentile went DOWN, not up. 0.46-0.78
+            // puts the bleached lag on roughly a quarter of the flat ground,
+            // which is what a deflation surface looks like from the air.
+            float bleach = smoothstep(0.46, 0.78, sub * 0.50 + region * 0.34 + (D.a - 0.5) * 0.30)
+                         * (1.0 - rockW) * (1.0 - flowW)
+                         * (1.0 - smoothstep(0.06, 0.20, slope));
+            albedo = mix(albedo, uSilt * 1.16, bleach * 0.62);
 
             // --- near-field grit ----------------------------------------------
             // At 4 m the player must see individual stones, not a noise field.
@@ -3190,6 +3294,31 @@ export class Terrain {
                 albedo = mix(albedo, mix(uSilt, uSandDark, smoothstep(-0.26, 0.26, crest)),
                              rippleW * 0.13);
               }
+            }
+
+            // Mask read-out, not a look. uDbg2.w is 0 in the shipped build; a
+            // probe sets it to a mask index and the frame becomes that mask as a
+            // greyscale albedo, so "how much of the vista's massif is drawn as
+            // bedrock" is a pixel measurement rather than an opinion. This exists
+            // because round 8 started by *assuming* the ranges were sand-coloured
+            // because rockW was low there, and the assumption was worth 20 minutes
+            // to check instead of an afternoon to tune against.
+            // Modes 6 and 7 are not masks: they force the albedo to black and to
+            // white. The pair measures the terrain's AUTHORITY over a band of the
+            // frame — everything between the two readings is what albedo can
+            // possibly control, and everything under the black reading is
+            // atmospheric inscatter that no material change can touch. Round 8
+            // used it to find out why widening the albedo range from 0.82 to 1.38
+            // stops moved the vista's spatial variance by 3%.
+            if (uDbg2.w > 0.0) {
+              float m = uDbg2.w < 1.5 ? rockW
+                      : uDbg2.w < 2.5 ? screeW
+                      : uDbg2.w < 3.5 ? region
+                      : uDbg2.w < 4.5 ? sub
+                      : uDbg2.w < 5.5 ? flowW
+                      : uDbg2.w < 6.5 ? 0.0
+                      : 1.0;
+              albedo = vec3(m);
             }
 
             diffuseColor.rgb *= albedo * 0.80;
