@@ -2797,6 +2797,11 @@ export class Terrain {
           // chance of the A and the B differing in anything else.
           uniform vec4 uDbg;
           uniform vec3 uGravelClast;
+          // Playa fines. Only the traffic block reads it, to mix the "beaten
+          // ground" colour of a worn path; the declaration lives here because
+          // the palette rework that landed alongside the traffic block did not
+          // carry it and the shader failed to compile without it.
+          uniform vec3 uSilt;
           uniform vec4 uDbg2;
           uniform vec4 uDbg3;
           uniform vec3 uSoilA;

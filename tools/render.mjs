@@ -259,6 +259,38 @@ async function main() {
 
   const errors = [];
   const page = await browser.newPage({ viewport: { width: opts.width, height: opts.height }, deviceScaleFactor: 1 });
+
+  /**
+   * Cap console arguments INSIDE the page, before they reach CDP.
+   *
+   * One undeclared uniform used to take the whole harness down with
+   * `ERR_STRING_TOO_LONG` out of playwright's pipe transport, and the stack
+   * pointed at node's Buffer.toString rather than at anything in this project —
+   * so the failure mode of a one-word GLSL typo was a render tool that looked
+   * broken. three.js logs the ENTIRE annotated shader source on a compile
+   * failure, our terrain shader is ~3000 lines, and it re-logs on every frame
+   * for every material that failed: past 512 MB in a single CDP message the
+   * transport cannot even turn it into a string.
+   *
+   * Truncating here rather than in the `console` handler is deliberate — by the
+   * time a handler runs, the oversized message has already been through the
+   * pipe. 2 KB is enough to carry three.js's header and its first `ERROR: 0:NNN`
+   * line, which is the part that names the bug.
+   */
+  await page.addInitScript(() => {
+    const CAP = 2048;
+    const cap = (a) => {
+      try {
+        const s = typeof a === 'string' ? a : String(a);
+        return s.length > CAP ? `${s.slice(0, CAP)}…[+${s.length - CAP} chars truncated]` : s;
+      } catch { return '<unstringifiable>'; }
+    };
+    for (const k of ['log', 'warn', 'error', 'info', 'debug']) {
+      const orig = console[k].bind(console);
+      console[k] = (...args) => orig(...args.map(cap));
+    }
+  });
+
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('response', async (r) => {
