@@ -17,6 +17,13 @@
  *    MEDIAN of the per-pair differences with the IQR beside it. Drift that is
  *    slow relative to one pair cancels; drift that is not shows up as IQR.
  *
+ *    Pairing 20-frame BLOCKS was tried first and was not enough — blocks sit
+ *    ~600 ms apart and the drift spikes inside that. Measured with block
+ *    pairing, the same configuration against itself had an IQR of 7.25 ms on a
+ *    27 ms frame and a bias of -3.95 ms: by this probe's own rule that run was
+ *    void, and not one pass was resolvable. Pairing at the FRAME (two frames
+ *    ~30 ms apart) is what made the instrument work.
+ *
  * 2. IT PRINTED NUMBERS THE INSTRUMENT CANNOT RESOLVE. A cost is only reported
  *    if |median| > IQR. Otherwise this prints "below noise" and the noise floor,
  *    because "bloom costs 0.4 ms" and "bloom costs nothing measurable" are
