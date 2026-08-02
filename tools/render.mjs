@@ -198,6 +198,7 @@ function parseArgs(argv) {
     else if (a === '--hide') o.hide = (o.hide ?? []).concat(argv[++i].split(','));
     else if (a === '--cinematic') o.cinematic = true;
     else if (a === '--aim') { o.aim = true; o.cinematic = true; }
+    else if (a === '--ablate') o.ablate = (o.ablate ?? []).concat(argv[++i].split(','));
     else if (!a.startsWith('--')) o.shots.push(a);
   }
   return o;
@@ -536,6 +537,10 @@ async function main() {
   // gap, not a rendering one. This drops into play, holds aim until the blend
   // has actually converged, and shoots that.
   const aiming = !!opts.aim;
+  // --ablate <flag>[,<flag>]: shoot with pipeline.enabled.<flag> forced false.
+  // "Which PASS draws that?" is the same question --hide answers for meshes,
+  // and it has already overturned one two-round-old diagnosis today.
+  const ablate = opts.ablate ?? [];
 
   const outDir = path.resolve(ROOT, opts.dir);
   await mkdir(outDir, { recursive: true });
@@ -552,12 +557,17 @@ async function main() {
   for (const name of wanted) {
     const t = Date.now();
     const meta = await page.evaluate(
-      ({ name, frames, cine, aim }) => {
+      ({ name, frames, cine, aim, abl }) => {
         const g = window.__GAME;
         const s = g.applyShot(name);
         if (cine) {
           const pipe = g.engine.pipeline;
           if (pipe?.enabled) { pipe.enabled.dof = true; pipe.enabled.motionBlur = true; }
+        }
+        for (const f of abl || []) {
+          if (g.engine.pipeline?.enabled && f in g.engine.pipeline.enabled) {
+            g.engine.pipeline.enabled[f] = false;
+          }
         }
         if (aim) {
           // Hold the aim key, exactly as a player does. There is no settable
@@ -586,7 +596,7 @@ async function main() {
         g.settle(pinned && pinned.volumetrics ? Math.max(frames, 32) : frames);
         return { note: s.note, tod: s.tod, pinned, stats: g.stats() };
       },
-      { name, frames: opts.frames, cine: cinematic, aim: aiming },
+      { name, frames: opts.frames, cine: cinematic, aim: aiming, abl: ablate },
     );
     const file = path.join(outDir, `${name}.png`);
     await writeFile(file, await page.screenshot({ type: 'png' }));
