@@ -966,7 +966,12 @@ export class RenderPipeline {
     this.prepRT = this._rt(w, h);
     this.taaA = this._rt(w, h);
     this.taaB = this._rt(w, h);
-    this.dofRT = this._rt(w, h);
+    // Half resolution. The gather is the most expensive post pass in the
+    // frame (2.5-3.3 ms full-res) and its output is, by definition, blurred —
+    // the one pass where resolution buys least. Sharpness is preserved by the
+    // composite, which blends this in by the alpha written above rather than
+    // replacing the frame with it.
+    this.dofRT = this._rt(Math.max(2, w >> 1), Math.max(2, h >> 1));
     this.compositeRT = this._rt(w, h);
 
     this.bloomRTs = [];
@@ -1023,7 +1028,7 @@ export class RenderPipeline {
     this.prepRT.setSize(w, h);
     this.taaA.setSize(w, h);
     this.taaB.setSize(w, h);
-    this.dofRT.setSize(w, h);
+    this.dofRT.setSize(Math.max(2, w >> 1), Math.max(2, h >> 1));
     this.compositeRT.setSize(w, h);
     this.aoRT.setSize(w, h);
     this.aoBlurRT.setSize(w, h);
@@ -2397,7 +2402,17 @@ export class RenderPipeline {
 
         // Sub-pixel defocus is not defocus, it is a soft filter over a sharp
         // image. Anything under the floor passes through untouched.
-        if (coc < uCoCFloor && velPix < 0.8) { gl_FragColor = vec4(centre, 1.0); return; }
+        // ALPHA IS THE BLEND WEIGHT, not opacity.
+        //
+        // This pass now renders at HALF resolution (see dofRT), which is where
+        // its cost went — measured 2.5-3.3 ms at full res, the largest single
+        // post item in the frame. Half res is only safe because the composite
+        // keeps the full-resolution sharp image wherever this pass says it did
+        // nothing: a is 0 for a pixel that took the early-out and 1 for a pixel
+        // that actually gathered, and the bilinear upsample of a gives a clean
+        // ramp across the boundary. Without that, running at half res would
+        // soften the in-focus majority of the frame, which is most of it.
+        if (coc < uCoCFloor && velPix < 0.8) { gl_FragColor = vec4(centre, 0.0); return; }
         coc = max(coc - uCoCFloor * 0.5, 0.0);
 
         float rot = ign(gl_FragCoord.xy + uFrame * 3.7) * 6.2831853;
@@ -2470,6 +2485,8 @@ export class RenderPipeline {
       uniform sampler2D tBloom;
       uniform sampler2D tStreak;
       uniform sampler2D tDirt;
+      uniform sampler2D tDof;
+      uniform float uDofOn;
       uniform sampler2D tLUT;
       uniform sampler2D tAdapt;
       uniform sampler2D tDepth;
@@ -2701,6 +2718,18 @@ export class RenderPipeline {
           color = texture2D(tDiffuse, duv).rgb;
         }
 
+        // Fold in the half-resolution defocus/motion gather.
+        //
+        // Its alpha is how much blur it actually produced, so an in-focus pixel
+        // keeps the full-resolution sharp read above and only genuinely
+        // defocused pixels take the upsampled version. Doing it here rather
+        // than by swapping tDiffuse is the whole reason the pass can run at
+        // half res without softening the frame.
+        if (uDofOn > 0.0) {
+          vec4 dofS = texture2D(tDof, duv);
+          color = mix(color, dofS.rgb, clamp(dofS.a, 0.0, 1.0));
+        }
+
         float avgLum = exp(texture2D(tAdapt, vec2(0.5)).r);
         float autoScale = mix(1.0, clamp(uKeyValue / max(avgLum, 1e-4), uExposureClamp.x, uExposureClamp.y), uAutoExposure);
         float exposure = uExposure * autoScale;
@@ -2813,6 +2842,8 @@ export class RenderPipeline {
         tDiffuse: { value: null },
         tBloom: { value: null },
         tStreak: { value: null },
+        tDof: { value: null },
+        uDofOn: { value: 0 },
         tDirt: { value: this.dirt },
         tLUT: { value: this.lut },
         tAdapt: { value: null },
@@ -3223,7 +3254,12 @@ export class RenderPipeline {
     // ---- 8. composite ----
     this._mark('composite');
     const u = this.compositeMat.uniforms;
-    u.tDiffuse.value = wantDof ? this.dofRT.texture : resolved.texture;
+    // tDiffuse is now ALWAYS the sharp full-resolution source. The defocus
+    // pass rides in through tDof at half res and is blended by its own alpha,
+    // so the frame is no longer routed through a half-res buffer wholesale.
+    u.tDiffuse.value = resolved.texture;
+    u.tDof.value = wantDof ? this.dofRT.texture : null;
+    u.uDofOn.value = wantDof ? 1 : 0;
     // `compositeFetch` off binds the 1x1 default instead of the half-res
     // half-float bloom and streak targets, WITHOUT changing anything the bloom
     // block does. That separates "the composite reads two big textures" from

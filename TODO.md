@@ -62,40 +62,72 @@ band changed.
 
 ## 1. Performance
 
-**The frame is `7.8 ms fixed + 18.7 ms per-pixel` at native 1920x1080.** A
-two-point fit over render scale predicts both middle scales to within 0.2 ms:
+**The frame is GPU-bound and the scene render is the biggest item in it.**
+Sim CPU is 0.2 ms; render submit blocks ~26 ms on back-pressure.
 
-| scale | pixels | measured | model |
-| --- | --- | --- | --- |
-| 1.00 | 1.000 | 26.44 | — |
-| 0.85 | 0.722 | 21.05 | 21.25 |
-| 0.70 | 0.490 | 16.94 | 16.92 |
-| 0.55 | 0.303 | 13.43 | — |
+An independent audit re-measured this and **my round-11 numbers below the line
+were wrong by about 2x on the largest item.** Three instruments had to be fixed
+before any figure could be trusted, and all three are worth knowing about:
 
-**Round 9's TODO said the target was "the main pass's per-pixel cost" at 58-70%
-of the frame. That is wrong.** The whole scene into the HDR target is 6.8-8.8 ms
-— roughly a quarter — and 548 draws and 5.5 M triangles rasterise inside it.
-Draw count and triangle count are both well over their stated budgets and
-cutting them would buy nothing.
+- **GPU timer queries are unusable on ANGLE Metal.** `EXT_disjoint_timer_query_webgl2`
+  billed 317.7 ms of "GPU" inside a 24 ms frame, and a 64x64 luminance blit read
+  15 ms. Each query eats a command-buffer boundary, so results scale with blit
+  COUNT, not work. This is almost certainly the historical "timer query 6x off".
+- **The M3 Pro's power governor invalidates any light-config measurement.** An
+  identical scene-only config read 4.7 ms after a heavy block and 16.1 ms after
+  a light one, and six extra fullscreen blits cost zero. Fix: give every config
+  constant **ballast** (extra fullscreen blits) so clock state cancels in the
+  differences. `probes/a12_ballast.js`. **This is why my 6.8-8.8 ms figure for
+  the scene was half the truth** — it was measured on a light config, at
+  governor speed.
+- **`setRenderScale` plus skipped passes poisons the raster with NaN.**
+  Reallocation leaves uninitialised half-float targets and the in-scene
+  volumetric quad samples them with blending. Clear every target on config change.
 
-What is priced, with null controls:
+| pass | ms | note |
+| --- | --- | --- |
+| **scene into HDR, total** | **12.4-15.2** | ~6.1 per-pixel shading, 1.75 shadow re-raster, ~5-7 vertex/draw |
+| DOF + motion blur | 2.5-3.3 | measured three ways; I had said 0.89 |
+| AO pass | 2.2-2.9 | — |
+| volumetric blits | 1.5-1.9 | plus 0.6 for the in-scene quad and particles |
+| bloom | 0.8-1.7 | I had said below noise; wrong at the top of the band |
+| composite | 0.5-0.7 | — |
+| present/FXAA, prep, luminance chain | ~1 combined | — |
 
-| | cost |
-| --- | --- |
-| occlusion pass (SSAO + micro + contact) | 2.46 ms |
-| volumetrics, whole module | 2.5 ms (cumulus march 1.68, its light march 0.89) |
-| DOF + motion blur pass | 0.89 ms, at the block spread |
-| bloom, all of it | below noise |
-| composite CA / LUT / grain | each below a 0.57 ms floor |
+**The "~12 ms hides in the unflagged passes" theory is dead.** Those five passes
+total ~1.5-2 ms. The missing time was the scene itself.
 
-**~12 ms of the per-pixel half is still unattributed.** It is not bloom, not the
-composite's features, not volumetrics. It is in the passes with no `enabled[]`
-flag — prep, the 6-level luminance chain, adaptation, composite, present/FXAA —
-and nobody has built a switch for them. That is the next person's first job.
+**Ranked cuts, with expected savings:**
+1. DOF/MB gather at half res — ~2-2.5 ms. **Done**, see below.
+2. Scene shading + geometry — ~2-3 ms available, never optimised because
+   everyone believed it was 7 ms total. Needs its own round.
+3. AO at half res with depth-aware upsample — ~1.5 ms, costs the 2-3 px contact band.
+4. Shadow cascades on alternate frames — ~0.9 ms, sun is static, low risk.
+5. Volumetric march half to quarter res — ~0.8 ms.
+6. Fuse composite + present — only ~0.4-0.5 ms. Feeding the luminance chain from
+   a bloom mip is worth nothing: the whole chain is 0.3 ms.
 
-**60 FPS at native needs per-pixel cut from 18.7 ms to 8.9 ms.** Better than
-half, in a chain whose expensive members have no switches. That is pass fusion
-and full-resolution work removal, not tuning.
+**Is 16.7 ms at native reachable? Not by post-chain work alone, and that is
+arithmetic.** Post in its entirety is ~10-11 ms, so deleting every effect except
+composite and present still leaves ~15-16 ms of scene — at budget with nothing
+switched on. Cuts 1+3+4+5+6 total ~6-7 ms and land at ~18-19 ms (53-55 FPS).
+Reaching 60 needs 2-3 ms out of the scene render as well. If the scene is
+untouchable the honest answer is no; the cheapest visible sacrifices per
+millisecond are DOF resolution (barely visible), then AO resolution (visible up
+close), then volumetric resolution.
+
+Near 16.7 ms the governor begins downclocking, so savings will **not** stack
+linearly. Measure every cut back to back with ballast, never a light config bare.
+
+**Cut 1 is landed.** The DOF/motion-blur gather runs at half resolution and the
+composite blends it by an alpha the pass writes (0 on its early-out, 1 where it
+actually gathered), so the full-resolution sharp read survives everywhere the
+pass did nothing. Verified with a positive control: forcing the blend to 1
+drops in-focus high-frequency energy 47%, while the shipped path drops 0.9%.
+**The saving itself is NOT yet measured** — every attempt landed on a contended
+machine (block spreads 12-26 ms against a 3.4 ms null control) and resizing the
+target at runtime to A/B it stalls worse than the effect. Measure it on a quiet
+machine with `probes/r12_frame.js`, run on both builds back to back.
 
 `motionBlur` is **inert** — rms 0.103 against a 0.224 liveness threshold.
 

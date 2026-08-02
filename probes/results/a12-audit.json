@@ -1,0 +1,27 @@
+{
+  "what": "Round-12 audit: where the 'missing ~12 ms' of the per-pixel half actually is. Instruments: probes/a12_ballast.js, a12_scene2.js, a12_cpu.js (a12_gpu.js and the resize-based probes are kept as documentation of instrument failures).",
+  "instrumentFailuresFound": {
+    "timerQueries": "EXT_disjoint_timer_query_webgl2 on ANGLE Metal bills each query a command-buffer boundary: 317.7 ms of 'GPU' in a 24 ms frame, a 64x64 blit billed 15 ms. Unusable; do not build on r8_gpu.js.",
+    "dvfs": "The M3 Pro downclocks under light GPU load. An identical scene-only config read 4.7 ms right after a heavy block and 16.1 ms right after a light one; 6 extra fullscreen blits cost 0. Any wall-clock measurement of a LIGHT configuration measures the power governor, not the work. Fix: constant fullscreen-blit ballast in every config so clocks cancel in differences; ballast priced in-run (0.26-0.47 ms/blit depending on session).",
+    "uninitializedTargets": "setRenderScale reallocates targets; a skipped pass then leaves NaN-dense uninitialized half-float memory that in-scene samplers (volumetric composite quad) read with blending, wrecking the raster. Scene-only at 0.55 scale read SLOWER than at 1.0 until targets were explicitly cleared."
+  },
+  "sessionFrameMsNative": "22.9-26.4 across sessions (moving camera, 1920x1080); r11_fill's 26.44 is in-band",
+  "cpu": { "stepAloneMs": 0.2, "renderSubmitP50Ms": 26.1, "reading": "frame is GPU-bound; submit blocks on back-pressure; CPU is irrelevant" },
+  "decompositionMsAtNative": {
+    "sceneIntoHdrTotal": "12.4-15.2 (two sessions; ~14 typical) — NOT the 6.8-8.8 in TODO.md",
+    "scenePerPixelShare": 6.1,
+    "sceneShadowCascadeRaster": 1.75,
+    "sceneRemainingFixed": "~5-7 (vertex/raster/draw overhead; CPU excluded by a12_cpu)",
+    "inSceneVolumetricQuadAndParticles": 0.63,
+    "aoPass": "2.2-2.9",
+    "volBlits": "1.5-1.9 (full-res depth linearise alone: below noise)",
+    "dofMotionBlurPass": "2.5-3.3 (measured 3 ways; r11's 0.89 was wrong)",
+    "bloomAll": "0.8-1.7 (r11's 'below noise' wrong at least at the top of this band)",
+    "composite": "0.5-0.7",
+    "presentFxaaBlit": "0.4 +/- 0.4 (shader arithmetic itself below noise)",
+    "prepBlit": "below noise (<= 0.5)",
+    "lumChainPlusAdapt": "~0.3 (targets are 64/16/4/1 px, not full-res)",
+    "closure": "base + sum of marginals predicted 33.99 vs measured 32.14 (session 1), 31.48 vs 31.63 (session 2), with 0.16-0.5 ms null controls"
+  },
+  "verdictOnTodoSection1": "The '~12 ms is in the unflagged passes (prep, luminance, adaptation, composite, present)' belief is FALSE: those five together cost ~1.5-2 ms. The unattributed time is the scene render itself (~14 ms, double the number r11 booked) plus under-measured DOF (~3 not 0.89) and bloom (~1 not 0)."
+}
