@@ -55,10 +55,14 @@ export const DEFAULT_BINDINGS = {
   steady:     ['ShiftLeft', 'Pad10'],
   cqc:        ['KeyF', 'Pad0'],
   cover:      ['KeyG', 'Pad3'],
-  drag:       ['KeyR', 'Pad4'],
+  // R is reload and T is drag, not the other way round. Every shooter made in
+  // the last twenty years puts reload on R, and reload is a verb a player uses
+  // every fight while dragging a body is one they use a handful of times a run.
+  // The acceptance probe pressed R for reload and reported the weapon broken.
+  drag:       ['KeyT', 'Pad4'],
   stow:       ['KeyQ', 'Pad5'],
   swapShoulder: ['KeyV', 'Pad11'],
-  reload:     ['KeyT', 'Pad8'],
+  reload:     ['KeyR', 'Pad8'],
   // Keyboard look, for trackpads. Held, not tapped.
   lookLeft:   ['ArrowLeft'],
   lookRight:  ['ArrowRight'],
