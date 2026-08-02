@@ -129,6 +129,29 @@ freeze every shadow map, render (that is the scene alone), then unfreeze exactly
 one cascade and render again. No instrumentation inside three, and it cannot
 drift.
 
+The first run of it (gameplay, 1920x1080, afternoon) says the shadow pass is
+**bigger than the scene it shadows**:
+
+| | draws | triangles |
+| --- | --- | --- |
+| scene, shadows excluded | 242 | 2.31 M |
+| cascade 0 (56 m extent, 2.7 cm texels) | 168 | 1.29 M |
+| cascade 1 (162 m, 7.9 cm) | 172 | 1.33 M |
+| cascade 2 (705 m, 34.4 cm) | 180 | 1.38 M |
+| all three in one frame | 520 | 4.01 M |
+
+Two things fall out of that. Each cascade draws essentially the *same* caster
+set — 168 / 172 / 180 — so three's own frustum cull against the shadow camera is
+rejecting almost nothing between them; the near cascade is drawing the whole
+world into a 56 m box. And cascade 2 rasterises 1.38 M triangles into a map whose
+texel is 34 cm, where nothing under a metre across can survive.
+
+The amortised cost is what the refresh schedule buys: over `[1,2,4]` it was 299
+shadow draws per frame, over `[1,3,6]` it is 260. Note that the >3 m camera-move
+guard in `Lighting.update()` forces every cascade to refresh, so the schedule's
+saving lands on standing and slow movement — which, in a stealth game, is most of
+the play time — and not on a sprint.
+
 `casterreach.js` sweeps `Lighting.casterReach` — how far up-sun a caster can be
 and still be drawn — reporting draws, triangles **and the pixel difference
 against the baseline**, so a saving is never bought with a shadow that quietly
