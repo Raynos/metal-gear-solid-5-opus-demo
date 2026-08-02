@@ -1506,6 +1506,31 @@ export class RenderPipeline {
         // the horizon search actually resolves the 2-3 pixel contact band.
         float pixPerMetre = uProjScale.y * uResolution.y * 0.5 / max(-P.z, 0.05);
         float pixRadius = uRadius * pixPerMetre;
+        // FADE the broad term when its own radius stops being resolvable,
+        // exactly as the micro term below already does.
+        //
+        // This is the mountain chevron banding, and it was blamed on the
+        // terrain for two rounds. TODO 2.3 pointed at the Jacobi thermal pass,
+        // the droplet brush and _smoothFlats' 25 degree slope gate; removing
+        // that gate entirely changes nothing, six full re-bakes with the whole
+        // erosion stack off change nothing, and a plain Lambert hillshade of
+        // the heightfield shows a clean mountain. Ablating THIS pass removes
+        // the banding outright -- high-pass RMS across the massif drops 1.110
+        // to 0.810 against a null control of 1.111.
+        //
+        // The mechanism is the clamp on the next line. At a kilometre the
+        // 1.15 m world radius projects to about one pixel and is clamped UP to
+        // three, so the horizon search stops measuring occlusion and starts
+        // measuring local slope and depth quantisation -- which is why the
+        // pattern follows the contours of the landform instead of lying on it.
+        //
+        // Clamping up is right for the WORK (a search still has to have a
+        // width); what was missing is that the RESULT has to be faded out over
+        // the same range, or the pass reports confident occlusion derived from
+        // a measurement it could not make. The micro term got this right and
+        // the broad term never had it.
+        float pixRadiusRaw = pixRadius;
+        float broadFade = smoothstep(1.5, 3.0, pixRadiusRaw);
         pixRadius = clamp(pixRadius, 3.0, 52.0);
 
         // Micro search. The raw projection decides whether the feature exists on
@@ -1546,7 +1571,10 @@ export class RenderPipeline {
           float hA = -1.0;   // cos of the horizon on the -omega side
           float hB = -1.0;   // cos of the horizon on the +omega side
 
-          for (int k = 0; k < STEPS; k++) {
+          // Skip the 24-tap search where its result is about to be faded to
+          // nothing. Distant pixels are most of a wide frame, so this is the
+          // rare fix that removes an artefact and work at the same time.
+          if (broadFade > 0.0) for (int k = 0; k < STEPS; k++) {
             float t = (float(k) + offset) / float(STEPS);
             t = t * t;                      // bias samples toward the centre
             vec2 off = omega * t * pixRadius * texel;
@@ -1616,6 +1644,8 @@ export class RenderPipeline {
         }
 
         float ao = clamp(visibility / float(SLICES), 0.0, 1.0);
+        // Unoccluded where the search could not resolve its own radius.
+        ao = mix(1.0, ao, broadFade);
         float micro = clamp(microVis / float(SLICES), 0.0, 1.0);
         micro = mix(1.0, micro, microFade);
 
