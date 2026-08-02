@@ -1632,9 +1632,49 @@ export class RenderPipeline {
           if (microFade > 0.0) {
             float mA = -1.0;
             float mB = -1.0;
+            // DETERMINISTIC sampling, unlike the broad term above.
+            //
+            // This is the paisley moire on the near pan — the last of four
+            // artefacts this one pass has turned out to own. Ablating microAO
+            // removes the weave from the ground outright and leaves everything
+            // else in the frame alone.
+            //
+            // The mechanism is the same unpaid debt as the shadow flicker:
+            // "they rely on TAA and on the per-frame IGN rotation for the rest
+            // of their denoising" (see the blur below) — and TAA was switched
+            // off for FXAA rounds ago, then round 12 froze uFrame to stop the
+            // flicker. A 24-tap estimator rotated by interleaved gradient noise
+            // is then sampled once, never averaged, and IGN's own diagonal
+            // structure is printed straight into the image. Its beat period is
+            // ~7 px against a 0.9 px micro blur kernel, so nothing downstream
+            // touches it.
+            //
+            // With no temporal filter, a FIXED sample pattern beats a jittered
+            // one: every pixel integrates the same three directions, so there
+            // is no per-pixel variance left to show as a pattern. What it costs
+            // is directional bias, and at a 16 cm radius that is not resolvable
+            // — the sandbag seams this term exists for are unchanged. It costs
+            // no taps and no time.
+            // The whole slice basis is rebuilt on the fixed direction, not just
+            // the tap offsets: the visibility integral below is one-dimensional
+            // IN the slice plane, so sampling along one direction and
+            // integrating against another's projected normal is simply wrong.
+            // No extra taps — the taps are what this pass costs.
+            float mphi = (float(s) + 0.37) * PI_ / float(SLICES);
+            vec2 momega = vec2(cos(mphi), sin(mphi));
+            vec3 msliceN = cross(vec3(momega, 0.0), V);
+            float mlen = length(msliceN);
+            if (mlen >= 1e-5) {
+            msliceN /= mlen;
+            vec3 mprojN = N - msliceN * dot(N, msliceN);
+            float mprojLen = length(mprojN);
+            vec3 mtangent = cross(V, msliceN);
+            float mcosN = clamp(dot(mprojN, V) / max(mprojLen, 1e-6), -1.0, 1.0);
+            float mn = sign(dot(mprojN, mtangent)) * acos(mcosN);
+            float msinN = sin(mn);
             for (int k = 0; k < MICRO_STEPS; k++) {
-              float t = (float(k) + offset) / float(MICRO_STEPS);
-              vec2 off = omega * t * microPix * texel;
+              float t = (float(k) + 0.5) / float(MICRO_STEPS);
+              vec2 off = momega * t * microPix * texel;
               for (int side = 0; side < 2; side++) {
                 vec2 suv = side == 0 ? vUv + off : vUv - off;
                 float sd = texture2D(tDepth, suv).x;
@@ -1652,11 +1692,12 @@ export class RenderPipeline {
                 if (side == 0) mB = max(mB, cosH); else mA = max(mA, cosH);
               }
             }
-            float m1 = n + max(-acos(clamp(mA, -1.0, 1.0)) - n, -HALF_PI);
-            float m2 = n + min( acos(clamp(mB, -1.0, 1.0)) - n,  HALF_PI);
-            microVis += projNLen * 0.25 * (
-                (m1 * 2.0 * sinN - cos(2.0 * m1 - n)) +
-                (m2 * 2.0 * sinN - cos(2.0 * m2 - n)) + 2.0 * cos(n));
+            float m1 = mn + max(-acos(clamp(mA, -1.0, 1.0)) - mn, -HALF_PI);
+            float m2 = mn + min( acos(clamp(mB, -1.0, 1.0)) - mn,  HALF_PI);
+            microVis += mprojLen * 0.25 * (
+                (m1 * 2.0 * msinN - cos(2.0 * m1 - mn)) +
+                (m2 * 2.0 * msinN - cos(2.0 * m2 - mn)) + 2.0 * cos(mn));
+            }
           }
         }
 

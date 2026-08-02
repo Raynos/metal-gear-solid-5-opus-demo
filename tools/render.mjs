@@ -169,6 +169,12 @@ function parseArgs(argv) {
       else if (a === '--frames') o.filmFrames = +argv[++i];
       else if (a === '--every') o.filmEvery = +argv[++i];
       else if (a === '--speed') o.filmSpeed = +argv[++i];
+      // --hide and --ablate were parsed for stills only, and film returns here
+      // before the still parser ever sees them. Every temporal defect in
+      // TODO.md is therefore the one class this project cannot ask "which mesh
+      // draws that" about — the question that has overturned five diagnoses.
+      else if (a === '--hide') o.hide = (o.hide ?? []).concat(argv[++i].split(','));
+      else if (a === '--ablate') o.ablate = (o.ablate ?? []).concat(argv[++i].split(','));
       else if (!a.startsWith('--')) o.shots.push(a);
     }
     return o;
@@ -450,6 +456,29 @@ async function main() {
       // integrating float error over a hundred frames.
       window.__FILM = { p: eng.camera.position.clone(), q: eng.camera.quaternion.clone(), t: 0 };
     }, name);
+    const filmHidden = await page.evaluate(
+      ({ hide, abl }) => {
+        const g = window.__GAME;
+        const names = [];
+        for (const f of abl || []) {
+          if (g.engine.pipeline?.enabled && f in g.engine.pipeline.enabled) g.engine.pipeline.enabled[f] = false;
+        }
+        if (hide?.length) {
+          g.world.scene.traverse((o) => {
+            if (!(o.isMesh || o.isInstancedMesh || o.isPoints)) return;
+            const tag = ((o.name || '') + ' ' + (o.material?.name || '')).toLowerCase();
+            if (hide.some((s) => tag.includes(s.toLowerCase()))) { o.visible = false; names.push(o.name || '(unnamed)'); }
+          });
+        }
+        return names;
+      },
+      { hide: opts.hide ?? [], abl: opts.ablate ?? [] },
+    );
+    if (opts.hide?.length) {
+      console.log(`hidden: ${filmHidden.length} mesh(es) matching ${opts.hide.join(',')}`);
+      if (!filmHidden.length) console.error('  WARNING: nothing matched — the film below is unmodified');
+    }
+    if (opts.ablate?.length) console.log(`ablated: ${opts.ablate.join(',')}`);
     const digits = String(opts.filmFrames).length;
     for (let i = 0; i < opts.filmFrames; i++) {
       await page.evaluate(
