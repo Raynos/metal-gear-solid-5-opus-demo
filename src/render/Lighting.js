@@ -239,6 +239,8 @@ uniform sampler2D uAmbAOMap;
 uniform vec4 uAmbAO;
 uniform vec4 uAmbScreen;
 uniform vec3 uAmbBounce;
+/** LIGHT_TRANSPORT.groundAlbedo — what the pocket a surface stands in is made of. */
+uniform vec3 uAmbGround;
 // The cloud deck's numbers survive in the material because .z is the
 // terminator roll-in width, which the key light needs; the deck's own weather
 // sampler does not, because the cloud shade now arrives in uAmbAOMap.a.
@@ -277,9 +279,22 @@ const AMB_APPLY = /* glsl */ `
 			// light that leaves a crevice wall lands on the opposite wall and
 			// comes back out, and sand is bright enough for that to matter — a
 			// crevice in sand at ao 0.5 is only about a stop down, not two.
-			vec3 ambA = 2.0404 * diffuseColor.rgb - 0.3324;
-			vec3 ambB = -4.7951 * diffuseColor.rgb + 0.6417;
-			vec3 ambC = 2.7552 * diffuseColor.rgb + 0.6903;
+			// ROUND 11: the fit is authored against the surface's OWN albedo,
+			// which is right for a crease in one material and wrong for the case
+			// that actually crushes in this game. The pixels that measure black
+			// are DARK objects standing in a pocket of BRIGHT SAND — the
+			// underside of a canvas awning, the shade face of a crate, the belly
+			// of a barrel. The light filling those pockets has bounced off the
+			// desert floor, not off the tarp, so scoring the bounce by the tarp's
+			// own 0.06 albedo says "no light comes back" when a metre of lit sand
+			// is right there. Score it against a blend instead, never darker than
+			// the fragment's own albedo so nothing bright can lose contrast.
+			// uAmbGround is LIGHT_TRANSPORT.groundAlbedo — the same number the SH
+			// probe's ground hemisphere is built from, so the two cannot disagree.
+			vec3 ambAlb = mix( diffuseColor.rgb, max( diffuseColor.rgb, uAmbGround ), 0.6 );
+			vec3 ambA = 2.0404 * ambAlb - 0.3324;
+			vec3 ambB = -4.7951 * ambAlb + 0.6417;
+			vec3 ambC = 2.7552 * ambAlb + 0.6903;
 			vec3 ambMB = max( vec3( ambVis ), ( ( ambVis * ambA + ambB ) * ambVis + ambC ) * ambVis );
 			ambMB = clamp( mix( vec3( 1.0 ), ambMB, uAmbAO.y ), 0.0, 1.0 );
 			irradiance *= ambMB;
@@ -404,6 +419,16 @@ export const SHARED_UNIFORMS = {
    * shadow map says is lit gets the whole warm kick and one in shade gets none.
    */
   uAmbBounce: { x: 0, y: 0, z: 0 },
+  /**
+   * Albedo of the ground the world is standing on, read by the multi-bounce
+   * fit in AMB_APPLY. Constant, but it lives here rather than being baked into
+   * the GLSL so it stays one number with the SH probe's ground hemisphere.
+   */
+  uAmbGround: {
+    x: LIGHT_TRANSPORT.groundAlbedo[0],
+    y: LIGHT_TRANSPORT.groundAlbedo[1],
+    z: LIGHT_TRANSPORT.groundAlbedo[2],
+  },
 };
 
 /**
@@ -568,6 +593,60 @@ const AMBIENT = {
    * flatter ratio, not a darker sky.
    */
   nightKeyFill: 2.10,
+  /**
+   * Key:fill in DAYLIGHT, overriding LIGHT_TRANSPORT.keyFillLow/keyFillHigh.
+   *
+   * ROUND 11 — the fix for "shadows read as black holes", which is what a round
+   * sent to chase hard-edged shadow blobs actually found once the blobs turned
+   * out not to be shadows at all (they are outpost-pad's vehicle corridor; see
+   * probes/r11_blob2.js).
+   *
+   * Measured on the `ground` frame by ablating getShadowCSM to 1.0 and
+   * differencing, so "shadowed" is the set of pixels the shadow term itself
+   * darkens rather than a box drawn by eye. 3.8% of that frame is genuinely in
+   * cast shadow, and it sits at a MEDIAN of -3.62 stops under lit ground, with
+   * its 25th percentile at -6.30 stops reading RGB (14,13,12) and its bottom
+   * percentile at (4,4,5). The shadow term is removing 3.08 stops at the median
+   * — which is not a bug in the filter, it is exactly what keyFillHigh = 8.6
+   * asks for. The number is the defect.
+   *
+   * 8.6:1 is a CLEAR-SKY number and LIGHT_TRANSPORT says so in as many words:
+   * "~9:1 overhead (direct beam carries ~89% of the illuminance)". 89% direct
+   * is a clean atmosphere. This game is not set in one — `skyTurbidity` runs
+   * well above clear, ARCHITECTURE.md calls the aerial perspective "very
+   * strong", and the whole visual target is a hazy, high-key desert where
+   * "shadows are lifted, cool, and full of bounced sky light — never crushed to
+   * black". In dusty air at a 68 degree sun the diffuse fraction is roughly a
+   * fifth, not a ninth, so the honest overhead ratio is nearer 5.5:1.
+   *
+   * Measured through probes/r11_shadowtone.js, the ramp's own output is exactly
+   * log2(ratio) stops between lit and shaded: noon 3.07 -> 2.43, afternoon
+   * 2.28 -> 1.77, dusk and night untouched. In the PRINT the gain is smaller,
+   * because the shadowed population sits low on the tone curve and the grade's
+   * black pedestal eats most of it: the crate's shade face in `gameplay` goes
+   * +0.26 stops relative to lit sand, the barrel bodies +0.25.
+   *
+   * It CANNOT change the shadow's hue: the calibration applies one scalar to
+   * all nine SH coefficients (see the key:fill block below), and the ambient's
+   * blue/red is unmoved at 2.12 (noon) and 2.65 (afternoon).
+   *
+   * It also cannot move the exposure. `_updateExposure` reads
+   * `atmosphere.skyRadiance`, which is `hazeRadiance` — deliberately the
+   * un-rescaled sky-only term, for exactly this reason.
+   *
+   * The low-sun end is left alone at 1.6:1. At a grazing sun the sky has
+   * already taken over, `ridge` is the one dusk frame and `night` has its own
+   * override, so both come out of this bit-identical inside the noise floor
+   * (change 0.073 and 0.201 mean against a same-build rerun floor of 1.5).
+   *
+   * WHAT THIS DOES NOT FIX. A fully ENCLOSED pocket — the sand under the
+   * arch canvas in `ground` — is still RGB (10,10,10) and neutral. Lifting the
+   * fill 1.7x moved it 1.16x, because at that level the print is almost all
+   * pedestal and almost no signal. Getting a cool colour into a pocket that
+   * deep is a grade problem, not a fill problem, and the grade is
+   * RenderPipeline's. Left rather than cranked until something else broke.
+   */
+  dayKeyFill: [1.6, 5.5],
 };
 
 /**
@@ -638,6 +717,7 @@ function installCSMChunks() {
     lib.uniforms.uAmbAO = { value: SHARED_UNIFORMS.uAmbAO };
     lib.uniforms.uAmbScreen = { value: SHARED_UNIFORMS.uAmbScreen };
     lib.uniforms.uAmbBounce = { value: SHARED_UNIFORMS.uAmbBounce };
+    lib.uniforms.uAmbGround = { value: SHARED_UNIFORMS.uAmbGround };
   }
 
   // Diffuse irradiance now comes from the sky SH light probe. Leaving the
@@ -998,7 +1078,13 @@ export class Lighting {
     };
 
     /** Sweepable ambient-transport knobs; see the AMBIENT block up top. */
-    this.ambientModel = { ...AMBIENT, nearBand: AMBIENT.nearBand.slice() };
+    // Arrays are copied so a tool sweeping one number cannot write through into
+    // the module constant and poison every Lighting built afterwards.
+    this.ambientModel = {
+      ...AMBIENT,
+      nearBand: AMBIENT.nearBand.slice(),
+      dayKeyFill: AMBIENT.dayKeyFill.slice(),
+    };
     this._ao = null;
 
     this.setTimeOfDay('afternoon');
@@ -1310,7 +1396,12 @@ export class Lighting {
       // to ~9:1 overhead (direct beam carries ~89% of the illuminance), so the
       // ramp now spans the whole range of solar elevations.
       const t = THREE.MathUtils.smoothstep(cosKey, 0.04, 0.90);
-      ratio = LT.keyFillLow + (LT.keyFillHigh - LT.keyFillLow) * t;
+      // AMBIENT.dayKeyFill wins if present, the same way nightKeyFill does for
+      // the night presets. See its comment for the measurement.
+      const dk = AM.dayKeyFill;
+      const lo = dk ? dk[0] : LT.keyFillLow;
+      const hi = dk ? dk[1] : LT.keyFillHigh;
+      ratio = lo + (hi - lo) * t;
     }
     const targetUp = lum3(eKey) / Math.max(ratio - 1, 0.25);
     const rawUp = Math.max(lum3(eUp), 1e-6);
