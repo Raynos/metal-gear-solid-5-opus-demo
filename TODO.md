@@ -19,6 +19,14 @@ agents produced **27 chromium processes and 6.8 GB**.
 
 - `shot.mjs` should `connect()` via `shotd-client`, and fall back to a private
   browser only when no daemon is running.
+- **It is simpler than it looks**: the daemon already writes the PNGs and
+  `report.json` itself (`shotd.mjs:677`), so the client does not transfer image
+  bytes. It POSTs `{root, shots, out, width, height}` to `/shot`, or
+  `{root, src, args}` to `/eval`, and prints the JSON reply. Roughly 40 lines.
+- Keep the fallback loud, not silent: if the daemon is absent or its source hash
+  does not match this tree, print WHY before falling back. A machine quietly
+  melting because every agent spawned its own browser is the failure this whole
+  section exists to prevent, and it was invisible for hours.
 - Start the daemon in its own herdr pane, from main: `node tools/shotd.mjs --idle 600`
 - Move that pane: `herdr pane move <id> --new-tab --workspace w5` (bare
   `--workspace` is not valid syntax — that is why the earlier move failed).
