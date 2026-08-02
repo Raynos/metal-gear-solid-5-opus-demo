@@ -72,8 +72,12 @@ From Adrian Courrèges' frame teardown, https://www.adriancourreges.com/blog/201
 - **SSAO is a hybrid**: line-integral SSAO (5 taps) + scalable ambient obscurance
   (11 taps), both half-res, combined in a compute shader.
 - **Diffuse GI at half resolution**, bilaterally upscaled against full-res depth.
-- **FXAA, not TAA.** Our TAA measured as the most expensive pass; the real game
-  does not use it.
+- **FXAA, not TAA.** The real game does not use TAA. *(The claim that used to sit
+  here — "our TAA measured as the most expensive pass" — was an artefact of the
+  broken ruler: it timed the baseline once and each variant in sequence on a
+  machine that drifts 2x within a run, so the drift was charged to whichever pass
+  ran last. Re-measured with paired adjacent frames, the TAA blit is at or below
+  the noise floor. See `tools/probes/README.md`.)*
 - Bloom: 4 iterations of Kawase blur at quarter res, bright-pass keyed off HDR
   luminance stored in the alpha channel.
 - DOF: sprite-scatter per pixel with CoC-sized disks, accumulated at 1/2, 1/4,

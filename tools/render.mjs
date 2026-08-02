@@ -38,6 +38,92 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import path from 'node:path';
+
+/**
+ * Installed into the page as `window.__pinDeterminism()` and run immediately
+ * before every `settle()`.
+ *
+ * `settle()` in main.js already rewinds the pipeline frame counter (TAA jitter
+ * phase, AO rotation, grain seed) and `engine.elapsed`. That is not sufficient:
+ * several things integrate their own clock and survive a settle, so a shot
+ * depended on how many frames the page happened to have drawn before it.
+ *
+ * Measured (tools/probes/determinism.js, gameplay, 640x360 centre window), two
+ * captures of the same shot with a camera excursion between them:
+ *
+ *   nothing pinned                        rms 5.20   max 134 codes   85% of pixels
+ *   what settle() pins today              rms 2.53   max 108         33%
+ *   + character animation clocks          rms 1.10   max  42         28%
+ *   + shadow cascade refresh phase        rms 0.77   max  33         25%
+ *   + TAA and exposure history, 32 frames rms 0.23   max   9          4%
+ *
+ * The dominant term is `src/characters/anim.js`: every `Animator` seeds `t`,
+ * `phase` and `breath` from `Math.random()` and integrates them forever, so the
+ * garrison and its cast shadows were in a different pose in every run. An 11x
+ * drop in the noise floor is the difference between "this A/B shows no visual
+ * change" being a finding and being unfalsifiable.
+ *
+ * Defensive throughout — a tree where a module failed to install still shoots.
+ */
+const PIN_SRC = `
+window.__pinDeterminism = function () {
+  const g = window.__GAME;
+  if (!g) return { pinned: false };
+  const eng = g.engine;
+  const pipe = eng.pipeline;
+  const out = { animators: 0, taa: false, exposure: false, shadows: false };
+
+  const list = g.world && g.world.registry && g.world.registry.characters
+    ? g.world.registry.characters.characters : null;
+  if (Array.isArray(list)) {
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i] && list[i].anim;
+      if (!a) continue;
+      // Fixed but per-index, so the crowd does not idle in lockstep.
+      a.t = 7.31 * i + 3.5;
+      a.phase = (0.6180339887 * (i + 1)) % 1;
+      a.breath = 2.17 * i + 1.1;
+      a.hitTime = 1e3;
+      if (a.loco) {
+        a.loco.smoothSpeed = a.loco.speed || 0;
+        a.loco.stanceBlend = a.loco.stance === 'crouch' ? 1 : 0;
+        a.loco.proneBlend = a.loco.stance === 'prone' ? 1 : 0;
+      }
+      a.bobY = 0;
+      if (a.weaponSway && a.weaponSway.set) a.weaponSway.set(0, 0, 0);
+      if (a.weaponSwayVel && a.weaponSwayVel.set) a.weaponSwayVel.set(0, 0, 0);
+      if (a.lookBlend && a.lookBlend.set) a.lookBlend.set(0, 0);
+      out.animators++;
+    }
+  }
+
+  if (pipe) {
+    const r = eng.renderer;
+    // The history flag alone is not enough: it stops the NEXT frame reading
+    // history, but the buffers still hold the previous shot's image and are
+    // read again from frame 2 on.
+    if ('_historyValid' in pipe) { pipe._historyValid = false; out.taa = true; }
+    for (const name of ['taaA', 'taaB', 'adaptA', 'adaptB']) {
+      const rt = pipe[name];
+      if (!rt) continue;
+      r.setRenderTarget(rt);
+      r.clear(true, false, false);
+      if (name === 'adaptA') out.exposure = true;
+    }
+    r.setRenderTarget(null);
+  }
+
+  // Cascades 1+ refresh on a schedule keyed to a free-running counter, so which
+  // ones are fresh depended on the page's frame count.
+  const lighting = g.world && g.world.lighting;
+  if (lighting && typeof lighting.invalidateShadows === 'function') {
+    lighting.invalidateShadows();
+    out.shadows = true;
+  }
+  return out;
+};
+`;
+
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -152,6 +238,7 @@ async function main() {
     await cleanup(2);
   }
   const loadMs = Date.now() - tLoad;
+  await page.evaluate(PIN_SRC);
 
   if (opts.mode === 'eval') {
     const src = await readFile(path.resolve(opts.probe), 'utf8');
@@ -185,8 +272,11 @@ async function main() {
       ({ name, frames }) => {
         const g = window.__GAME;
         const s = g.applyShot(name);
+        // Pin AFTER the pose is set (invalidateShadows wants the final camera)
+        // and before settle, so the frame is a function of the source alone.
+        const pinned = window.__pinDeterminism ? window.__pinDeterminism() : null;
         g.settle(frames);
-        return { note: s.note, tod: s.tod, stats: g.stats() };
+        return { note: s.note, tod: s.tod, pinned, stats: g.stats() };
       },
       { name, frames: opts.frames },
     );

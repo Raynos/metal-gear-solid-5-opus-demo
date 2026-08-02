@@ -877,32 +877,51 @@ export class Lighting {
     // visibly along a 40 m shadow instead of staying pin-sharp.
     this.lightAngularSize = LIGHT_TRANSPORT.sunAngularSize;
 
-    // Per-cascade shadow map resolution, near to far.
-    //
-    // Every cascade used to run at the full 2048, which is three 2048 maps
-    // rasterised from the whole scene — 12.6 M shadow texels per full refresh
-    // for a 2 MP frame. The texel footprints that buys are absurd at the far
-    // end: cascade 0 fits a ~40 m box, so 2048 is a 2 cm texel, while cascade 2
-    // fits ~400 m and 2048 is 20 cm. The contact hardening this project is
-    // judged on lives entirely in cascade 0 (its penumbra search is 11 texels =
-    // ~22 cm there), so the near map keeps its resolution and the outer two are
-    // stepped down to what their own footprint justifies: 1536 gives cascade 1
-    // a ~7 cm texel and 1024 gives cascade 2 a ~40 cm one, at 88-380 m where
-    // aerial perspective has already washed the shadow edge out.
-    const S = QUALITY.shadowMapSize;
-    const mapSizes = [S, Math.round(S * 0.75), Math.round(S * 0.5), Math.round(S * 0.5)];
+    // Every cascade gets a full-size map. A round tried 2048/1536/1024 to buy
+    // milliseconds and it leaked: a roofed interior at ~200 m in the vista shot
+    // went from L=80.6 to 105.7 (+31%) — daylight through a roof — while
+    // controls in the same frame moved ~1 code. A 1536 map over cascade 1's
+    // 160 m extent is a 10.5 cm texel, and a 10 cm gap in a roof is exactly the
+    // hole light came through. The refresh schedule below is where the
+    // measurable saving actually was, and it costs no resolution at all.
+    const mapSizes = [QUALITY.shadowMapSize, QUALITY.shadowMapSize, QUALITY.shadowMapSize, 1024];
     // How often each cascade is re-rendered, in frames. The far cascades cover
     // hundreds of metres and are snapped to a coarse texel grid, so refreshing
     // them every frame costs a full scene draw for a result that is bit-identical
-    // most of the time. Staggering the phases keeps any single frame cheap.
-    // Phases are chosen so no two outer cascades ever land on the same frame.
+    // most of the time. Measured (tools/probes/cascades.js, gameplay, 1080p):
+    // the scene itself is 242 draws / 2.31 M triangles, and the three cascades
+    // add 520 draws / 4.01 M triangles on a frame where they all refresh — the
+    // shadow pass is bigger than the scene it shadows. Amortised over [1,2,4]
+    // that was 299 shadow draws a frame; over [1,3,6] it is 255.
     //
-    // 2/4 -> 3/6: at 60 fps a mid cascade refreshed every third frame is 50 ms
-    // of lag on a shadow 30-90 m away, which is below what a moving caster shows
-    // at that distance, and it takes the amortised cost of the cascade set from
-    // 1.75 scene depth passes per frame to 1.50.
+    // The >3 m camera-move guard in update() forces every cascade to refresh, so
+    // this saving lands on standing and slow movement, not on a sprint. In a
+    // stealth game that is most of the play time.
+    //
+    // Phases are chosen so no two cascades above 0 ever land on the same frame:
+    // cascade 1 fires at f mod 3 == 1, cascade 2 at f mod 6 == 3 (which is
+    // always f mod 3 == 0), cascade 3 at f mod 12 == 5 (f mod 3 == 2,
+    // f mod 6 == 5). No frame ever pays for two cascade refits at once.
     this.refreshInterval = [1, 3, 6, 12];
-    this._refreshPhase = [0, 0, 2, 5];
+    this._refreshPhase = [0, 1, 3, 5];
+
+    /**
+     * How far up-sun a caster can be and still matter, in metres.
+     *
+     * The shadow camera is pushed back `radius + casterReach` along the light
+     * and its near plane sits at 1, so this is literally the depth of the
+     * column three frustum-culls casters against. It was 420 — the far edge of
+     * the terrain's shadow-casting clipmap rings measured from the CAMERA — but
+     * a cascade is fitted to a slice of the view frustum whose centre already
+     * sits well down-range, so 420 on top of that reaches hundreds of metres
+     * past anything that can cast at all.
+     *
+     * Shrinking it is free of visual consequence by construction: the PCSS
+     * penumbra uniform is `depthRange * angularSize / (2 * radius)`, a
+     * conversion from normalised depth units to UV, and normalised depth
+     * differences scale by exactly the same depthRange. The two cancel.
+     */
+    this.casterReach = 420;
 
     /** @type {THREE.DirectionalLight[]} */
     this.cascades = [];
@@ -1965,9 +1984,11 @@ export class Lighting {
       // flat across the map and every bounding sphere in the valley intersects
       // it — dusk cost 2.3 M triangles in cascade 0 alone where noon cost 0.8 M.
       // Nothing further than the terrain's shadow-casting clipmap rings (±192 m)
-      // can cast anyway, so 420 m is the honest number; beyond that the
-      // volumetric sun shadow-height field carries the kilometre-scale occlusion.
-      const dist = radius + 420;
+      // can cast anyway; beyond that the volumetric sun shadow-height field
+      // carries the kilometre-scale occlusion. `casterReach` is that number and
+      // it is also the only per-cascade caster cull available without taking the
+      // shadow pass away from three — see the field's comment.
+      const dist = radius + this.casterReach;
 
       // Snap the centre to the shadow texel grid in light space.
       t.eye.copy(t.center).addScaledVector(dir, dist);
