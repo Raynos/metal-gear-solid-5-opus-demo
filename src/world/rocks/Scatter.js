@@ -298,38 +298,6 @@ function groundPlane(terrain, x, z, r, size) {
 }
 
 /**
- * Spatial bucket for the instance groups, so an InstancedMesh covers a patch of
- * ground the frustum can reject rather than the whole annulus.
- *
- * ROUND 12. The group key was (variant, LOD, casts) and nothing else, which
- * makes every group one world-spanning mesh with one bounding sphere centred on
- * the play area — never cullable from anywhere inside it. Counted at the
- * `gameplay` pose (probes/r12_cull.js): `rockcollar_stones_r0_b0` submitted 1059
- * instances of which 171 (16.1%) were inside the camera frustum, and each of the
- * six `rock_boulders*_lod2_b1` meshes submitted ~680 of which ~200 (28%) were.
- *
- * The tile widens with the band because the bands are annuli and their area
- * grows with r^2: one tile size either fragments the far field into ten-instance
- * draws or fails to subdivide the near one. 96 / 192 / 384 m keeps every bucket
- * in the tens-to-low-hundreds and, since a CULLED mesh costs no draw call at
- * all, the count only rises inside the wedge the camera can actually see. A
- * finer 64/128/256 was tried and shot: it takes the gameplay pose to 713 draws /
- * 3.63 M triangles against this one's 587 / 3.79 M, which is 160k more triangles
- * bought with 126 more draws — the wrong side of a trade this scene does not
- * need to make.
- *
- * This deliberately partly reverses the round-11 note below about merging groups
- * that agreed on LOD and shadow state to save draws. That note is still right
- * about redundant STATE — what it got wrong is that it was trading raster and
- * vertex work, which is 5-7 ms of this frame, for submission cost, which is 0.2
- * ms of CPU across all 368 draws.
- */
-function tileKey(band, x, z) {
-  const T = band === 0 ? 96 : band === 1 ? 192 : 384;
-  return `${Math.floor(x / T)}_${Math.floor(z / T)}`;
-}
-
-/**
  * Collects instance transforms per (variant, LOD band) and turns them into
  * InstancedMeshes at the end.
  */
@@ -348,7 +316,7 @@ class Field {
    * still gets a drift that lies flat in the ground plane.
    */
   addCollar(family, ring, band, matrix, tint, x, z) {
-    const key = `${family}:${ring}:${band}:${tileKey(band, x, z)}`;
+    const key = `${family}:${ring}:${band}`;
     let g = this.collars.get(key);
     if (!g) {
       g = { family, ring, band, matrices: [], tints: [], xz: [] };
@@ -369,7 +337,7 @@ class Field {
     // of identical state. Twelve of the module's draws were that, and this scene
     // is submission-bound, so they are worth more than the triangles.
     const casts = band <= shadowBand;
-    const key = `${variant.id}:${lod}:${casts ? 'S' : 'N'}:${tileKey(band, x, z)}`;
+    const key = `${variant.id}:${lod}:${casts ? 'S' : 'N'}`;
     let g = this.groups.get(key);
     if (!g) {
       g = { variant, lod, band, casts, matrices: [], tints: [], xz: [] };

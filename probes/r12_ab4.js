@@ -14,8 +14,12 @@
  * first-position bias and any drift linear over four blocks both cancel. Ten
  * pairs, median of paired differences.
  *
- * Positive control `ballastMinus8` removes 8 of the 24 ballast blits, priced by
- * a12_ballast.js at 0.34 ms each: it must read about +2.7 ms. Read it FIRST.
+ * POSITIVE CONTROL: `aoOff`. The occlusion pass was independently measured this
+ * round at ~6.45 ms, seen in 6 of 6 reps, and it is by a distance the largest
+ * single item in the post chain. If this probe cannot see 6.45 ms it cannot see
+ * anything and the rest of the table is void. `ballastMinus8` is kept as a
+ * second, smaller control (8 blits at 0.34 ms = ~2.7 ms) so the instrument's
+ * resolution can be bracketed rather than guessed. Read both FIRST.
  */
 const g = window.__GAME;
 const eng = g.engine ?? g.world.engine;
@@ -23,7 +27,7 @@ const pipe = eng.pipeline;
 const renderer = eng.renderer;
 const gl = renderer.getContext();
 
-const WARM = 32, N = 30, PAIRS = 10, K = 24;
+const WARM = 32, N = 30, PAIRS = 12, K = 24;
 
 g.applyShot('gameplay');
 eng.deterministic = true;
@@ -32,7 +36,11 @@ pipe.enabled.dof = true;
 pipe.enabled.motionBlur = true;
 
 const inst = [];
-eng.scene.traverse((o) => { if (o.isInstancedMesh && o.frustumCulled) inst.push(o); });
+let U = null;
+eng.scene.traverse((o) => {
+  if (o.isInstancedMesh && o.frustumCulled) inst.push(o);
+  if (o.isMesh && /^terrain-L/.test(o.name || '') && o.material?.userData?.shader) U = o.material.userData.shader.uniforms;
+});
 
 const SM = Object.getPrototypeOf(pipe.prepMat).constructor;
 const VERT = 'varying vec2 vUv;\nvoid main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
@@ -79,11 +87,16 @@ function block() {
   gl.finish();
   return (performance.now() - t0) / N;
 }
-function reset() { bal = K; for (const o of inst) o.frustumCulled = true; }
+function reset() { bal = K; pipe.enabled.ssao = true; if (U) U.uPerf.value.set(0, 0, 0, 0); for (const o of inst) o.frustumCulled = true; }
 const ARMS = {
   nullB:         () => {},
+  aoOff:         () => { pipe.enabled.ssao = false; },
   ballastMinus8: () => { bal = K - 8; },
   cullOff:       () => { for (const o of inst) o.frustumCulled = false; },
+  // The ceiling on any terrain-shader work: uPerf.x replaces the entire 1200-line
+  // custom fragment body with the baked normal and a flat albedo.
+  flatTerrain:   () => { if (U) U.uPerf.value.x = 1; },
+  terrNoBedrock: () => { if (U) U.uPerf.value.y = 1; },
 };
 const med = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 function run(applyB) {
@@ -104,4 +117,4 @@ const only = (typeof ARGS !== 'undefined' && ARGS && ARGS.length) ? new Set(ARGS
 const out = {};
 for (const [k, apply] of Object.entries(ARMS)) { if (!only || only.has(k)) out[k] = run(apply); }
 reset();
-return { instancedMeshes: inst.length, note: 'ballastMinus8 must read ~+2.7 ms.', results: out };
+return { instancedMeshes: inst.length, note: 'aoOff must read ~+6.45 ms and ballastMinus8 ~+2.7 ms, or nothing here is a measurement.', results: out };

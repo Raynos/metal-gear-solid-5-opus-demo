@@ -319,22 +319,6 @@ function scatterAnnulus({ field, rng, rInner, rOuter, candidates, accept, varian
  * tier onto a coarse spatial grid costs a handful of draw calls and lets the
  * frustum discard most of the field — which is the only reason several thousand
  * distant bushes fit in the triangle budget at all.
- *
- * ROUND 12: the grid was not subdividing anything. Every caller passed a tile of
- * 500-600 m for a field 62-175 m in RADIUS, so the whole tier landed in one or
- * two buckets and the merge below then folded those into one. Counted from the
- * scene graph at the `gameplay` pose (probes/r12_cull.js), `bush-n1-2000000` was
- * a single mesh of 1635 instances of which 342 — 20.9% — were inside the camera
- * frustum, and `bush-n0` the same. Across every instanced mesh in the scene,
- * 1.03 M of 1.98 M instanced triangles were off screen and paying full vertex
- * and clip cost.
- *
- * The tiles are now sized to the field they cover (roughly a third of its
- * radius). The draw-call argument in the merge below still stands and is left
- * alone — what changed is that at 500 m it applied to the entire field, and at
- * 32-64 m it applies to the one tile that genuinely straddles the play centre.
- * A culled tile costs no draw call at all, so the count only rises inside the
- * wedge the camera can see.
  */
 function buildTiles(geo, mats, mat, depthMat, name, tile, shadowRadius = 0) {
   // Shadow casting is bucketed with the geometry, not switched per tier: a bush
@@ -455,7 +439,7 @@ export function createScrub(field, uniforms, seed = 20260731) {
     accept: (s, r) => r() < 0.004 + Math.pow(s.woody, 0.85) * 0.95,
     variants: scrubGeos, tilt: 0.5, scaleRange: [0.42, 1.72], sink: 0.05,
   });
-  scrubGeos.forEach((g, i) => add(buildTiles(g, near[i], scrubMat, scrubDepth, `scrub-n${i}`, 48, 62)));
+  scrubGeos.forEach((g, i) => add(buildTiles(g, near[i], scrubMat, scrubDepth, `scrub-n${i}`, 500, 62)));
   counts.scrubNear = near.reduce((a, b) => a + b.length, 0);
 
   // ---- massed bush clumps -------------------------------------------------
@@ -522,7 +506,7 @@ export function createScrub(field, uniforms, seed = 20260731) {
     accept: (s, r) => r() < 0.0012 + Math.pow(s.woody, 0.85) * 0.76,
     variants: bushGeoNear, tilt: 0.55, scaleRange: [0.50, 1.58], sink: 0.05,
   });
-  bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMatNear, bushDepth, `bush-n${i}`, 80, 48)));
+  bushGeoNear.forEach((g, i) => add(buildTiles(g, bushNear[i], bushMatNear, bushDepth, `bush-n${i}`, 500, 48)));
   counts.bushNear = bushNear.reduce((a, b) => a + b.length, 0);
 
   // ---- dry brush balls ----------------------------------------------------
@@ -542,7 +526,7 @@ export function createScrub(field, uniforms, seed = 20260731) {
       r() < (0.03 + (1 - s.density) * 0.34) * smooth01(s.standW, 0.42, 0.72) + s.shelter * 0.55,
     variants: brushGeos, tilt: 0.85, scaleRange: [0.42, 1.52],
   });
-  brushGeos.forEach((g, i) => add(buildTiles(g, brush[i], brushMat, brushDepth, `brush-${i}`, 80)));
+  brushGeos.forEach((g, i) => add(buildTiles(g, brush[i], brushMat, brushDepth, `brush-${i}`, 600)));
   counts.brush = brush.reduce((a, b) => a + b.length, 0);
 
   // ---- dead trees ---------------------------------------------------------
@@ -561,7 +545,7 @@ export function createScrub(field, uniforms, seed = 20260731) {
     accept: (s, r) => s.slope < 0.34 && s.density > 0.20 && r() < 0.004 + s.density * 0.075,
     variants: treeGeos, tilt: 0.35, scaleRange: [0.85, 2.55], sink: 0.08,
   });
-  treeGeos.forEach((g, i) => add(buildTiles(g, treeNear[i], treeMat, treeDepth, `tree-n${i}`, 96, 130)));
+  treeGeos.forEach((g, i) => add(buildTiles(g, treeNear[i], treeMat, treeDepth, `tree-n${i}`, 500, 130)));
 
   const treeMatFar = branchMaterial(uniforms, BRANCH_COLORS.tree, SWAY.tree, 0.84, [560, 740]);
   const treeL1 = [growPlant(deadTreeParamsL1(3901))];
@@ -572,7 +556,7 @@ export function createScrub(field, uniforms, seed = 20260731) {
     accept: (s, r) => s.slope > 0.04 && s.slope < 0.32 && s.density > 0.14 && r() < 0.004 + s.density * 0.11,
     variants: treeL1, tilt: 0.3, scaleRange: [1.05, 3.15], sink: 0.10,
   });
-  add(buildTiles(treeL1[0], treeFar[0], treeMatFar, null, 'tree-f', 256));
+  add(buildTiles(treeL1[0], treeFar[0], treeMatFar, null, 'tree-f', 560));
   counts.trees = treeNear.reduce((a, b) => a + b.length, 0) + treeFar[0].length;
 
   counts.tris = Math.round(tris);

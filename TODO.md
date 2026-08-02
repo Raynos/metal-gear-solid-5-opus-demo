@@ -167,6 +167,44 @@ but its mechanism was wrong. The sun-gated ground bounce is ruled out
 (zeroing `uAmbBounce` moves shaded clast -0.24). Remaining candidates: the
 flat-shaded facet normals, and the chips' albedo / envMapIntensity.
 
+**ROUND 12, MEASURED with a positive control that fires.** The instrument is
+`probes/r12_ab4.js`: long blocks (32 warm + 30 timed), ABBA over 12 pairs,
+constant ballast, and the AO pass as the positive control — it is ~6.45 ms and
+anything that cannot see it cannot see anything. On a quiet machine (load 2.5
+over 12 cores, 0 other chromiums):
+
+| arm | saving | note |
+| --- | --- | --- |
+| null control | 0.16-0.36 ms | the floor; nothing below ~1 ms is real |
+| AO pass off | **+3.80, +4.29 ms** | positive control, twice. Under-reads the 6.45 by ~35%, so everything below is a LOWER bound |
+| ballast -8 blits | +1.96 ms | second control; 8 x 0.34 = 2.7 expected, same under-read |
+| **whole terrain fragment body off** | **+2.67 ms** | uPerf.x. This is the ceiling on terrain shading work |
+| terrain bedrock block gated | +0.25 ms | at the floor |
+| frustum culling off on all instanced clutter | **-0.25 ms** | see below |
+
+Two conclusions, and the second one killed a change I had already made.
+
+**Terrain per-pixel shading is worth 2.7 ms and is the best target left in the
+scene.** That is the whole custom fragment body against a baked-normal flat
+reference, so it is what a complete distance LOD could approach — not what
+tinkering can. The structural move is a SECOND, reduced material for the outer
+clipmap rings with the near-field half compiled out, rather than more uniform
+branches in the one uber-shader; branching does not reduce register allocation
+and this shader's occupancy is paid by every terrain pixel in the frame.
+
+**Vertex/raster is NOT where the money is, and 1 M off-screen triangles cost
+nothing.** Counted at the gameplay pose (`probes/r12_cull.js`), 1.03 M of the
+1.98 M instanced triangles are outside the camera frustum — the clutter rings
+are single world-spanning InstancedMeshes with one bounding sphere each, so
+`bush-n1-2000000` submits 1635 instances at 20.9% frustum occupancy. Tiling
+them so the frustum could reject them took the gameplay pose from 368 draws /
+4.20 M triangles to 587 / 3.79 M. It measured **-0.25 ms against a 0.16 ms null
+control** — i.e. nothing — and turning culling off entirely on all 710 tiled
+meshes also measured nothing. That change is REVERTED: it blew the 350-draw
+budget by 68% and bought nothing. This agrees with the round-12 cascade result
+elsewhere in this file: raster on this GPU is close to free, and the frame is
+bound by per-pixel work.
+
 **Ranked cuts, with expected savings:**
 1. DOF/MB gather at half res — ~2-2.5 ms. **Done**, see below.
 2. Scene shading + geometry — ~2-3 ms available, never optimised because
