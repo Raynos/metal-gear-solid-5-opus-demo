@@ -4,7 +4,7 @@ import { assemble } from './skinning.js';
 import { makeMaterialSet, Z, SZ, MZ } from './materials.js';
 import { frameMatrix, setDetail } from './geometry.js';
 import {
-  buildTorso, buildHips, buildNeck, buildCollar, buildHead, buildHair, buildPonytail, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
+  buildTorso, buildHips, buildNeck, buildNeckGaiter, buildCollar, buildHead, buildHair, buildPonytail, buildEyes, buildEar, buildArm, buildHand, buildLeg, buildBoot, ARM, armPoint, headTransform,
 } from './body.js';
 import {
   buildChestRig, buildBelt, buildHolster, buildBackpack, buildHelmet, buildCap, buildBoonie,
@@ -62,6 +62,10 @@ function buildCharacterGeometryImpl(loadout) {
   one(buildTorso({ bulk }), 'cloth', 'torso');
   one(buildHips({ bulk }), 'cloth', 'hips');
   one(buildNeck(), 'skin', 'neck');
+  // The undershirt's neck. Skinned to the NECK bone, not the chest: it is a
+  // garment worn on the neck and it has to turn with it, or a head turn slides
+  // the cut edge across the throat.
+  one(buildNeckGaiter(), 'cloth', 'neck');
   // The collar rides the chest, not the neck: a collar that follows the skull
   // swings with every head turn and detaches from the shoulders.
   add(buildCollar({ bulk }), 'rigidChest');
